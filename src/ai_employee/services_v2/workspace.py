@@ -7,14 +7,21 @@ import shutil
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 from ai_employee.domain.base import freeze_json
-from ai_employee.domain.services_v2 import ArtifactStore
+from ai_employee.domain.services_v2 import ArtifactStore, Cancellation
 from ai_employee.domain.v2 import (
     ApprovalRecord,
     ArtifactDescriptor,
     ArtifactPutRequest,
+    DecisionOutcome,
+    EditIntentRequest,
+    ExecutionResult,
+    PolicyDecision,
     PromotionRecord,
+    StableFailure,
+    StableFailureCode,
     WorkspaceRequest,
     WorkspaceSnapshot,
 )
@@ -126,6 +133,75 @@ class GitWorkspaceManager:
             ),
         )
 
+    def apply_edit(
+        self,
+        snapshot: WorkspaceSnapshot,
+        request: EditIntentRequest,
+        decision: PolicyDecision,
+        cancellation: Cancellation,
+    ) -> ExecutionResult:
+        """Apply an exact declared unified diff; never interpret prose as edits."""
+
+        if decision.request_digest != request.content_digest:
+            return self._edit_failure(request, StableFailureCode.POLICY_DENIED, "digest mismatch")
+        if decision.outcome is not DecisionOutcome.ALLOW:
+            code = (
+                StableFailureCode.APPROVAL_REQUIRED
+                if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED
+                else StableFailureCode.POLICY_DENIED
+            )
+            return self._edit_failure(request, code, "edit is not allowed by policy")
+        if cancellation.cancelled():
+            return self._edit_failure(
+                request, StableFailureCode.CANCELLED, "edit was cancelled", status="cancelled"
+            )
+        isolated = self._require_owned(snapshot)
+        patch = request.unified_diff.encode("utf-8")
+        declared = set(request.paths)
+        observed = self._patch_paths(request.unified_diff)
+        if not observed or observed != declared:
+            return self._edit_failure(
+                request,
+                StableFailureCode.INVALID_REQUEST,
+                "unified diff paths must exactly match declared edit paths",
+            )
+        check = subprocess.run(
+            ("git", "-C", str(isolated), "apply", "--check", "--whitespace=nowarn", "-"),
+            input=patch,
+            capture_output=True,
+            check=False,
+        )
+        if check.returncode:
+            return self._edit_failure(
+                request,
+                StableFailureCode.INVALID_REQUEST,
+                check.stderr.decode("utf-8", "replace")[:2_000] or "patch preflight failed",
+            )
+        applied = subprocess.run(
+            ("git", "-C", str(isolated), "apply", "--whitespace=nowarn", "-"),
+            input=patch,
+            capture_output=True,
+            check=False,
+        )
+        if applied.returncode:
+            return self._edit_failure(
+                request,
+                StableFailureCode.PROCESS_FAILED,
+                applied.stderr.decode("utf-8", "replace")[:2_000] or "patch application failed",
+            )
+        return ExecutionResult(
+            id=identifier("edit-result"),
+            run_id=request.run_id,
+            created_at=now(),
+            request_digest=request.content_digest or "",
+            status="succeeded",
+            exit_code=0,
+            duration_seconds=0.0,
+            resource_usage=freeze_json(
+                {"patch_sha256": sha256_bytes(patch), "changed_paths": tuple(sorted(observed))}
+            ),
+        )
+
     def _diff(self, worktree: Path, nonce: str) -> bytes:
         index = self._git_path(worktree, "--git-path", "index")
         temporary_index = self.state_root / f"index-{nonce}"
@@ -225,6 +301,37 @@ class GitWorkspaceManager:
         original = Path(snapshot.original_worktree)
         run_git(original, "worktree", "remove", "--force", str(path))
         self._owned.remove(path)
+
+    @staticmethod
+    def _patch_paths(patch: str) -> set[str]:
+        paths: set[str] = set()
+        for line in patch.splitlines():
+            if line.startswith("--- a/") or line.startswith("+++ b/"):
+                value = line[6:]
+                if value != "/dev/null":
+                    paths.add(value)
+        return paths
+
+    @staticmethod
+    def _edit_failure(
+        request: EditIntentRequest,
+        code: StableFailureCode,
+        message: str,
+        *,
+        status: Literal["failed", "cancelled"] = "failed",
+    ) -> ExecutionResult:
+        return ExecutionResult.model_validate(
+            {
+                "id": identifier("edit-result"),
+                "run_id": request.run_id,
+                "created_at": now(),
+                "request_digest": request.content_digest,
+                "status": status,
+                "failure": StableFailure(code=code, message=message),
+                "duration_seconds": 0.0,
+            },
+            strict=True,
+        )
 
     def _require_owned(self, snapshot: WorkspaceSnapshot) -> Path:
         path = Path(snapshot.isolated_worktree).resolve()

@@ -301,10 +301,19 @@ class EditIntentRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "edit_intent_request"
     paths: tuple[RelativePath, ...] = Field(min_length=1)
     summary: str = Field(min_length=1, max_length=4_000)
+    unified_diff: str = Field(min_length=1, max_length=1_000_000)
 
     _paths_are_relative = field_validator("paths")(
         lambda values: tuple(_relative_path(value) for value in values)
     )
+
+    @model_validator(mode="after")
+    def _patch_is_textual_and_paths_are_unique(self) -> Self:
+        if "\x00" in self.unified_diff:
+            raise ValueError("unified diff must not contain NUL bytes")
+        if len(self.paths) != len(set(self.paths)):
+            raise ValueError("edit paths must be unique")
+        return self
 
 
 class ReviewRequest(DigestedRecordV2):

@@ -13,6 +13,7 @@ from ai_employee.domain.v2 import (
     ArtifactPutRequest,
     DecisionOutcome,
     DownloadRequest,
+    EditIntentRequest,
     InstallRequest,
     PolicyDecision,
     ProcessRequest,
@@ -368,6 +369,75 @@ def test_git_workspace_rejects_state_root_inside_repository(tmp_path: Path) -> N
     )
     with pytest.raises(ValueError, match="outside"):
         manager.create(request)
+
+
+def test_git_workspace_applies_only_exact_declared_edit_patch(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "test@example.test"),
+        check=True,
+    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Test"), check=True)
+    (repository / "file.txt").write_text("before\n")
+    subprocess.run(("git", "-C", str(repository), "add", "file.txt"), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    manager = GitWorkspaceManager(
+        tmp_path / "state", AtomicArtifactStore(tmp_path / "artifacts")
+    )
+    snapshot = manager.create(
+        WorkspaceRequest(
+            id="workspace-edit-request",
+            run_id="run-1",
+            created_at=NOW,
+            repository=str(repository),
+            base_commit=head,
+        )
+    )
+    patch = (
+        "diff --git a/file.txt b/file.txt\n"
+        "--- a/file.txt\n"
+        "+++ b/file.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    )
+    mismatched = EditIntentRequest(
+        id="edit-mismatch",
+        run_id="run-1",
+        created_at=NOW,
+        paths=("other.txt",),
+        summary="attempt a mismatched edit",
+        unified_diff=patch,
+    )
+    rejected = manager.apply_edit(
+        snapshot,
+        mismatched,
+        allow(mismatched.content_digest or ""),
+        NeverCancelled(),
+    )
+    assert rejected.failure is not None
+    assert rejected.failure.code.value == "INVALID_REQUEST"
+    assert Path(snapshot.isolated_worktree, "file.txt").read_text() == "before\n"
+
+    request = EditIntentRequest(
+        id="edit-1",
+        run_id="run-1",
+        created_at=NOW,
+        paths=("file.txt",),
+        summary="apply an exact bounded patch",
+        unified_diff=patch,
+    )
+    result = manager.apply_edit(
+        snapshot, request, allow(request.content_digest or ""), NeverCancelled()
+    )
+    assert result.status == "succeeded"
+    assert Path(snapshot.isolated_worktree, "file.txt").read_text() == "after\n"
+    assert (repository / "file.txt").read_text() == "before\n"
 
 
 def test_installer_denies_global_and_runs_local_fake_manager(tmp_path: Path) -> None:

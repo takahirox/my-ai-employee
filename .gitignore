@@ -8,5 +8,5 @@ __pycache__/
 build/
 dist/
 *.db
-.fleet/
+/.fleet/
 .DS_Store

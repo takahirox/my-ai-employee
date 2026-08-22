@@ -13,7 +13,8 @@ The authority boundary is intentionally narrow:
    history, and metrics. Replay reads accepted `ResultEnvelope` events and invokes no
    worker handler.
 
-Graph and profile schemas are versioned at `1`. Unknown fields are rejected. Replanning
+Graph schemas remain versioned at `1`; Project Harness and work-service contracts are
+versioned at `2`. Unknown fields are rejected. Replanning
 creates revision `n + 1`; accepted values are frozen and never edited in place. Runtime
 generation and graph-revision fences reject stale state mutations.
 
@@ -21,6 +22,19 @@ Project and safety rules outrank routing optimization. Adaptive routing uses suc
 rate, then duration and cost, only after three samples. Until then it records an
 explicit deterministic fallback reason. v0.1 contains no learned or opaque optimizer.
 
-Process-like nodes accept structured command results but the runtime does not expose a
-general subprocess API. Network and unrestricted process authorities are disabled by
-the built-in policy floor.
+v0.2 adds a reviewed-patch vertical slice around the same authority root:
+
+```text
+CLI worker (read-only proposal generation)
+  -> strict WorkerProposalEnvelope
+  -> PolicyResolver / approval
+  -> controlled process, download, install, or exact-patch edit service
+  -> deterministic Harness verification
+  -> patch artifact + AcceptanceLedger
+  -> explicit digest-bound promotion
+```
+
+The worker never writes authoritative state and free-form prose is never executable.
+General commands use `LocalProcessExecutor`. Git worktree lifecycle, diff construction,
+exact patch application, and promotion are deterministic system operations encapsulated
+by `GitWorkspaceManager`; they are not arbitrary worker subprocess authority.

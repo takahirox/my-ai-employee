@@ -37,7 +37,7 @@ from .domain.v2 import (
     WorkspaceSnapshot,
 )
 from .graph import accept_graph
-from .inspector import compare_runs, inspect_run, serve
+from .inspector import compare_runs, inspect_any_run, serve
 from .project import (
     discover_project,
     discover_project_harness,
@@ -212,12 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = runtime.execute(run, pause_after_nodes=args.pause_after)
             print(canonical_json({"run_id": run_id, "state": outcome.run.state.value}))
         elif args.command == "inspect":
-            try:
-                work_run = store.get_work_run(args.run_id)
-            except KeyError:
-                print(canonical_json(inspect_run(store, args.run_id)))
-            else:
-                print(canonical_json({"schema_version": "2", "run": work_run}))
+            print(canonical_json(inspect_any_run(store, args.run_id)))
         elif args.command == "replay":
             report = DeterministicRuntime({}, store=store).replay(args.run_id)
             print(canonical_json(report.__dict__))
@@ -258,6 +253,10 @@ def _work(args: argparse.Namespace) -> int:
         located = shutil.which(executable)
         if located is not None:
             executable_paths.append(Path(located).resolve().parent)
+    for command in harness.commands.values():
+        located = shutil.which(command.argv[0])
+        if located is not None:
+            executable_paths.append(Path(located).resolve().parent)
 
     with SQLiteStore(db_path) as store:
         run_id = identifier("work")
@@ -293,7 +292,7 @@ def _work(args: argparse.Namespace) -> int:
             path = artifacts.root / "sha256" / digest[:2] / digest
             return path.read_bytes()
 
-        capabilities = ["process"]
+        capabilities = ["edit_intent", "process"]
         if harness.network.mode.value != "disabled":
             capabilities.append("download")
         if harness.install.ecosystems:
@@ -601,6 +600,10 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
         located = shutil.which(executable)
         if located is not None:
             executable_paths.append(Path(located).resolve().parent)
+    for command in harness.commands.values():
+        located = shutil.which(command.argv[0])
+        if located is not None:
+            executable_paths.append(Path(located).resolve().parent)
 
     def executor_for(workspace_snapshot: WorkspaceSnapshot) -> LocalProcessExecutor:
         return LocalProcessExecutor(
@@ -614,7 +617,7 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
         run_id=run.id,
         created_at=now(),
         kind=PolicyLayerKind.BUILTIN,
-        allowed_capabilities=("process",),
+        allowed_capabilities=("edit_intent", "process"),
         writable_paths=harness.paths.writable,
         https_domains=(),
         network_mode=NetworkMode.DISABLED,

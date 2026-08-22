@@ -10,6 +10,18 @@ from urllib.parse import urlparse
 
 from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
 from .domain.base import FrozenDict
+from .domain.policy_v2 import PolicyLayer
+from .domain.v2 import (
+    AcceptanceLedger,
+    ApprovalRecord,
+    ArtifactDescriptor,
+    ExecutionResult,
+    PolicyDecision,
+    PromotionRecord,
+    WorkerAvailability,
+    WorkerResult,
+    WorkspaceSnapshot,
+)
 from .serialization import canonical_json
 from .storage import SQLiteStore
 
@@ -78,6 +90,88 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     }
 
 
+def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Project v0.2 work evidence without reading artifact bodies or secrets."""
+
+    run = store.get_work_run(run_id)
+    artifacts = store.list_records("artifact_descriptor_v2", ArtifactDescriptor, run_id=run_id)
+    patch = next((item for item in artifacts if item.id == run.patch_artifact_id), None)
+    return {
+        "schema_version": "2",
+        "run_id": run.id,
+        "kind": "work_run",
+        "state": run.status,
+        "generation": run.generation,
+        "run": _json_model(run),
+        "events": [_json_model(item) for item in store.work_events(run_id)],
+        "policy": {
+            "effective_digest": run.effective_policy_digest,
+            "layers": [
+                _json_model(item)
+                for item in store.list_records("policy_layer_v2", PolicyLayer, run_id=run_id)
+            ],
+            "decisions": [
+                _json_model(item)
+                for item in store.list_records(
+                    "policy_decision_v2", PolicyDecision, run_id=run_id
+                )
+            ],
+        },
+        "approvals": [
+            _json_model(item)
+            for item in store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        ],
+        "worker": {
+            "availability": [
+                _json_model(item)
+                for item in store.list_records(
+                    "worker_availability_v2", WorkerAvailability, run_id=run_id
+                )
+            ],
+            "results": [
+                _json_model(item)
+                for item in store.list_records("worker_result_v2", WorkerResult, run_id=run_id)
+            ],
+        },
+        "workspace": [
+            _json_model(item)
+            for item in store.list_records("workspace_v2", WorkspaceSnapshot, run_id=run_id)
+        ],
+        "actions": [
+            _json_model(item)
+            for item in store.list_records("action_result_v2", ExecutionResult, run_id=run_id)
+        ],
+        "verification": [
+            _json_model(item)
+            for item in store.list_records(
+                "verification_result_v2", ExecutionResult, run_id=run_id
+            )
+        ],
+        "artifacts": [_json_model(item) for item in artifacts],
+        "patch": None if patch is None else _json_model(patch),
+        "acceptance": [
+            _json_model(item)
+            for item in store.list_records(
+                "acceptance_ledger_v2", AcceptanceLedger, run_id=run_id
+            )
+        ],
+        "review": {"digest": run.review_digest},
+        "promotions": [
+            _json_model(item)
+            for item in store.list_records("promotion_v2", PromotionRecord, run_id=run_id)
+        ],
+    }
+
+
+def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Read either runtime generation without mutating or migrating state."""
+
+    try:
+        return inspect_work_run(store, run_id)
+    except KeyError:
+        return inspect_run(store, run_id)
+
+
 def _json_model(value: object) -> dict[str, Any]:
     data = json.loads(canonical_json(value))
     if not isinstance(data, dict):
@@ -104,7 +198,7 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
             if parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.removeprefix("/api/runs/")
                 try:
-                    body = canonical_json(inspect_run(store, run_id)).encode()
+                    body = canonical_json(inspect_any_run(store, run_id)).encode()
                 except KeyError:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return

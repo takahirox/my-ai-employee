@@ -13,6 +13,7 @@ from .v2 import (
     ArtifactPutRequest,
     DownloadRequest,
     DownloadResult,
+    EditIntentRequest,
     ExecutionResult,
     InstallRequest,
     InstallResult,
@@ -43,6 +44,14 @@ class WorkspaceManager(Protocol):
     def adopt(self, snapshot: WorkspaceSnapshot) -> None: ...
 
     def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor: ...
+
+    def apply_edit(
+        self,
+        snapshot: WorkspaceSnapshot,
+        request: EditIntentRequest,
+        decision: PolicyDecision,
+        cancellation: Cancellation,
+    ) -> ExecutionResult: ...
 
     def promote(
         self,

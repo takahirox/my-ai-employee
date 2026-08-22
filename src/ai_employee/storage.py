@@ -110,7 +110,7 @@ class SQLiteStore:
                 "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('schema_version', '1')"
             )
             self._connection.execute(
-                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('fleet_version', '0.1.0')"
+                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('fleet_version', '0.2.0')"
             )
 
     def _schema_version(self) -> int:

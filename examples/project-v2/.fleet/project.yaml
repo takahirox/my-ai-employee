@@ -1,0 +1,50 @@
+schema_version: 2
+commands:
+  test:
+    argv: ["uv", "run", "pytest", "-q"]
+    cwd: "."
+  lint:
+    argv: ["uv", "run", "ruff", "check", "."]
+    cwd: "."
+  typecheck:
+    argv: ["uv", "run", "mypy"]
+    cwd: "."
+rules: []
+paths:
+  writable: ["src/**", "tests/**", "docs/**", "README.md", "CHANGELOG.md"]
+  protected: [".git/**", ".env*", ".github/workflows/**"]
+  generated: ["build/**", "dist/**"]
+verification:
+  required: ["test", "lint", "typecheck"]
+  evidence_freshness: "exact_diff"
+  review:
+    required: true
+    block_severities: ["critical", "high"]
+network:
+  mode: "disabled"
+  https_domains: []
+  ports: []
+install:
+  ecosystems: []
+  existing_lock: "deny"
+  new_dependency: "deny"
+  manifest_lock_mutation: "deny"
+  lifecycle_scripts: "deny"
+  new_registry_domain: "deny"
+  host_global: "deny"
+approvals:
+  process_shell: "required"
+  new_dependency: "required"
+  manifest_lock_mutation: "required"
+  lifecycle_scripts: "deny"
+  new_registry_domain: "required"
+  promotion: "required"
+worker:
+  preferred: "codex_cli"
+  allowed: ["codex_cli", "claude_code_cli"]
+budgets:
+  wall_seconds: 1800.0
+  worker_turns: 1
+  processes: 40
+  download_bytes: 0
+  artifact_bytes: 100000000

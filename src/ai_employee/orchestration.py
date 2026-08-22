@@ -32,6 +32,7 @@ from .domain.v2 import (
     DecisionOutcome,
     DigestedRecordV2,
     DownloadRequest,
+    EditIntentRequest,
     InstallRequest,
     PolicyDecision,
     ProcessRequest,
@@ -415,6 +416,12 @@ class WorkCoordinator:
                         run, status="failed", failure_code="INSTALL_SERVICE_UNAVAILABLE"
                     )
                 result = installer.install(payload, service_decision, cancellation)
+            elif proposal.kind is ActionKind.EDIT_INTENT and isinstance(
+                payload, EditIntentRequest
+            ):
+                result = self.workspace.apply_edit(
+                    snapshot, payload, service_decision, cancellation
+                )
             else:
                 return self._update(run, status="failed", failure_code="UNSUPPORTED_ACTION")
             self.store.put("action_result_v2", result, run_id=run.id)
@@ -478,7 +485,8 @@ class WorkCoordinator:
         changed_paths = tuple(
             line[6:]
             for line in patch_text.splitlines()
-            if line.startswith("+++ b/") and line[6:] != "/dev/null"
+            if (line.startswith("+++ b/") or line.startswith("--- a/"))
+            and line[6:] != "/dev/null"
         )
         if any(
             fnmatch(path, pattern)
@@ -582,6 +590,26 @@ class WorkCoordinator:
                 reason_code="process_not_declared_by_harness",
                 limits=resolution.decision.limits,
             )
+        if proposal.kind is ActionKind.EDIT_INTENT and isinstance(
+            proposal.payload, EditIntentRequest
+        ):
+            writable = resolution.effective_policy.writable_paths or ()
+            path_denied = any(
+                not any(fnmatch(path, pattern) for pattern in writable)
+                or any(fnmatch(path, pattern) for pattern in self.protected_paths)
+                for path in proposal.payload.paths
+            )
+            if path_denied:
+                return PolicyDecision(
+                    id=identifier("policy-decision"),
+                    run_id=proposal.run_id,
+                    created_at=now(),
+                    request_digest=proposal.content_digest or "",
+                    effective_policy_digest=run_policy_digest,
+                    outcome=DecisionOutcome.DENY,
+                    reason_code="edit_path_denied_by_harness",
+                    limits=resolution.decision.limits,
+                )
         payload = resolution.decision.model_dump()
         payload.update(
             {"effective_policy_digest": run_policy_digest, "content_digest": None}
