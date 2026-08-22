@@ -105,9 +105,7 @@ def test_v2_request_is_strict_frozen_and_digest_excludes_identity_time() -> None
 
 def test_versioned_digest_fails_closed_and_retains_explicit_null() -> None:
     assert versioned_digest({"value": None}) != versioned_digest({})
-    assert versioned_digest({"b": "日本語", "a": 1}) == versioned_digest(
-        {"a": 1, "b": "日本語"}
-    )
+    assert versioned_digest({"b": "日本語", "a": 1}) == versioned_digest({"a": 1, "b": "日本語"})
     with pytest.raises(ValueError, match="unsupported digest algorithm"):
         versioned_digest({}, algorithm="sha512")
     with pytest.raises(ValueError, match="unsupported digest format"):

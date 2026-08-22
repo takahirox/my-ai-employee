@@ -50,9 +50,9 @@ class GitWorkspaceManager:
         if self.state_root == repository or repository in self.state_root.parents:
             raise ValueError("Fleet state root must be outside the source repository")
         head = run_git(repository, "rev-parse", "HEAD").decode().strip()
-        requested = run_git(
-            repository, "rev-parse", f"{request.base_commit}^{{commit}}"
-        ).decode().strip()
+        requested = (
+            run_git(repository, "rev-parse", f"{request.base_commit}^{{commit}}").decode().strip()
+        )
         if requested != head:
             raise ValueError("base_commit must match the source worktree HEAD")
         status = run_git(repository, "status", "--porcelain=v2", "--untracked-files=all")
@@ -253,9 +253,7 @@ class GitWorkspaceManager:
         current_index = self._file_digest(self._git_path(original, "--git-path", "index"))
         if current_index != expected_index:
             raise ValueError("source worktree index changed")
-        current_status = run_git(
-            original, "status", "--porcelain=v2", "--untracked-files=all"
-        )
+        current_status = run_git(original, "status", "--porcelain=v2", "--untracked-files=all")
         if sha256_bytes(current_status) != snapshot.dirty_state_digest:
             raise ValueError("source worktree dirty state changed")
         with self.artifacts.open_verified(reviewed_patch) as stream:

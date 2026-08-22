@@ -205,9 +205,7 @@ class WorkCoordinator:
         run_id: str | None = None,
     ) -> WorkRun:
         run_id = run_id or identifier("work")
-        policy_digest = canonical_digest(
-            [layer.content_digest for layer in self.policy_layers]
-        )
+        policy_digest = canonical_digest([layer.content_digest for layer in self.policy_layers])
         run = WorkRun(
             id=run_id,
             goal=goal,
@@ -318,9 +316,7 @@ class WorkCoordinator:
             if self.approval_service is None or run.worker_result_id is None:
                 raise ValueError("resume requires the original approval and worker result services")
             result = self.store.get("worker_result_v2", run.worker_result_id, WorkerResult)
-            decisions = self.store.list_records(
-                "policy_decision_v2", PolicyDecision, run_id=run.id
-            )
+            decisions = self.store.list_records("policy_decision_v2", PolicyDecision, run_id=run.id)
             decision_by_request = {item.request_digest: item for item in decisions}
             channel = _Channel(self, run)
             for proposal in result.proposals:
@@ -347,9 +343,7 @@ class WorkCoordinator:
             if run.worker_result_id is None or run.workspace_id is None:
                 raise ValueError("paused or cancelled run is missing durable action state")
             result = self.store.get("worker_result_v2", run.worker_result_id, WorkerResult)
-            decisions = self.store.list_records(
-                "policy_decision_v2", PolicyDecision, run_id=run.id
-            )
+            decisions = self.store.list_records("policy_decision_v2", PolicyDecision, run_id=run.id)
             decision_by_request = {item.request_digest: item for item in decisions}
             channel = _Channel(self, run)
             for proposal in result.proposals:
@@ -360,9 +354,7 @@ class WorkCoordinator:
             snapshot = self.store.get("workspace_v2", run.workspace_id, WorkspaceSnapshot)
             self.workspace.adopt(snapshot)
             self.store.clear_control(run.id)
-            resumed = self._update(
-                run, generation=run.generation + 1, status="running"
-            )
+            resumed = self._update(run, generation=run.generation + 1, status="running")
             return self._execute_actions(
                 resumed, snapshot, channel, _Cancellation(self.store, run.id)
             )
@@ -390,9 +382,7 @@ class WorkCoordinator:
                 return self._update(run, status="failed", failure_code="POLICY_DENIED")
             if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
                 approval = self._request_approval(proposal, decision)
-                return self._update(
-                    run, status="waiting_approval", pending_approval_id=approval.id
-                )
+                return self._update(run, status="waiting_approval", pending_approval_id=approval.id)
             payload = proposal.payload
             service_decision = bind_service_decision(payload, decision)
             self._event(
@@ -416,9 +406,7 @@ class WorkCoordinator:
                         run, status="failed", failure_code="INSTALL_SERVICE_UNAVAILABLE"
                     )
                 result = installer.install(payload, service_decision, cancellation)
-            elif proposal.kind is ActionKind.EDIT_INTENT and isinstance(
-                payload, EditIntentRequest
-            ):
+            elif proposal.kind is ActionKind.EDIT_INTENT and isinstance(payload, EditIntentRequest):
                 result = self.workspace.apply_edit(
                     snapshot, payload, service_decision, cancellation
                 )
@@ -451,9 +439,7 @@ class WorkCoordinator:
             if self.store.control(run.id) == "pause":
                 return self._update(run, status="paused")
             if request.run_id != run.id:
-                return self._update(
-                    run, status="failed", failure_code="STALE_VERIFICATION_REQUEST"
-                )
+                return self._update(run, status="failed", failure_code="STALE_VERIFICATION_REQUEST")
             verification_proposal = ActionProposal(
                 id=identifier("verification-proposal"),
                 run_id=run.id,
@@ -465,9 +451,7 @@ class WorkCoordinator:
             )
             proposal_decision = self._decide(verification_proposal)
             if proposal_decision.outcome is not DecisionOutcome.ALLOW:
-                return self._update(
-                    run, status="failed", failure_code="VERIFICATION_POLICY_DENIED"
-                )
+                return self._update(run, status="failed", failure_code="VERIFICATION_POLICY_DENIED")
             result = executor.execute(
                 request,
                 bind_service_decision(request, proposal_decision),
@@ -475,9 +459,7 @@ class WorkCoordinator:
             )
             self.store.put("verification_result_v2", result, run_id=run.id)
             if result.status != "succeeded":
-                return self._update(
-                    run, status="failed", failure_code="VERIFICATION_FAILED"
-                )
+                return self._update(run, status="failed", failure_code="VERIFICATION_FAILED")
             verification_digests.append(result.content_digest or "")
         patch = self.workspace.capture_diff(snapshot)
         self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
@@ -485,13 +467,10 @@ class WorkCoordinator:
         changed_paths = tuple(
             line[6:]
             for line in patch_text.splitlines()
-            if (line.startswith("+++ b/") or line.startswith("--- a/"))
-            and line[6:] != "/dev/null"
+            if (line.startswith("+++ b/") or line.startswith("--- a/")) and line[6:] != "/dev/null"
         )
         if any(
-            fnmatch(path, pattern)
-            for path in changed_paths
-            for pattern in self.protected_paths
+            fnmatch(path, pattern) for path in changed_paths for pattern in self.protected_paths
         ):
             return self._update(run, status="failed", failure_code="REVIEW_BLOCKED")
         promotion_approval_id: str | None = None
@@ -611,9 +590,7 @@ class WorkCoordinator:
                     limits=resolution.decision.limits,
                 )
         payload = resolution.decision.model_dump()
-        payload.update(
-            {"effective_policy_digest": run_policy_digest, "content_digest": None}
-        )
+        payload.update({"effective_policy_digest": run_policy_digest, "content_digest": None})
         return PolicyDecision.model_validate(payload, strict=True)
 
     def _request_approval(

@@ -235,9 +235,7 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
             store,
             runtime,
             NoWorkspace(),  # type: ignore[arg-type]
-            lambda _snapshot, _cancellation: ScriptedWorkerAdapter(
-                [WorkerProposalEnvelope()]
-            ),
+            lambda _snapshot, _cancellation: ScriptedWorkerAdapter([WorkerProposalEnvelope()]),
             lambda _snapshot: (_ for _ in ()).throw(
                 AssertionError("plan-only must not create an executor")
             ),
@@ -301,9 +299,7 @@ def test_deleted_protected_path_is_rejected(tmp_path: Path) -> None:
         b"+++ /dev/null\n"
         b"@@ -1 +0,0 @@\n-secret\n"
     )
-    store, run = _complete_coordinator_run(
-        tmp_path, patch, protected_paths=("protected.txt",)
-    )
+    store, run = _complete_coordinator_run(tmp_path, patch, protected_paths=("protected.txt",))
     try:
         assert run.status == "failed"
         assert run.failure_code == "REVIEW_BLOCKED"

@@ -182,9 +182,7 @@ class ProjectLocalInstaller:
             inventory_artifact_digest=inventory.artifact_digest,
         )
 
-    def _validate(
-        self, request: InstallRequest, decision: PolicyDecision
-    ) -> StableFailure | None:
+    def _validate(self, request: InstallRequest, decision: PolicyDecision) -> StableFailure | None:
         forbidden = {"-g", "--global", "--user", "sudo"}
         if request.operation == "host_global" or any(item in forbidden for item in request.argv):
             return StableFailure(

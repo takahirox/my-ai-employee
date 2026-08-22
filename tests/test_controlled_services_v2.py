@@ -140,8 +140,10 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     )
     result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
     assert result.status == "succeeded"
-    descriptor_path = store.content_root / (result.stdout_artifact_digest or "")[:2] / (
-        result.stdout_artifact_digest or ""
+    descriptor_path = (
+        store.content_root
+        / (result.stdout_artifact_digest or "")[:2]
+        / (result.stdout_artifact_digest or "")
     )
     assert descriptor_path.read_bytes() == b"yes:unset"
 
@@ -165,9 +167,11 @@ def test_process_executor_reads_only_descriptor_bound_stdin(tmp_path: Path) -> N
     executor = LocalProcessExecutor(
         (tmp_path,),
         store,
-        stdin_resolver=lambda digest: store.open_verified(descriptor)
-        if digest == descriptor.artifact_digest
-        else (_ for _ in ()).throw(KeyError(digest)),
+        stdin_resolver=lambda digest: (
+            store.open_verified(descriptor)
+            if digest == descriptor.artifact_digest
+            else (_ for _ in ()).throw(KeyError(digest))
+        ),
     )
     request = ProcessRequest(
         id="process-stdin-1",
@@ -182,8 +186,10 @@ def test_process_executor_reads_only_descriptor_bound_stdin(tmp_path: Path) -> N
     )
     result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
     assert result.status == "succeeded"
-    output = store.content_root / (result.stdout_artifact_digest or "")[:2] / (
-        result.stdout_artifact_digest or ""
+    output = (
+        store.content_root
+        / (result.stdout_artifact_digest or "")[:2]
+        / (result.stdout_artifact_digest or "")
     )
     assert output.read_bytes() == b"bounded input"
 
@@ -386,9 +392,7 @@ def test_git_workspace_applies_only_exact_declared_edit_patch(tmp_path: Path) ->
     head = subprocess.check_output(
         ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
     ).strip()
-    manager = GitWorkspaceManager(
-        tmp_path / "state", AtomicArtifactStore(tmp_path / "artifacts")
-    )
+    manager = GitWorkspaceManager(tmp_path / "state", AtomicArtifactStore(tmp_path / "artifacts"))
     snapshot = manager.create(
         WorkspaceRequest(
             id="workspace-edit-request",

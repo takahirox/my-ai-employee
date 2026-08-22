@@ -174,9 +174,7 @@ class ProcessRequest(DigestedRecordV2):
             "PRIVATE_KEY",
         )
         secret_names = [
-            name
-            for name in names
-            if any(marker in name.upper() for marker in secret_markers)
+            name for name in names if any(marker in name.upper() for marker in secret_markers)
         ]
         if secret_names:
             raise ValueError(
@@ -238,9 +236,9 @@ class InstallRequest(DigestedRecordV2):
     lifecycle_scripts: bool = False
     expected_mutations: tuple[RelativePath, ...] = ()
 
-    _paths = field_validator(
-        "manifest_path", "lock_path", "manager_executable", "target"
-    )(_relative_path)
+    _paths = field_validator("manifest_path", "lock_path", "manager_executable", "target")(
+        _relative_path
+    )
     _mutation_paths = field_validator("expected_mutations")(
         lambda values: tuple(_relative_path(value) for value in values)
     )

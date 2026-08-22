@@ -99,9 +99,7 @@ class LocalProcessExecutor:
             if request.stdin_artifact_digest is not None:
                 assert self.stdin_resolver is not None
                 stdin_handle = self.stdin_resolver(request.stdin_artifact_digest)
-            stdin: BinaryIO | int = (
-                subprocess.DEVNULL if stdin_handle is None else stdin_handle
-            )
+            stdin: BinaryIO | int = subprocess.DEVNULL if stdin_handle is None else stdin_handle
             try:
                 process = subprocess.Popen(
                     argv,
@@ -162,9 +160,9 @@ class LocalProcessExecutor:
                 duration_seconds=time.monotonic() - started,
                 resource_usage=freeze_json(
                     {
-                        "argv_sha256": __import__("hashlib").sha256(
-                            "\0".join(argv).encode()
-                        ).hexdigest(),
+                        "argv_sha256": __import__("hashlib")
+                        .sha256("\0".join(argv).encode())
+                        .hexdigest(),
                         "policy_digest": decision.effective_policy_digest,
                         "stdout_bytes": len(stdout),
                         "stderr_bytes": len(stderr),
@@ -256,9 +254,7 @@ class LocalProcessExecutor:
     def _resolve_executable(self, value: str, cwd: Path) -> Path:
         if "/" in value:
             candidate = (
-                (cwd / value).resolve()
-                if not Path(value).is_absolute()
-                else Path(value).resolve()
+                (cwd / value).resolve() if not Path(value).is_absolute() else Path(value).resolve()
             )
             allowed = any(
                 candidate == root or root in candidate.parents

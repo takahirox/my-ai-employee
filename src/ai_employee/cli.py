@@ -266,9 +266,7 @@ def _work(args: argparse.Namespace) -> int:
                 (root,),
                 artifacts,
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
-                stdin_resolver=lambda digest: artifacts.open_verified(
-                    descriptors[digest]
-                ),
+                stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
         def prompt_writer(value: bytes) -> str:
@@ -349,9 +347,7 @@ def _work(args: argparse.Namespace) -> int:
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
             adapter_type = (
-                CodexCliWorkerAdapter
-                if args.worker == "codex_cli"
-                else ClaudeCodeCliWorkerAdapter
+                CodexCliWorkerAdapter if args.worker == "codex_cli" else ClaudeCodeCliWorkerAdapter
             )
             return adapter_type(
                 executor_for(root),
@@ -361,6 +357,7 @@ def _work(args: argparse.Namespace) -> int:
                 prompt_writer=prompt_writer,
                 cancellation=cancellation,
             )
+
         if harness.provisional or args.worker not in harness.worker.allowed:
             print(
                 canonical_json(
@@ -414,12 +411,16 @@ def _work(args: argparse.Namespace) -> int:
             protected_paths=harness.paths.protected,
             allowed_processes=tuple(command.argv for command in harness.commands.values()),
         )
-        head = __import__("subprocess").run(
-            ("git", "-C", str(repository), "rev-parse", "HEAD"),
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stdout.strip()
+        head = (
+            __import__("subprocess")
+            .run(
+                ("git", "-C", str(repository), "rev-parse", "HEAD"),
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+            .stdout.strip()
+        )
         run = coordinator.start(
             args.goal,
             str(repository),
@@ -487,11 +488,7 @@ def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
     if run.status == "completed":
         promotions = store.list_records("promotion_v2", PromotionRecord, run_id=run.id)
         if any(item.reviewed_patch_digest == args.patch_digest for item in promotions):
-            print(
-                canonical_json(
-                    {"schema_version": "2", "run_id": run.id, "status": "completed"}
-                )
-            )
+            print(canonical_json({"schema_version": "2", "run_id": run.id, "status": "completed"}))
             return 0
     if run.status != "ready_to_promote" or run.patch_artifact_id is None:
         _print_work_failure(run.id, run.status, "PROMOTION_NOT_READY")
@@ -508,9 +505,7 @@ def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
         _print_work_failure(run.id, run.status, "PROMOTION_APPROVAL_REQUIRED")
         return 4
     approval = store.get("approval_v2", run.pending_approval_id, ApprovalRecord)
-    ledger = store.get(
-        "acceptance_ledger_v2", run.acceptance_ledger_id, AcceptanceLedger
-    )
+    ledger = store.get("acceptance_ledger_v2", run.acceptance_ledger_id, AcceptanceLedger)
     gate_criteria = {
         item.criterion_id: item
         for item in ledger.criteria
@@ -521,8 +516,7 @@ def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
         or any(item.disposition != "satisfied" for item in ledger.criteria)
         or set(gate_criteria) != {"reviewed-patch", "promotion-ready"}
         or not all(
-            patch.artifact_digest in item.evidence_refs
-            and run.review_digest in item.evidence_refs
+            patch.artifact_digest in item.evidence_refs and run.review_digest in item.evidence_refs
             for item in gate_criteria.values()
         )
     ):
@@ -548,9 +542,7 @@ def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
         _print_work_failure(run.id, run.status, "WORKSPACE_CONFLICT")
         return 8
     store.put("promotion_v2", promotion, run_id=run.id)
-    completed = run.model_copy(
-        update={"status": "completed", "generation": run.generation + 1}
-    )
+    completed = run.model_copy(update={"status": "completed", "generation": run.generation + 1})
     store.save_work_run(completed)
     store.checkpoint_work(
         completed.id,
@@ -586,11 +578,7 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
         raise TypeError("expected a v0.2 work run")
     harness = discover_project_harness(run.repository)
     if run.workspace_id is None:
-        print(
-            canonical_json(
-                {"schema_version": "2", "run_id": run.id, "status": run.status}
-            )
-        )
+        print(canonical_json({"schema_version": "2", "run_id": run.id, "status": run.status}))
         return 0
     snapshot = store.get("workspace_v2", run.workspace_id, WorkspaceSnapshot)
     storage_root = Path(store.path).resolve().parent

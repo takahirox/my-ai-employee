@@ -158,9 +158,9 @@ class RestrictedDownloadClient:
                 actual = hashlib.sha256(content).hexdigest()
                 if request.expected_sha256 is not None and actual != request.expected_sha256:
                     raise _IntegrityError("download checksum mismatch")
-                media_type = headers.get(
-                    "content-type", "application/octet-stream"
-                ).split(";", 1)[0]
+                media_type = headers.get("content-type", "application/octet-stream").split(";", 1)[
+                    0
+                ]
                 if (
                     request.expected_media_type is not None
                     and media_type != request.expected_media_type
@@ -239,8 +239,7 @@ class RestrictedDownloadClient:
         if port not in self.allowed_ports:
             raise ValueError("URL port is not allowlisted")
         allowed = any(
-            host == rule
-            or (rule.startswith(".") and host.endswith(rule) and host != rule[1:])
+            host == rule or (rule.startswith(".") and host.endswith(rule) and host != rule[1:])
             for rule in self.allowed_domains
         )
         if not allowed:
@@ -274,8 +273,7 @@ class RestrictedDownloadClient:
         tls.settimeout(read_timeout)
         target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         request = (
-            f"GET {target} HTTP/1.1\r\nHost: {host}\r\n"
-            "Connection: close\r\nAccept: */*\r\n\r\n"
+            f"GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
         )
         tls.sendall(request.encode("ascii"))
         response = http.client.HTTPResponse(tls)

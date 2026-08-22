@@ -52,9 +52,7 @@ class AtomicArtifactStore:
                 os.link(temporary, destination)
             except FileExistsError:
                 if self._digest_file(destination) != (artifact_digest, size):
-                    raise OSError(
-                        "existing content does not match its content address"
-                    ) from None
+                    raise OSError("existing content does not match its content address") from None
             temporary.unlink()
             descriptor = ArtifactDescriptor(
                 id=identifier("artifact"),

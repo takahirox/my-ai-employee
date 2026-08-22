@@ -110,7 +110,7 @@ class SQLiteStore:
                 "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('schema_version', '1')"
             )
             self._connection.execute(
-                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('fleet_version', '0.2.0')"
+                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('fleet_version', '0.2.1')"
             )
 
     def _schema_version(self) -> int:
@@ -130,8 +130,7 @@ class SQLiteStore:
                 "event_id TEXT NOT NULL UNIQUE,run_id TEXT NOT NULL,payload TEXT NOT NULL)"
             )
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS work_events_v2_run "
-                "ON work_events_v2(run_id, sequence)"
+                "CREATE INDEX IF NOT EXISTS work_events_v2_run ON work_events_v2(run_id, sequence)"
             )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS work_checkpoints_v2 ("
@@ -141,7 +140,7 @@ class SQLiteStore:
                 "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
             )
             connection.execute(
-                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('fleet_version','0.2.0')"
+                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('fleet_version','0.2.1')"
             )
 
     def put(

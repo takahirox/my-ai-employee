@@ -112,9 +112,7 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             ],
             "decisions": [
                 _json_model(item)
-                for item in store.list_records(
-                    "policy_decision_v2", PolicyDecision, run_id=run_id
-                )
+                for item in store.list_records("policy_decision_v2", PolicyDecision, run_id=run_id)
             ],
         },
         "approvals": [
@@ -143,17 +141,13 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ],
         "verification": [
             _json_model(item)
-            for item in store.list_records(
-                "verification_result_v2", ExecutionResult, run_id=run_id
-            )
+            for item in store.list_records("verification_result_v2", ExecutionResult, run_id=run_id)
         ],
         "artifacts": [_json_model(item) for item in artifacts],
         "patch": None if patch is None else _json_model(patch),
         "acceptance": [
             _json_model(item)
-            for item in store.list_records(
-                "acceptance_ledger_v2", AcceptanceLedger, run_id=run_id
-            )
+            for item in store.list_records("acceptance_ledger_v2", AcceptanceLedger, run_id=run_id)
         ],
         "review": {"digest": run.review_digest},
         "promotions": [

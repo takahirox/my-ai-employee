@@ -239,9 +239,7 @@ class ProjectHarnessV2(HarnessModel):
 
     @field_validator("commands")
     @classmethod
-    def _freeze_commands(
-        cls, value: Mapping[str, HarnessCommand]
-    ) -> Mapping[str, HarnessCommand]:
+    def _freeze_commands(cls, value: Mapping[str, HarnessCommand]) -> Mapping[str, HarnessCommand]:
         if any(not name for name in value):
             raise ValueError("command names must be non-empty")
         return FrozenDict(value)

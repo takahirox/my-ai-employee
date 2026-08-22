@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "my-ai-employee"
-version = "0.2.0"
+version = "0.2.1"
 description = "Deterministic trust kernel for a goal-driven, graph-first AI fleet runtime"
 readme = "README.md"
 requires-python = ">=3.11"
