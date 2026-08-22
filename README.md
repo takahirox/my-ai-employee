@@ -40,8 +40,16 @@ human approval.
   small read-only Inspector;
 - Python graph construction plus strict JSON/YAML loading.
 
-See [Architecture](docs/architecture.md), [Project Harness example](examples/project/.fleet/project.yaml),
-and [declarative graph](examples/demo_graph.yaml).
+## Documentation
+
+- [Architecture and authority boundaries](docs/architecture.md)
+- [Project Harness guide](docs/project-harness.md) and
+  [example profile](examples/project/.fleet/project.yaml)
+- [OpenAI Agents SDK and TAKT influences](docs/influences.md)
+- [Security, permissions, sandboxing, and secrets](docs/security.md)
+- [Development and release checks](docs/development.md)
+- [v0.2/v0.3 roadmap](docs/roadmap.md)
+- [Declarative graph example](examples/demo_graph.yaml)
 
 ## Python API
 
@@ -65,5 +73,6 @@ python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```
 
-Python 3.11, 3.12, and 3.13 are supported. See `CONTRIBUTING.md` and
-`SECURITY.md` before submitting changes or reporting vulnerabilities.
+Python 3.11, 3.12, and 3.13 are supported. See [CONTRIBUTING.md](CONTRIBUTING.md)
+and [SECURITY.md](SECURITY.md) before submitting changes or reporting
+vulnerabilities.

@@ -18,7 +18,6 @@ from ai_employee.domain import (
     transition_task,
 )
 from ai_employee.serialization import canonical_json, loads_model
-
 from tests.helpers import node, provenance, run, task
 
 
@@ -45,7 +44,7 @@ class TransitionTests(unittest.TestCase):
         for source, allowed in RUN_TRANSITIONS.items():
             for target in RunState:
                 candidate = base.model_copy(update={"state": source, "transitions": ()})
-                operation = lambda: transition_run(  # noqa: E731
+                operation = lambda candidate=candidate, target=target: transition_run(  # noqa: E731
                     candidate,
                     target,
                     provenance(),
@@ -67,7 +66,7 @@ class TransitionTests(unittest.TestCase):
         for source, allowed in TASK_TRANSITIONS.items():
             for target in TaskState:
                 candidate = base.model_copy(update={"state": source, "transitions": ()})
-                operation = lambda: transition_task(  # noqa: E731
+                operation = lambda candidate=candidate, target=target: transition_task(  # noqa: E731
                     candidate,
                     target,
                     provenance(),
@@ -87,7 +86,7 @@ class TransitionTests(unittest.TestCase):
         for source, allowed in NODE_TRANSITIONS.items():
             for target in NodeState:
                 candidate = base.model_copy(update={"state": source, "transitions": ()})
-                operation = lambda: transition_node(  # noqa: E731
+                operation = lambda candidate=candidate, target=target: transition_node(  # noqa: E731
                     candidate,
                     target,
                     provenance(),

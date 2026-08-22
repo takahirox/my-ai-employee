@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
 from .demo import run_demo
 from .domain import (
-    ContractKind, ExecutionPolicy, Goal, Graph, ResultEnvelope, ResultStatus, Run,
+    ContractKind,
+    ExecutionPolicy,
+    Goal,
+    Graph,
+    ResultEnvelope,
+    ResultStatus,
+    Run,
 )
+from .domain.base import freeze_json
 from .graph import accept_graph
 from .inspector import compare_runs, inspect_run, serve
 from .project import discover_project_profile
@@ -75,20 +82,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     with SQLiteStore(args.db) as store:
         if args.command == "demo":
-            run_id = args.run_id or f"demo-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            run_id = args.run_id or f"demo-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
             outcome = run_demo(store, run_id=run_id)
-            print(canonical_json({"run_id": run_id, "state": outcome.run.state.value, "coverage": outcome.coverage}))
+            print(
+                canonical_json(
+                    {
+                        "run_id": run_id,
+                        "state": outcome.run.state.value,
+                        "coverage": outcome.coverage,
+                    }
+                )
+            )
         elif args.command == "run":
             graph = loads_yaml_model(Path(args.graph).read_text(encoding="utf-8"), Graph)
-            run_id = args.run_id or f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            run_id = args.run_id or f"run-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
             policy = ExecutionPolicy(
-                max_nodes=graph.budget.max_nodes, max_attempts=graph.budget.max_attempts,
+                max_nodes=graph.budget.max_nodes,
+                max_attempts=graph.budget.max_attempts,
                 max_wall_seconds=graph.budget.max_wall_seconds,
             )
             accepted = accept_graph(graph, policy)
-            run = Run(id=run_id, goal=Goal(id=f"goal-{run_id}", statement=args.goal), accepted_graph=accepted, policy=policy)
+            run = Run(
+                id=run_id,
+                goal=Goal(id=f"goal-{run_id}", statement=args.goal),
+                accepted_graph=accepted,
+                policy=policy,
+            )
             store.save_graph(run_id, accepted)
-            runtime = DeterministicRuntime({node.id: _declarative_handler for node in graph.nodes}, store=store)
+            runtime = DeterministicRuntime(
+                {node.id: _declarative_handler for node in graph.nodes}, store=store
+            )
             outcome = runtime.execute(run, pause_after_nodes=args.pause_after)
             print(canonical_json({"run_id": run_id, "state": outcome.run.state.value}))
         elif args.command == "inspect":
@@ -113,10 +136,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _declarative_handler(context: NodeExecutionContext) -> ResultEnvelope:
     configuration = context.node.configuration
-    status_text = configuration.get("status", "succeeded") if isinstance(configuration, dict) else "succeeded"
+    status_text = (
+        configuration.get("status", "succeeded") if isinstance(configuration, dict) else "succeeded"
+    )
     status = ResultStatus(status_text)
-    value = configuration.get("value") if isinstance(configuration, dict) and "value" in configuration else _default_value(context)
-    return ResultEnvelope(contract_id=context.node.output_contract.id, status=status, value=value)
+    value = (
+        configuration.get("value")
+        if isinstance(configuration, dict) and "value" in configuration
+        else _default_value(context)
+    )
+    return ResultEnvelope(
+        contract_id=context.node.output_contract.id,
+        status=status,
+        value=freeze_json(value),
+    )
 
 
 def _default_value(context: NodeExecutionContext) -> object:

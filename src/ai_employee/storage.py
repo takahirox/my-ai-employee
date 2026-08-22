@@ -12,8 +12,17 @@ from typing import Any, TypeVar
 from pydantic import BaseModel
 
 from .domain import (
-    AcceptedGraphRevision, Artifact, Event, ExecutionMetrics, Node, ProjectProfile, Run,
-    StateTransition, StrategyPerformance, Task, VerificationEvidence,
+    AcceptedGraphRevision,
+    Artifact,
+    Event,
+    ExecutionMetrics,
+    Node,
+    ProjectProfile,
+    Run,
+    StateTransition,
+    StrategyPerformance,
+    Task,
+    VerificationEvidence,
 )
 from .serialization import canonical_json
 
@@ -96,7 +105,12 @@ class SQLiteStore:
             )
 
     def put(
-        self, kind: str, model: BaseModel, *, run_id: str | None = None, revision: int = 1,
+        self,
+        kind: str,
+        model: BaseModel,
+        *,
+        run_id: str | None = None,
+        revision: int = 1,
     ) -> None:
         record_id = getattr(model, "id", None)
         if record_id is None and isinstance(model, AcceptedGraphRevision):
@@ -105,14 +119,18 @@ class SQLiteStore:
             raise ValueError("stored model requires an id")
         with self._connection:
             self._connection.execute(
-                "INSERT OR REPLACE INTO records(kind, record_id, run_id, revision, payload) VALUES(?,?,?,?,?)",
+                "INSERT OR REPLACE INTO records"
+                "(kind, record_id, run_id, revision, payload) VALUES(?,?,?,?,?)",
                 (kind, record_id, run_id, revision, canonical_json(model)),
             )
 
-    def get(self, kind: str, record_id: str, model_type: type[ModelT], *, revision: int | None = None) -> ModelT:
+    def get(
+        self, kind: str, record_id: str, model_type: type[ModelT], *, revision: int | None = None
+    ) -> ModelT:
         if revision is None:
             row = self._connection.execute(
-                "SELECT payload FROM records WHERE kind=? AND record_id=? ORDER BY revision DESC LIMIT 1",
+                "SELECT payload FROM records WHERE kind=? AND record_id=? "
+                "ORDER BY revision DESC LIMIT 1",
                 (kind, record_id),
             ).fetchone()
         else:
@@ -124,14 +142,17 @@ class SQLiteStore:
             raise KeyError((kind, record_id, revision))
         return model_type.model_validate_json(row["payload"], strict=True)
 
-    def list_records(self, kind: str, model_type: type[ModelT], *, run_id: str | None = None) -> tuple[ModelT, ...]:
+    def list_records(
+        self, kind: str, model_type: type[ModelT], *, run_id: str | None = None
+    ) -> tuple[ModelT, ...]:
         if run_id is None:
             rows = self._connection.execute(
                 "SELECT payload FROM records WHERE kind=? ORDER BY record_id, revision", (kind,)
             )
         else:
             rows = self._connection.execute(
-                "SELECT payload FROM records WHERE kind=? AND run_id=? ORDER BY record_id, revision",
+                "SELECT payload FROM records WHERE kind=? AND run_id=? "
+                "ORDER BY record_id, revision",
                 (kind, run_id),
             )
         return tuple(model_type.model_validate_json(row["payload"], strict=True) for row in rows)
@@ -166,7 +187,9 @@ class SQLiteStore:
                 "INSERT INTO events(event_id, run_id, event_type, payload) VALUES(?,?,?,?)",
                 (event.id, event.run_id, event.event_type, canonical_json(event)),
             )
-        return int(cursor.lastrowid)
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an event sequence")
+        return cursor.lastrowid
 
     def events(self, run_id: str) -> tuple[Event, ...]:
         rows = self._connection.execute(
@@ -193,20 +216,29 @@ class SQLiteStore:
         return int(row["generation"]), payload
 
     def save_transition(self, run_id: str, transition: StateTransition, *, sequence: int) -> None:
-        self.put("transition", _TransitionRecord.from_transition(sequence, transition), run_id=run_id, revision=sequence)
+        self.put(
+            "transition",
+            _TransitionRecord.from_transition(sequence, transition),
+            run_id=run_id,
+            revision=sequence,
+        )
 
     def save_performance(self, profile_id: str, performance: StrategyPerformance) -> None:
         with self._connection:
             self._connection.execute(
-                "INSERT OR REPLACE INTO strategy_performance(profile_id, strategy_id, payload) VALUES(?,?,?)",
+                "INSERT OR REPLACE INTO strategy_performance"
+                "(profile_id, strategy_id, payload) VALUES(?,?,?)",
                 (profile_id, performance.strategy_id, canonical_json(performance)),
             )
 
     def performance(self, profile_id: str) -> tuple[StrategyPerformance, ...]:
         rows = self._connection.execute(
-            "SELECT payload FROM strategy_performance WHERE profile_id=? ORDER BY strategy_id", (profile_id,)
+            "SELECT payload FROM strategy_performance WHERE profile_id=? ORDER BY strategy_id",
+            (profile_id,),
         )
-        return tuple(StrategyPerformance.model_validate_json(row["payload"], strict=True) for row in rows)
+        return tuple(
+            StrategyPerformance.model_validate_json(row["payload"], strict=True) for row in rows
+        )
 
     def request_control(self, run_id: str, action: str) -> None:
         if action not in {"pause", "cancel"}:
@@ -217,7 +249,9 @@ class SQLiteStore:
             )
 
     def control(self, run_id: str) -> str | None:
-        row = self._connection.execute("SELECT action FROM controls WHERE run_id=?", (run_id,)).fetchone()
+        row = self._connection.execute(
+            "SELECT action FROM controls WHERE run_id=?", (run_id,)
+        ).fetchone()
         return None if row is None else str(row["action"])
 
     def clear_control(self, run_id: str) -> None:
@@ -233,4 +267,6 @@ class _TransitionRecord(BaseModel):
 
     @classmethod
     def from_transition(cls, sequence: int, transition: StateTransition) -> _TransitionRecord:
-        return cls(id=f"{transition.entity_id}:{sequence}", sequence=sequence, transition=transition)
+        return cls(
+            id=f"{transition.entity_id}:{sequence}", sequence=sequence, transition=transition
+        )

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable
 
 from .domain import AcceptedGraphRevision, ExecutionPolicy, Graph, NodeKind
 
@@ -37,25 +37,40 @@ def validate_graph(
     if len(nodes) > min(graph.budget.max_nodes, policy.max_nodes):
         issues.append(GraphValidationIssue("node_budget_exceeded", graph.id, "too many nodes"))
     if graph.budget.max_attempts > policy.max_attempts:
-        issues.append(GraphValidationIssue("attempt_budget_exceeded", graph.id, "attempt cap exceeds policy"))
+        issues.append(
+            GraphValidationIssue("attempt_budget_exceeded", graph.id, "attempt cap exceeds policy")
+        )
     if graph.budget.max_wall_seconds > policy.max_wall_seconds:
-        issues.append(GraphValidationIssue("time_budget_exceeded", graph.id, "time cap exceeds policy"))
+        issues.append(
+            GraphValidationIssue("time_budget_exceeded", graph.id, "time cap exceeds policy")
+        )
 
     adjacency: dict[str, list[str]] = defaultdict(list)
     reverse: dict[str, list[str]] = defaultdict(list)
     for edge in graph.edges:
         adjacency[edge.source_id].append(edge.target_id)
         reverse[edge.target_id].append(edge.source_id)
-        if edge.loop and edge.max_traversals is not None:
-            if edge.max_traversals > graph.budget.max_loop_iterations:
-                issues.append(GraphValidationIssue("loop_budget_exceeded", edge.id, "loop exceeds graph budget"))
+        if (
+            edge.loop
+            and edge.max_traversals is not None
+            and edge.max_traversals > graph.budget.max_loop_iterations
+        ):
+            issues.append(
+                GraphValidationIssue("loop_budget_exceeded", edge.id, "loop exceeds graph budget")
+            )
     for node in graph.nodes:
         if node.kind not in set(NodeKind):
             issues.append(GraphValidationIssue("unsupported_node_kind", node.id, str(node.kind)))
         if node.retry_limit > graph.budget.max_retries:
-            issues.append(GraphValidationIssue("retry_budget_exceeded", node.id, "retry exceeds graph budget"))
+            issues.append(
+                GraphValidationIssue("retry_budget_exceeded", node.id, "retry exceeds graph budget")
+            )
         if node.max_iterations > graph.budget.max_loop_iterations:
-            issues.append(GraphValidationIssue("iteration_budget_exceeded", node.id, "iteration exceeds graph budget"))
+            issues.append(
+                GraphValidationIssue(
+                    "iteration_budget_exceeded", node.id, "iteration exceeds graph budget"
+                )
+            )
         for capability in sorted(set(node.required_capabilities)):
             if capability in denied:
                 issues.append(GraphValidationIssue("capability_denied", node.id, capability))
@@ -64,25 +79,36 @@ def validate_graph(
 
     reachable = _walk(graph.entry_node_ids, adjacency)
     for node_id in sorted(set(nodes) - reachable):
-        issues.append(GraphValidationIssue("unreachable_node", node_id, "not reachable from an entry"))
+        issues.append(
+            GraphValidationIssue("unreachable_node", node_id, "not reachable from an entry")
+        )
     can_reach_terminal = _walk(graph.terminal_node_ids, reverse)
     for node_id in sorted(reachable - can_reach_terminal):
         issues.append(GraphValidationIssue("no_terminal_path", node_id, "cannot reach a terminal"))
     for component in _cyclic_components(nodes, adjacency):
         internal = [
-            edge for edge in graph.edges
+            edge
+            for edge in graph.edges
             if edge.source_id in component and edge.target_id in component
         ]
-        bounded_loop_edges = [edge for edge in internal if edge.loop and edge.max_traversals is not None]
+        bounded_loop_edges = [
+            edge for edge in internal if edge.loop and edge.max_traversals is not None
+        ]
         # Declared loop edges are the only repeatable back-edges. Removing them
         # must break the component's cycle, making the bound enforceable.
         without_loops: dict[str, list[str]] = defaultdict(list)
         for edge in internal:
             if not edge.loop:
                 without_loops[edge.source_id].append(edge.target_id)
-        residual_cycle = bool(_cyclic_components({node_id: object() for node_id in component}, without_loops))
+        residual_cycle = bool(
+            _cyclic_components({node_id: object() for node_id in component}, without_loops)
+        )
         if not bounded_loop_edges or residual_cycle:
-            issues.append(GraphValidationIssue("unbounded_cycle", min(component), "cycle edges require bounds"))
+            issues.append(
+                GraphValidationIssue(
+                    "unbounded_cycle", min(component), "cycle edges require bounds"
+                )
+            )
     return tuple(sorted(set(issues)))
 
 
@@ -98,7 +124,9 @@ def _walk(starts: Iterable[str], adjacency: dict[str, list[str]]) -> set[str]:
     return seen
 
 
-def _cyclic_components(nodes: dict[str, object], adjacency: dict[str, list[str]]) -> list[set[str]]:
+def _cyclic_components(
+    nodes: Mapping[str, object], adjacency: Mapping[str, list[str]]
+) -> list[set[str]]:
     index = 0
     stack: list[str] = []
     indices: dict[str, int] = {}
@@ -160,4 +188,6 @@ def replan(
 ) -> AcceptedGraphRevision:
     """Create a new accepted revision; the previous value remains immutable."""
 
-    return accept_graph(candidate, policy, previous=accepted, available_capabilities=available_capabilities)
+    return accept_graph(
+        candidate, policy, previous=accepted, available_capabilities=available_capabilities
+    )

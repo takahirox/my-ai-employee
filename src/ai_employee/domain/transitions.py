@@ -6,6 +6,7 @@ from collections.abc import Mapping, Set
 from types import MappingProxyType
 from typing import TypeVar
 
+from .base import freeze_json
 from .enums import FailureKind, NodeState, RunState, TaskState
 from .models import Failure, Node, Run, StateTransition, Task, TransitionProvenance
 
@@ -15,99 +16,103 @@ StateT = TypeVar("StateT", RunState, TaskState, NodeState)
 def _immutable_transition_table(
     table: Mapping[StateT, Set[StateT]],
 ) -> Mapping[StateT, Set[StateT]]:
-    return MappingProxyType(
-        {source: frozenset(targets) for source, targets in table.items()}
-    )
+    return MappingProxyType({source: frozenset(targets) for source, targets in table.items()})
 
 
-RUN_TRANSITIONS: Mapping[RunState, Set[RunState]] = _immutable_transition_table({
-    RunState.CREATED: {RunState.READY, RunState.CANCELLED, RunState.FAILED},
-    RunState.READY: {
-        RunState.RUNNING,
-        RunState.PAUSED,
-        RunState.CANCELLED,
-        RunState.FAILED,
-        RunState.BLOCKED,
-    },
-    RunState.RUNNING: {
-        RunState.PAUSED,
-        RunState.CANCELLING,
-        RunState.SUCCEEDED,
-        RunState.FAILED,
-        RunState.EXHAUSTED,
-        RunState.BLOCKED,
-    },
-    RunState.PAUSED: {
-        RunState.READY,
-        RunState.RUNNING,
-        RunState.CANCELLING,
-        RunState.CANCELLED,
-        RunState.BLOCKED,
-    },
-    RunState.CANCELLING: {RunState.CANCELLED, RunState.FAILED},
-    RunState.BLOCKED: {RunState.READY, RunState.CANCELLED, RunState.FAILED},
-    RunState.CANCELLED: set(),
-    RunState.SUCCEEDED: set(),
-    RunState.FAILED: set(),
-    RunState.EXHAUSTED: set(),
-})
+RUN_TRANSITIONS: Mapping[RunState, Set[RunState]] = _immutable_transition_table(
+    {
+        RunState.CREATED: {RunState.READY, RunState.CANCELLED, RunState.FAILED},
+        RunState.READY: {
+            RunState.RUNNING,
+            RunState.PAUSED,
+            RunState.CANCELLED,
+            RunState.FAILED,
+            RunState.BLOCKED,
+        },
+        RunState.RUNNING: {
+            RunState.PAUSED,
+            RunState.CANCELLING,
+            RunState.SUCCEEDED,
+            RunState.FAILED,
+            RunState.EXHAUSTED,
+            RunState.BLOCKED,
+        },
+        RunState.PAUSED: {
+            RunState.READY,
+            RunState.RUNNING,
+            RunState.CANCELLING,
+            RunState.CANCELLED,
+            RunState.BLOCKED,
+        },
+        RunState.CANCELLING: {RunState.CANCELLED, RunState.FAILED},
+        RunState.BLOCKED: {RunState.READY, RunState.CANCELLED, RunState.FAILED},
+        RunState.CANCELLED: set(),
+        RunState.SUCCEEDED: set(),
+        RunState.FAILED: set(),
+        RunState.EXHAUSTED: set(),
+    }
+)
 
-TASK_TRANSITIONS: Mapping[TaskState, Set[TaskState]] = _immutable_transition_table({
-    TaskState.PENDING: {TaskState.READY, TaskState.SKIPPED, TaskState.CANCELLED},
-    TaskState.READY: {
-        TaskState.RUNNING,
-        TaskState.SKIPPED,
-        TaskState.CANCELLED,
-        TaskState.BLOCKED,
-    },
-    TaskState.RUNNING: {
-        TaskState.PAUSED,
-        TaskState.SUCCEEDED,
-        TaskState.FAILED,
-        TaskState.EXHAUSTED,
-        TaskState.CANCELLED,
-        TaskState.BLOCKED,
-    },
-    TaskState.PAUSED: {TaskState.READY, TaskState.RUNNING, TaskState.CANCELLED},
-    TaskState.BLOCKED: {TaskState.READY, TaskState.CANCELLED, TaskState.FAILED},
-    TaskState.SUCCEEDED: set(),
-    TaskState.FAILED: set(),
-    TaskState.EXHAUSTED: set(),
-    TaskState.CANCELLED: set(),
-    TaskState.SKIPPED: set(),
-})
+TASK_TRANSITIONS: Mapping[TaskState, Set[TaskState]] = _immutable_transition_table(
+    {
+        TaskState.PENDING: {TaskState.READY, TaskState.SKIPPED, TaskState.CANCELLED},
+        TaskState.READY: {
+            TaskState.RUNNING,
+            TaskState.SKIPPED,
+            TaskState.CANCELLED,
+            TaskState.BLOCKED,
+        },
+        TaskState.RUNNING: {
+            TaskState.PAUSED,
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
+            TaskState.EXHAUSTED,
+            TaskState.CANCELLED,
+            TaskState.BLOCKED,
+        },
+        TaskState.PAUSED: {TaskState.READY, TaskState.RUNNING, TaskState.CANCELLED},
+        TaskState.BLOCKED: {TaskState.READY, TaskState.CANCELLED, TaskState.FAILED},
+        TaskState.SUCCEEDED: set(),
+        TaskState.FAILED: set(),
+        TaskState.EXHAUSTED: set(),
+        TaskState.CANCELLED: set(),
+        TaskState.SKIPPED: set(),
+    }
+)
 
-NODE_TRANSITIONS: Mapping[NodeState, Set[NodeState]] = _immutable_transition_table({
-    NodeState.PENDING: {NodeState.READY, NodeState.SKIPPED, NodeState.CANCELLED},
-    NodeState.READY: {
-        NodeState.RUNNING,
-        NodeState.SKIPPED,
-        NodeState.CANCELLED,
-        NodeState.BLOCKED,
-    },
-    NodeState.RUNNING: {
-        NodeState.WAITING,
-        NodeState.SUCCEEDED,
-        NodeState.FAILED,
-        NodeState.EXHAUSTED,
-        NodeState.CANCELLED,
-        NodeState.BLOCKED,
-    },
-    NodeState.WAITING: {
-        NodeState.READY,
-        NodeState.RUNNING,
-        NodeState.FAILED,
-        NodeState.EXHAUSTED,
-        NodeState.CANCELLED,
-        NodeState.BLOCKED,
-    },
-    NodeState.BLOCKED: {NodeState.READY, NodeState.CANCELLED, NodeState.FAILED},
-    NodeState.SUCCEEDED: set(),
-    NodeState.FAILED: set(),
-    NodeState.EXHAUSTED: set(),
-    NodeState.CANCELLED: set(),
-    NodeState.SKIPPED: set(),
-})
+NODE_TRANSITIONS: Mapping[NodeState, Set[NodeState]] = _immutable_transition_table(
+    {
+        NodeState.PENDING: {NodeState.READY, NodeState.SKIPPED, NodeState.CANCELLED},
+        NodeState.READY: {
+            NodeState.RUNNING,
+            NodeState.SKIPPED,
+            NodeState.CANCELLED,
+            NodeState.BLOCKED,
+        },
+        NodeState.RUNNING: {
+            NodeState.WAITING,
+            NodeState.SUCCEEDED,
+            NodeState.FAILED,
+            NodeState.EXHAUSTED,
+            NodeState.CANCELLED,
+            NodeState.BLOCKED,
+        },
+        NodeState.WAITING: {
+            NodeState.READY,
+            NodeState.RUNNING,
+            NodeState.FAILED,
+            NodeState.EXHAUSTED,
+            NodeState.CANCELLED,
+            NodeState.BLOCKED,
+        },
+        NodeState.BLOCKED: {NodeState.READY, NodeState.CANCELLED, NodeState.FAILED},
+        NodeState.SUCCEEDED: set(),
+        NodeState.FAILED: set(),
+        NodeState.EXHAUSTED: set(),
+        NodeState.CANCELLED: set(),
+        NodeState.SKIPPED: set(),
+    }
+)
 
 FailureState = RunState | TaskState | NodeState
 
@@ -128,7 +133,7 @@ def _reject(kind: FailureKind, code: str, message: str, details: object) -> Tran
             code=code,
             message=message,
             retryable=False,
-            details=details,
+            details=freeze_json(details),
         )
     )
 
@@ -200,27 +205,33 @@ def _validate_transition(
             f"transition to {target.value!r} cannot retain a structured failure",
             {"to": target.value, "failure_kind": failure.kind.value},
         )
-    if target in cancellation_targets and failure is not None:
-        if failure.kind is not FailureKind.CANCELLATION:
-            raise _reject(
-                FailureKind.INVALID_OUTPUT,
-                "invalid_cancellation_failure",
-                "CANCELLED only accepts a cancellation failure",
-                {"failure_kind": failure.kind.value},
-            )
+    if (
+        target in cancellation_targets
+        and failure is not None
+        and failure.kind is not FailureKind.CANCELLATION
+    ):
+        raise _reject(
+            FailureKind.INVALID_OUTPUT,
+            "invalid_cancellation_failure",
+            "CANCELLED only accepts a cancellation failure",
+            {"failure_kind": failure.kind.value},
+        )
     exhaustion_targets: set[FailureState] = {
         RunState.EXHAUSTED,
         TaskState.EXHAUSTED,
         NodeState.EXHAUSTED,
     }
-    if target in exhaustion_targets and failure is not None:
-        if failure.kind is not FailureKind.RESOURCE_EXHAUSTION:
-            raise _reject(
-                FailureKind.INVALID_OUTPUT,
-                "invalid_exhaustion_failure",
-                "EXHAUSTED requires a resource_exhaustion failure",
-                {"failure_kind": failure.kind.value},
-            )
+    if (
+        target in exhaustion_targets
+        and failure is not None
+        and failure.kind is not FailureKind.RESOURCE_EXHAUSTION
+    ):
+        raise _reject(
+            FailureKind.INVALID_OUTPUT,
+            "invalid_exhaustion_failure",
+            "EXHAUSTED requires a resource_exhaustion failure",
+            {"failure_kind": failure.kind.value},
+        )
 
 
 def transition_run(

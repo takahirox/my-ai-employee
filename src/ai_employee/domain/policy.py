@@ -6,7 +6,7 @@ import math
 
 from pydantic import Field, field_validator
 
-from .base import Identifier, SchemaModel
+from .base import Identifier, SchemaModel, freeze_json
 from .enums import FailureKind
 from .models import ExecutionPolicy, Failure
 
@@ -60,7 +60,7 @@ def _reject(code: str, message: str, details: object) -> PolicyCompositionError:
             code=code,
             message=message,
             retryable=False,
-            details=details,
+            details=freeze_json(details),
         )
     )
 
@@ -98,10 +98,7 @@ def compose_execution_policy(
     enabled_authorities = []
     if floor.network_enabled and not DEFAULT_SAFETY_FLOOR.network_enabled:
         enabled_authorities.append("network")
-    if (
-        floor.unrestricted_process_enabled
-        and not DEFAULT_SAFETY_FLOOR.unrestricted_process_enabled
-    ):
+    if floor.unrestricted_process_enabled and not DEFAULT_SAFETY_FLOOR.unrestricted_process_enabled:
         enabled_authorities.append("unrestricted_process")
     if missing_denials or missing_approvals or raised_floor_caps or enabled_authorities:
         raise _reject(

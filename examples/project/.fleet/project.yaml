@@ -1,12 +1,16 @@
 {
-  "schema_version": "1", "id": "example-project", "profile_version": "1", "root": ".",
-  "commands": {"test": "python -m unittest discover -s tests -v"},
-  "rules": [{
-    "schema_version": "1", "value": {"rule": "offline-only"}, "provenance": "explicit",
-    "source_reference": ".fleet/project.yaml", "provisional": false
-  }],
-  "protected_paths": [".git/**"], "generated_paths": [], "completion_defaults": {},
-  "contracts": [], "verification_requirements": [], "review_rules": [],
+  "schema_version": "1",
+  "id": "example-project",
+  "profile_version": "1",
+  "root": ".",
+  "commands": {"test": "python -m unittest discover -s tests", "build": "python -m build"},
+  "rules": [],
+  "protected_paths": [".git/**", ".env*"],
+  "generated_paths": ["build/**", "dist/**"],
+  "completion_defaults": {},
+  "contracts": [],
+  "verification_requirements": [],
+  "review_rules": [],
   "canonical_document_refs": ["README.md", "CONTRIBUTING.md"],
   "workspace_preferences": {"network": false, "sandbox": "workspace-write"}
 }

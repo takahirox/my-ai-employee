@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from ai_employee.demo import demo_goal, demo_graph, run_demo
 from ai_employee.domain import (
-    Artifact, ExecutionPolicy, Goal, Reference, ResultEnvelope, ResultStatus, Run, RunState,
+    Artifact,
+    ExecutionPolicy,
+    Goal,
+    Reference,
+    ResultEnvelope,
+    ResultStatus,
+    Run,
+    RunState,
     VerificationEvidence,
 )
 from ai_employee.graph import accept_graph
@@ -20,7 +27,9 @@ class RuntimeTests(unittest.TestCase):
         with SQLiteStore(":memory:") as store:
             outcome = run_demo(store, run_id="demo-test")
             self.assertEqual(outcome.run.state, RunState.SUCCEEDED)
-            self.assertEqual([result.status for _, result in outcome.results].count(ResultStatus.FAILED), 1)
+            self.assertEqual(
+                [result.status for _, result in outcome.results].count(ResultStatus.FAILED), 1
+            )
             self.assertTrue(outcome.coverage.complete)
             replay = DeterministicRuntime({}, store=store).replay("demo-test")
             self.assertEqual(replay.invoked_handlers, 0)
@@ -34,7 +43,9 @@ class RuntimeTests(unittest.TestCase):
         goal = goal.model_copy(update={"completion_criteria": goal.completion_criteria})
         graph = demo_graph()
         policy = ExecutionPolicy(max_nodes=10, max_attempts=8, max_wall_seconds=60.0)
-        run = Run(id="blocked-run", goal=goal, accepted_graph=accept_graph(graph, policy), policy=policy)
+        run = Run(
+            id="blocked-run", goal=goal, accepted_graph=accept_graph(graph, policy), policy=policy
+        )
 
         def always(context):
             return ResultEnvelope(
@@ -50,22 +61,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("missing evidence", outcome.run.failure.message)
 
     def test_pause_checkpoint_and_resume(self) -> None:
-        graph = demo_graph().model_copy(update={
-            "edges": demo_graph().edges[:1],
-            "nodes": demo_graph().nodes[:2],
-            "terminal_node_ids": ("gate",),
-            "budget": demo_graph().budget.model_copy(update={"max_attempts": 4}),
-        })
+        graph = demo_graph().model_copy(
+            update={
+                "edges": demo_graph().edges[:1],
+                "nodes": demo_graph().nodes[:2],
+                "terminal_node_ids": ("gate",),
+                "budget": demo_graph().budget.model_copy(update={"max_attempts": 4}),
+            }
+        )
         policy = ExecutionPolicy(max_nodes=10, max_attempts=4, max_wall_seconds=60.0)
         run = Run(
-            id="pause-run", goal=Goal(id="pause-goal", statement="pause and resume"),
-            accepted_graph=accept_graph(graph, policy), policy=policy,
+            id="pause-run",
+            goal=Goal(id="pause-goal", statement="pause and resume"),
+            accepted_graph=accept_graph(graph, policy),
+            policy=policy,
         )
 
         def always(context):
             return ResultEnvelope(
                 contract_id=context.node.output_contract.id,
-                status=ResultStatus.SUCCEEDED, value={"ok": True},
+                status=ResultStatus.SUCCEEDED,
+                value={"ok": True},
             )
 
         with SQLiteStore(":memory:") as store:
@@ -81,45 +97,59 @@ class RuntimeTests(unittest.TestCase):
         goal, requirement = demo_goal()
         policy = ExecutionPolicy(max_nodes=10, max_attempts=8, max_wall_seconds=60.0)
         run = Run(
-            id="resume-facts", goal=goal,
-            accepted_graph=accept_graph(graph, policy), policy=policy,
+            id="resume-facts",
+            goal=goal,
+            accepted_graph=accept_graph(graph, policy),
+            policy=policy,
         )
 
         def handler(context):
             envelope = ResultEnvelope(
                 contract_id=context.node.output_contract.id,
-                status=ResultStatus.SUCCEEDED, value={"ok": True},
+                status=ResultStatus.SUCCEEDED,
+                value={"ok": True},
             )
             if context.node.id == "prepare":
                 artifact = Artifact(
-                    id="artifact-demo", run_id=run.id, media_type="application/json",
-                    digest=canonical_digest({"demo": True}), size_bytes=13,
-                    locator="memory:artifact-demo", created_at=datetime.now(timezone.utc),
+                    id="artifact-demo",
+                    run_id=run.id,
+                    media_type="application/json",
+                    digest=canonical_digest({"demo": True}),
+                    size_bytes=13,
+                    locator="memory:artifact-demo",
+                    created_at=datetime.now(UTC),
                     producer_node_id=context.node.id,
                 )
                 return NodeProposal(
-                    envelope.model_copy(update={
-                        "artifact_refs": (
-                            Reference(
-                                kind="artifact", target_id=artifact.id,
-                                digest=artifact.digest,
+                    envelope.model_copy(
+                        update={
+                            "artifact_refs": (
+                                Reference(
+                                    kind="artifact",
+                                    target_id=artifact.id,
+                                    digest=artifact.digest,
+                                ),
                             ),
-                        ),
-                    }),
+                        }
+                    ),
                     artifacts=(artifact,),
                 )
             if context.node.id == "verify":
                 evidence = VerificationEvidence(
-                    id="evidence-demo", requirement_ids=(requirement.id,),
-                    kind="offline-check", passed=True, summary="persisted evidence",
-                    produced_at=datetime.now(timezone.utc), producer=context.node.id,
+                    id="evidence-demo",
+                    requirement_ids=(requirement.id,),
+                    kind="offline-check",
+                    passed=True,
+                    summary="persisted evidence",
+                    produced_at=datetime.now(UTC),
+                    producer=context.node.id,
                 )
                 return NodeProposal(
-                    envelope.model_copy(update={
-                        "evidence_refs": (
-                            Reference(kind="evidence", target_id=evidence.id),
-                        ),
-                    }),
+                    envelope.model_copy(
+                        update={
+                            "evidence_refs": (Reference(kind="evidence", target_id=evidence.id),),
+                        }
+                    ),
                     evidence=(evidence,),
                 )
             return envelope
@@ -127,11 +157,15 @@ class RuntimeTests(unittest.TestCase):
         with SQLiteStore(":memory:") as store:
             runtime = DeterministicRuntime({node.id: handler for node in graph.nodes}, store=store)
             paused = runtime.execute(
-                run, requirements=(requirement,), pause_after_nodes=3,
+                run,
+                requirements=(requirement,),
+                pause_after_nodes=3,
             )
             self.assertTrue(paused.paused)
             resumed = runtime.execute(
-                paused.run, requirements=(requirement,), resume=True,
+                paused.run,
+                requirements=(requirement,),
+                resume=True,
             )
             self.assertEqual(resumed.run.state, RunState.SUCCEEDED)
             self.assertEqual([item.id for item in resumed.artifacts], ["artifact-demo"])
@@ -139,20 +173,27 @@ class RuntimeTests(unittest.TestCase):
 
     def test_failed_terminal_node_refuses_completion(self) -> None:
         source = demo_graph()
-        graph = source.model_copy(update={
-            "nodes": source.nodes[:1], "edges": (),
-            "entry_node_ids": ("prepare",), "terminal_node_ids": ("prepare",),
-        })
+        graph = source.model_copy(
+            update={
+                "nodes": source.nodes[:1],
+                "edges": (),
+                "entry_node_ids": ("prepare",),
+                "terminal_node_ids": ("prepare",),
+            }
+        )
         policy = ExecutionPolicy(max_nodes=10, max_attempts=8, max_wall_seconds=60.0)
         run = Run(
-            id="failed-terminal", goal=Goal(id="terminal-goal", statement="must fail"),
-            accepted_graph=accept_graph(graph, policy), policy=policy,
+            id="failed-terminal",
+            goal=Goal(id="terminal-goal", statement="must fail"),
+            accepted_graph=accept_graph(graph, policy),
+            policy=policy,
         )
 
         def fail(context):
             return ResultEnvelope(
                 contract_id=context.node.output_contract.id,
-                status=ResultStatus.FAILED, value={"ok": False},
+                status=ResultStatus.FAILED,
+                value={"ok": False},
             )
 
         outcome = DeterministicRuntime({"prepare": fail}).execute(run)
@@ -161,17 +202,20 @@ class RuntimeTests(unittest.TestCase):
 
     def test_node_iteration_budget_is_enforced(self) -> None:
         source = demo_graph()
-        graph = source.model_copy(update={
-            "nodes": tuple(
-                node.model_copy(update={"max_iterations": 1})
-                if node.id == "gate" else node
-                for node in source.nodes
-            ),
-        })
+        graph = source.model_copy(
+            update={
+                "nodes": tuple(
+                    node.model_copy(update={"max_iterations": 1}) if node.id == "gate" else node
+                    for node in source.nodes
+                ),
+            }
+        )
         policy = ExecutionPolicy(max_nodes=10, max_attempts=8, max_wall_seconds=60.0)
         run = Run(
-            id="iteration-budget", goal=Goal(id="iteration-goal", statement="stay bounded"),
-            accepted_graph=accept_graph(graph, policy), policy=policy,
+            id="iteration-budget",
+            goal=Goal(id="iteration-goal", statement="stay bounded"),
+            accepted_graph=accept_graph(graph, policy),
+            policy=policy,
         )
 
         def handler(context):

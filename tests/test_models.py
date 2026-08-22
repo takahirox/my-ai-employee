@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import ValidationError
 
@@ -15,12 +15,11 @@ from ai_employee.domain import (
     GateResult,
     GateStatus,
     OutputContract,
-    ProvenanceKind,
     ProvenancedValue,
+    ProvenanceKind,
     ResultEnvelope,
     ResultStatus,
 )
-
 from tests.helpers import output_contract
 
 
@@ -174,7 +173,7 @@ class ModelTests(unittest.TestCase):
             id="event.one",
             run_id="run.one",
             event_type="node.started",
-            timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            timestamp=datetime(2025, 1, 1, tzinfo=UTC),
             actor="runtime",
         )
         self.assertIsNotNone(event.timestamp.tzinfo)

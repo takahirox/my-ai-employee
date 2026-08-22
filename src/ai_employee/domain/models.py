@@ -569,7 +569,10 @@ class GateResult(EntityModel):
             raise ValueError("a passed gate cannot contain a failure")
         if self.status is not GateStatus.PASSED and self.failure is None:
             raise ValueError("failed and timed-out gates require a structured failure")
-        if self.status is GateStatus.TIMEOUT and self.failure is not None:
-            if self.failure.kind is not FailureKind.TIMEOUT:
-                raise ValueError("a timed-out gate requires a timeout failure")
+        if (
+            self.status is GateStatus.TIMEOUT
+            and self.failure is not None
+            and self.failure.kind is not FailureKind.TIMEOUT
+        ):
+            raise ValueError("a timed-out gate requires a timeout failure")
         return self

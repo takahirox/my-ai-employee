@@ -6,15 +6,29 @@ import json
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from time import monotonic
 
 from .domain import (
-    Artifact, EvidenceCoverage, Event, Failure, FailureKind, Node, NodeKind, NodeState,
-    ResultEnvelope, ResultStatus, Run, RunState,
-    TransitionProvenance, VerificationEvidence, VerificationRequirement,
-    transition_node, transition_run,
+    Artifact,
+    Event,
+    EvidenceCoverage,
+    Failure,
+    FailureKind,
+    Node,
+    NodeKind,
+    NodeState,
+    ResultEnvelope,
+    ResultStatus,
+    Run,
+    RunState,
+    TransitionProvenance,
+    VerificationEvidence,
+    VerificationRequirement,
+    transition_node,
+    transition_run,
 )
+from .domain.base import freeze_json
 from .evidence import aggregate_coverage, assess_completion
 from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
@@ -71,7 +85,7 @@ class DeterministicRuntime:
     ) -> None:
         self.handlers = dict(handlers)
         self.store = store
-        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def execute(
         self,
@@ -93,13 +107,13 @@ class DeterministicRuntime:
             if generation != run.generation:
                 raise ValueError("checkpoint rejected by generation fence")
             queue = deque(str(item) for item in checkpoint["queue"])
-            traversal_counts = defaultdict(int, {
-                str(key): int(value) for key, value in checkpoint["traversals"].items()
-            })
-            attempts = defaultdict(int, {
-                str(key): int(value) for key, value in checkpoint["attempts"].items()
-            })
-            results = [
+            traversal_counts: defaultdict[str, int] = defaultdict(
+                int, {str(key): int(value) for key, value in checkpoint["traversals"].items()}
+            )
+            attempts: defaultdict[str, int] = defaultdict(
+                int, {str(key): int(value) for key, value in checkpoint["attempts"].items()}
+            )
+            results: list[tuple[str, ResultEnvelope]] = [
                 (
                     str(item["node_id"]),
                     ResultEnvelope.model_validate_json(
@@ -119,9 +133,9 @@ class DeterministicRuntime:
             run = run.model_copy(update={"generation": run.generation + 1})
         else:
             queue = deque(sorted(graph.entry_node_ids))
-            traversal_counts: defaultdict[str, int] = defaultdict(int)
-            attempts: defaultdict[str, int] = defaultdict(int)
-            results: list[tuple[str, ResultEnvelope]] = []
+            traversal_counts = defaultdict(int)
+            attempts = defaultdict(int)
+            results = []
             artifacts = []
             evidence = []
             elapsed_before = 0.0
@@ -146,25 +160,39 @@ class DeterministicRuntime:
             if requested_control == "pause":
                 run = self._transition_run(run, RunState.PAUSED, "pause requested")
                 self._checkpoint(
-                    run, queue, traversal_counts, attempts, results,
+                    run,
+                    queue,
+                    traversal_counts,
+                    attempts,
+                    results,
                     elapsed_wall_seconds=elapsed,
                 )
                 self._persist_run(run)
                 outcome = self._outcome(run, results, artifacts, evidence, requirements)
                 return RuntimeOutcome(**{**outcome.__dict__, "paused": True})
-            if requested_control == "cancel" or (cancel_requested is not None and cancel_requested()):
+            if requested_control == "cancel" or (
+                cancel_requested is not None and cancel_requested()
+            ):
                 run = self._transition_run(run, RunState.CANCELLING, "cancellation requested")
                 run = self._transition_run(run, RunState.CANCELLED, "cancellation acknowledged")
                 self._persist_run(run)
                 return self._outcome(run, results, artifacts, evidence, requirements)
             if elapsed > min(graph.budget.max_wall_seconds, run.policy.max_wall_seconds):
-                return self._exhaust(run, "time_budget_exhausted", results, artifacts, evidence, requirements)
+                return self._exhaust(
+                    run, "time_budget_exhausted", results, artifacts, evidence, requirements
+                )
             if sum(attempts.values()) >= min(graph.budget.max_attempts, run.policy.max_attempts):
-                return self._exhaust(run, "attempt_budget_exhausted", results, artifacts, evidence, requirements)
+                return self._exhaust(
+                    run, "attempt_budget_exhausted", results, artifacts, evidence, requirements
+                )
             if pause_after_nodes is not None and executed >= pause_after_nodes:
                 run = self._transition_run(run, RunState.PAUSED, "pause boundary reached")
                 self._checkpoint(
-                    run, queue, traversal_counts, attempts, results,
+                    run,
+                    queue,
+                    traversal_counts,
+                    attempts,
+                    results,
                     elapsed_wall_seconds=elapsed,
                 )
                 self._persist_run(run)
@@ -175,21 +203,32 @@ class DeterministicRuntime:
             base_node = nodes[node_id]
             if attempts[node_id] >= base_node.max_iterations:
                 return self._exhaust(
-                    run, "node_iteration_budget_exhausted",
-                    results, artifacts, evidence, requirements,
+                    run,
+                    "node_iteration_budget_exhausted",
+                    results,
+                    artifacts,
+                    evidence,
+                    requirements,
                 )
             attempt = attempts[node_id]
             attempts[node_id] += 1
-            active = base_node.model_copy(update={
-                "state": NodeState.PENDING, "attempt": attempt,
-                "generation": run.generation, "graph_revision": graph_revision,
-                "transitions": (), "failure": None,
-            })
+            active = base_node.model_copy(
+                update={
+                    "state": NodeState.PENDING,
+                    "attempt": attempt,
+                    "generation": run.generation,
+                    "graph_revision": graph_revision,
+                    "transitions": (),
+                    "failure": None,
+                }
+            )
             active = self._transition_node(active, NodeState.READY, run, "dependencies satisfied")
             active = self._transition_node(active, NodeState.RUNNING, run, "handler dispatched")
             proposal = self._invoke(run, active, attempt, tuple(results))
             envelope, accepted_artifacts, accepted_evidence = self._validate_proposal(
-                run, active, proposal,
+                run,
+                active,
+                proposal,
             )
 
             if (
@@ -197,13 +236,23 @@ class DeterministicRuntime:
                 and attempt < min(active.retry_limit, graph.budget.max_retries)
                 and any(failure.retryable for failure in envelope.failures)
             ):
-                failure = envelope.failures[0] if envelope.failures else self._failure(
-                    "retryable_result", "node returned a failed result", retryable=True
+                failure = (
+                    envelope.failures[0]
+                    if envelope.failures
+                    else self._failure(
+                        "retryable_result", "node returned a failed result", retryable=True
+                    )
                 )
-                active = self._transition_node(active, NodeState.FAILED, run, "attempt failed", failure)
+                active = self._transition_node(
+                    active, NodeState.FAILED, run, "attempt failed", failure
+                )
                 self._persist_node(run.id, active)
                 results.append((node_id, envelope))
-                self._event(run, "node.result", {"node_id": node_id, "attempt": attempt, "envelope": envelope})
+                self._event(
+                    run,
+                    "node.result",
+                    {"node_id": node_id, "attempt": attempt, "envelope": envelope},
+                )
                 queue.appendleft(node_id)
                 continue
 
@@ -211,58 +260,81 @@ class DeterministicRuntime:
             transition_failure = None
             if envelope.status is ResultStatus.BLOCKED:
                 target_state = NodeState.BLOCKED
-                transition_failure = envelope.failures[0] if envelope.failures else self._failure(
-                    "node_blocked", "node returned blocked"
+                transition_failure = (
+                    envelope.failures[0]
+                    if envelope.failures
+                    else self._failure("node_blocked", "node returned blocked")
                 )
             elif envelope.status is ResultStatus.CANCELLED:
                 target_state = NodeState.CANCELLED
             elif envelope.status is ResultStatus.FAILED:
                 target_state = NodeState.FAILED
-                transition_failure = envelope.failures[0] if envelope.failures else self._failure(
-                    "node_failed", "node returned failed"
+                transition_failure = (
+                    envelope.failures[0]
+                    if envelope.failures
+                    else self._failure("node_failed", "node returned failed")
                 )
-            active = self._transition_node(active, target_state, run, "structured result accepted", transition_failure)
+            active = self._transition_node(
+                active, target_state, run, "structured result accepted", transition_failure
+            )
             self._persist_node(run.id, active)
             results.append((node_id, envelope))
             artifacts.extend(accepted_artifacts)
             evidence.extend(accepted_evidence)
-            self._event(run, "node.result", {"node_id": node_id, "attempt": attempt, "envelope": envelope})
+            self._event(
+                run, "node.result", {"node_id": node_id, "attempt": attempt, "envelope": envelope}
+            )
             executed += 1
 
-            selected = [edge for edge in edges[node_id] if _condition_matches(edge.condition, envelope.status)]
+            selected = [
+                edge
+                for edge in edges[node_id]
+                if _condition_matches(edge.condition, envelope.status)
+            ]
             for edge in selected:
                 traversal_counts[edge.id] += 1
                 bound = edge.max_traversals if edge.loop else 1
                 if traversal_counts[edge.id] > (bound or 1):
-                    return self._exhaust(run, "loop_budget_exhausted", results, artifacts, evidence, requirements)
+                    return self._exhaust(
+                        run, "loop_budget_exhausted", results, artifacts, evidence, requirements
+                    )
                 queue.append(edge.target_id)
-                self._event(run, "edge.traversed", {"edge_id": edge.id, "target_id": edge.target_id})
+                self._event(
+                    run, "edge.traversed", {"edge_id": edge.id, "target_id": edge.target_id}
+                )
 
         coverage = aggregate_coverage(requirements, evidence)
         gate_ids = {node.id for node in graph.nodes if node.kind is NodeKind.GATE}
         latest_results = {node_id: result for node_id, result in results}
         successful_gates = {
-            node_id for node_id in gate_ids
-            if node_id in latest_results and latest_results[node_id].status is ResultStatus.SUCCEEDED
+            node_id
+            for node_id in gate_ids
+            if node_id in latest_results
+            and latest_results[node_id].status is ResultStatus.SUCCEEDED
         }
         terminal_nodes_succeeded = all(
-            node_id in latest_results
-            and latest_results[node_id].status is ResultStatus.SUCCEEDED
+            node_id in latest_results and latest_results[node_id].status is ResultStatus.SUCCEEDED
             for node_id in graph.terminal_node_ids
         )
         findings = tuple(finding for _, result in results for finding in result.findings)
         completion = assess_completion(
-            criteria=run.goal.completion_criteria, coverage=coverage, artifacts=artifacts,
+            criteria=run.goal.completion_criteria,
+            coverage=coverage,
+            artifacts=artifacts,
             mandatory_gates_passed=gate_ids <= successful_gates,
-            terminal_nodes_succeeded=terminal_nodes_succeeded, findings=findings,
+            terminal_nodes_succeeded=terminal_nodes_succeeded,
+            findings=findings,
         )
         if completion.complete:
             run = self._transition_run(run, RunState.SUCCEEDED, "completion facts satisfied")
         else:
             failure = Failure(
-                id="completion_failure", kind=FailureKind.VERIFICATION, code="completion_incomplete",
-                message="; ".join(completion.reasons), retryable=True,
-                details={"reasons": completion.reasons},
+                id="completion_failure",
+                kind=FailureKind.VERIFICATION,
+                code="completion_incomplete",
+                message="; ".join(completion.reasons),
+                retryable=True,
+                details=freeze_json({"reasons": completion.reasons}),
             )
             run = self._transition_run(run, RunState.BLOCKED, "completion refused", failure)
         self._persist_run(run)
@@ -276,56 +348,76 @@ class DeterministicRuntime:
         events = self.store.events(run_id)
         controls = [
             {"type": event.event_type, "payload": event.payload}
-            for event in events if event.event_type in {"node.result", "edge.traversed", "run.transition"}
+            for event in events
+            if event.event_type in {"node.result", "edge.traversed", "run.transition"}
         ]
         return ReplayReport(
-            run_id=run_id, event_count=len(events),
+            run_id=run_id,
+            event_count=len(events),
             result_count=sum(event.event_type == "node.result" for event in events),
-            control_digest=canonical_digest(controls), invoked_handlers=0,
+            control_digest=canonical_digest(controls),
+            invoked_handlers=0,
         )
 
     def _invoke(
-        self, run: Run, node: Node, attempt: int,
+        self,
+        run: Run,
+        node: Node,
+        attempt: int,
         results: tuple[tuple[str, ResultEnvelope], ...],
     ) -> ResultEnvelope | NodeProposal:
         handler = self.handlers.get(node.id) or self.handlers.get(node.kind)
         if handler is None:
             return ResultEnvelope(
-                contract_id=node.output_contract.id, status=ResultStatus.FAILED,
+                contract_id=node.output_contract.id,
+                status=ResultStatus.FAILED,
                 failures=(self._failure("missing_handler", f"no handler for node {node.id}"),),
             )
         try:
             return handler(NodeExecutionContext(run, node, attempt, results))
         except Exception as exc:  # worker exceptions are converted at the trust boundary
             return ResultEnvelope(
-                contract_id=node.output_contract.id, status=ResultStatus.FAILED,
+                contract_id=node.output_contract.id,
+                status=ResultStatus.FAILED,
                 failures=(self._failure("handler_exception", f"{type(exc).__name__}: {exc}"),),
             )
 
     def _validate_proposal(
-        self, run: Run, node: Node, proposal: ResultEnvelope | NodeProposal,
+        self,
+        run: Run,
+        node: Node,
+        proposal: ResultEnvelope | NodeProposal,
     ) -> tuple[ResultEnvelope, tuple[Artifact, ...], tuple[VerificationEvidence, ...]]:
         wrapped = proposal if isinstance(proposal, NodeProposal) else NodeProposal(proposal)
         try:
             wrapped.envelope.validate_contract(node.output_contract)
         except ValueError as exc:
             envelope = ResultEnvelope(
-                contract_id=node.output_contract.id, status=ResultStatus.FAILED,
-                failures=(Failure(
-                    id="invalid_output", kind=FailureKind.INVALID_OUTPUT, code="contract_violation",
-                    message=str(exc), retryable=True,
-                ),),
+                contract_id=node.output_contract.id,
+                status=ResultStatus.FAILED,
+                failures=(
+                    Failure(
+                        id="invalid_output",
+                        kind=FailureKind.INVALID_OUTPUT,
+                        code="contract_violation",
+                        message=str(exc),
+                        retryable=True,
+                    ),
+                ),
             )
             return envelope, (), ()
         referenced_artifacts = {item.target_id for item in wrapped.envelope.artifact_refs}
         accepted_artifacts = tuple(
-            item for item in wrapped.artifacts
-            if item.id in referenced_artifacts and item.run_id == run.id
+            item
+            for item in wrapped.artifacts
+            if item.id in referenced_artifacts
+            and item.run_id == run.id
             and item.producer_node_id in {None, node.id}
         )
         referenced_evidence = {item.target_id for item in wrapped.envelope.evidence_refs}
         accepted_evidence = tuple(
-            item for item in wrapped.evidence
+            item
+            for item in wrapped.evidence
             if item.id in referenced_evidence and item.producer == node.id
         )
         for artifact in accepted_artifacts:
@@ -337,29 +429,52 @@ class DeterministicRuntime:
         return wrapped.envelope, accepted_artifacts, accepted_evidence
 
     def _transition_run(
-        self, run: Run, target: RunState, cause: str, failure: Failure | None = None,
+        self,
+        run: Run,
+        target: RunState,
+        cause: str,
+        failure: Failure | None = None,
     ) -> Run:
         updated = transition_run(
-            run, target, self._provenance(run, cause), expected_generation=run.generation,
-            expected_graph_revision=run.accepted_graph.revision_number, failure=failure,
+            run,
+            target,
+            self._provenance(run, cause),
+            expected_generation=run.generation,
+            expected_graph_revision=run.accepted_graph.revision_number,
+            failure=failure,
         )
         self._event(updated, "run.transition", {"transition": updated.transitions[-1]})
         return updated
 
     def _transition_node(
-        self, node: Node, target: NodeState, run: Run, cause: str,
+        self,
+        node: Node,
+        target: NodeState,
+        run: Run,
+        cause: str,
         failure: Failure | None = None,
     ) -> Node:
         return transition_node(
-            node, target, self._provenance(run, cause), expected_generation=run.generation,
-            expected_graph_revision=run.accepted_graph.revision_number, failure=failure,
+            node,
+            target,
+            self._provenance(run, cause),
+            expected_generation=run.generation,
+            expected_graph_revision=run.accepted_graph.revision_number,
+            failure=failure,
         )
 
     def _provenance(self, run: Run, cause: str) -> TransitionProvenance:
+        graph_digest = run.accepted_graph.content_digest
+        if graph_digest is None:
+            raise ValueError("accepted graph is missing its canonical digest")
         return TransitionProvenance(
-            cause=cause, rule_version="runtime-v1", actor="runtime", timestamp=self.clock(),
-            graph_digest=run.accepted_graph.content_digest,
-            policy_digest=canonical_digest(run.policy), input_digest=canonical_digest(run.goal),
+            cause=cause,
+            rule_version="runtime-v1",
+            actor="runtime",
+            timestamp=self.clock(),
+            graph_digest=graph_digest,
+            policy_digest=canonical_digest(run.policy),
+            input_digest=canonical_digest(run.goal),
             evidence_digest=canonical_digest([]),
         )
 
@@ -367,23 +482,42 @@ class DeterministicRuntime:
         if self.store is None:
             return
         sequence = len(self.store.events(run.id)) + 1
-        self.store.append_event(Event(
-            id=f"{run.id}-event-{sequence}", run_id=run.id, event_type=event_type,
-            timestamp=self.clock(), actor="runtime", payload=json.loads(canonical_json(payload)),
-        ))
+        self.store.append_event(
+            Event(
+                id=f"{run.id}-event-{sequence}",
+                run_id=run.id,
+                event_type=event_type,
+                timestamp=self.clock(),
+                actor="runtime",
+                payload=json.loads(canonical_json(payload)),
+            )
+        )
 
     def _checkpoint(
-        self, run: Run, queue: deque[str], traversals: Mapping[str, int],
-        attempts: Mapping[str, int], results: list[tuple[str, ResultEnvelope]],
-        *, elapsed_wall_seconds: float,
+        self,
+        run: Run,
+        queue: deque[str],
+        traversals: Mapping[str, int],
+        attempts: Mapping[str, int],
+        results: list[tuple[str, ResultEnvelope]],
+        *,
+        elapsed_wall_seconds: float,
     ) -> None:
         if self.store is None:
             return
-        self.store.checkpoint(run.id, run.generation, {
-            "queue": list(queue), "traversals": dict(traversals), "attempts": dict(attempts),
-            "results": [{"node_id": node_id, "envelope": envelope} for node_id, envelope in results],
-            "elapsed_wall_seconds": elapsed_wall_seconds,
-        })
+        self.store.checkpoint(
+            run.id,
+            run.generation,
+            {
+                "queue": list(queue),
+                "traversals": dict(traversals),
+                "attempts": dict(attempts),
+                "results": [
+                    {"node_id": node_id, "envelope": envelope} for node_id, envelope in results
+                ],
+                "elapsed_wall_seconds": elapsed_wall_seconds,
+            },
+        )
 
     def _persist_run(self, run: Run) -> None:
         if self.store is not None:
@@ -393,10 +527,21 @@ class DeterministicRuntime:
         if self.store is not None:
             self.store.save_node(run_id, node)
 
-    def _exhaust(self, run: Run, code: str, results: list[tuple[str, ResultEnvelope]], artifacts: list[Artifact], evidence: list[VerificationEvidence], requirements: tuple[VerificationRequirement, ...]) -> RuntimeOutcome:
+    def _exhaust(
+        self,
+        run: Run,
+        code: str,
+        results: list[tuple[str, ResultEnvelope]],
+        artifacts: list[Artifact],
+        evidence: list[VerificationEvidence],
+        requirements: tuple[VerificationRequirement, ...],
+    ) -> RuntimeOutcome:
         failure = Failure(
-            id="runtime_exhausted", kind=FailureKind.RESOURCE_EXHAUSTION, code=code,
-            message=code.replace("_", " "), retryable=False,
+            id="runtime_exhausted",
+            kind=FailureKind.RESOURCE_EXHAUSTION,
+            code=code,
+            message=code.replace("_", " "),
+            retryable=False,
         )
         run = self._transition_run(run, RunState.EXHAUSTED, code, failure)
         self._persist_run(run)
@@ -405,14 +550,27 @@ class DeterministicRuntime:
     @staticmethod
     def _failure(code: str, message: str, *, retryable: bool = False) -> Failure:
         return Failure(
-            id=f"failure-{code}", kind=FailureKind.EXECUTION, code=code,
-            message=message, retryable=retryable,
+            id=f"failure-{code}",
+            kind=FailureKind.EXECUTION,
+            code=code,
+            message=message,
+            retryable=retryable,
         )
 
     @staticmethod
-    def _outcome(run: Run, results: list[tuple[str, ResultEnvelope]], artifacts: list[Artifact], evidence: list[VerificationEvidence], requirements: tuple[VerificationRequirement, ...]) -> RuntimeOutcome:
+    def _outcome(
+        run: Run,
+        results: list[tuple[str, ResultEnvelope]],
+        artifacts: list[Artifact],
+        evidence: list[VerificationEvidence],
+        requirements: tuple[VerificationRequirement, ...],
+    ) -> RuntimeOutcome:
         return RuntimeOutcome(
-            run, tuple(results), tuple(artifacts), tuple(evidence), aggregate_coverage(requirements, evidence)
+            run,
+            tuple(results),
+            tuple(artifacts),
+            tuple(evidence),
+            aggregate_coverage(requirements, evidence),
         )
 
 

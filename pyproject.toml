@@ -24,6 +24,12 @@ dependencies = [
   "PyYAML>=6.0.2,<7",
 ]
 
+[project.urls]
+Homepage = "https://github.com/takahirox/my-ai-employee"
+Repository = "https://github.com/takahirox/my-ai-employee"
+Issues = "https://github.com/takahirox/my-ai-employee/issues"
+Changelog = "https://github.com/takahirox/my-ai-employee/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2.2,<2",

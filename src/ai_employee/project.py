@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
-from .domain import ProjectProfile, ProvenanceKind, ProvenancedValue
+from .domain import ProjectProfile, ProvenancedValue, ProvenanceKind
+from .domain.base import freeze_json
 from .serialization import loads_yaml_model
 
 PROFILE_PATHS = (".fleet/project.yaml", ".fleet/project.yml", ".fleet/project.json")
@@ -32,7 +34,9 @@ def infer_project_profile(root: str | Path) -> ProjectProfile:
     commands: dict[str, str] = {}
     sources: list[str] = []
     if (project_root / "pyproject.toml").is_file():
-        commands.update({"test": "python -m unittest discover -s tests", "build": "python -m build"})
+        commands.update(
+            {"test": "python -m unittest discover -s tests", "build": "python -m build"}
+        )
         sources.append("pyproject.toml")
     if (project_root / "package.json").is_file():
         try:
@@ -48,13 +52,17 @@ def infer_project_profile(root: str | Path) -> ProjectProfile:
     documents = tuple(name for name in CANONICAL_DOCUMENTS if (project_root / name).is_file())
     rules = tuple(
         ProvenancedValue(
-            value={"kind": "discovered_file", "path": source},
-            provenance=ProvenanceKind.INFERRED, source_reference=source, provisional=True,
+            value=freeze_json({"kind": "discovered_file", "path": source}),
+            provenance=ProvenanceKind.INFERRED,
+            source_reference=source,
+            provisional=True,
         )
         for source in sources
     )
     return ProjectProfile(
-        id="inferred-project", commands=commands, rules=rules,
+        id="inferred-project",
+        commands=freeze_json(commands),
+        rules=rules,
         canonical_document_refs=documents,
     )
 
@@ -63,9 +71,18 @@ def profile_template(profile_id: str = "project") -> dict[str, Any]:
     """Return safe explicit defaults suitable for a human-authored .fleet profile."""
 
     return {
-        "schema_version": "1", "id": profile_id, "profile_version": "1", "root": ".",
-        "commands": {}, "rules": [], "protected_paths": [".git/**"], "generated_paths": [],
-        "completion_defaults": {}, "contracts": [], "verification_requirements": [],
-        "review_rules": [], "canonical_document_refs": ["README.md"],
+        "schema_version": "1",
+        "id": profile_id,
+        "profile_version": "1",
+        "root": ".",
+        "commands": {},
+        "rules": [],
+        "protected_paths": [".git/**"],
+        "generated_paths": [],
+        "completion_defaults": {},
+        "contracts": [],
+        "verification_requirements": [],
+        "review_rules": [],
+        "canonical_document_refs": ["README.md"],
         "workspace_preferences": {"network": False, "sandbox": "workspace-write"},
     }

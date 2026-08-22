@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from ai_employee.domain import (
     AcceptedGraphRevision,
     ContractKind,
     ExecutionPolicy,
-    Graph,
     Goal,
+    Graph,
     Node,
     NodeKind,
     OutputContract,
@@ -75,7 +75,7 @@ def provenance() -> TransitionProvenance:
         cause="unit test",
         rule_version="transition.v1",
         actor="runtime",
-        timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        timestamp=datetime(2025, 1, 1, tzinfo=UTC),
         graph_digest=DIGEST,
         policy_digest=DIGEST,
         input_digest=DIGEST,

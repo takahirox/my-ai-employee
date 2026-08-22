@@ -25,7 +25,11 @@ class EscalationDecision:
 
 
 def decide_escalation(
-    failure: Failure, *, attempt: int, replan_count: int, budget: Budget,
+    failure: Failure,
+    *,
+    attempt: int,
+    replan_count: int,
+    budget: Budget,
     node_retry_limit: int,
 ) -> EscalationDecision:
     """Choose one stable action from structured failure facts and hard budgets."""
@@ -38,9 +42,13 @@ def decide_escalation(
         return EscalationDecision(EscalationAction.EXHAUST, "a hard resource budget was exhausted")
     retry_cap = min(node_retry_limit, budget.max_retries)
     if failure.retryable and attempt < retry_cap:
-        return EscalationDecision(EscalationAction.RETRY, "retryable failure remains within retry budget")
+        return EscalationDecision(
+            EscalationAction.RETRY, "retryable failure remains within retry budget"
+        )
     if failure.kind in {FailureKind.GRAPH, FailureKind.VALIDATION}:
         if replan_count < budget.max_replans:
-            return EscalationDecision(EscalationAction.REPLAN, "graph failure remains within replan budget")
+            return EscalationDecision(
+                EscalationAction.REPLAN, "graph failure remains within replan budget"
+            )
         return EscalationDecision(EscalationAction.EXHAUST, "replan budget was exhausted")
     return EscalationDecision(EscalationAction.FAIL, "failure is not safely retryable")

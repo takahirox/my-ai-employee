@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
 from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
+from .domain.base import FrozenDict
 from .serialization import canonical_json
 from .storage import SQLiteStore
 
@@ -34,9 +36,7 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     # still exposes references and persisted evidence when absent.
     events = store.events(run_id)
     results = [event.payload for event in events if event.event_type == "node.result"]
-    routing = [
-        item.custom for item in metrics if item.custom is not None
-    ]
+    routing = [item.custom for item in metrics if item.custom is not None]
     return {
         "run_id": run.id,
         "state": run.state.value,
@@ -47,28 +47,42 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             "stable": True,
             "candidate": None,
             "nodes": [
-                {"id": node.id, "kind": node.kind.value, "state": latest_nodes.get(node.id, node).state.value}
+                {
+                    "id": node.id,
+                    "kind": node.kind.value,
+                    "state": latest_nodes.get(node.id, node).state.value,
+                }
                 for node in run.accepted_graph.graph.nodes
             ],
         },
-        "transitions": [item.model_dump(mode="json") for item in run.transitions],
+        "transitions": [_json_model(item) for item in run.transitions],
         "node_transitions": [
-            item.model_dump(mode="json")
-            for node in latest_nodes.values() for item in node.transitions
+            _json_model(item) for node in latest_nodes.values() for item in node.transitions
         ],
-        "gates": [item for item in results if item.get("node_id") in {
-            node.id for node in run.accepted_graph.graph.nodes if node.kind.value == "gate"
-        }],
-        "artifacts": [item.model_dump(mode="json") for item in artifacts],
-        "contracts": [node.output_contract.model_dump(mode="json") for node in run.accepted_graph.graph.nodes],
-        "evidence": [item.model_dump(mode="json") for item in evidence],
+        "gates": [
+            item
+            for item in results
+            if isinstance(item, FrozenDict)
+            and item.get("node_id")
+            in {node.id for node in run.accepted_graph.graph.nodes if node.kind.value == "gate"}
+        ],
+        "artifacts": [_json_model(item) for item in artifacts],
+        "contracts": [_json_model(node.output_contract) for node in run.accepted_graph.graph.nodes],
+        "evidence": [_json_model(item) for item in evidence],
         "evidence_requirement_refs": sorted(requirement_ids),
         "review_decision": None,
-        "context_provenance": [item.model_dump(mode="json") for item in contexts],
+        "context_provenance": [_json_model(item) for item in contexts],
         "routing_reasons": routing,
-        "metrics": [item.model_dump(mode="json") for item in metrics],
-        "events": [item.model_dump(mode="json") for item in events],
+        "metrics": [_json_model(item) for item in metrics],
+        "events": [_json_model(item) for item in events],
     }
+
+
+def _json_model(value: object) -> dict[str, Any]:
+    data = json.loads(canonical_json(value))
+    if not isinstance(data, dict):
+        raise TypeError("Inspector model projection must be an object")
+    return data
 
 
 def compare_runs(store: SQLiteStore, left_id: str, right_id: str) -> dict[str, Any]:
@@ -85,7 +99,7 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
     """Serve a local read-only JSON/HTML Inspector until interrupted."""
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.removeprefix("/api/runs/")
@@ -110,11 +124,14 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    HTTPServer((host, port), Handler).serve_forever()
 
 
 _INDEX = """<!doctype html><meta charset=utf-8><title>Fleet Inspector</title>
-<style>body{font:14px system-ui;max-width:1000px;margin:2rem auto}input{width:24rem}pre{white-space:pre-wrap}</style>
+<style>
+body{font:14px system-ui;max-width:1000px;margin:2rem auto}
+input{width:24rem}pre{white-space:pre-wrap}
+</style>
 <h1>Fleet Inspector</h1><p>Read-only local projection</p>
 <input id=r placeholder="run id"><button onclick="loadRun()">Inspect</button><pre id=o></pre>
 <script>async function loadRun(){let r=document.querySelector('#r').value;

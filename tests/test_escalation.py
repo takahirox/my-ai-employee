@@ -10,25 +10,40 @@ class EscalationTests(unittest.TestCase):
     def test_retry_replan_and_exhaustion_are_budgeted(self) -> None:
         budget = Budget(max_retries=1, max_replans=1)
         retryable = Failure(
-            id="retry", kind=FailureKind.EXECUTION, code="temporary",
-            message="temporary", retryable=True,
+            id="retry",
+            kind=FailureKind.EXECUTION,
+            code="temporary",
+            message="temporary",
+            retryable=True,
         )
         self.assertEqual(
             decide_escalation(
-                retryable, attempt=0, replan_count=0, budget=budget, node_retry_limit=2,
+                retryable,
+                attempt=0,
+                replan_count=0,
+                budget=budget,
+                node_retry_limit=2,
             ).action,
             EscalationAction.RETRY,
         )
         graph_failure = retryable.model_copy(update={"kind": FailureKind.GRAPH, "retryable": False})
         self.assertEqual(
             decide_escalation(
-                graph_failure, attempt=1, replan_count=0, budget=budget, node_retry_limit=2,
+                graph_failure,
+                attempt=1,
+                replan_count=0,
+                budget=budget,
+                node_retry_limit=2,
             ).action,
             EscalationAction.REPLAN,
         )
         self.assertEqual(
             decide_escalation(
-                graph_failure, attempt=1, replan_count=1, budget=budget, node_retry_limit=2,
+                graph_failure,
+                attempt=1,
+                replan_count=1,
+                budget=budget,
+                node_retry_limit=2,
             ).action,
             EscalationAction.EXHAUST,
         )
@@ -39,12 +54,18 @@ class EscalationTests(unittest.TestCase):
             (FailureKind.CANCELLATION, EscalationAction.CANCEL),
         ):
             failure = Failure(
-                id=f"failure-{kind.value}", kind=kind, code=kind.value,
-                message=kind.value, retryable=True,
+                id=f"failure-{kind.value}",
+                kind=kind,
+                code=kind.value,
+                message=kind.value,
+                retryable=True,
             )
             self.assertEqual(
                 decide_escalation(
-                    failure, attempt=0, replan_count=0, budget=Budget(max_retries=5),
+                    failure,
+                    attempt=0,
+                    replan_count=0,
+                    budget=Budget(max_retries=5),
                     node_retry_limit=5,
                 ).action,
                 action,

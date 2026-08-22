@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timezone
+from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, TypeAlias
 
@@ -27,27 +28,20 @@ class StableStrEnum(StrEnum):
         return self.value
 
 
-class FrozenDict(dict[str, Any]):
+class FrozenDict(Mapping[str, Any]):
     """JSON object that retains normal serialization but rejects mutation."""
 
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> FrozenDict:
-        result = cls()
-        for key, item in value.items():
-            dict.__setitem__(result, key, item)
-        return result
+    def __init__(self, value: Mapping[str, Any]) -> None:
+        self._value = dict(value)
 
-    def _immutable(self, *_args: object, **_kwargs: object) -> None:
-        raise TypeError("canonical JSON values are immutable")
+    def __getitem__(self, key: str) -> Any:
+        return self._value[key]
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -66,12 +60,14 @@ def ensure_utc(value: object) -> datetime:
         raise TypeError("timestamp must be a datetime or ISO 8601 string")
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("timestamp must include a UTC offset")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def freeze_json(value: object) -> JsonValue:
     """Validate a JSON-compatible tree and return an immutable equivalent."""
 
+    if isinstance(value, FrozenDict):
+        return value
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -84,7 +80,7 @@ def freeze_json(value: object) -> JsonValue:
             if not isinstance(key, str):
                 raise TypeError("JSON object keys must be strings")
             frozen[key] = freeze_json(item)
-        return FrozenDict.from_dict(frozen)
+        return FrozenDict(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(freeze_json(item) for item in value)
     raise TypeError(f"unsupported canonical JSON value: {type(value).__name__}")

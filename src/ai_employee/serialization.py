@@ -56,13 +56,16 @@ def canonical_digest(value: object) -> str:
 def dumps_yaml(value: object) -> str:
     """Emit deterministic JSON, which is a portable YAML 1.2 representation."""
 
-    return json.dumps(
-        _json_ready(value),
-        sort_keys=True,
-        indent=2,
-        ensure_ascii=False,
-        allow_nan=False,
-    ) + "\n"
+    return (
+        json.dumps(
+            _json_ready(value),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
 
 
 def loads_model(text: str | bytes, model_type: type[ModelT]) -> ModelT:

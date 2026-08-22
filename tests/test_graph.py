@@ -17,7 +17,7 @@ class GraphBoundaryTests(unittest.TestCase):
         accepted = accept_graph(graph, self.policy)
         self.assertEqual(accepted.revision_number, 1)
         self.assertEqual(len(accepted.content_digest), 64)
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             accepted.graph.nodes[0].name = "changed"
 
     def test_replanning_creates_next_revision(self) -> None:
@@ -31,13 +31,22 @@ class GraphBoundaryTests(unittest.TestCase):
         base = demo_graph()
         edges = tuple(
             edge.model_copy(update={"loop": False, "max_traversals": None})
-            if edge.id == "repair-gate" else edge
+            if edge.id == "repair-gate"
+            else edge
             for edge in base.edges
         )
-        graph = base.model_copy(update={
-            "edges": edges,
-            "budget": Budget(max_attempts=8, max_retries=1, max_nodes=10, max_wall_seconds=120.0),
-        })
+        graph = base.model_copy(
+            update={
+                "edges": edges,
+                "budget": Budget(
+                    max_attempts=8,
+                    max_retries=1,
+                    max_nodes=10,
+                    max_wall_seconds=120.0,
+                    max_loop_iterations=2,
+                ),
+            }
+        )
         codes = {item.code for item in validate_graph(graph, self.policy)}
         self.assertEqual(codes, {"time_budget_exceeded", "unbounded_cycle"})
         with self.assertRaises(GraphValidationError) as caught:

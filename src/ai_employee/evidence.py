@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterable
+from datetime import UTC, datetime
 
 from .domain import (
-    Artifact, CompletionCriterion, EvidenceCoverage, EvidencePack, Finding, MergeDecision,
-    MergeDecisionState, Reference, ReviewAssessment, VerificationEvidence,
+    Artifact,
+    CompletionCriterion,
+    EvidenceCoverage,
+    EvidencePack,
+    Finding,
+    MergeDecision,
+    MergeDecisionState,
+    Reference,
+    ReviewAssessment,
+    VerificationEvidence,
     VerificationRequirement,
 )
+from .domain.base import freeze_json
 
 
 def aggregate_coverage(
@@ -30,24 +39,36 @@ def aggregate_coverage(
     satisfied = tuple(sorted(key for key, values in mapping.items() if values))
     missing = tuple(sorted(set(by_id) - set(satisfied)))
     return EvidenceCoverage(
-        requirement_ids=tuple(sorted(by_id)), satisfied_requirement_ids=satisfied,
+        requirement_ids=tuple(sorted(by_id)),
+        satisfied_requirement_ids=satisfied,
         missing_requirement_ids=missing,
-        mapping={key: sorted(values) for key, values in sorted(mapping.items())}, complete=not missing,
+        mapping=freeze_json({key: sorted(values) for key, values in sorted(mapping.items())}),
+        complete=not missing,
     )
 
 
 def build_evidence_pack(
-    *, pack_id: str, run_id: str, contract_ids: Iterable[str],
-    requirements: Iterable[VerificationRequirement], evidence: Iterable[VerificationEvidence],
-    reviews: Iterable[ReviewAssessment] = (), artifact_refs: Iterable[Reference] = (),
+    *,
+    pack_id: str,
+    run_id: str,
+    contract_ids: Iterable[str],
+    requirements: Iterable[VerificationRequirement],
+    evidence: Iterable[VerificationEvidence],
+    reviews: Iterable[ReviewAssessment] = (),
+    artifact_refs: Iterable[Reference] = (),
 ) -> EvidencePack:
     requirement_items = tuple(requirements)
     evidence_items = tuple(evidence)
     return EvidencePack(
-        id=pack_id, run_id=run_id, contract_ids=tuple(sorted(set(contract_ids))),
-        requirements=requirement_items, evidence=evidence_items,
-        coverage=aggregate_coverage(requirement_items, evidence_items), reviews=tuple(reviews),
-        artifact_refs=tuple(artifact_refs), created_at=datetime.now(timezone.utc),
+        id=pack_id,
+        run_id=run_id,
+        contract_ids=tuple(sorted(set(contract_ids))),
+        requirements=requirement_items,
+        evidence=evidence_items,
+        coverage=aggregate_coverage(requirement_items, evidence_items),
+        reviews=tuple(reviews),
+        artifact_refs=tuple(artifact_refs),
+        created_at=datetime.now(UTC),
     )
 
 
@@ -58,8 +79,11 @@ class CompletionAssessment:
 
 
 def assess_completion(
-    *, criteria: Iterable[CompletionCriterion], coverage: EvidenceCoverage,
-    artifacts: Iterable[Artifact], mandatory_gates_passed: bool,
+    *,
+    criteria: Iterable[CompletionCriterion],
+    coverage: EvidenceCoverage,
+    artifacts: Iterable[Artifact],
+    mandatory_gates_passed: bool,
     terminal_nodes_succeeded: bool = True,
     findings: Iterable[Finding] = (),
 ) -> CompletionAssessment:
@@ -78,17 +102,25 @@ def assess_completion(
         reasons.append("terminal nodes have not succeeded")
     reasons.extend(
         f"blocking finding remains: {item.id}"
-        for item in sorted(findings, key=lambda value: value.id) if item.blocking
+        for item in sorted(findings, key=lambda value: value.id)
+        if item.blocking
     )
     return CompletionAssessment(not reasons, tuple(reasons))
 
 
 def decide_merge(
-    evidence_pack: EvidencePack, *, mandatory_approval_required: bool,
+    evidence_pack: EvidencePack,
+    *,
+    mandatory_approval_required: bool,
     mandatory_approval_satisfied: bool,
 ) -> MergeDecision:
     blocking = sorted(
-        (finding for review in evidence_pack.reviews for finding in review.blocking_findings if finding.blocking),
+        (
+            finding
+            for review in evidence_pack.reviews
+            for finding in review.blocking_findings
+            if finding.blocking
+        ),
         key=lambda item: item.id,
     )
     if blocking:
@@ -96,7 +128,9 @@ def decide_merge(
         reasons = tuple(f"blocking finding: {item.id}" for item in blocking)
     elif not evidence_pack.coverage.complete:
         state = MergeDecisionState.MORE_EVIDENCE_REQUIRED
-        reasons = tuple(f"missing evidence: {item}" for item in evidence_pack.coverage.missing_requirement_ids)
+        reasons = tuple(
+            f"missing evidence: {item}" for item in evidence_pack.coverage.missing_requirement_ids
+        )
     elif mandatory_approval_required and not mandatory_approval_satisfied:
         state = MergeDecisionState.HUMAN_REVIEW_REQUIRED
         reasons = ("mandatory approval remains outstanding",)
@@ -107,7 +141,9 @@ def decide_merge(
         state = MergeDecisionState.AUTO_MERGE_ELIGIBLE
         reasons = ("all mandatory evidence and review gates are satisfied",)
     return MergeDecision(
-        id=f"merge-{evidence_pack.id}", state=state, reasons=reasons,
+        id=f"merge-{evidence_pack.id}",
+        state=state,
+        reasons=reasons,
         evidence_pack_id=evidence_pack.id,
         mandatory_approval_satisfied=mandatory_approval_satisfied,
     )
@@ -119,7 +155,9 @@ class RiskAssessment:
     factors: tuple[str, ...]
 
 
-def assess_change_risk(*, changed_paths: Iterable[str], touches_policy: bool = False) -> RiskAssessment:
+def assess_change_risk(
+    *, changed_paths: Iterable[str], touches_policy: bool = False
+) -> RiskAssessment:
     paths = tuple(sorted(set(changed_paths)))
     factors: list[str] = []
     if len(paths) > 20:

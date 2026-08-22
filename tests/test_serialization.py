@@ -16,7 +16,6 @@ from ai_employee.serialization import (
     loads_model,
     loads_yaml_model,
 )
-
 from tests.helpers import graph
 
 
@@ -53,9 +52,11 @@ class SerializationTests(unittest.TestCase):
             "payload": {1: "forbidden"},
         }
         yaml_stub = SimpleNamespace(safe_load=lambda _text: parsed)
-        with patch.dict(sys.modules, {"yaml": yaml_stub}):
-            with self.assertRaisesRegex(TypeError, "object keys must be strings"):
-                loads_yaml_model("not JSON", Event)
+        with (
+            patch.dict(sys.modules, {"yaml": yaml_stub}),
+            self.assertRaisesRegex(TypeError, "object keys must be strings"),
+        ):
+            loads_yaml_model("not JSON", Event)
 
     def test_accepted_revision_digest_is_stable_and_verified(self) -> None:
         first = AcceptedGraphRevision(revision_number=1, graph=graph())
@@ -72,11 +73,7 @@ class SerializationTests(unittest.TestCase):
     def test_accepted_revision_is_deeply_immutable(self) -> None:
         raw = {"ordered": [1, {"safe": True}]}
         candidate = graph().model_copy(
-            update={
-                "nodes": (
-                    graph().nodes[0].model_copy(update={"configuration": raw}),
-                )
-            }
+            update={"nodes": (graph().nodes[0].model_copy(update={"configuration": raw}),)}
         )
         # Validation at the acceptance boundary reconstructs and freezes even a
         # model instance produced through Pydantic's unchecked model_copy API.
