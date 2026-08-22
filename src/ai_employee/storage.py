@@ -124,6 +124,26 @@ class SQLiteStore:
                 (kind, record_id, run_id, revision, canonical_json(model)),
             )
 
+    def put_once(
+        self,
+        kind: str,
+        model: BaseModel,
+        *,
+        run_id: str | None = None,
+        revision: int = 1,
+    ) -> bool:
+        """Persist a record revision only if that exact key is still unused."""
+        record_id = getattr(model, "id", None)
+        if record_id is None:
+            raise ValueError("stored model requires an id")
+        with self._connection:
+            cursor = self._connection.execute(
+                "INSERT OR IGNORE INTO records"
+                "(kind, record_id, run_id, revision, payload) VALUES(?,?,?,?,?)",
+                (kind, record_id, run_id, revision, canonical_json(model)),
+            )
+        return cursor.rowcount == 1
+
     def get(
         self, kind: str, record_id: str, model_type: type[ModelT], *, revision: int | None = None
     ) -> ModelT:
