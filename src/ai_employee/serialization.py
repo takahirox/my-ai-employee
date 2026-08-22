@@ -53,6 +53,55 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+DIGEST_ALGORITHM = "sha256"
+DIGEST_FORMAT_VERSION = "1"
+
+
+def canonical_content(value: object, *, excluded_fields: frozenset[str] = frozenset()) -> object:
+    """Return the deterministic content payload used by v2 identity digests.
+
+    Callers explicitly select identity-only fields (timestamps, stored digests, and
+    secret bindings) for exclusion.  Explicit null values in the remaining payload
+    are retained.
+    """
+
+    ready = _json_ready(value)
+    return _exclude_fields(ready, excluded_fields)
+
+
+def _exclude_fields(value: object, excluded_fields: frozenset[str]) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _exclude_fields(item, excluded_fields)
+            for key, item in value.items()
+            if key not in excluded_fields
+        }
+    if isinstance(value, list):
+        return [_exclude_fields(item, excluded_fields) for item in value]
+    return value
+
+
+def versioned_digest(
+    value: object,
+    *,
+    excluded_fields: frozenset[str] = frozenset(),
+    algorithm: str = DIGEST_ALGORITHM,
+    format_version: str = DIGEST_FORMAT_VERSION,
+) -> str:
+    """Digest a versioned canonical envelope, failing closed on unknown formats."""
+
+    if algorithm != DIGEST_ALGORITHM:
+        raise ValueError(f"unsupported digest algorithm: {algorithm}")
+    if format_version != DIGEST_FORMAT_VERSION:
+        raise ValueError(f"unsupported digest format version: {format_version}")
+    envelope = {
+        "algorithm": algorithm,
+        "format_version": format_version,
+        "payload": canonical_content(value, excluded_fields=excluded_fields),
+    }
+    return canonical_digest(envelope)
+
+
 def dumps_yaml(value: object) -> str:
     """Emit deterministic JSON, which is a portable YAML 1.2 representation."""
 

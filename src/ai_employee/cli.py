@@ -21,7 +21,7 @@ from .domain import (
 from .domain.base import freeze_json
 from .graph import accept_graph
 from .inspector import compare_runs, inspect_run, serve
-from .project import discover_project_profile
+from .project import discover_project, migration_candidate, write_migration_candidate
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import canonical_json, loads_yaml_model
 from .storage import SQLiteStore
@@ -72,13 +72,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     project = commands.add_parser("project", help="show explicit or provisional ProjectProfile")
     project.add_argument("root", nargs="?", default=".")
+    project.add_argument("--migrate", action="store_true", help="render a safe v2 candidate")
+    project.add_argument("--output", help="write the migration candidate to this new path")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "project":
-        print(canonical_json(discover_project_profile(args.root)))
+        if args.output and not args.migrate:
+            build_parser().error("--output requires --migrate")
+        if args.migrate:
+            if args.output:
+                destination = write_migration_candidate(args.root, args.output)
+                print(canonical_json({"output": str(destination)}))
+            else:
+                print(migration_candidate(args.root), end="")
+        else:
+            print(canonical_json(discover_project(args.root)))
         return 0
     with SQLiteStore(args.db) as store:
         if args.command == "demo":
