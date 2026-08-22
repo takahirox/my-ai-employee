@@ -1,0 +1,36 @@
+{
+  "schema_version": "1",
+  "id": "declarative-graph",
+  "graph_schema_version": "1",
+  "nodes": [
+    {
+      "schema_version": "1", "id": "start", "kind": "function", "name": "Start",
+      "output_contract": {
+        "schema_version": "1", "id": "contract-start", "contract_version": "1",
+        "expected_type": "object", "required_fields": ["ok"], "allow_additional_fields": false
+      },
+      "required_capabilities": [], "retry_limit": 0, "max_iterations": 1,
+      "configuration": {"value": {"ok": true}}, "state": "pending", "generation": 0,
+      "graph_revision": 1, "attempt": 0, "transitions": [], "failure": null
+    },
+    {
+      "schema_version": "1", "id": "done", "kind": "system", "name": "Done",
+      "output_contract": {
+        "schema_version": "1", "id": "contract-done", "contract_version": "1",
+        "expected_type": "object", "required_fields": ["ok"], "allow_additional_fields": false
+      },
+      "required_capabilities": [], "retry_limit": 0, "max_iterations": 1,
+      "configuration": {"value": {"ok": true}}, "state": "pending", "generation": 0,
+      "graph_revision": 1, "attempt": 0, "transitions": [], "failure": null
+    }
+  ],
+  "edges": [{
+    "schema_version": "1", "id": "start-done", "source_id": "start", "target_id": "done",
+    "condition": null, "loop": false, "max_traversals": null
+  }],
+  "entry_node_ids": ["start"], "terminal_node_ids": ["done"],
+  "budget": {
+    "schema_version": "1", "max_attempts": 4, "max_retries": 0, "max_replans": 0,
+    "max_loop_iterations": 1, "max_nodes": 10, "max_wall_seconds": 60.0
+  }
+}
