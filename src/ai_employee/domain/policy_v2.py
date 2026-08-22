@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import PurePath
 from typing import ClassVar, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -13,6 +14,7 @@ from .v2 import (
     DigestedRecordV2,
     InstallRequest,
     PolicyDecision,
+    ProcessRequest,
     SchemaModelV2,
 )
 
@@ -237,6 +239,15 @@ class PolicyResolver:
         if capability in denied or (allowed_set is not None and capability not in allowed_set):
             outcome = DecisionOutcome.DENY
             reason = "capability_denied"
+            decision_approvals = ()
+        elif (
+            isinstance(request.payload, ProcessRequest)
+            and PurePath(request.payload.argv[0]).name
+            in {"sh", "bash", "dash", "zsh", "fish", "cmd", "powershell", "pwsh"}
+            and not shell
+        ):
+            outcome = DecisionOutcome.DENY
+            reason = "process_shell_denied"
             decision_approvals = ()
         elif decision_approvals:
             outcome = DecisionOutcome.APPROVAL_REQUIRED

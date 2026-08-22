@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from ai_employee.domain.base import freeze_json
 from ai_employee.domain.services_v2 import ArtifactStore, Cancellation
@@ -49,6 +49,7 @@ class LocalProcessExecutor:
         executable_paths: Sequence[str | Path] = ("/usr/bin", "/bin"),
         inherited_environment: Mapping[str, str] | None = None,
         secret_resolver: Callable[[str], str] | None = None,
+        stdin_resolver: Callable[[str], BinaryIO] | None = None,
         maximum_processes: int = 1,
         terminate_grace_seconds: float = 1.0,
     ) -> None:
@@ -59,6 +60,7 @@ class LocalProcessExecutor:
         self.executable_paths = tuple(Path(path).resolve() for path in executable_paths)
         self.inherited_environment = dict(inherited_environment or os.environ)
         self.secret_resolver = secret_resolver
+        self.stdin_resolver = stdin_resolver
         self.terminate_grace_seconds = terminate_grace_seconds
         self._slots = threading.BoundedSemaphore(maximum_processes)
 
@@ -93,26 +95,39 @@ class LocalProcessExecutor:
             executable = self._resolve_executable(request.argv[0], cwd)
             environment = self._environment(request)
             argv = (str(executable), *request.argv[1:])
+            stdin_handle: BinaryIO | None = None
+            if request.stdin_artifact_digest is not None:
+                assert self.stdin_resolver is not None
+                stdin_handle = self.stdin_resolver(request.stdin_artifact_digest)
+            stdin: BinaryIO | int = (
+                subprocess.DEVNULL if stdin_handle is None else stdin_handle
+            )
             try:
                 process = subprocess.Popen(
                     argv,
                     cwd=cwd,
                     env=environment,
-                    stdin=subprocess.DEVNULL,
+                    stdin=stdin,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
                     start_new_session=True,
                 )
             except OSError as error:
+                if stdin_handle is not None:
+                    stdin_handle.close()
                 return self._result(
                     request,
                     started,
                     failure=self._failure(StableFailureCode.SPAWN_FAILED, str(error)),
                 )
-            stdout, stderr, exceeded, cancelled, timed_out = self._capture(
-                process, request, cancellation, started, timeout
-            )
+            try:
+                stdout, stderr, exceeded, cancelled, timed_out = self._capture(
+                    process, request, cancellation, started, timeout
+                )
+            finally:
+                if stdin_handle is not None:
+                    stdin_handle.close()
             stdout_digest = self._store_output(request, stdout, "process_stdout")
             stderr_digest = self._store_output(request, stderr, "process_stderr")
             status: Literal["succeeded", "failed", "cancelled", "indeterminate"]
@@ -316,7 +331,7 @@ class LocalProcessExecutor:
                 StableFailureCode.BUDGET_EXCEEDED,
                 "process request exceeds the effective policy budget",
             )
-        if request.stdin_artifact_digest is not None:
+        if request.stdin_artifact_digest is not None and self.stdin_resolver is None:
             return self._failure(
                 StableFailureCode.INVALID_REQUEST,
                 "stdin artifacts are unavailable without a descriptor-bound resolver",

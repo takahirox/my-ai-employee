@@ -40,6 +40,8 @@ class MediatedActionChannel(Protocol):
 class WorkspaceManager(Protocol):
     def create(self, request: WorkspaceRequest) -> WorkspaceSnapshot: ...
 
+    def adopt(self, snapshot: WorkspaceSnapshot) -> None: ...
+
     def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor: ...
 
     def promote(
@@ -100,3 +102,7 @@ class ApprovalService(Protocol):
         request_digest: Digest,
         decision: Literal["approved", "denied"],
     ) -> ApprovalRecord: ...
+
+    def apply(
+        self, decision: PolicyDecision, approval: ApprovalRecord
+    ) -> PolicyDecision: ...

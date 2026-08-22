@@ -158,6 +158,35 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     assert failed.failure.code.value == "BUDGET_EXCEEDED"
 
 
+def test_process_executor_reads_only_descriptor_bound_stdin(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    descriptor = store.put(io.BytesIO(b"bounded input"), artifact_request())
+    executor = LocalProcessExecutor(
+        (tmp_path,),
+        store,
+        stdin_resolver=lambda digest: store.open_verified(descriptor)
+        if digest == descriptor.artifact_digest
+        else (_ for _ in ()).throw(KeyError(digest)),
+    )
+    request = ProcessRequest(
+        id="process-stdin-1",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", "cat"),
+        stdin_artifact_digest=descriptor.artifact_digest,
+        timeout_seconds=10.0,
+        stdout_bytes=100,
+        stderr_bytes=100,
+        purpose="verify descriptor-bound stdin",
+    )
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+    assert result.status == "succeeded"
+    output = store.content_root / (result.stdout_artifact_digest or "")[:2] / (
+        result.stdout_artifact_digest or ""
+    )
+    assert output.read_bytes() == b"bounded input"
+
+
 def test_process_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     store = AtomicArtifactStore(tmp_path / "artifacts")
     executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.1)

@@ -97,6 +97,17 @@ class GitWorkspaceManager:
             ),
         )
 
+    def adopt(self, snapshot: WorkspaceSnapshot) -> None:
+        """Rehydrate ownership after a CLI restart without trusting an arbitrary path."""
+        path = Path(snapshot.isolated_worktree).resolve()
+        metadata = snapshot.worktree_metadata
+        owner = metadata.get("owner") if isinstance(metadata, Mapping) else None
+        if owner != "fleet" or self.state_root not in path.parents or not path.is_dir():
+            raise ValueError("persisted workspace ownership is invalid")
+        if run_git(path, "rev-parse", "HEAD").decode().strip() != snapshot.head_commit:
+            raise ValueError("persisted workspace HEAD changed")
+        self._owned.add(path)
+
     def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor:
         isolated = self._require_owned(snapshot)
         patch_bytes = self._diff(isolated, snapshot.id)

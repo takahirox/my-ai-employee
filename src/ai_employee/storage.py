@@ -56,6 +56,15 @@ class SQLiteStore:
             yield self._connection
 
     def _create_schema(self) -> None:
+        existing = self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='fleet_meta'"
+        ).fetchone()
+        if existing is not None:
+            row = self._connection.execute(
+                "SELECT value FROM fleet_meta WHERE key='schema_version'"
+            ).fetchone()
+            if row is not None and int(row[0]) > 2:
+                raise ValueError("database schema is newer than this Fleet version")
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS fleet_meta (
@@ -98,10 +107,41 @@ class SQLiteStore:
         )
         with self._connection:
             self._connection.execute(
-                "INSERT OR REPLACE INTO fleet_meta(key, value) VALUES('schema_version', '1')"
+                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('schema_version', '1')"
             )
             self._connection.execute(
-                "INSERT OR REPLACE INTO fleet_meta(key, value) VALUES('fleet_version', '0.1.0')"
+                "INSERT OR IGNORE INTO fleet_meta(key, value) VALUES('fleet_version', '0.1.0')"
+            )
+
+    def _schema_version(self) -> int:
+        row = self._connection.execute(
+            "SELECT value FROM fleet_meta WHERE key='schema_version'"
+        ).fetchone()
+        return 1 if row is None else int(row[0])
+
+    def migrate_v2(self) -> None:
+        """Transactionally add v2 projections only when a v2 write is requested."""
+        if self._schema_version() == 2:
+            return
+        with self.transaction() as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS work_events_v2 ("
+                "sequence INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "event_id TEXT NOT NULL UNIQUE,run_id TEXT NOT NULL,payload TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS work_events_v2_run "
+                "ON work_events_v2(run_id, sequence)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS work_checkpoints_v2 ("
+                "run_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,payload TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('fleet_version','0.2.0')"
             )
 
     def put(
@@ -277,6 +317,60 @@ class SQLiteStore:
     def clear_control(self, run_id: str) -> None:
         with self._connection:
             self._connection.execute("DELETE FROM controls WHERE run_id=?", (run_id,))
+
+    def save_work_run(self, run: Any) -> None:
+        self.migrate_v2()
+        self.put("work_run_v2", run, run_id=str(run.id), revision=int(run.generation) + 1)
+
+    def get_work_run(self, run_id: str) -> Any:
+        from .orchestration import WorkRun
+
+        if self._schema_version() < 2:
+            raise KeyError(run_id)
+        return self.get("work_run_v2", run_id, WorkRun)
+
+    def append_work_event(self, event: Any) -> int:
+        self.migrate_v2()
+        with self._connection:
+            cursor = self._connection.execute(
+                "INSERT INTO work_events_v2(event_id, run_id, payload) VALUES(?,?,?)",
+                (event.id, event.run_id, canonical_json(event)),
+            )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a v2 event sequence")
+        return int(cursor.lastrowid)
+
+    def work_events(self, run_id: str) -> tuple[Any, ...]:
+        from .orchestration import WorkEvent
+
+        if self._schema_version() < 2:
+            return ()
+        rows = self._connection.execute(
+            "SELECT payload FROM work_events_v2 WHERE run_id=? ORDER BY sequence", (run_id,)
+        )
+        return tuple(WorkEvent.model_validate_json(row["payload"], strict=True) for row in rows)
+
+    def checkpoint_work(self, run_id: str, generation: int, payload: object) -> None:
+        self.migrate_v2()
+        with self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO work_checkpoints_v2(run_id,generation,payload) "
+                "VALUES(?,?,?)",
+                (run_id, generation, canonical_json(payload)),
+            )
+
+    def load_work_checkpoint(self, run_id: str) -> tuple[int, dict[str, Any]]:
+        if self._schema_version() < 2:
+            raise KeyError(run_id)
+        row = self._connection.execute(
+            "SELECT generation,payload FROM work_checkpoints_v2 WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        payload = json.loads(row["payload"])
+        if not isinstance(payload, dict):
+            raise ValueError("v2 checkpoint payload must be an object")
+        return int(row["generation"]), payload
 
 
 class _TransitionRecord(BaseModel):

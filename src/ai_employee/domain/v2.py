@@ -436,7 +436,7 @@ class InstallResult(ExecutionResult):
 class WorkerAvailability(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_availability"
     adapter: Identifier
-    availability: Literal["available", "unavailable", "unknown"]
+    availability: Literal["available", "unavailable", "auth_unknown", "unknown"]
     auth: Literal["available", "unavailable", "unknown"]
     version: str | None = Field(default=None, max_length=200)
     failure: StableFailure | None = None
