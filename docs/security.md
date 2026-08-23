@@ -27,5 +27,11 @@ CLI worker authentication remains owned by the official Codex/Claude tool. Fleet
 not inspect auth files and filters credential-like environment variables from controlled
 commands. Artifact bodies are not returned by Inspector projections.
 
+Machine-local worker executable overrides belong in Operator Config, not the repository's
+Project Harness. Overrides must be absolute paths, are resolved through the controlled
+`ProcessExecutor`, and do not grant additional process, filesystem, network, or project
+authority. Runtime dependency directories must be explicitly listed as `path_entries`;
+the unrestricted host `PATH` is never inherited.
+
 v0.2 does not provide containers, remote execution, deployment, automatic Git commit/push,
 or a distributed security boundary. Report vulnerabilities according to `SECURITY.md`.

@@ -443,6 +443,7 @@ class InstallResult(ExecutionResult):
 class WorkerAvailability(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_availability"
     adapter: Identifier
+    executable: str | None = Field(default=None, min_length=1, max_length=4_096)
     availability: Literal["available", "unavailable", "auth_unknown", "unknown"]
     auth: Literal["available", "unavailable", "unknown"]
     version: str | None = Field(default=None, max_length=200)

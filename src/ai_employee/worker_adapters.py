@@ -111,7 +111,7 @@ class CliWorkerAdapter:
     """Base adapter whose probing and proposal calls use ProcessExecutor exclusively."""
 
     adapter: ClassVar[str]
-    executable: ClassVar[str]
+    default_executable: ClassVar[str]
     noninteractive_flag: ClassVar[str]
 
     def __init__(
@@ -121,6 +121,7 @@ class CliWorkerAdapter:
         policy_decider: Callable[[ProcessRequest], PolicyDecision],
         *,
         run_id: str,
+        executable: str | None = None,
         cwd: str = ".",
         prompt_writer: Callable[[bytes], str] | None = None,
         cancellation: Cancellation | None = None,
@@ -130,6 +131,10 @@ class CliWorkerAdapter:
         self.output_reader = output_reader
         self.policy_decider = policy_decider
         self.run_id = run_id
+        selected_executable = executable or type(self).default_executable
+        if not selected_executable or "\x00" in selected_executable:
+            raise ValueError("worker executable must be non-empty and NUL-free")
+        self.executable = selected_executable
         self.cwd = cwd
         self.prompt_writer = prompt_writer
         self.cancellation = cancellation or _NeverCancelled()
@@ -143,6 +148,7 @@ class CliWorkerAdapter:
                 run_id=self.run_id,
                 created_at=now(),
                 adapter=self.adapter,
+                executable=self.executable,
                 availability="unavailable",
                 auth="unknown",
                 failure=version.failure
@@ -159,6 +165,7 @@ class CliWorkerAdapter:
                 run_id=self.run_id,
                 created_at=now(),
                 adapter=self.adapter,
+                executable=self.executable,
                 availability="unavailable",
                 auth="unknown",
                 version=self._output(version.stdout_artifact_digest).strip()[:200],
@@ -172,6 +179,7 @@ class CliWorkerAdapter:
             run_id=self.run_id,
             created_at=now(),
             adapter=self.adapter,
+            executable=self.executable,
             availability="auth_unknown",
             auth="unknown",
             version=self._output(version.stdout_artifact_digest).strip()[:200],
@@ -259,7 +267,7 @@ class CliWorkerAdapter:
 
 class CodexCliWorkerAdapter(CliWorkerAdapter):
     adapter = "codex_cli"
-    executable = "codex"
+    default_executable = "codex"
     noninteractive_flag = "exec"
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
@@ -280,7 +288,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
 
 class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
     adapter = "claude_code_cli"
-    executable = "claude"
+    default_executable = "claude"
     noninteractive_flag = "--print"
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:

@@ -62,11 +62,13 @@ class NoWorkspace:
 class CapturingExecutor:
     def __init__(self) -> None:
         self.decision: PolicyDecision | None = None
+        self.request: ProcessRequest | None = None
 
     def execute(
         self, request: ProcessRequest, decision: PolicyDecision, _cancellation: object
     ) -> ExecutionResult:
         self.decision = decision
+        self.request = request
         return ExecutionResult(
             id="worker-execution-1",
             run_id=request.run_id,
@@ -220,9 +222,13 @@ def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
         lambda _digest: b"",
         deny,
         run_id="run-1",
+        executable="/custom/bin/codex",
     )
     availability = adapter.probe()
     assert availability.availability == "unavailable"
+    assert availability.executable == "/custom/bin/codex"
+    assert executor.request is not None
+    assert executor.request.argv == ("/custom/bin/codex", "--version")
     assert executor.decision is not None
     assert executor.decision.outcome is DecisionOutcome.DENY
     assert executor.decision.reason_code == "operator_policy_denied"

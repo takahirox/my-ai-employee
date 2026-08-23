@@ -8,9 +8,10 @@ import shutil
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from . import __version__
+from .config import WorkerName, load_operator_config
 from .demo import run_demo
 from .domain import (
     ContractKind,
@@ -115,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     work.add_argument("goal")
     work.add_argument("--repo", default=".")
     work.add_argument("--worker", choices=("codex_cli", "claude_code_cli"), default="codex_cli")
+    work.add_argument(
+        "--operator-config",
+        help=(
+            "machine-local worker executable config (default: ~/.config/my-ai-employee/config.yaml)"
+        ),
+    )
     work.add_argument("--plan-only", action="store_true")
     work.add_argument("--non-interactive", action="store_true")
     work.add_argument("--json", action="store_true")
@@ -243,20 +250,32 @@ def _work(args: argparse.Namespace) -> int:
 
     repository = Path(args.repo).resolve()
     harness = discover_project_harness(repository)
+    operator_config = load_operator_config(args.operator_config)
+    worker_command = operator_config.worker_command(cast(WorkerName, args.worker))
     db_path = Path(args.db)
     storage_root = db_path.resolve().parent
     workspace_root = repository.parent / f".fleet-{repository.name}" / "workspaces"
     artifacts = AtomicArtifactStore(storage_root / "artifacts")
     descriptors: dict[str, ArtifactDescriptor] = {}
     executable_paths = [Path("/usr/bin"), Path("/bin")]
-    for executable in ("codex", "claude"):
+
+    def add_executable_path(executable: str) -> None:
+        path = Path(executable)
+        if path.is_absolute():
+            executable_paths.extend((path.parent, path.resolve().parent))
+            return
         located = shutil.which(executable)
         if located is not None:
-            executable_paths.append(Path(located).resolve().parent)
+            executable_paths.extend((Path(located).parent, Path(located).resolve().parent))
+
+    add_executable_path(worker_command.executable)
+    for path_entry in worker_command.path_entries:
+        executable_paths.append(Path(path_entry))
+    # Codex and Claude Code are Node-based today. Keep interpreter lookup explicit
+    # and deterministic instead of inheriting the host PATH wholesale.
+    add_executable_path("node")
     for command in harness.commands.values():
-        located = shutil.which(command.argv[0])
-        if located is not None:
-            executable_paths.append(Path(located).resolve().parent)
+        add_executable_path(command.argv[0])
 
     with SQLiteStore(db_path) as store:
         run_id = identifier("work")
@@ -354,6 +373,7 @@ def _work(args: argparse.Namespace) -> int:
                 read_output,
                 decide_worker_process,
                 run_id=run_id,
+                executable=worker_command.executable,
                 prompt_writer=prompt_writer,
                 cancellation=cancellation,
             )

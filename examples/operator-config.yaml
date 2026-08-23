@@ -1,0 +1,8 @@
+schema_version: 1
+workers:
+  codex_cli:
+    executable: /absolute/path/to/codex
+    # Add interpreter/runtime directories only when the executable needs them.
+    path_entries: [/absolute/path/to/runtime/bin]
+  claude_code_cli:
+    executable: /absolute/path/to/claude

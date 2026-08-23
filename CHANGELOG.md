@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added machine-local Operator Config support for explicit Codex and Claude Code
+  executable paths, deterministic runtime path entries, and executable provenance.
+
 ## 0.2.1
 
 - Applied the repository formatter to the v0.2 implementation so the full CI

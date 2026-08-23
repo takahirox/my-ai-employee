@@ -49,6 +49,25 @@ login flow. Fleet does not read or store its credential. Codex is invoked in a
 read-only proposal sandbox; edits are returned as typed unified diffs and applied
 by Fleet only after path and policy checks.
 
+Worker executable locations are machine-specific operator configuration, not
+version-controlled Project Harness policy. By default Fleet optionally loads
+`~/.config/my-ai-employee/config.yaml`; use `--operator-config PATH` or the
+`MY_AI_EMPLOYEE_CONFIG` environment variable to select another file:
+
+```yaml
+schema_version: 1
+workers:
+  codex_cli:
+    executable: /absolute/path/to/codex
+    # Optional runtime/interpreter directories required by the executable.
+    path_entries: [/absolute/path/to/runtime/bin]
+```
+
+Configured executable paths must be absolute. If no entry exists, Fleet retains
+the backward-compatible deterministic `PATH` lookup for `codex` or `claude`. The
+effective executable is recorded with worker availability provenance. See
+[`examples/operator-config.yaml`](examples/operator-config.yaml).
+
 The Claude Code adapter currently disables Claude tools completely, so it is most
 useful when sufficient bounded context is already present in the goal. Codex CLI is
 the source-aware primary adapter for v0.2. Direct OpenAI or Anthropic API keys are
