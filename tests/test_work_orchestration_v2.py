@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -13,6 +14,7 @@ from ai_employee.domain.v2 import (
     DecisionOutcome,
     EditIntentRequest,
     ExecutionResult,
+    InstallResult,
     PolicyDecision,
     ProcessRequest,
     StableFailure,
@@ -30,6 +32,8 @@ from ai_employee.worker_adapters import (
     CodexCliWorkerAdapter,
     ScriptedWorkerAdapter,
     WorkerProposalEnvelope,
+    _bounded_prompt,
+    _validate_worker_envelope,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -193,6 +197,48 @@ def test_scripted_adapter_rejects_prose_command_injection() -> None:
     assert channel.submissions == 0
 
 
+def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
+    payload = json.loads(
+        _bounded_prompt(worker_request(), scratch_directory="/tmp/fleet-worker-run-1")
+    )
+
+    assert payload["protocol"] == "fleet-worker-proposal/2"
+    assert payload["run_id"] == "run-1"
+    assert payload["response_schema"]["title"] == "WorkerProposalEnvelope"
+    assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
+    assert "read-only tools" in payload["instruction"]
+    assert "only below that exact directory" in payload["instruction"]
+    assert "supplied run_id" in payload["instruction"]
+
+
+def test_codex_worker_uses_explicit_scratch_as_its_only_workspace() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    adapter = CodexCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        allow,
+        run_id="run-1",
+        scratch_directory="/tmp/fleet-worker-run-1",
+    )
+
+    argv = adapter._proposal_argv("prompt")
+
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert argv[argv.index("--cd") + 1] == "/tmp/fleet-worker-run-1"
+    assert "--skip-git-repo-check" in argv
+    assert "--add-dir" not in argv
+
+
 def test_scripted_adapter_rejects_unknown_envelope_fields() -> None:
     adapter = ScriptedWorkerAdapter(
         [{"schema_version": "2", "proposals": (), "command": "touch escaped"}]
@@ -201,6 +247,49 @@ def test_scripted_adapter_rejects_unknown_envelope_fields() -> None:
     assert result.status == "failed"
     assert result.failure is not None
     assert result.failure.code.value == "WORKER_PROTOCOL_ERROR"
+
+
+def test_cli_worker_recomputes_untrusted_proposal_and_request_digests() -> None:
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "content_digest": ZERO,
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.txt"],
+                        "summary": "Add an example file.",
+                        "unified_diff": (
+                            "diff --git a/example.txt b/example.txt\n"
+                            "new file mode 100644\n"
+                            "--- /dev/null\n"
+                            "+++ b/example.txt\n"
+                            "@@ -0,0 +1 @@\n"
+                            "+example\n"
+                        ),
+                        "content_digest": ZERO,
+                    },
+                    "reason": "Implement the requested example.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    proposal = envelope.proposals[0]
+    assert proposal.content_digest != ZERO
+    assert proposal.payload.content_digest != ZERO
 
 
 def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
@@ -229,6 +318,7 @@ def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
     assert availability.executable == "/custom/bin/codex"
     assert executor.request is not None
     assert executor.request.argv == ("/custom/bin/codex", "--version")
+    assert executor.request.stderr_bytes == 1_000_000
     assert executor.decision is not None
     assert executor.decision.outcome is DecisionOutcome.DENY
     assert executor.decision.reason_code == "operator_policy_denied"
@@ -323,10 +413,21 @@ def test_v2_inspector_projects_evidence_without_artifact_bodies(tmp_path: Path) 
     store, run = _complete_coordinator_run(tmp_path, patch)
     try:
         assert run.status == "ready_to_promote"
+        install = InstallResult(
+            id="install-result-1",
+            run_id="work-1",
+            created_at=NOW,
+            request_digest=ZERO,
+            status="succeeded",
+            duration_seconds=0.01,
+            inventory_artifact_digest=ZERO,
+        )
+        store.put("action_result_v2", install, run_id="work-1")
         view = inspect_work_run(store, "work-1")
         assert view["kind"] == "work_run"
         assert view["state"] == "ready_to_promote"
         assert view["verification"][0]["status"] == "succeeded"
+        assert any(item.get("inventory_artifact_digest") == ZERO for item in view["actions"])
         assert view["acceptance"][0]["criteria"]
         assert view["patch"]["artifact_digest"] == sha256(patch).hexdigest()
         assert "body" not in view["patch"]

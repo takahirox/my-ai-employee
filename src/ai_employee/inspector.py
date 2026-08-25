@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+from pydantic import RootModel
+
 from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
 from .domain.base import FrozenDict
 from .domain.policy_v2 import PolicyLayer
@@ -15,7 +17,9 @@ from .domain.v2 import (
     AcceptanceLedger,
     ApprovalRecord,
     ArtifactDescriptor,
+    DownloadResult,
     ExecutionResult,
+    InstallResult,
     PolicyDecision,
     PromotionRecord,
     WorkerAvailability,
@@ -24,6 +28,10 @@ from .domain.v2 import (
 )
 from .serialization import canonical_json
 from .storage import SQLiteStore
+
+
+class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
+    """Decode the structurally distinct result variants stored under one record kind."""
 
 
 def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
@@ -136,8 +144,8 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             for item in store.list_records("workspace_v2", WorkspaceSnapshot, run_id=run_id)
         ],
         "actions": [
-            _json_model(item)
-            for item in store.list_records("action_result_v2", ExecutionResult, run_id=run_id)
+            _json_model(item.root)
+            for item in store.list_records("action_result_v2", _ActionResultRecord, run_id=run_id)
         ],
         "verification": [
             _json_model(item)

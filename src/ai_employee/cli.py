@@ -365,6 +365,8 @@ def _work(args: argparse.Namespace) -> int:
             snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
+            scratch_directory = workspace_root / "worker-scratch" / run_id
+            scratch_directory.mkdir(parents=True, exist_ok=True)
             adapter_type = (
                 CodexCliWorkerAdapter if args.worker == "codex_cli" else ClaudeCodeCliWorkerAdapter
             )
@@ -375,6 +377,7 @@ def _work(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 executable=worker_command.executable,
                 prompt_writer=prompt_writer,
+                scratch_directory=str(scratch_directory),
                 cancellation=cancellation,
             )
 

@@ -124,6 +124,7 @@ class CliWorkerAdapter:
         executable: str | None = None,
         cwd: str = ".",
         prompt_writer: Callable[[bytes], str] | None = None,
+        scratch_directory: str | None = None,
         cancellation: Cancellation | None = None,
         timeout_seconds: float = 300.0,
     ) -> None:
@@ -137,6 +138,9 @@ class CliWorkerAdapter:
         self.executable = selected_executable
         self.cwd = cwd
         self.prompt_writer = prompt_writer
+        if scratch_directory is not None and ("\x00" in scratch_directory or not scratch_directory):
+            raise ValueError("worker scratch directory must be non-empty and NUL-free")
+        self.scratch_directory = scratch_directory
         self.cancellation = cancellation or _NeverCancelled()
         self.timeout_seconds = timeout_seconds
 
@@ -189,7 +193,7 @@ class CliWorkerAdapter:
         self, request: WorkerRequest, mediated_channel: MediatedActionChannel
     ) -> WorkerResult:
         started = time.monotonic()
-        prompt = _bounded_prompt(request)
+        prompt = _bounded_prompt(request, scratch_directory=self.scratch_directory)
         stdin_digest = self.prompt_writer(prompt) if self.prompt_writer else None
         argv = self._proposal_argv(None if stdin_digest else prompt.decode("utf-8"))
         process = self._execute(
@@ -207,7 +211,7 @@ class CliWorkerAdapter:
             )
         try:
             payload = self._extract_payload(self._output(process.stdout_artifact_digest))
-            envelope = WorkerProposalEnvelope.model_validate_json(payload, strict=True)
+            envelope = _validate_worker_envelope(payload)
         except ValueError as error:
             return _worker_failure(
                 request,
@@ -248,7 +252,7 @@ class CliWorkerAdapter:
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=timeout,
             stdout_bytes=1_000_000,
-            stderr_bytes=200_000,
+            stderr_bytes=1_000_000,
             budget_class="worker",
             purpose=purpose,
         )
@@ -279,8 +283,18 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             "--ephemeral",
             "--ignore-user-config",
             "--sandbox",
-            "read-only",
         ]
+        if self.scratch_directory is not None:
+            argv.extend(
+                (
+                    "workspace-write",
+                    "--cd",
+                    self.scratch_directory,
+                    "--skip-git-repo-check",
+                )
+            )
+        else:
+            argv.append("read-only")
         if inline_prompt is not None:
             argv.append(inline_prompt)
         return tuple(argv)
@@ -314,9 +328,10 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
         return output
 
 
-def _bounded_prompt(request: WorkerRequest) -> bytes:
+def _bounded_prompt(request: WorkerRequest, *, scratch_directory: str | None = None) -> bytes:
     payload = {
         "protocol": "fleet-worker-proposal/2",
+        "run_id": request.run_id,
         "goal": request.goal,
         "accepted_plan_digest": request.accepted_plan_digest,
         "workspace_context": request.workspace_context,
@@ -324,12 +339,43 @@ def _bounded_prompt(request: WorkerRequest) -> bytes:
         "effective_policy_digest": request.effective_policy_digest,
         "remaining_budgets": request.remaining_budgets,
         "prior_result_digests": request.prior_result_digests,
-        "instruction": "Return only the strict JSON envelope. Do not run tools or commands.",
+        "response_schema": _envelope_schema(),
+        "writable_scratch_directory": scratch_directory,
+        "instruction": (
+            "Return only the strict JSON envelope. You may inspect repository files with "
+            "read-only tools. Do not edit the repository or run commands that change repository "
+            "state; express every requested repository action only as a typed proposal. If a "
+            "writable_scratch_directory is supplied, you may create temporary candidate files "
+            "only below that exact directory and use them for deterministic diff generation and "
+            "read-only validation against the repository. Every proposal and nested request must "
+            "use the supplied run_id."
+        ),
     }
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
         raise ValueError("bounded worker request exceeds 64000 bytes")
     return value
+
+
+def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
+    """Validate proposals after replacing worker-claimed digests with local computation."""
+
+    raw = json.loads(payload)
+    if not isinstance(raw, dict):
+        raise ValueError("worker proposal envelope must be a JSON object")
+    proposals = raw.get("proposals")
+    if isinstance(proposals, list):
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                continue
+            proposal.pop("content_digest", None)
+            proposal.pop("digest_metadata", None)
+            request = proposal.get("payload")
+            if isinstance(request, dict):
+                request.pop("content_digest", None)
+                request.pop("digest_metadata", None)
+    normalized = json.dumps(raw, separators=(",", ":"))
+    return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
 
 
 def _envelope_schema() -> dict[str, object]:
