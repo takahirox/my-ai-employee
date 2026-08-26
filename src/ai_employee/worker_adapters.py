@@ -344,6 +344,11 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
         proposals = wrapper["proposals"]
         if not isinstance(proposals, list):
             raise ValueError("Codex proposals must be a JSON array")
+        proposals.sort(
+            key=lambda proposal: (
+                0 if isinstance(proposal, dict) and proposal.get("kind") == "install" else 1
+            )
+        )
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 raise ValueError("Codex proposal entries must be JSON objects")
@@ -358,7 +363,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             raise ValueError("Codex usage_json must be JSON text")
         usage = json.loads(usage_json)
         if usage is not None and not isinstance(usage, dict):
-            raise ValueError("Codex usage_json must encode a JSON object or be null")
+            raise ValueError("Codex usage_json must encode a JSON object")
         return json.dumps(
             {
                 "schema_version": "2",
@@ -466,7 +471,11 @@ def _bounded_prompt(
             "The supplied output schema accepts edit_intent proposals and existing_lock install "
             "proposals only. Put each proposed repository patch directly in proposals with all "
             "schema fields populated. Request an existing_lock install when repository-local "
-            "dependencies are required for verification. Use the "
+            "dependencies are required for verification. That install must use manifest_path "
+            "package.json, lock_path package-lock.json, manager_executable tools/fleet-npm, argv "
+            "[ci, --ignore-scripts], target node_modules, network_required true, lifecycle_scripts "
+            "false, and expected_mutations []; Fleet will execute it before edit proposals. Use "
+            "the "
             "supplied run_id for both the proposal and payload run_id. Set assistant_note "
             "directly; use an empty string when there is no note. Encode a usage object as JSON "
             "text in usage_json, using {} when no usage is available. In unified_diff, use "
@@ -581,17 +590,23 @@ def worker_proposal_schema_json() -> bytes:
             **identity_properties,
             "ecosystem": {"type": "string", "enum": ["node_project"]},
             "operation": {"type": "string", "enum": ["existing_lock"]},
-            "manifest_path": {"type": "string"},
-            "lock_path": {"type": "string"},
+            "manifest_path": {"type": "string", "enum": ["package.json"]},
+            "lock_path": {"type": "string", "enum": ["package-lock.json"]},
             "manifest_digest": {"type": "string"},
             "lock_digest": {"type": "string"},
-            "manager_executable": {"type": "string"},
+            "manager_executable": {"type": "string", "enum": ["tools/fleet-npm"]},
             "manager_version": {"type": "string"},
-            "argv": {"type": "array", "items": {"type": "string"}},
-            "target": {"type": "string"},
-            "network_required": {"type": "boolean"},
-            "lifecycle_scripts": {"type": "boolean"},
-            "expected_mutations": {"type": "array", "items": {"type": "string"}},
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "target": {"type": "string", "enum": ["node_modules"]},
+            "network_required": {"type": "boolean", "enum": [True]},
+            "lifecycle_scripts": {"type": "boolean", "enum": [False]},
+            "expected_mutations": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
         "required": [
             *identity_properties,

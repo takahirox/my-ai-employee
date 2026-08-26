@@ -68,6 +68,22 @@ class ProjectLocalInstaller:
                     message=f"{request.ecosystem} installs require project-local {expected_target}",
                 ),
             )
+        if request.ecosystem == "node_project" and request.operation == "existing_lock" and (
+            request.argv != ("ci", "--ignore-scripts")
+            or request.lifecycle_scripts
+            or request.expected_mutations
+        ):
+            return self._failed(
+                request,
+                started,
+                StableFailure(
+                    code=StableFailureCode.INVALID_REQUEST,
+                    message=(
+                        "node existing_lock install requires ci --ignore-scripts and no declared "
+                        "manifest mutations"
+                    ),
+                ),
+            )
         if not manifest.is_file() or not lock.is_file() or not manager.is_file():
             return self._failed(
                 request,

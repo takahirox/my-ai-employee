@@ -331,6 +331,9 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
         "type": "string",
         "enum": ["existing_lock"],
     }
+    install_payload = install_proposal["properties"]["payload"]["properties"]
+    assert install_payload["manager_executable"]["enum"] == ["tools/fleet-npm"]
+    assert install_payload["target"]["enum"] == ["node_modules"]
 
 
 def test_codex_worker_decodes_edit_transport() -> None:
@@ -405,6 +408,42 @@ def test_codex_worker_decodes_edit_transport() -> None:
         "assistant_note": "No action needed.",
         "usage": {"input_tokens": 12},
     }
+
+
+def test_codex_worker_orders_existing_lock_install_before_edits() -> None:
+    adapter = CodexCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        lambda request: PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        ),
+        run_id="run-1",
+    )
+    output = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {"kind": "edit_intent", "payload": {}},
+                {"kind": "install", "payload": {}},
+            ],
+            "assistant_note": "",
+            "usage_json": "{}",
+        }
+    )
+
+    decoded = json.loads(adapter._extract_payload(output))
+
+    assert [proposal["kind"] for proposal in decoded["proposals"]] == [
+        "install",
+        "edit_intent",
+    ]
+    assert all(proposal["run_id"] == "run-1" for proposal in decoded["proposals"])
 
 
 def test_codex_prompt_describes_edit_transport() -> None:

@@ -545,3 +545,40 @@ def test_installer_denies_global_and_runs_local_fake_manager(tmp_path: Path) -> 
     )
     assert denied_target.failure is not None
     assert denied_target.failure.code.value == "HOST_INSTALL_DENIED"
+
+
+def test_installer_restricts_node_existing_lock_arguments(tmp_path: Path) -> None:
+    manifest = tmp_path / "package.json"
+    lock = tmp_path / "package-lock.json"
+    manager = tmp_path / "manager"
+    manifest.write_text("{}\n")
+    lock.write_text("{}\n")
+    manager.write_text("#!/bin/sh\nexit 0\n")
+    manager.chmod(0o755)
+    store = AtomicArtifactStore(tmp_path / "artifacts-node-argv")
+    installer = ProjectLocalInstaller(
+        tmp_path,
+        LocalProcessExecutor((tmp_path,), store),
+        store,
+    )
+    request = InstallRequest(
+        id="install-node-argv",
+        run_id="run-1",
+        created_at=NOW,
+        ecosystem="node_project",
+        operation="existing_lock",
+        manifest_path="package.json",
+        lock_path="package-lock.json",
+        manifest_digest=__import__("hashlib").sha256(manifest.read_bytes()).hexdigest(),
+        lock_digest=__import__("hashlib").sha256(lock.read_bytes()).hexdigest(),
+        manager_executable="manager",
+        manager_version="fake-1",
+        argv=("install", "surprise"),
+        target="node_modules",
+    )
+
+    result = installer.install(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert result.failure is not None
+    assert result.failure.code.value == "INVALID_REQUEST"
+    assert "ci --ignore-scripts" in result.failure.message
