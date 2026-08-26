@@ -458,6 +458,8 @@ def test_codex_prompt_describes_edit_transport() -> None:
     assert "response_schema" not in prompt
     assert "edit_intent" in prompt["transport_instruction"]
     assert "existing_lock" in prompt["transport_instruction"]
+    assert "diff --git" in prompt["transport_instruction"]
+    assert "never use *** Begin Patch" in prompt["transport_instruction"]
 
 
 def test_ollama_prompt_can_include_pydantic_schema_for_json_mode() -> None:

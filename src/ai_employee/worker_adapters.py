@@ -479,7 +479,9 @@ def _bounded_prompt(
             "supplied run_id for both the proposal and payload run_id. Set assistant_note "
             "directly; use an empty string when there is no note. Encode a usage object as JSON "
             "text in usage_json, using {} when no usage is available. In unified_diff, use "
-            "actual newline characters for line boundaries; do not "
+            "a standard Git unified diff beginning with diff --git for every file; never use "
+            "*** Begin Patch, *** Add File, or other apply_patch markers. Use actual newline "
+            "characters for line boundaries; do not "
             "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
             "content digests locally."
         )
