@@ -12,11 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from .domain.base import FrozenDict
 
-WorkerName = Literal["codex_cli", "claude_code_cli"]
+WorkerName = Literal["codex_cli", "claude_code_cli", "ollama_cli"]
 CONFIG_ENVIRONMENT_VARIABLE = "MY_AI_EMPLOYEE_CONFIG"
 DEFAULT_EXECUTABLES: Mapping[WorkerName, str] = {
     "codex_cli": "codex",
     "claude_code_cli": "claude",
+    "ollama_cli": "ollama",
 }
 
 

@@ -26,6 +26,7 @@ workers:
     assert config.worker_command("codex_cli").executable == "/custom/bin/codex"
     assert config.worker_command("codex_cli").path_entries == ("/runtime/bin",)
     assert config.worker_command("claude_code_cli").executable == "claude"
+    assert config.worker_command("ollama_cli").executable == "ollama"
 
 
 def test_explicit_missing_config_duplicate_keys_and_relative_paths_fail_closed(

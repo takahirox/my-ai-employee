@@ -463,7 +463,10 @@ class WorkCoordinator:
             verification_digests.append(result.content_digest or "")
         patch = self.workspace.capture_diff(snapshot)
         self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
-        patch_text = self.artifact_reader(patch).decode("utf-8", "replace")
+        patch_bytes = self.artifact_reader(patch)
+        if not patch_bytes.strip():
+            return self._update(run, status="failed", failure_code="EMPTY_PATCH")
+        patch_text = patch_bytes.decode("utf-8", "replace")
         changed_paths = tuple(
             line[6:]
             for line in patch_text.splitlines()

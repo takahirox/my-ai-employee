@@ -444,6 +444,58 @@ def test_git_workspace_applies_only_exact_declared_edit_patch(tmp_path: Path) ->
     assert (repository / "file.txt").read_text() == "before\n"
 
 
+def test_git_workspace_recounts_worker_hunk_lengths(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-recount"
+    repository.mkdir()
+    subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
+        check=True,
+    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True)
+    (repository / "base.txt").write_text("base\n")
+    subprocess.run(("git", "-C", str(repository), "add", "base.txt"), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    manager = GitWorkspaceManager(
+        tmp_path / "state-recount", AtomicArtifactStore(tmp_path / "artifacts-recount")
+    )
+    snapshot = manager.create(
+        WorkspaceRequest(
+            id="workspace-recount-request",
+            run_id="run-1",
+            created_at=NOW,
+            repository=str(repository),
+            base_commit=head,
+        )
+    )
+    request = EditIntentRequest(
+        id="edit-recount",
+        run_id="run-1",
+        created_at=NOW,
+        paths=("new.txt",),
+        summary="accept a structurally valid diff with a stale hunk count",
+        unified_diff=(
+            "diff --git a/new.txt b/new.txt\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new.txt\n"
+            "@@ -0,0 +1,99 @@\n"
+            "+one\n"
+            "+two\n"
+        ),
+    )
+
+    result = manager.apply_edit(
+        snapshot, request, allow(request.content_digest or ""), NeverCancelled()
+    )
+
+    assert result.status == "succeeded"
+    assert Path(snapshot.isolated_worktree, "new.txt").read_text() == "one\ntwo\n"
+
+
 def test_installer_denies_global_and_runs_local_fake_manager(tmp_path: Path) -> None:
     manifest = tmp_path / "pyproject.toml"
     lock = tmp_path / "uv.lock"

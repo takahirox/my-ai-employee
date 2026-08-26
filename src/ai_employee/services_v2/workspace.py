@@ -166,7 +166,16 @@ class GitWorkspaceManager:
                 "unified diff paths must exactly match declared edit paths",
             )
         check = subprocess.run(
-            ("git", "-C", str(isolated), "apply", "--check", "--whitespace=nowarn", "-"),
+            (
+                "git",
+                "-C",
+                str(isolated),
+                "apply",
+                "--check",
+                "--recount",
+                "--whitespace=nowarn",
+                "-",
+            ),
             input=patch,
             capture_output=True,
             check=False,
@@ -178,7 +187,15 @@ class GitWorkspaceManager:
                 check.stderr.decode("utf-8", "replace")[:2_000] or "patch preflight failed",
             )
         applied = subprocess.run(
-            ("git", "-C", str(isolated), "apply", "--whitespace=nowarn", "-"),
+            (
+                "git",
+                "-C",
+                str(isolated),
+                "apply",
+                "--recount",
+                "--whitespace=nowarn",
+                "-",
+            ),
             input=patch,
             capture_output=True,
             check=False,

@@ -190,8 +190,8 @@ class HarnessApprovals(HarnessModel):
 
 class HarnessWorker(HarnessModel):
     schema_name: ClassVar[str] = "harness_worker"
-    preferred: Literal["codex_cli", "claude_code_cli"] | None = None
-    allowed: tuple[Literal["codex_cli", "claude_code_cli"], ...] = ()
+    preferred: Literal["codex_cli", "claude_code_cli", "ollama_cli"] | None = None
+    allowed: tuple[Literal["codex_cli", "claude_code_cli", "ollama_cli"], ...] = ()
 
     @model_validator(mode="after")
     def _preferred_is_allowed(self) -> Self:

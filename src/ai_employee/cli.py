@@ -60,7 +60,9 @@ from .storage import SQLiteStore
 from .worker_adapters import (
     ClaudeCodeCliWorkerAdapter,
     CodexCliWorkerAdapter,
+    OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
+    worker_proposal_schema_json,
 )
 
 
@@ -115,7 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     work = commands.add_parser("work", help="create a mediated v0.2 work run")
     work.add_argument("goal")
     work.add_argument("--repo", default=".")
-    work.add_argument("--worker", choices=("codex_cli", "claude_code_cli"), default="codex_cli")
+    work.add_argument(
+        "--worker",
+        choices=("codex_cli", "claude_code_cli", "ollama_cli"),
+        default="codex_cli",
+    )
+    work.add_argument("--model", help="explicit worker model (for example qwen3-coder:30b)")
     work.add_argument(
         "--operator-config",
         help=(
@@ -249,6 +256,8 @@ def _work(args: argparse.Namespace) -> int:
     from .orchestration import WorkCoordinator, bind_service_decision
 
     repository = Path(args.repo).resolve()
+    if args.worker == "ollama_cli" and not args.model:
+        raise ValueError("--worker ollama_cli requires --model")
     harness = discover_project_harness(repository)
     operator_config = load_operator_config(args.operator_config)
     worker_command = operator_config.worker_command(cast(WorkerName, args.worker))
@@ -285,6 +294,7 @@ def _work(args: argparse.Namespace) -> int:
                 (root,),
                 artifacts,
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
+                inherited_environment={"HOME": str(Path.home())},
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
@@ -365,11 +375,23 @@ def _work(args: argparse.Namespace) -> int:
             snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
-            scratch_directory = workspace_root / "worker-scratch" / run_id
-            scratch_directory.mkdir(parents=True, exist_ok=True)
-            adapter_type = (
-                CodexCliWorkerAdapter if args.worker == "codex_cli" else ClaudeCodeCliWorkerAdapter
-            )
+            adapter_type = {
+                "codex_cli": CodexCliWorkerAdapter,
+                "claude_code_cli": ClaudeCodeCliWorkerAdapter,
+                "ollama_cli": OllamaCliWorkerAdapter,
+            }[args.worker]
+            scratch_directory: str | None = None
+            output_schema_path: str | None = None
+            if adapter_type is ClaudeCodeCliWorkerAdapter:
+                scratch = workspace_root / "worker-scratch" / run_id
+                scratch.mkdir(parents=True, exist_ok=True)
+                scratch_directory = str(scratch)
+            elif adapter_type is CodexCliWorkerAdapter:
+                schema_directory = workspace_root / "worker-schema" / run_id
+                schema_directory.mkdir(parents=True, exist_ok=True)
+                schema = schema_directory / "proposal-envelope.json"
+                schema.write_bytes(worker_proposal_schema_json())
+                output_schema_path = str(schema)
             return adapter_type(
                 executor_for(root),
                 read_output,
@@ -377,8 +399,13 @@ def _work(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 executable=worker_command.executable,
                 prompt_writer=prompt_writer,
-                scratch_directory=str(scratch_directory),
+                scratch_directory=scratch_directory,
+                output_schema_path=output_schema_path,
+                model=args.model,
+                inherit_environment=("HOME",) if adapter_type is OllamaCliWorkerAdapter else (),
+                include_response_schema=adapter_type is OllamaCliWorkerAdapter,
                 cancellation=cancellation,
+                timeout_seconds=harness.budgets.wall_seconds,
             )
 
         if harness.provisional or args.worker not in harness.worker.allowed:

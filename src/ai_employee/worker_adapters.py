@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from typing import ClassVar, Literal
 
 from pydantic import ConfigDict, Field
@@ -125,6 +127,10 @@ class CliWorkerAdapter:
         cwd: str = ".",
         prompt_writer: Callable[[bytes], str] | None = None,
         scratch_directory: str | None = None,
+        output_schema_path: str | None = None,
+        model: str | None = None,
+        inherit_environment: tuple[str, ...] = (),
+        include_response_schema: bool = False,
         cancellation: Cancellation | None = None,
         timeout_seconds: float = 300.0,
     ) -> None:
@@ -141,6 +147,16 @@ class CliWorkerAdapter:
         if scratch_directory is not None and ("\x00" in scratch_directory or not scratch_directory):
             raise ValueError("worker scratch directory must be non-empty and NUL-free")
         self.scratch_directory = scratch_directory
+        if output_schema_path is not None and (
+            "\x00" in output_schema_path or not output_schema_path
+        ):
+            raise ValueError("worker output schema path must be non-empty and NUL-free")
+        self.output_schema_path = output_schema_path
+        if model is not None and ("\x00" in model or not model):
+            raise ValueError("worker model must be non-empty and NUL-free")
+        self.model = model
+        self.inherit_environment = inherit_environment
+        self.include_response_schema = include_response_schema
         self.cancellation = cancellation or _NeverCancelled()
         self.timeout_seconds = timeout_seconds
 
@@ -193,7 +209,11 @@ class CliWorkerAdapter:
         self, request: WorkerRequest, mediated_channel: MediatedActionChannel
     ) -> WorkerResult:
         started = time.monotonic()
-        prompt = _bounded_prompt(request, scratch_directory=self.scratch_directory)
+        prompt = _bounded_prompt(
+            request,
+            scratch_directory=self.scratch_directory,
+            include_response_schema=self.include_response_schema,
+        )
         stdin_digest = self.prompt_writer(prompt) if self.prompt_writer else None
         argv = self._proposal_argv(None if stdin_digest else prompt.decode("utf-8"))
         process = self._execute(
@@ -208,6 +228,8 @@ class CliWorkerAdapter:
                 started,
                 StableFailureCode.WORKER_UNAVAILABLE,
                 process.failure.message if process.failure else "worker invocation failed",
+                stdout_artifact_digest=process.stdout_artifact_digest,
+                stderr_artifact_digest=process.stderr_artifact_digest,
             )
         try:
             payload = self._extract_payload(self._output(process.stdout_artifact_digest))
@@ -218,6 +240,8 @@ class CliWorkerAdapter:
                 started,
                 StableFailureCode.WORKER_PROTOCOL_ERROR,
                 f"invalid worker proposal envelope: {error}",
+                stdout_artifact_digest=process.stdout_artifact_digest,
+                stderr_artifact_digest=process.stderr_artifact_digest,
             )
         for proposal in envelope.proposals:
             mediated_channel.submit(proposal)
@@ -249,6 +273,7 @@ class CliWorkerAdapter:
             created_at=now(),
             argv=argv,
             cwd=self.cwd,
+            inherit_environment=self.inherit_environment,
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=timeout,
             stdout_bytes=1_000_000,
@@ -275,15 +300,19 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
     noninteractive_flag = "exec"
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
-        argv = [
-            self.executable,
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--sandbox",
-        ]
+        argv = [self.executable]
+        if self.model is not None:
+            argv.extend(("--model", self.model))
+        argv.extend(
+            (
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--sandbox",
+            )
+        )
         if self.scratch_directory is not None:
             argv.extend(
                 (
@@ -295,6 +324,8 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             )
         else:
             argv.append("read-only")
+        if self.output_schema_path is not None:
+            argv.extend(("--output-schema", self.output_schema_path))
         if inline_prompt is not None:
             argv.append(inline_prompt)
         return tuple(argv)
@@ -328,8 +359,40 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
         return output
 
 
-def _bounded_prompt(request: WorkerRequest, *, scratch_directory: str | None = None) -> bytes:
-    payload = {
+class OllamaCliWorkerAdapter(CliWorkerAdapter):
+    """Local-only adapter using Ollama's schema-constrained generation."""
+
+    adapter = "ollama_cli"
+    default_executable = "ollama"
+    noninteractive_flag = "run"
+
+    def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
+        if self.model is None:
+            raise ValueError("Ollama worker requires an explicit model")
+        argv = [
+            self.executable,
+            "run",
+            self.model,
+            "--format",
+            "json",
+            "--hidethinking",
+            "--nowordwrap",
+        ]
+        if inline_prompt is not None:
+            argv.append(inline_prompt)
+        return tuple(argv)
+
+    def _extract_payload(self, output: str) -> str:
+        return re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", output).strip()
+
+
+def _bounded_prompt(
+    request: WorkerRequest,
+    *,
+    scratch_directory: str | None = None,
+    include_response_schema: bool = False,
+) -> bytes:
+    payload: dict[str, object] = {
         "protocol": "fleet-worker-proposal/2",
         "run_id": request.run_id,
         "goal": request.goal,
@@ -339,11 +402,12 @@ def _bounded_prompt(request: WorkerRequest, *, scratch_directory: str | None = N
         "effective_policy_digest": request.effective_policy_digest,
         "remaining_budgets": request.remaining_budgets,
         "prior_result_digests": request.prior_result_digests,
-        "response_schema": _envelope_schema(),
+        "response_contract": "fleet-worker-proposal/2 schema supplied by the worker adapter",
         "writable_scratch_directory": scratch_directory,
         "instruction": (
-            "Return only the strict JSON envelope. You may inspect repository files with "
-            "read-only tools. Do not edit the repository or run commands that change repository "
+            "Return only the strict JSON envelope. The repository is the current working "
+            "directory; you may inspect its files with read-only tools. Do not edit the "
+            "repository or run commands that change repository "
             "state; express every requested repository action only as a typed proposal. If a "
             "writable_scratch_directory is supplied, you may create temporary candidate files "
             "only below that exact directory and use them for deterministic diff generation and "
@@ -351,6 +415,8 @@ def _bounded_prompt(request: WorkerRequest, *, scratch_directory: str | None = N
             "use the supplied run_id."
         ),
     }
+    if include_response_schema:
+        payload["response_schema"] = _envelope_schema()
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
         raise ValueError("bounded worker request exceeds 64000 bytes")
@@ -374,6 +440,9 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
             if isinstance(request, dict):
                 request.pop("content_digest", None)
                 request.pop("digest_metadata", None)
+                unified_diff = request.get("unified_diff")
+                if proposal.get("kind") == "edit_intent" and isinstance(unified_diff, str):
+                    request["unified_diff"] = _normalize_new_file_diff(unified_diff)
     normalized = json.dumps(raw, separators=(",", ":"))
     return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
 
@@ -382,11 +451,59 @@ def _envelope_schema() -> dict[str, object]:
     return WorkerProposalEnvelope.model_json_schema()
 
 
+def _normalize_new_file_diff(value: str) -> str:
+    """Repair only the common typed new-file diff whose body omitted '+' markers."""
+
+    lines = value.splitlines(keepends=True)
+    if "--- /dev/null\n" not in lines or not any(line.startswith("+++ b/") for line in lines):
+        return value
+    hunk = next((index for index, line in enumerate(lines) if line.startswith("@@ ")), None)
+    if hunk is None:
+        return value
+    if " @@" not in lines[hunk][3:]:
+        ending = "\n" if lines[hunk].endswith("\n") else ""
+        lines[hunk] = f"{lines[hunk].rstrip()} @@{ending}"
+    body = lines[hunk + 1 :]
+    if not body or all(line.startswith(("+", "\\")) for line in body):
+        return "".join(lines)
+    repaired = [line if line.startswith("\\") else f"+{line}" for line in body]
+    return "".join((*lines[: hunk + 1], *repaired))
+
+
+def worker_proposal_schema_json() -> bytes:
+    """Return the canonical schema supplied to structured-output worker CLIs."""
+
+    schema = deepcopy(_envelope_schema())
+    _make_structured_output_compatible(schema)
+    return canonical_json(schema).encode("utf-8")
+
+
+def _make_structured_output_compatible(node: object) -> None:
+    """Normalize Pydantic JSON Schema to the strict Structured Outputs subset."""
+
+    if isinstance(node, list):
+        for value in node:
+            _make_structured_output_compatible(value)
+        return
+    if not isinstance(node, dict):
+        return
+    if node.get("type") == "object":
+        properties = node.setdefault("properties", {})
+        if isinstance(properties, dict):
+            node["required"] = list(properties)
+        node["additionalProperties"] = False
+    for value in node.values():
+        _make_structured_output_compatible(value)
+
+
 def _worker_failure(
     request: WorkerRequest,
     started: float,
     code: StableFailureCode,
     message: str,
+    *,
+    stdout_artifact_digest: str | None = None,
+    stderr_artifact_digest: str | None = None,
 ) -> WorkerResult:
     return WorkerResult(
         id=identifier("worker-result"),
@@ -396,4 +513,6 @@ def _worker_failure(
         status="failed",
         failure=StableFailure(code=code, message=message[:2_000]),
         duration_seconds=time.monotonic() - started,
+        stdout_artifact_digest=stdout_artifact_digest,
+        stderr_artifact_digest=stderr_artifact_digest,
     )

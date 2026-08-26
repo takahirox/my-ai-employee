@@ -30,10 +30,12 @@ from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
     CodexCliWorkerAdapter,
+    OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
     WorkerProposalEnvelope,
     _bounded_prompt,
     _validate_worker_envelope,
+    worker_proposal_schema_json,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -204,9 +206,11 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
 
     assert payload["protocol"] == "fleet-worker-proposal/2"
     assert payload["run_id"] == "run-1"
-    assert payload["response_schema"]["title"] == "WorkerProposalEnvelope"
+    assert payload["response_contract"].startswith("fleet-worker-proposal/2")
+    assert "response_schema" not in payload
     assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
     assert "read-only tools" in payload["instruction"]
+    assert "current working directory" in payload["instruction"]
     assert "only below that exact directory" in payload["instruction"]
     assert "supplied run_id" in payload["instruction"]
 
@@ -237,6 +241,85 @@ def test_codex_worker_uses_explicit_scratch_as_its_only_workspace() -> None:
     assert argv[argv.index("--cd") + 1] == "/tmp/fleet-worker-run-1"
     assert "--skip-git-repo-check" in argv
     assert "--add-dir" not in argv
+
+
+def test_codex_worker_without_scratch_inspects_current_repository_read_only() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    adapter = CodexCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        allow,
+        run_id="run-1",
+        output_schema_path="/tmp/fleet-worker-schema.json",
+        model="qwen3-coder:30b",
+    )
+
+    argv = adapter._proposal_argv("prompt")
+
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--cd" not in argv
+    assert "--skip-git-repo-check" not in argv
+    assert argv[argv.index("--output-schema") + 1] == "/tmp/fleet-worker-schema.json"
+    assert argv.count("--ask-for-approval") == 1
+    assert argv[argv.index("--model") + 1] == "qwen3-coder:30b"
+
+
+def test_ollama_worker_uses_local_model_and_inline_schema() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    adapter = OllamaCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        allow,
+        run_id="run-1",
+        model="qwen3-coder:30b",
+    )
+
+    argv = adapter._proposal_argv("prompt")
+
+    assert argv[:3] == ("ollama", "run", "qwen3-coder:30b")
+    assert argv[argv.index("--format") + 1] == "json"
+    assert "--hidethinking" in argv
+    assert argv[-1] == "prompt"
+
+
+def test_worker_proposal_schema_is_canonical_json() -> None:
+    schema = json.loads(worker_proposal_schema_json())
+
+    assert schema["title"] == "WorkerProposalEnvelope"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["schema_version", "proposals", "assistant_note", "usage"]
+    for definition in schema["$defs"].values():
+        if definition.get("type") == "object":
+            assert definition["additionalProperties"] is False
+            assert set(definition["required"]) == set(definition["properties"])
+
+
+def test_ollama_prompt_can_include_pydantic_schema_for_json_mode() -> None:
+    prompt = _bounded_prompt(worker_request(), include_response_schema=True)
+    schema = json.loads(prompt)["response_schema"]
+
+    assert schema["title"] == "WorkerProposalEnvelope"
+    assert "required" not in schema
 
 
 def test_scripted_adapter_rejects_unknown_envelope_fields() -> None:
@@ -290,6 +373,50 @@ def test_cli_worker_recomputes_untrusted_proposal_and_request_digests() -> None:
     proposal = envelope.proposals[0]
     assert proposal.content_digest != ZERO
     assert proposal.payload.content_digest != ZERO
+
+
+def test_cli_worker_repairs_unmarked_new_file_diff_body() -> None:
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.md"],
+                        "summary": "Add an example file.",
+                        "unified_diff": (
+                            "diff --git a/example.md b/example.md\n"
+                            "new file mode 100644\n"
+                            "--- /dev/null\n"
+                            "+++ b/example.md\n"
+                            "@@ -0,0 +1,99\n"
+                            "# Example\n"
+                            "\n"
+                            "- item\n"
+                        ),
+                    },
+                    "reason": "Implement the requested example.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert "@@ -0,0 +1,99 @@\n" in payload.unified_diff
+    assert payload.unified_diff.endswith("+# Example\n+\n+- item\n")
 
 
 def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
@@ -399,6 +526,15 @@ def test_deleted_protected_path_is_rejected(tmp_path: Path) -> None:
     try:
         assert run.status == "failed"
         assert run.failure_code == "REVIEW_BLOCKED"
+    finally:
+        store.close()
+
+
+def test_empty_patch_is_not_ready_to_promote(tmp_path: Path) -> None:
+    store, run = _complete_coordinator_run(tmp_path, b"")
+    try:
+        assert run.status == "failed"
+        assert run.failure_code == "EMPTY_PATCH"
     finally:
         store.close()
 

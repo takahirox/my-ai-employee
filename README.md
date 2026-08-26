@@ -49,6 +49,18 @@ login flow. Fleet does not read or store its credential. Codex is invoked in a
 read-only proposal sandbox; edits are returned as typed unified diffs and applied
 by Fleet only after path and policy checks.
 
+To keep repository context on the local machine, Fleet can use an already-installed
+Ollama model directly. For example:
+
+```bash
+fleet work "Create a reviewed design note" --repo /path/to/project \
+  --worker ollama_cli --model qwen3-coder:30b \
+  --db /tmp/fleet-local.db --json
+```
+
+The named model must already be available in local Ollama; Fleet
+does not implicitly download it.
+
 Worker executable locations are machine-specific operator configuration, not
 version-controlled Project Harness policy. By default Fleet optionally loads
 `~/.config/my-ai-employee/config.yaml`; use `--operator-config PATH` or the
