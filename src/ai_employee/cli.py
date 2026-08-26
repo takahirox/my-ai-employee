@@ -20,6 +20,7 @@ from .domain import (
     Graph,
     ResultEnvelope,
     ResultStatus,
+    RoutingMode,
     Run,
 )
 from .domain.base import freeze_json
@@ -45,6 +46,7 @@ from .project import (
     migration_candidate,
     write_migration_candidate,
 )
+from .routing import assess_task, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import canonical_json, loads_yaml_model
 from .services_v2 import (
@@ -120,9 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
     work.add_argument(
         "--worker",
         choices=("codex_cli", "claude_code_cli", "ollama_cli"),
-        default="codex_cli",
+        default=None,
     )
     work.add_argument("--model", help="explicit worker model (for example qwen3-coder:30b)")
+    work.add_argument(
+        "--routing-mode",
+        choices=("legacy", "fixed", "adaptive"),
+        default="adaptive",
+        help="selection mode (default: adaptive; legacy enables explicit worker/model use)",
+    )
+    work.add_argument("--strategy", help="exact strategy ID for fixed routing")
+    work.add_argument(
+        "--strategy-set",
+        help="operator-defined named subset of strategies available to this run",
+    )
     work.add_argument(
         "--operator-config",
         help=(
@@ -256,11 +269,73 @@ def _work(args: argparse.Namespace) -> int:
     from .orchestration import WorkCoordinator, bind_service_decision
 
     repository = Path(args.repo).resolve()
+    run_id = identifier("work")
+    routing_enabled = args.routing_mode != "legacy"
+    if args.routing_mode == "fixed" and args.strategy is None:
+        raise ValueError("--routing-mode fixed requires --strategy")
+    if args.routing_mode == "adaptive" and args.strategy is not None:
+        raise ValueError("--routing-mode adaptive rejects --strategy")
+    if args.routing_mode == "legacy" and args.strategy is not None:
+        raise ValueError("--strategy requires --routing-mode fixed")
+    if args.routing_mode == "legacy" and args.strategy_set is not None:
+        raise ValueError("--strategy-set requires fixed or adaptive routing")
+    if routing_enabled and args.model is not None:
+        raise ValueError("--routing-mode cannot be combined with --model")
+    if routing_enabled and args.worker is not None:
+        raise ValueError("--routing-mode cannot be combined with --worker")
     if args.worker == "ollama_cli" and not args.model:
         raise ValueError("--worker ollama_cli requires --model")
     harness = discover_project_harness(repository)
+    capabilities = ["edit_intent", "process"]
+    if harness.network.mode.value != "disabled":
+        capabilities.append("download")
+    if harness.install.ecosystems:
+        capabilities.append("install")
     operator_config = load_operator_config(args.operator_config)
-    worker_command = operator_config.worker_command(cast(WorkerName, args.worker))
+    worker_name = cast(WorkerName, args.worker or "codex_cli")
+    worker_model = args.model
+    worker_effort: str | None = None
+    task_assessment = None
+    selected_strategy = None
+    effective_strategy_set = None
+    if routing_enabled:
+        routing_mode = RoutingMode(args.routing_mode)
+        effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
+        strategies = operator_config.execution_strategies(
+            routing_mode, effective_strategy_set
+        )
+        if not strategies:
+            raise ValueError("routing requires operator-configured strategies")
+        if not harness.worker.allowed_strategy_ids:
+            raise ValueError("routing requires Harness allowed strategy IDs")
+        if routing_mode is RoutingMode.ADAPTIVE and not harness.worker.adaptive_routing:
+            raise ValueError("adaptive routing requires Harness opt-in")
+        risk = (
+            6
+            if harness.install.ecosystems
+            else 3
+            if harness.network.mode.value != "disabled"
+            else 0
+        )
+        task_assessment = assess_task(
+            args.goal,
+            run_id=run_id,
+            risk=risk,
+            required_capabilities=capabilities,
+        )
+        selected_strategy = select_strategy(
+            strategies,
+            mode=routing_mode,
+            fixed_strategy_id=args.strategy,
+            assessment=task_assessment,
+            allowed_strategy_ids=harness.worker.allowed_strategy_ids,
+            allowed_backends=harness.worker.allowed,
+            local_backend_allowed=harness.worker.local_backend,
+        )
+        worker_name = cast(WorkerName, selected_strategy.backend)
+        worker_model = selected_strategy.model
+        worker_effort = selected_strategy.effort
+    worker_command = operator_config.worker_command(worker_name)
     db_path = Path(args.db)
     storage_root = db_path.resolve().parent
     workspace_root = repository.parent / f".fleet-{repository.name}" / "workspaces"
@@ -287,8 +362,6 @@ def _work(args: argparse.Namespace) -> int:
         add_executable_path(command.argv[0])
 
     with SQLiteStore(db_path) as store:
-        run_id = identifier("work")
-
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(
                 (root,),
@@ -319,11 +392,6 @@ def _work(args: argparse.Namespace) -> int:
             path = artifacts.root / "sha256" / digest[:2] / digest
             return path.read_bytes()
 
-        capabilities = ["edit_intent", "process"]
-        if harness.network.mode.value != "disabled":
-            capabilities.append("download")
-        if harness.install.ecosystems:
-            capabilities.append("install")
         required_approvals = tuple(
             operation
             for operation in (
@@ -379,7 +447,7 @@ def _work(args: argparse.Namespace) -> int:
                 "codex_cli": CodexCliWorkerAdapter,
                 "claude_code_cli": ClaudeCodeCliWorkerAdapter,
                 "ollama_cli": OllamaCliWorkerAdapter,
-            }[args.worker]
+            }[worker_name]
             scratch_directory: str | None = None
             output_schema_path: str | None = None
             if adapter_type is ClaudeCodeCliWorkerAdapter:
@@ -401,14 +469,15 @@ def _work(args: argparse.Namespace) -> int:
                 prompt_writer=prompt_writer,
                 scratch_directory=scratch_directory,
                 output_schema_path=output_schema_path,
-                model=args.model,
+                model=worker_model,
+                effort=worker_effort,
                 inherit_environment=("HOME",) if adapter_type is OllamaCliWorkerAdapter else (),
                 include_response_schema=adapter_type is OllamaCliWorkerAdapter,
                 cancellation=cancellation,
                 timeout_seconds=harness.budgets.wall_seconds,
             )
 
-        if harness.provisional or args.worker not in harness.worker.allowed:
+        if harness.provisional or worker_name not in harness.worker.allowed:
             print(
                 canonical_json(
                     {
@@ -444,6 +513,9 @@ def _work(args: argparse.Namespace) -> int:
             lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
+            task_assessment=task_assessment,
+            selected_strategy=selected_strategy,
+            strategy_set=effective_strategy_set,
             approval_service=DigestApprovalService(store, operator_label="local-operator"),
             download_client=RestrictedDownloadClient(
                 artifacts,
@@ -475,7 +547,7 @@ def _work(args: argparse.Namespace) -> int:
             args.goal,
             str(repository),
             head,
-            worker_name=args.worker,
+            worker_name=worker_name,
             plan_only=args.plan_only,
             run_id=run_id,
         )

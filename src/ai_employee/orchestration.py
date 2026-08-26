@@ -10,7 +10,8 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
-from .domain.base import freeze_json
+from .domain import ExecutionStrategy, TaskAssessment
+from .domain.base import Identifier, freeze_json
 from .domain.policy_v2 import PolicyLayer, PolicyResolver
 from .domain.services_v2 import (
     ApprovalService,
@@ -88,6 +89,9 @@ class WorkRun(BaseModel):
     repository: str
     base_commit: str
     worker: str
+    task_assessment: TaskAssessment | None = None
+    selected_strategy: ExecutionStrategy | None = None
+    strategy_set: Identifier | None = None
     status: WorkStatus = "planning"
     generation: int = Field(default=0, ge=0)
     plan_only: bool = False
@@ -165,6 +169,9 @@ class WorkCoordinator:
         artifact_reader: Callable[[ArtifactDescriptor], bytes],
         policy_layers: tuple[PolicyLayer, ...],
         *,
+        task_assessment: TaskAssessment | None = None,
+        selected_strategy: ExecutionStrategy | None = None,
+        strategy_set: Identifier | None = None,
         approval_service: ApprovalService | None = None,
         download_client: DownloadClient | None = None,
         installer_factory: Callable[[WorkspaceSnapshot], Installer] | None = None,
@@ -179,6 +186,12 @@ class WorkCoordinator:
             )
         if max_worker_turns < 1:
             raise ValueError("max_worker_turns must be positive")
+        if (task_assessment is None) != (selected_strategy is None):
+            raise ValueError(
+                "task_assessment and selected_strategy must be provided together"
+            )
+        if strategy_set is not None and selected_strategy is None:
+            raise ValueError("strategy_set requires a selected strategy")
         self.store = store
         self.runtime = runtime
         self.workspace = workspace
@@ -186,6 +199,9 @@ class WorkCoordinator:
         self.process_factory = process_factory
         self.artifact_reader = artifact_reader
         self.policy_layers = policy_layers
+        self.task_assessment = task_assessment
+        self.selected_strategy = selected_strategy
+        self.strategy_set = strategy_set
         self.approval_service = approval_service
         self.download_client = download_client
         self.installer_factory = installer_factory
@@ -212,6 +228,9 @@ class WorkCoordinator:
             repository=repository,
             base_commit=base_commit,
             worker=worker_name,
+            task_assessment=self.task_assessment,
+            selected_strategy=self.selected_strategy,
+            strategy_set=self.strategy_set,
             plan_only=plan_only,
             effective_policy_digest=policy_digest,
         )

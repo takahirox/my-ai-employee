@@ -6,3 +6,56 @@ workers:
     path_entries: [/absolute/path/to/runtime/bin]
   claude_code_cli:
     executable: /absolute/path/to/claude
+  ollama_cli:
+    executable: /absolute/path/to/ollama
+routing:
+  default_strategy_set: codex-balanced
+  # Sets reference strategies below; they cannot redefine a model or effort.
+  strategy_sets:
+    codex-balanced: [codex-luna-max, codex-sol-high]
+    claude-only: [claude-exact]
+    codex-claude: [codex-luna-max, codex-sol-high, claude-exact]
+    local-only: [ollama-local]
+  strategies:
+    - id: codex-luna-max
+      backend: codex_cli
+      model: gpt-5.6-luna
+      effort: max
+      capabilities: [edit_intent, process]
+      min_complexity: 1
+      max_complexity: 3
+      min_scale: 1
+      max_scale: 3
+      max_risk: 0
+    - id: codex-sol-high
+      backend: codex_cli
+      model: gpt-5.6-sol
+      effort: high
+      capabilities: [edit_intent, process]
+      min_complexity: 1
+      max_complexity: 10
+      min_scale: 1
+      max_scale: 10
+      max_risk: 10
+    - id: claude-exact
+      backend: claude_code_cli
+      # Replace with a full model ID; avoid a moving alias for evaluations.
+      model: REPLACE_WITH_EXACT_CLAUDE_MODEL_ID
+      effort: high
+      capabilities: [edit_intent, process]
+      min_complexity: 1
+      max_complexity: 10
+      min_scale: 1
+      max_scale: 10
+      max_risk: 10
+    - id: ollama-local
+      backend: ollama_cli
+      # Replace with an installed, pinned Ollama model reference.
+      model: REPLACE_WITH_PINNED_OLLAMA_MODEL
+      effort: low
+      capabilities: [edit_intent, process]
+      min_complexity: 1
+      max_complexity: 10
+      min_scale: 1
+      max_scale: 10
+      max_risk: 10

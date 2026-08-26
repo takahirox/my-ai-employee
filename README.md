@@ -66,19 +66,45 @@ version-controlled Project Harness policy. By default Fleet optionally loads
 `~/.config/my-ai-employee/config.yaml`; use `--operator-config PATH` or the
 `MY_AI_EMPLOYEE_CONFIG` environment variable to select another file:
 
-```yaml
-schema_version: 1
-workers:
-  codex_cli:
-    executable: /absolute/path/to/codex
-    # Optional runtime/interpreter directories required by the executable.
-    path_entries: [/absolute/path/to/runtime/bin]
+Task-aware adaptive routing is the default for `fleet work`. When the operator does
+not provide routing configuration, the built-in cloud-only `codex-balanced` set is
+used. Operator configuration can replace each exact strategy ID, backend, model,
+effort, capability, and complexity/scale/risk bound. The Project Harness can only
+narrow allowed IDs/backends and must opt into adaptive or local routing. Named
+strategy sets provide reproducible evaluation profiles without duplicating model
+definitions. Explicit worker/model selection remains available through
+`--routing-mode legacy`.
+
+```bash
+fleet work "Fix the bug" --repo /path/to/project --routing-mode fixed --strategy codex-luna-max
+fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive
+fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set codex-balanced
+fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set claude-only
+fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set codex-claude
+fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set local-only
+fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker codex_cli --model MODEL
 ```
+
+Routing never automatically falls back to another model, backend, or local
+strategy; an unsatisfied selection fails closed. Routed execution binds the configured
+model and effort for Codex (`--model` plus `model_reasoning_effort`), Claude
+(`--model` plus `--effort`), and Ollama (`run MODEL` plus `--think`). A Local strategy
+still requires both an operator-defined set and Project Harness `local_backend: true`.
+
+Inspector persists the strategy-set name, task assessment, and selected strategy for
+evaluation. Decomposition is top-level assessment data only, not a set of independently
+executed subtasks.
+
+When both `--routing-mode` and `--strategy-set` are omitted, adaptive routing uses the
+operator-configured `default_strategy_set`. The built-in and example default is
+`codex-balanced`: ordinary, low-risk work uses `gpt-5.6-luna` with `max` effort,
+while work outside its configured bounds uses `gpt-5.6-sol` with `high` effort.
 
 Configured executable paths must be absolute. If no entry exists, Fleet retains
 the backward-compatible deterministic `PATH` lookup for `codex` or `claude`. The
-effective executable is recorded with worker availability provenance. See
-[`examples/operator-config.yaml`](examples/operator-config.yaml).
+effective executable is recorded with worker availability provenance. See the
+complete, updated [`operator config`](examples/operator-config.yaml) and
+[`Project Harness`](examples/project-v2/.fleet/project.yaml) examples.
 
 The Claude Code adapter currently disables Claude tools completely, so it is most
 useful when sufficient bounded context is already present in the goal. Codex CLI is

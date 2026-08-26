@@ -111,6 +111,19 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "state": run.status,
         "generation": run.generation,
         "run": _json_model(run),
+        "routing": {
+            "strategy_set": run.strategy_set,
+            "assessment": (
+                None
+                if run.task_assessment is None
+                else _json_model(run.task_assessment)
+            ),
+            "selected_strategy": (
+                None
+                if run.selected_strategy is None
+                else _json_model(run.selected_strategy)
+            ),
+        },
         "events": [_json_model(item) for item in store.work_events(run_id)],
         "policy": {
             "effective_digest": run.effective_policy_digest,

@@ -192,6 +192,18 @@ class HarnessWorker(HarnessModel):
     schema_name: ClassVar[str] = "harness_worker"
     preferred: Literal["codex_cli", "claude_code_cli", "ollama_cli"] | None = None
     allowed: tuple[Literal["codex_cli", "claude_code_cli", "ollama_cli"], ...] = ()
+    allowed_strategy_ids: tuple[str, ...] = ()
+    adaptive_routing: bool = False
+    local_backend: bool = False
+
+    @field_validator("allowed_strategy_ids")
+    @classmethod
+    def _unique_nonblank_strategy_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not strategy_id.strip() for strategy_id in value):
+            raise ValueError("allowed strategy IDs must be non-blank")
+        if len(value) != len(set(value)):
+            raise ValueError("allowed strategy IDs must be unique")
+        return value
 
     @model_validator(mode="after")
     def _preferred_is_allowed(self) -> Self:
@@ -258,7 +270,12 @@ class ProjectHarnessV2(HarnessModel):
                 raise ValueError("provisional Harness cannot grant network authority")
             if self.install.ecosystems or self.install.existing_lock is not InstallDisposition.DENY:
                 raise ValueError("provisional Harness cannot grant install authority")
-            if self.worker.allowed:
+            if (
+                self.worker.allowed
+                or self.worker.allowed_strategy_ids
+                or self.worker.adaptive_routing
+                or self.worker.local_backend
+            ):
                 raise ValueError("provisional Harness cannot grant worker authority")
         return self
 

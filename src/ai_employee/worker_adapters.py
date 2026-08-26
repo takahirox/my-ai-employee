@@ -114,6 +114,7 @@ class CliWorkerAdapter:
     adapter: ClassVar[str]
     default_executable: ClassVar[str]
     noninteractive_flag: ClassVar[str]
+    supports_reasoning_effort: ClassVar[bool] = False
     uses_codex_edit_transport: ClassVar[bool] = False
 
     def __init__(
@@ -129,6 +130,7 @@ class CliWorkerAdapter:
         scratch_directory: str | None = None,
         output_schema_path: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         inherit_environment: tuple[str, ...] = (),
         include_response_schema: bool = False,
         cancellation: Cancellation | None = None,
@@ -155,6 +157,11 @@ class CliWorkerAdapter:
         if model is not None and ("\x00" in model or not model):
             raise ValueError("worker model must be non-empty and NUL-free")
         self.model = model
+        if effort is not None and ("\x00" in effort or not effort):
+            raise ValueError("worker effort must be non-empty and NUL-free")
+        if effort is not None and not type(self).supports_reasoning_effort:
+            raise ValueError("worker adapter does not support reasoning effort")
+        self.effort = effort
         self.inherit_environment = inherit_environment
         self.include_response_schema = include_response_schema
         self.cancellation = cancellation or _NeverCancelled()
@@ -299,12 +306,15 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
     adapter = "codex_cli"
     default_executable = "codex"
     noninteractive_flag = "exec"
+    supports_reasoning_effort = True
     uses_codex_edit_transport = True
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
         argv = [self.executable]
         if self.model is not None:
             argv.extend(("--model", self.model))
+        if self.effort is not None:
+            argv.extend(("--config", f'model_reasoning_effort="{self.effort}"'))
         argv.extend(
             (
                 "--ask-for-approval",
@@ -379,6 +389,7 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
     adapter = "claude_code_cli"
     default_executable = "claude"
     noninteractive_flag = "--print"
+    supports_reasoning_effort = True
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
         argv = [
@@ -392,6 +403,10 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
             "",
             "--no-session-persistence",
         ]
+        if self.model is not None:
+            argv.extend(("--model", self.model))
+        if self.effort is not None:
+            argv.extend(("--effort", self.effort))
         if inline_prompt is not None:
             argv.append(inline_prompt)
         return tuple(argv)
@@ -409,6 +424,7 @@ class OllamaCliWorkerAdapter(CliWorkerAdapter):
     adapter = "ollama_cli"
     default_executable = "ollama"
     noninteractive_flag = "run"
+    supports_reasoning_effort = True
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
         if self.model is None:
@@ -422,6 +438,8 @@ class OllamaCliWorkerAdapter(CliWorkerAdapter):
             "--hidethinking",
             "--nowordwrap",
         ]
+        if self.effort is not None:
+            argv.extend(("--think", self.effort))
         if inline_prompt is not None:
             argv.append(inline_prompt)
         return tuple(argv)

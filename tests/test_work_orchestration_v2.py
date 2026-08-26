@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
+from ai_employee.domain import ExecutionStrategy, RoutingMode, TaskAssessment
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
     ActionKind,
@@ -29,6 +30,7 @@ from ai_employee.runtime import DeterministicRuntime
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
+    ClaudeCodeCliWorkerAdapter,
     CodexCliWorkerAdapter,
     OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
@@ -262,6 +264,7 @@ def test_codex_worker_without_scratch_inspects_current_repository_read_only() ->
         run_id="run-1",
         output_schema_path="/tmp/fleet-worker-schema.json",
         model="qwen3-coder:30b",
+        effort="high",
     )
 
     argv = adapter._proposal_argv("prompt")
@@ -272,6 +275,60 @@ def test_codex_worker_without_scratch_inspects_current_repository_read_only() ->
     assert argv[argv.index("--output-schema") + 1] == "/tmp/fleet-worker-schema.json"
     assert argv.count("--ask-for-approval") == 1
     assert argv[argv.index("--model") + 1] == "qwen3-coder:30b"
+    assert argv[argv.index("--config") + 1] == 'model_reasoning_effort="high"'
+
+
+def test_claude_worker_binds_exact_model_and_effort() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    adapter = ClaudeCodeCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        allow,
+        run_id="run-1",
+        model="claude-exact-model",
+        effort="high",
+    )
+
+    argv = adapter._proposal_argv("prompt")
+
+    assert argv[argv.index("--model") + 1] == "claude-exact-model"
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_ollama_worker_binds_thinking_effort() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    adapter = OllamaCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        allow,
+        run_id="run-1",
+        model="qwen3-coder:30b",
+        effort="low",
+    )
+
+    argv = adapter._proposal_argv("prompt")
+
+    assert argv[argv.index("--think") + 1] == "low"
 
 
 def test_ollama_worker_uses_local_model_and_inline_schema() -> None:
@@ -737,6 +794,22 @@ def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
 def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -> None:
     with SQLiteStore(tmp_path / "fleet.db") as store:
         runtime = DeterministicRuntime({}, store=store)
+        assessment = TaskAssessment(
+            id="assessment-plan",
+            run_id="work-plan",
+            goal_digest=ZERO,
+            complexity=1,
+            scale=1,
+            risk=0,
+            reasons=("plan-only routing",),
+        )
+        strategy = ExecutionStrategy(
+            id="strategy-codex",
+            routing_mode=RoutingMode.POLICY,
+            backend="codex_cli",
+            model="gpt-5.6-luna",
+            effort="medium",
+        )
         coordinator = WorkCoordinator(
             store,
             runtime,
@@ -749,6 +822,8 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
                 AssertionError("plan-only must not read artifacts")
             ),
             (builtin_policy("work-plan"),),
+            task_assessment=assessment,
+            selected_strategy=strategy,
         )
         run = coordinator.start(
             "plan safely",
@@ -758,6 +833,12 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
             plan_only=True,
             run_id="work-plan",
         )
+        routing = inspect_work_run(store, run.id)["routing"]
+        assert routing["assessment"]["complexity"] == 1
+        assert routing["assessment"]["run_id"] == run.id
+        assert routing["selected_strategy"]["backend"] == "codex_cli"
+        assert routing["selected_strategy"]["model"] == "gpt-5.6-luna"
+        assert routing["selected_strategy"]["effort"] == "medium"
         assert run.status == "planned"
         assert run.workspace_id is None
         assert store.load_work_checkpoint(run.id)[1]["status"] == "planned"

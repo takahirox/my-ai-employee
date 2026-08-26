@@ -6,11 +6,19 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
-from .domain.base import FrozenDict
+from .domain import ExecutionStrategy, RoutingMode
+from .domain.base import FrozenDict, Identifier
 
 WorkerName = Literal["codex_cli", "claude_code_cli", "ollama_cli"]
 CONFIG_ENVIRONMENT_VARIABLE = "MY_AI_EMPLOYEE_CONFIG"
@@ -48,6 +56,122 @@ class WorkerCommandConfig(BaseModel):
         return value
 
 
+class OperatorStrategyConfig(BaseModel):
+    """An operator-configured execution strategy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    id: Identifier
+    backend: WorkerName
+    model: str = Field(min_length=1, max_length=200)
+    effort: str = Field(min_length=1, max_length=100)
+    capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
+    min_complexity: int = Field(default=1, ge=1, le=10)
+    max_complexity: int = Field(default=10, ge=1, le=10)
+    min_scale: int = Field(default=1, ge=1, le=10)
+    max_scale: int = Field(default=10, ge=1, le=10)
+    max_risk: int = Field(default=10, ge=0, le=10)
+
+    @model_validator(mode="after")
+    def _valid_bounds_and_capabilities(self) -> Self:
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("strategy capabilities must be unique")
+        if self.min_complexity > self.max_complexity:
+            raise ValueError("minimum complexity cannot exceed maximum complexity")
+        if self.min_scale > self.max_scale:
+            raise ValueError("minimum scale cannot exceed maximum scale")
+        return self
+
+
+class OperatorRoutingConfig(BaseModel):
+    """The exact execution strategies available to a routing caller."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    strategies: tuple[OperatorStrategyConfig, ...] = Field(min_length=1)
+    default_strategy_set: Identifier | None = None
+    strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(
+        default_factory=dict
+    )
+
+    @field_validator("strategy_sets")
+    @classmethod
+    def _freeze_strategy_sets(
+        cls, value: Mapping[Identifier, tuple[Identifier, ...]]
+    ) -> Mapping[Identifier, tuple[Identifier, ...]]:
+        for name, strategy_ids in value.items():
+            if not strategy_ids:
+                raise ValueError(f"strategy set {name!r} must not be empty")
+            if len(strategy_ids) != len(set(strategy_ids)):
+                raise ValueError(f"strategy set {name!r} must contain unique IDs")
+        return FrozenDict(value)
+
+    @field_serializer("strategy_sets")
+    def _serialize_strategy_sets(
+        self, value: Mapping[Identifier, tuple[Identifier, ...]]
+    ) -> dict[Identifier, tuple[Identifier, ...]]:
+        return dict(value)
+
+    @model_validator(mode="after")
+    def _unique_strategy_ids(self) -> Self:
+        ids = tuple(strategy.id for strategy in self.strategies)
+        if len(ids) != len(set(ids)):
+            raise ValueError("operator strategy IDs must be unique")
+        unknown = {
+            strategy_id
+            for strategy_ids in self.strategy_sets.values()
+            for strategy_id in strategy_ids
+            if strategy_id not in ids
+        }
+        if unknown:
+            raise ValueError(
+                f"strategy sets reference unknown strategy IDs: {sorted(unknown)}"
+            )
+        if (
+            self.default_strategy_set is not None
+            and self.default_strategy_set not in self.strategy_sets
+        ):
+            raise ValueError("default strategy set must name a configured strategy set")
+        return self
+
+
+def default_operator_routing_config() -> OperatorRoutingConfig:
+    """Built-in cloud-only routing used when the operator does not override it."""
+
+    return OperatorRoutingConfig(
+        default_strategy_set="codex-balanced",
+        strategy_sets={
+            "codex-balanced": ("codex-luna-max", "codex-sol-high"),
+        },
+        strategies=(
+            OperatorStrategyConfig(
+                id="codex-luna-max",
+                backend="codex_cli",
+                model="gpt-5.6-luna",
+                effort="max",
+                capabilities=("edit_intent", "process"),
+                min_complexity=1,
+                max_complexity=3,
+                min_scale=1,
+                max_scale=3,
+                max_risk=0,
+            ),
+            OperatorStrategyConfig(
+                id="codex-sol-high",
+                backend="codex_cli",
+                model="gpt-5.6-sol",
+                effort="high",
+                capabilities=("edit_intent", "process"),
+                min_complexity=1,
+                max_complexity=10,
+                min_scale=1,
+                max_scale=10,
+                max_risk=10,
+            ),
+        ),
+    )
+
+
 class OperatorConfig(BaseModel):
     """Host-specific configuration; never grants project execution authority."""
 
@@ -55,6 +179,9 @@ class OperatorConfig(BaseModel):
 
     schema_version: Literal[1] = 1
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
+    routing: OperatorRoutingConfig | None = Field(
+        default_factory=default_operator_routing_config
+    )
 
     @field_validator("workers")
     @classmethod
@@ -75,6 +202,45 @@ class OperatorConfig(BaseModel):
     def worker_command(self, worker: WorkerName) -> WorkerCommandConfig:
         configured = self.workers.get(worker)
         return configured or WorkerCommandConfig(executable=DEFAULT_EXECUTABLES[worker])
+
+    def execution_strategies(
+        self, mode: RoutingMode, strategy_set: str | None = None
+    ) -> tuple[ExecutionStrategy, ...]:
+        if self.routing is None:
+            return ()
+        configured = self.routing.strategies
+        selected_set = self.strategy_set_name(strategy_set)
+        if selected_set is not None:
+            selected_ids = self.routing.strategy_sets.get(selected_set)
+            if selected_ids is None:
+                raise ValueError(f"unknown strategy set: {selected_set}")
+            selected = set(selected_ids)
+            configured = tuple(
+                strategy for strategy in configured if strategy.id in selected
+            )
+        return tuple(
+            ExecutionStrategy(
+                id=strategy.id,
+                routing_mode=mode,
+                backend=strategy.backend,
+                model=strategy.model,
+                effort=strategy.effort,
+                capabilities=strategy.capabilities,
+                min_complexity=strategy.min_complexity,
+                max_complexity=strategy.max_complexity,
+                min_scale=strategy.min_scale,
+                max_scale=strategy.max_scale,
+                max_risk=strategy.max_risk,
+            )
+            for strategy in configured
+        )
+
+    def strategy_set_name(self, requested: str | None = None) -> str | None:
+        if requested is not None:
+            return requested
+        if self.routing is None:
+            return None
+        return self.routing.default_strategy_set
 
 
 def default_operator_config_path(

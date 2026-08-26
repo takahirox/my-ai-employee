@@ -275,7 +275,70 @@ class ExecutionStrategy(EntityModel):
     escalation_strategy: str = Field(default="deterministic", min_length=1, max_length=100)
     verification_depth: str = Field(default="focused", min_length=1, max_length=100)
     reviewer_strategy: str = Field(default="independent", min_length=1, max_length=100)
+    capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
+    min_complexity: int = Field(default=1, ge=1, le=10)
+    max_complexity: int = Field(default=10, ge=1, le=10)
+    min_scale: int = Field(default=1, ge=1, le=10)
+    max_scale: int = Field(default=10, ge=1, le=10)
+    max_risk: int = Field(default=10, ge=0, le=10)
     routing_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _valid_task_suitability(self) -> Self:
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("strategy capabilities must be unique")
+        if self.min_complexity > self.max_complexity:
+            raise ValueError("minimum complexity cannot exceed maximum complexity")
+        if self.min_scale > self.max_scale:
+            raise ValueError("minimum scale cannot exceed maximum scale")
+        return self
+
+
+class TaskDecompositionItem(EntityModel):
+    """A bounded assessment item, not an executable or recursively nested task."""
+
+    title: str = Field(min_length=1, max_length=500)
+    complexity: int = Field(ge=1, le=10)
+    scale: int = Field(ge=1, le=10)
+    risk: int = Field(ge=0, le=10)
+    required_capabilities: tuple[Identifier, ...] = Field(default=(), max_length=50)
+    reasons: tuple[str, ...] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def _valid_item_assessment(self) -> Self:
+        if len(set(self.required_capabilities)) != len(self.required_capabilities):
+            raise ValueError("required capabilities must be unique")
+        if any(not reason.strip() or len(reason) > 1_000 for reason in self.reasons):
+            raise ValueError("reasons must be non-blank and at most 1000 characters")
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("reasons must be unique and deterministically ordered")
+        return self
+
+
+class TaskAssessment(EntityModel):
+    """Persisted deterministic assessment used as task-aware routing input."""
+
+    run_id: Identifier
+    goal_digest: Digest
+    complexity: int = Field(ge=1, le=10)
+    scale: int = Field(ge=1, le=10)
+    risk: int = Field(ge=0, le=10)
+    required_capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
+    decomposition: tuple[TaskDecompositionItem, ...] = Field(default=(), max_length=100)
+    reasons: tuple[str, ...] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def _valid_assessment(self) -> Self:
+        if len(set(self.required_capabilities)) != len(self.required_capabilities):
+            raise ValueError("required capabilities must be unique")
+        if any(not reason.strip() or len(reason) > 1_000 for reason in self.reasons):
+            raise ValueError("reasons must be non-blank and at most 1000 characters")
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("reasons must be unique and deterministically ordered")
+        item_ids = tuple(item.id for item in self.decomposition)
+        if len(set(item_ids)) != len(item_ids):
+            raise ValueError("decomposition item IDs must be unique")
+        return self
 
 
 class TransitionProvenance(SchemaModel):
