@@ -6,7 +6,6 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
 from typing import ClassVar, Literal
 
 from pydantic import ConfigDict, Field
@@ -115,6 +114,7 @@ class CliWorkerAdapter:
     adapter: ClassVar[str]
     default_executable: ClassVar[str]
     noninteractive_flag: ClassVar[str]
+    uses_codex_edit_transport: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -213,6 +213,7 @@ class CliWorkerAdapter:
             request,
             scratch_directory=self.scratch_directory,
             include_response_schema=self.include_response_schema,
+            codex_edit_transport=self.uses_codex_edit_transport,
         )
         stdin_digest = self.prompt_writer(prompt) if self.prompt_writer else None
         argv = self._proposal_argv(None if stdin_digest else prompt.decode("utf-8"))
@@ -298,6 +299,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
     adapter = "codex_cli"
     default_executable = "codex"
     noninteractive_flag = "exec"
+    uses_codex_edit_transport = True
 
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
         argv = [self.executable]
@@ -329,6 +331,41 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
         if inline_prompt is not None:
             argv.append(inline_prompt)
         return tuple(argv)
+
+    def _extract_payload(self, output: str) -> str:
+        """Decode the small Codex-compatible transport into the domain envelope."""
+
+        wrapper = json.loads(output)
+        if not isinstance(wrapper, dict):
+            raise ValueError("Codex transport must be a JSON object")
+        expected = {"schema_version", "proposals", "assistant_note", "usage_json"}
+        if set(wrapper) != expected or wrapper.get("schema_version") != "2":
+            raise ValueError("Codex transport has invalid or unknown fields")
+        proposals = wrapper["proposals"]
+        if not isinstance(proposals, list):
+            raise ValueError("Codex proposals must be a JSON array")
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                raise ValueError("Codex proposal entries must be JSON objects")
+            # Runtime-owned attribution and scope binding must not depend on model text.
+            proposal["worker_id"] = self.adapter
+            proposal["run_id"] = self.run_id
+            payload = proposal.get("payload")
+            if isinstance(payload, dict):
+                payload["run_id"] = self.run_id
+        usage_json = wrapper["usage_json"]
+        usage = None if usage_json is None else json.loads(usage_json)
+        if usage is not None and not isinstance(usage, dict):
+            raise ValueError("Codex usage_json must encode a JSON object or be null")
+        return json.dumps(
+            {
+                "schema_version": "2",
+                "proposals": proposals,
+                "assistant_note": wrapper["assistant_note"],
+                "usage": usage,
+            },
+            separators=(",", ":"),
+        )
 
 
 class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
@@ -391,6 +428,7 @@ def _bounded_prompt(
     *,
     scratch_directory: str | None = None,
     include_response_schema: bool = False,
+    codex_edit_transport: bool = False,
 ) -> bytes:
     payload: dict[str, object] = {
         "protocol": "fleet-worker-proposal/2",
@@ -402,7 +440,11 @@ def _bounded_prompt(
         "effective_policy_digest": request.effective_policy_digest,
         "remaining_budgets": request.remaining_budgets,
         "prior_result_digests": request.prior_result_digests,
-        "response_contract": "fleet-worker-proposal/2 schema supplied by the worker adapter",
+        "response_contract": (
+            "codex-edit-transport/1"
+            if codex_edit_transport
+            else "fleet-worker-proposal/2 schema supplied by the worker adapter"
+        ),
         "writable_scratch_directory": scratch_directory,
         "instruction": (
             "Return only the strict JSON envelope. The repository is the current working "
@@ -417,6 +459,14 @@ def _bounded_prompt(
     }
     if include_response_schema:
         payload["response_schema"] = _envelope_schema()
+    if codex_edit_transport:
+        payload["transport_instruction"] = (
+            "The supplied output schema accepts only edit_intent proposals. Put each proposed "
+            "repository patch directly in proposals with all schema fields populated. Use the "
+            "supplied run_id for both the proposal and payload run_id. Set assistant_note "
+            "directly. Encode a usage object as JSON text in usage_json, or set usage_json to "
+            "null. Fleet will compute all omitted content digests locally."
+        )
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
         raise ValueError("bounded worker request exceeds 64000 bytes")
@@ -471,29 +521,70 @@ def _normalize_new_file_diff(value: str) -> str:
 
 
 def worker_proposal_schema_json() -> bytes:
-    """Return the canonical schema supplied to structured-output worker CLIs."""
+    """Return the minimal strict schema used to transport Codex worker output.
 
-    schema = deepcopy(_envelope_schema())
-    _make_structured_output_compatible(schema)
+    The full Pydantic action union contains constraints outside the Structured Outputs
+    subset. The Codex adapter therefore accepts only ``edit_intent`` through a small strict
+    schema; Fleet then validates it locally before mediation.
+    """
+
+    identity_properties: dict[str, object] = {
+        "schema_version": {"type": "string", "enum": ["2"]},
+        "id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "created_at": {"type": "string"},
+    }
+    payload_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            **identity_properties,
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+            "unified_diff": {"type": "string"},
+        },
+        "required": [*identity_properties, "paths", "summary", "unified_diff"],
+        "additionalProperties": False,
+    }
+    proposal_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            **identity_properties,
+            "worker_id": {"type": "string"},
+            "kind": {"type": "string", "enum": ["edit_intent"]},
+            "payload": payload_schema,
+            "reason": {"type": "string"},
+            "expected_artifact_kinds": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            *identity_properties,
+            "worker_id",
+            "kind",
+            "payload",
+            "reason",
+            "expected_artifact_kinds",
+        ],
+        "additionalProperties": False,
+    }
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["2"]},
+            "proposals": {"type": "array", "items": proposal_schema},
+            "assistant_note": {"type": ["string", "null"]},
+            "usage_json": {"type": ["string", "null"]},
+        },
+        "required": [
+            "schema_version",
+            "proposals",
+            "assistant_note",
+            "usage_json",
+        ],
+        "additionalProperties": False,
+    }
     return canonical_json(schema).encode("utf-8")
-
-
-def _make_structured_output_compatible(node: object) -> None:
-    """Normalize Pydantic JSON Schema to the strict Structured Outputs subset."""
-
-    if isinstance(node, list):
-        for value in node:
-            _make_structured_output_compatible(value)
-        return
-    if not isinstance(node, dict):
-        return
-    if node.get("type") == "object":
-        properties = node.setdefault("properties", {})
-        if isinstance(properties, dict):
-            node["required"] = list(properties)
-        node["additionalProperties"] = False
-    for value in node.values():
-        _make_structured_output_compatible(value)
 
 
 def _worker_failure(

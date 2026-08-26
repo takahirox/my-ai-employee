@@ -305,13 +305,106 @@ def test_ollama_worker_uses_local_model_and_inline_schema() -> None:
 def test_worker_proposal_schema_is_canonical_json() -> None:
     schema = json.loads(worker_proposal_schema_json())
 
-    assert schema["title"] == "WorkerProposalEnvelope"
+    assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
-    assert schema["required"] == ["schema_version", "proposals", "assistant_note", "usage"]
-    for definition in schema["$defs"].values():
-        if definition.get("type") == "object":
-            assert definition["additionalProperties"] is False
-            assert set(definition["required"]) == set(definition["properties"])
+    assert schema["required"] == [
+        "schema_version",
+        "proposals",
+        "assistant_note",
+        "usage_json",
+    ]
+    proposal = schema["properties"]["proposals"]["items"]
+    assert proposal["properties"]["kind"] == {"type": "string", "enum": ["edit_intent"]}
+    assert proposal["properties"]["payload"]["properties"]["unified_diff"] == {
+        "type": "string"
+    }
+
+
+def test_codex_worker_decodes_edit_transport() -> None:
+    adapter = CodexCliWorkerAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        lambda request: PolicyDecision(
+            id="worker-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        ),
+        run_id="run-1",
+    )
+    output = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "wrong-run",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "/root",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "wrong-run",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.md"],
+                        "summary": "Add example.",
+                        "unified_diff": "example patch",
+                    },
+                    "reason": "Add the requested example.",
+                    "expected_artifact_kinds": ["documentation"],
+                }
+            ],
+            "assistant_note": "No action needed.",
+            "usage_json": '{"input_tokens":12}',
+        }
+    )
+
+    decoded = json.loads(adapter._extract_payload(output))
+
+    assert decoded == {
+        "schema_version": "2",
+        "proposals": [
+            {
+                "schema_version": "2",
+                "id": "proposal-1",
+                "run_id": "run-1",
+                "created_at": "2026-01-01T00:00:00Z",
+                "worker_id": "codex_cli",
+                "kind": "edit_intent",
+                "payload": {
+                    "schema_version": "2",
+                    "id": "edit-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "paths": ["example.md"],
+                    "summary": "Add example.",
+                    "unified_diff": "example patch",
+                },
+                "reason": "Add the requested example.",
+                "expected_artifact_kinds": ["documentation"],
+            }
+        ],
+        "assistant_note": "No action needed.",
+        "usage": {"input_tokens": 12},
+    }
+
+
+def test_codex_prompt_describes_edit_transport() -> None:
+    prompt = json.loads(
+        _bounded_prompt(
+            worker_request(),
+            codex_edit_transport=True,
+        )
+    )
+
+    assert prompt["response_contract"] == "codex-edit-transport/1"
+    assert "response_schema" not in prompt
+    assert "edit_intent" in prompt["transport_instruction"]
 
 
 def test_ollama_prompt_can_include_pydantic_schema_for_json_mode() -> None:
