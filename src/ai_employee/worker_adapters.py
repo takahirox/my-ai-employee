@@ -553,9 +553,16 @@ def _normalize_new_file_section(value: str) -> str:
         body = [f"+{line}\n" for line in content.split("\n")]
         lines = [*lines[: hunk + 1], *body]
     if not body or all(line.startswith(("+", "\\")) for line in body):
-        return "".join(lines)
+        return _recount_new_file_hunk(lines, hunk)
     repaired = [line if line.startswith("\\") else f"+{line}" for line in body]
-    return "".join((*lines[: hunk + 1], *repaired))
+    return _recount_new_file_hunk([*lines[: hunk + 1], *repaired], hunk)
+
+
+def _recount_new_file_hunk(lines: list[str], hunk: int) -> str:
+    added = sum(1 for line in lines[hunk + 1 :] if line.startswith("+"))
+    ending = "\n" if lines[hunk].endswith("\n") else ""
+    lines[hunk] = f"@@ -0,0 +1,{added} @@{ending}"
+    return "".join(lines)
 
 
 def worker_proposal_schema_json() -> bytes:
