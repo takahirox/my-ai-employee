@@ -526,6 +526,56 @@ def test_cli_worker_repairs_unmarked_new_file_diff_body() -> None:
     assert payload.unified_diff.endswith("+# Example\n+\n+- item\n")
 
 
+def test_cli_worker_repairs_only_new_file_sections_in_multi_file_diff() -> None:
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["package.json", "example.ts"],
+                        "summary": "Update the manifest and add an example.",
+                        "unified_diff": (
+                            "diff --git a/package.json b/package.json\n"
+                            "--- a/package.json\n"
+                            "+++ b/package.json\n"
+                            "@@ -1 +1 @@\n"
+                            "-{}\n"
+                            "+{\"private\":true}\n"
+                            "diff --git a/example.ts b/example.ts\n"
+                            "new file mode 100644\n"
+                            "--- /dev/null\n"
+                            "+++ b/example.ts\n"
+                            "@@ -0,0 +1,2 @@\n"
+                            "export const answer = 42;\n"
+                            "\n"
+                        ),
+                    },
+                    "reason": "Implement the requested example.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert "\ndiff --git a/example.ts b/example.ts\n" in payload.unified_diff
+    assert "\n+diff --git" not in payload.unified_diff
+    assert payload.unified_diff.endswith("+export const answer = 42;\n+\n")
+
+
 def test_cli_worker_expands_flattened_markdown_new_file_diff() -> None:
     breaks = "<br>".join(f"section {index}" for index in range(11))
     raw = json.dumps(

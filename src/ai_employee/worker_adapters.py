@@ -509,7 +509,21 @@ def _envelope_schema() -> dict[str, object]:
 
 
 def _normalize_new_file_diff(value: str) -> str:
-    """Repair only the common typed new-file diff whose body omitted '+' markers."""
+    """Repair malformed new-file bodies without rewriting neighboring file patches."""
+
+    lines = value.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
+    if not starts:
+        return _normalize_new_file_section(value)
+    chunks: list[str] = ["".join(lines[: starts[0]])]
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        chunks.append(_normalize_new_file_section("".join(lines[start:end])))
+    return "".join(chunks)
+
+
+def _normalize_new_file_section(value: str) -> str:
+    """Repair one new-file patch whose body omitted '+' markers."""
 
     lines = value.splitlines(keepends=True)
     if "--- /dev/null\n" not in lines or not any(line.startswith("+++ b/") for line in lines):
