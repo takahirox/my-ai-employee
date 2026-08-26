@@ -354,7 +354,9 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             if isinstance(payload, dict):
                 payload["run_id"] = self.run_id
         usage_json = wrapper["usage_json"]
-        usage = None if usage_json is None else json.loads(usage_json)
+        if not isinstance(usage_json, str):
+            raise ValueError("Codex usage_json must be JSON text")
+        usage = json.loads(usage_json)
         if usage is not None and not isinstance(usage, dict):
             raise ValueError("Codex usage_json must encode a JSON object or be null")
         return json.dumps(
@@ -461,11 +463,14 @@ def _bounded_prompt(
         payload["response_schema"] = _envelope_schema()
     if codex_edit_transport:
         payload["transport_instruction"] = (
-            "The supplied output schema accepts only edit_intent proposals. Put each proposed "
-            "repository patch directly in proposals with all schema fields populated. Use the "
+            "The supplied output schema accepts edit_intent proposals and existing_lock install "
+            "proposals only. Put each proposed repository patch directly in proposals with all "
+            "schema fields populated. Request an existing_lock install when repository-local "
+            "dependencies are required for verification. Use the "
             "supplied run_id for both the proposal and payload run_id. Set assistant_note "
-            "directly. Encode a usage object as JSON text in usage_json, or set usage_json to "
-            "null. In unified_diff, use actual newline characters for line boundaries; do not "
+            "directly; use an empty string when there is no note. Encode a usage object as JSON "
+            "text in usage_json, using {} when no usage is available. In unified_diff, use "
+            "actual newline characters for line boundaries; do not "
             "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
             "content digests locally."
         )
@@ -534,8 +539,9 @@ def worker_proposal_schema_json() -> bytes:
     """Return the minimal strict schema used to transport Codex worker output.
 
     The full Pydantic action union contains constraints outside the Structured Outputs
-    subset. The Codex adapter therefore accepts only ``edit_intent`` through a small strict
-    schema; Fleet then validates it locally before mediation.
+    subset. The Codex adapter therefore accepts only ``edit_intent`` and the narrowly scoped
+    ``existing_lock`` install operation through a small strict schema; Fleet then validates
+    every proposal locally before mediation.
     """
 
     identity_properties: dict[str, object] = {
@@ -544,7 +550,7 @@ def worker_proposal_schema_json() -> bytes:
         "run_id": {"type": "string"},
         "created_at": {"type": "string"},
     }
-    payload_schema: dict[str, object] = {
+    edit_payload_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             **identity_properties,
@@ -555,36 +561,80 @@ def worker_proposal_schema_json() -> bytes:
         "required": [*identity_properties, "paths", "summary", "unified_diff"],
         "additionalProperties": False,
     }
-    proposal_schema: dict[str, object] = {
+    install_payload_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             **identity_properties,
-            "worker_id": {"type": "string"},
-            "kind": {"type": "string", "enum": ["edit_intent"]},
-            "payload": payload_schema,
-            "reason": {"type": "string"},
-            "expected_artifact_kinds": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
+            "ecosystem": {"type": "string", "enum": ["node_project"]},
+            "operation": {"type": "string", "enum": ["existing_lock"]},
+            "manifest_path": {"type": "string"},
+            "lock_path": {"type": "string"},
+            "manifest_digest": {"type": "string"},
+            "lock_digest": {"type": "string"},
+            "manager_executable": {"type": "string"},
+            "manager_version": {"type": "string"},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "target": {"type": "string"},
+            "network_required": {"type": "boolean"},
+            "lifecycle_scripts": {"type": "boolean"},
+            "expected_mutations": {"type": "array", "items": {"type": "string"}},
         },
         "required": [
             *identity_properties,
-            "worker_id",
-            "kind",
-            "payload",
-            "reason",
-            "expected_artifact_kinds",
+            "ecosystem",
+            "operation",
+            "manifest_path",
+            "lock_path",
+            "manifest_digest",
+            "lock_digest",
+            "manager_executable",
+            "manager_version",
+            "argv",
+            "target",
+            "network_required",
+            "lifecycle_scripts",
+            "expected_mutations",
         ],
         "additionalProperties": False,
     }
+
+    def proposal_schema(kind: str, payload_schema: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "properties": {
+                **identity_properties,
+                "worker_id": {"type": "string"},
+                "kind": {"type": "string", "enum": [kind]},
+                "payload": payload_schema,
+                "reason": {"type": "string"},
+                "expected_artifact_kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                *identity_properties,
+                "worker_id",
+                "kind",
+                "payload",
+                "reason",
+                "expected_artifact_kinds",
+            ],
+            "additionalProperties": False,
+        }
+
+    edit_proposal_schema = proposal_schema("edit_intent", edit_payload_schema)
+    install_proposal_schema = proposal_schema("install", install_payload_schema)
     schema: dict[str, object] = {
         "type": "object",
         "properties": {
             "schema_version": {"type": "string", "enum": ["2"]},
-            "proposals": {"type": "array", "items": proposal_schema},
-            "assistant_note": {"type": ["string", "null"]},
-            "usage_json": {"type": ["string", "null"]},
+            "proposals": {
+                "type": "array",
+                "items": {"anyOf": [edit_proposal_schema, install_proposal_schema]},
+            },
+            "assistant_note": {"type": "string"},
+            "usage_json": {"type": "string"},
         },
         "required": [
             "schema_version",

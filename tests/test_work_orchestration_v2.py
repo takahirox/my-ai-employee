@@ -313,10 +313,23 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
         "assistant_note",
         "usage_json",
     ]
-    proposal = schema["properties"]["proposals"]["items"]
-    assert proposal["properties"]["kind"] == {"type": "string", "enum": ["edit_intent"]}
-    assert proposal["properties"]["payload"]["properties"]["unified_diff"] == {
+    edit_proposal, install_proposal = schema["properties"]["proposals"]["items"]["anyOf"]
+    assert schema["properties"]["assistant_note"] == {"type": "string"}
+    assert schema["properties"]["usage_json"] == {"type": "string"}
+    assert edit_proposal["properties"]["kind"] == {
+        "type": "string",
+        "enum": ["edit_intent"],
+    }
+    assert edit_proposal["properties"]["payload"]["properties"]["unified_diff"] == {
         "type": "string"
+    }
+    assert install_proposal["properties"]["kind"] == {
+        "type": "string",
+        "enum": ["install"],
+    }
+    assert install_proposal["properties"]["payload"]["properties"]["operation"] == {
+        "type": "string",
+        "enum": ["existing_lock"],
     }
 
 
@@ -405,6 +418,7 @@ def test_codex_prompt_describes_edit_transport() -> None:
     assert prompt["response_contract"] == "codex-edit-transport/1"
     assert "response_schema" not in prompt
     assert "edit_intent" in prompt["transport_instruction"]
+    assert "existing_lock" in prompt["transport_instruction"]
 
 
 def test_ollama_prompt_can_include_pydantic_schema_for_json_mode() -> None:
