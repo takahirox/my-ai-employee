@@ -82,8 +82,16 @@ fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strat
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set claude-only
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set codex-claude
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set local-only
+fleet work "Fix the bug" --repo /path/to/project --assessment-strategy codex-sol-high
 fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker codex_cli --model MODEL
 ```
+
+Adaptive routing first obtains a repository-isolated strict-JSON semantic assessment. The
+built-in assessment strategy is `gpt-5.6-sol` with `high` effort; operators may replace
+the default or select an exact authorized strategy with `--assessment-strategy`.
+Deterministic complexity/scale floors and Harness-derived risk/capabilities are merged
+afterward, and the LLM cannot lower them. Assessment failure is fail-closed and never
+falls back to another model or Local LLM.
 
 Routing never automatically falls back to another model, backend, or local
 strategy; an unsatisfied selection fails closed. Routed execution binds the configured
@@ -91,9 +99,9 @@ model and effort for Codex (`--model` plus `model_reasoning_effort`), Claude
 (`--model` plus `--effort`), and Ollama (`run MODEL` plus `--think`). A Local strategy
 still requires both an operator-defined set and Project Harness `local_backend: true`.
 
-Inspector persists the strategy-set name, task assessment, and selected strategy for
-evaluation. Decomposition is top-level assessment data only, not a set of independently
-executed subtasks.
+Inspector persists the strategy-set name, assessment strategy, merged task assessment,
+and selected execution strategy for evaluation. Decomposition is top-level assessment
+data only, not a set of independently executed subtasks.
 
 When both `--routing-mode` and `--strategy-set` are omitted, adaptive routing uses the
 operator-configured `default_strategy_set`. The built-in and example default is

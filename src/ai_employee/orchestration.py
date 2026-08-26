@@ -90,6 +90,7 @@ class WorkRun(BaseModel):
     base_commit: str
     worker: str
     task_assessment: TaskAssessment | None = None
+    assessment_strategy: ExecutionStrategy | None = None
     selected_strategy: ExecutionStrategy | None = None
     strategy_set: Identifier | None = None
     status: WorkStatus = "planning"
@@ -170,6 +171,7 @@ class WorkCoordinator:
         policy_layers: tuple[PolicyLayer, ...],
         *,
         task_assessment: TaskAssessment | None = None,
+        assessment_strategy: ExecutionStrategy | None = None,
         selected_strategy: ExecutionStrategy | None = None,
         strategy_set: Identifier | None = None,
         approval_service: ApprovalService | None = None,
@@ -192,6 +194,8 @@ class WorkCoordinator:
             )
         if strategy_set is not None and selected_strategy is None:
             raise ValueError("strategy_set requires a selected strategy")
+        if assessment_strategy is not None and task_assessment is None:
+            raise ValueError("assessment_strategy requires a task assessment")
         self.store = store
         self.runtime = runtime
         self.workspace = workspace
@@ -200,6 +204,7 @@ class WorkCoordinator:
         self.artifact_reader = artifact_reader
         self.policy_layers = policy_layers
         self.task_assessment = task_assessment
+        self.assessment_strategy = assessment_strategy
         self.selected_strategy = selected_strategy
         self.strategy_set = strategy_set
         self.approval_service = approval_service
@@ -229,6 +234,7 @@ class WorkCoordinator:
             base_commit=base_commit,
             worker=worker_name,
             task_assessment=self.task_assessment,
+            assessment_strategy=self.assessment_strategy,
             selected_strategy=self.selected_strategy,
             strategy_set=self.strategy_set,
             plan_only=plan_only,

@@ -31,6 +31,7 @@ from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
     ClaudeCodeCliWorkerAdapter,
+    CliTaskAssessmentAdapter,
     CodexCliWorkerAdapter,
     OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
@@ -276,6 +277,34 @@ def test_codex_worker_without_scratch_inspects_current_repository_read_only() ->
     assert argv.count("--ask-for-approval") == 1
     assert argv[argv.index("--model") + 1] == "qwen3-coder:30b"
     assert argv[argv.index("--config") + 1] == 'model_reasoning_effort="high"'
+
+
+def test_codex_semantic_assessor_binds_sol_high_without_tools() -> None:
+    strategy = ExecutionStrategy(
+        id="codex-sol-high",
+        routing_mode=RoutingMode.ADAPTIVE,
+        backend="codex_cli",
+        model="gpt-5.6-sol",
+        effort="high",
+    )
+    adapter = CliTaskAssessmentAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        lambda _request: (_ for _ in ()).throw(AssertionError("must not execute")),
+        run_id="run-1",
+        strategy=strategy,
+        executable="codex",
+        cwd=".",
+        prompt_writer=lambda _value: ZERO,
+        output_schema_path="/tmp/semantic-assessment.json",
+    )
+
+    argv = adapter._argv()
+
+    assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv[argv.index("--config") + 1] == 'model_reasoning_effort="high"'
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--output-schema" in argv
 
 
 def test_claude_worker_binds_exact_model_and_effort() -> None:

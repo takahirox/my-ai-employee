@@ -10,6 +10,7 @@ from unicodedata import normalize
 from .domain import (
     ExecutionStrategy,
     RoutingMode,
+    SemanticTaskAssessment,
     StrategyPerformance,
     TaskAssessment,
     TaskDecompositionItem,
@@ -21,6 +22,48 @@ MIN_ADAPTIVE_SAMPLES = 3
 
 class RoutingError(ValueError):
     pass
+
+
+def merge_semantic_assessment(
+    deterministic: TaskAssessment,
+    semantic: SemanticTaskAssessment,
+    *,
+    available_capabilities: Iterable[str],
+) -> TaskAssessment:
+    """Merge semantic classification without allowing it to weaken hard facts."""
+
+    available = set(available_capabilities)
+    unknown = set(semantic.required_capabilities) - available
+    if unknown:
+        raise RoutingError(
+            f"semantic assessment returned unsupported capabilities: {sorted(unknown)}"
+        )
+    required = tuple(
+        dict.fromkeys(
+            (*deterministic.required_capabilities, *semantic.required_capabilities)
+        )
+    )
+    reasons = tuple(
+        dict.fromkeys(
+            (
+                *deterministic.reasons,
+                *(f"semantic assessment: {reason}" for reason in semantic.reasons),
+            )
+        )
+    )
+    if len(reasons) > 20:
+        raise RoutingError("combined assessment has too many reasons")
+    return TaskAssessment(
+        id=deterministic.id,
+        run_id=deterministic.run_id,
+        goal_digest=deterministic.goal_digest,
+        complexity=max(deterministic.complexity, semantic.complexity),
+        scale=max(deterministic.scale, semantic.scale),
+        risk=deterministic.risk,
+        required_capabilities=required,
+        decomposition=deterministic.decomposition,
+        reasons=reasons,
+    )
 
 
 def assess_task(

@@ -16,6 +16,7 @@ from .demo import run_demo
 from .domain import (
     ContractKind,
     ExecutionPolicy,
+    ExecutionStrategy,
     Goal,
     Graph,
     ResultEnvelope,
@@ -46,7 +47,7 @@ from .project import (
     migration_candidate,
     write_migration_candidate,
 )
-from .routing import assess_task, select_strategy
+from .routing import assess_task, merge_semantic_assessment, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import canonical_json, loads_yaml_model
 from .services_v2 import (
@@ -61,9 +62,11 @@ from .services_v2._common import identifier, now
 from .storage import SQLiteStore
 from .worker_adapters import (
     ClaudeCodeCliWorkerAdapter,
+    CliTaskAssessmentAdapter,
     CodexCliWorkerAdapter,
     OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
+    semantic_assessment_schema_json,
     worker_proposal_schema_json,
 )
 
@@ -135,6 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
     work.add_argument(
         "--strategy-set",
         help="operator-defined named subset of strategies available to this run",
+    )
+    work.add_argument(
+        "--assessment-strategy",
+        help="exact operator-defined strategy used for adaptive task assessment",
     )
     work.add_argument(
         "--operator-config",
@@ -279,6 +286,8 @@ def _work(args: argparse.Namespace) -> int:
         raise ValueError("--strategy requires --routing-mode fixed")
     if args.routing_mode == "legacy" and args.strategy_set is not None:
         raise ValueError("--strategy-set requires fixed or adaptive routing")
+    if args.routing_mode != "adaptive" and args.assessment_strategy is not None:
+        raise ValueError("--assessment-strategy requires adaptive routing")
     if routing_enabled and args.model is not None:
         raise ValueError("--routing-mode cannot be combined with --model")
     if routing_enabled and args.worker is not None:
@@ -296,8 +305,11 @@ def _work(args: argparse.Namespace) -> int:
     worker_model = args.model
     worker_effort: str | None = None
     task_assessment = None
+    assessment_strategy = None
     selected_strategy = None
     effective_strategy_set = None
+    routing_mode = None
+    strategies: tuple[ExecutionStrategy, ...] = ()
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
         effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
@@ -323,19 +335,41 @@ def _work(args: argparse.Namespace) -> int:
             risk=risk,
             required_capabilities=capabilities,
         )
-        selected_strategy = select_strategy(
-            strategies,
-            mode=routing_mode,
-            fixed_strategy_id=args.strategy,
-            assessment=task_assessment,
-            allowed_strategy_ids=harness.worker.allowed_strategy_ids,
-            allowed_backends=harness.worker.allowed,
-            local_backend_allowed=harness.worker.local_backend,
-        )
-        worker_name = cast(WorkerName, selected_strategy.backend)
-        worker_model = selected_strategy.model
-        worker_effort = selected_strategy.effort
-    worker_command = operator_config.worker_command(worker_name)
+        if routing_mode is RoutingMode.ADAPTIVE:
+            assessment_strategy = operator_config.assessment_strategy(
+                routing_mode, args.assessment_strategy
+            )
+            if (
+                assessment_strategy.id not in harness.worker.allowed_strategy_ids
+                or assessment_strategy.backend not in harness.worker.allowed
+                or (
+                    assessment_strategy.backend in {"ollama", "ollama_cli"}
+                    and not harness.worker.local_backend
+                )
+            ):
+                raise ValueError("assessment strategy is denied by Project Harness")
+        else:
+            selected_strategy = select_strategy(
+                strategies,
+                mode=routing_mode,
+                fixed_strategy_id=args.strategy,
+                assessment=task_assessment,
+                allowed_strategy_ids=harness.worker.allowed_strategy_ids,
+                allowed_backends=harness.worker.allowed,
+                local_backend_allowed=harness.worker.local_backend,
+            )
+            worker_name = cast(WorkerName, selected_strategy.backend)
+            worker_model = selected_strategy.model
+            worker_effort = selected_strategy.effort
+    worker_command = (
+        None if selected_strategy is None and routing_enabled
+        else operator_config.worker_command(worker_name)
+    )
+    assessment_command = (
+        None
+        if assessment_strategy is None
+        else operator_config.worker_command(cast(WorkerName, assessment_strategy.backend))
+    )
     db_path = Path(args.db)
     storage_root = db_path.resolve().parent
     workspace_root = repository.parent / f".fleet-{repository.name}" / "workspaces"
@@ -352,9 +386,12 @@ def _work(args: argparse.Namespace) -> int:
         if located is not None:
             executable_paths.extend((Path(located).parent, Path(located).resolve().parent))
 
-    add_executable_path(worker_command.executable)
-    for path_entry in worker_command.path_entries:
-        executable_paths.append(Path(path_entry))
+    for command_config in (worker_command, assessment_command):
+        if command_config is None:
+            continue
+        add_executable_path(command_config.executable)
+        for path_entry in command_config.path_entries:
+            executable_paths.append(Path(path_entry))
     # Codex and Claude Code are Node-based today. Keep interpreter lookup explicit
     # and deterministic instead of inheriting the host PATH wholesale.
     add_executable_path("node")
@@ -439,10 +476,59 @@ def _work(args: argparse.Namespace) -> int:
             )
             return bind_service_decision(request, resolution.decision)
 
+        if assessment_strategy is not None:
+            assert assessment_command is not None
+            assert task_assessment is not None
+            assert routing_mode is RoutingMode.ADAPTIVE
+            assessment_directory = workspace_root / "assessment" / run_id
+            assessment_directory.mkdir(parents=True, exist_ok=True)
+            assessment_schema_path: str | None = None
+            if assessment_strategy.backend == "codex_cli":
+                schema = assessment_directory / "semantic-assessment.json"
+                schema.write_bytes(semantic_assessment_schema_json())
+                assessment_schema_path = str(schema)
+            semantic = CliTaskAssessmentAdapter(
+                executor_for(assessment_directory),
+                read_output,
+                decide_worker_process,
+                run_id=run_id,
+                strategy=assessment_strategy,
+                executable=assessment_command.executable,
+                cwd=".",
+                prompt_writer=prompt_writer,
+                output_schema_path=assessment_schema_path,
+                timeout_seconds=harness.budgets.wall_seconds,
+            ).assess(
+                args.goal,
+                task_assessment,
+                available_capabilities=capabilities,
+            )
+            task_assessment = merge_semantic_assessment(
+                task_assessment,
+                semantic,
+                available_capabilities=capabilities,
+            )
+            selected_strategy = select_strategy(
+                strategies,
+                mode=routing_mode,
+                assessment=task_assessment,
+                allowed_strategy_ids=harness.worker.allowed_strategy_ids,
+                allowed_backends=harness.worker.allowed,
+                local_backend_allowed=harness.worker.local_backend,
+            )
+            worker_name = cast(WorkerName, selected_strategy.backend)
+            worker_model = selected_strategy.model
+            worker_effort = selected_strategy.effort
+            worker_command = operator_config.worker_command(worker_name)
+            add_executable_path(worker_command.executable)
+            for path_entry in worker_command.path_entries:
+                executable_paths.append(Path(path_entry))
+
         def worker_factory(
             snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
+            assert worker_command is not None
             adapter_type = {
                 "codex_cli": CodexCliWorkerAdapter,
                 "claude_code_cli": ClaudeCodeCliWorkerAdapter,
@@ -514,6 +600,7 @@ def _work(args: argparse.Namespace) -> int:
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
             task_assessment=task_assessment,
+            assessment_strategy=assessment_strategy,
             selected_strategy=selected_strategy,
             strategy_set=effective_strategy_set,
             approval_service=DigestApprovalService(store, operator_label="local-operator"),

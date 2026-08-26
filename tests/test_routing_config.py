@@ -17,6 +17,12 @@ def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
     )
 
     assert config.strategy_set_name() == "codex-balanced"
+    assessor = config.assessment_strategy(RoutingMode.ADAPTIVE)
+    assert (assessor.id, assessor.model, assessor.effort) == (
+        "codex-sol-high",
+        "gpt-5.6-sol",
+        "high",
+    )
     strategies = config.execution_strategies(RoutingMode.ADAPTIVE)
     assert tuple(
         (strategy.id, strategy.model, strategy.effort) for strategy in strategies
@@ -74,6 +80,7 @@ def test_named_strategy_set_limits_available_strategies() -> None:
         routing=OperatorRoutingConfig(
             strategies=(codex, claude),
             default_strategy_set="claude-only",
+            default_assessment_strategy="codex",
             strategy_sets={"claude-only": ("claude",), "mixed": ("codex", "claude")},
         )
     )
@@ -84,6 +91,8 @@ def test_named_strategy_set_limits_available_strategies() -> None:
     assert selected[0].backend == "claude_code_cli"
     assert config.strategy_set_name() == "claude-only"
     assert config.strategy_set_name("mixed") == "mixed"
+    assert config.assessment_strategy(RoutingMode.ADAPTIVE).id == "codex"
+    assert config.assessment_strategy(RoutingMode.ADAPTIVE, "claude").id == "claude"
     with pytest.raises(ValueError, match="unknown strategy set"):
         config.execution_strategies(RoutingMode.ADAPTIVE, "missing")
 
@@ -123,6 +132,10 @@ def test_routing_rejects_empty_or_duplicate_strategies_and_capabilities() -> Non
     with pytest.raises(ValidationError, match="default strategy set"):
         OperatorRoutingConfig(
             strategies=(strategy,), default_strategy_set="missing"
+        )
+    with pytest.raises(ValidationError, match="default assessment strategy"):
+        OperatorRoutingConfig(
+            strategies=(strategy,), default_assessment_strategy="missing"
         )
 
 

@@ -10,6 +10,7 @@ workers:
     executable: /absolute/path/to/ollama
 routing:
   default_strategy_set: codex-balanced
+  default_assessment_strategy: codex-sol-high
   # Sets reference strategies below; they cannot redefine a model or effort.
   strategy_sets:
     codex-balanced: [codex-luna-max, codex-sol-high]

@@ -66,7 +66,10 @@ if [ "$1" = "--help" ]; then
   printf '%s\n' 'Usage: codex exec'
   exit 0
 fi
-exit 1
+printf '%s' '{"complexity":8,"scale":6,'
+printf '%s' '"required_capabilities":["edit_intent","process"],'
+printf '%s\n' '"reasons":["multiple dependent implementation steps"]}'
+exit 0
 """,
         encoding="utf-8",
     )
@@ -80,6 +83,7 @@ exit 1
                 "workers": {"codex_cli": {"executable": str(fake_codex)}},
                 "routing": {
                     "default_strategy_set": "codex-all",
+                    "default_assessment_strategy": "sol",
                     "strategy_sets": {
                         "small-only": ["luna"],
                         "codex-all": ["luna", "sol"],
@@ -146,12 +150,16 @@ def test_default_adaptive_routing_persists_selected_strategy(
 
     assessment = projection["routing"]["assessment"]
     selected = projection["routing"]["selected_strategy"]
+    assessor = projection["routing"]["assessment_strategy"]
     assert projection["routing"]["strategy_set"] == "codex-all"
     assert projection["state"] == "planned"
     assert projection["run"]["worker"] == "codex_cli"
     assert selected["backend"] == "codex_cli"
     assert selected["model"] == "gpt-5.6-sol"
     assert selected["effort"] == "high"
+    assert assessor["id"] == "sol"
+    assert assessor["model"] == "gpt-5.6-sol"
+    assert assessor["effort"] == "high"
     assert assessment["complexity"] > 2
     assert assessment["scale"] > 2
 
@@ -174,6 +182,17 @@ def test_default_adaptive_routing_persists_selected_strategy(
         (
             ("--routing-mode", "legacy", "--strategy-set", "codex-all"),
             "--strategy-set requires fixed or adaptive routing",
+        ),
+        (
+            (
+                "--routing-mode",
+                "fixed",
+                "--strategy",
+                "sol",
+                "--assessment-strategy",
+                "sol",
+            ),
+            "--assessment-strategy requires adaptive routing",
         ),
     ),
 )

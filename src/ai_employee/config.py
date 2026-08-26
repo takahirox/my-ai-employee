@@ -90,6 +90,7 @@ class OperatorRoutingConfig(BaseModel):
 
     strategies: tuple[OperatorStrategyConfig, ...] = Field(min_length=1)
     default_strategy_set: Identifier | None = None
+    default_assessment_strategy: Identifier | None = None
     strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(
         default_factory=dict
     )
@@ -132,6 +133,13 @@ class OperatorRoutingConfig(BaseModel):
             and self.default_strategy_set not in self.strategy_sets
         ):
             raise ValueError("default strategy set must name a configured strategy set")
+        if (
+            self.default_assessment_strategy is not None
+            and self.default_assessment_strategy not in ids
+        ):
+            raise ValueError(
+                "default assessment strategy must name a configured strategy"
+            )
         return self
 
 
@@ -140,6 +148,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
 
     return OperatorRoutingConfig(
         default_strategy_set="codex-balanced",
+        default_assessment_strategy="codex-sol-high",
         strategy_sets={
             "codex-balanced": ("codex-luna-max", "codex-sol-high"),
         },
@@ -241,6 +250,34 @@ class OperatorConfig(BaseModel):
         if self.routing is None:
             return None
         return self.routing.default_strategy_set
+
+    def assessment_strategy(
+        self, mode: RoutingMode, requested: str | None = None
+    ) -> ExecutionStrategy:
+        if self.routing is None:
+            raise ValueError("adaptive routing requires operator routing configuration")
+        selected_id = requested or self.routing.default_assessment_strategy
+        if selected_id is None:
+            raise ValueError("adaptive routing requires an assessment strategy")
+        configured = next(
+            (strategy for strategy in self.routing.strategies if strategy.id == selected_id),
+            None,
+        )
+        if configured is None:
+            raise ValueError(f"unknown assessment strategy: {selected_id}")
+        return ExecutionStrategy(
+            id=configured.id,
+            routing_mode=mode,
+            backend=configured.backend,
+            model=configured.model,
+            effort=configured.effort,
+            capabilities=configured.capabilities,
+            min_complexity=configured.min_complexity,
+            max_complexity=configured.max_complexity,
+            min_scale=configured.min_scale,
+            max_scale=configured.max_scale,
+            max_risk=configured.max_risk,
+        )
 
 
 def default_operator_config_path(

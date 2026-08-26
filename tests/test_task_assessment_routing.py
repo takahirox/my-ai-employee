@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from ai_employee.routing import RoutingError, assess_task
+from ai_employee.domain import SemanticTaskAssessment
+from ai_employee.routing import RoutingError, assess_task, merge_semantic_assessment
 from ai_employee.serialization import canonical_digest
 
 
@@ -112,6 +113,60 @@ class TaskAssessmentRoutingTests(unittest.TestCase):
                     risk=risk,
                     required_capabilities=capabilities,
                 )
+
+    def test_semantic_assessment_can_only_raise_deterministic_floors(self) -> None:
+        deterministic = assess_task(
+            "Short but architecture-sensitive migration",
+            run_id="run.semantic",
+            risk=6,
+            required_capabilities=("edit_intent", "process"),
+        )
+        semantic = SemanticTaskAssessment(
+            complexity=9,
+            scale=7,
+            required_capabilities=("install",),
+            reasons=("cross-cutting migration with compatibility constraints",),
+        )
+
+        merged = merge_semantic_assessment(
+            deterministic,
+            semantic,
+            available_capabilities=("edit_intent", "process", "install"),
+        )
+
+        self.assertEqual((merged.complexity, merged.scale, merged.risk), (9, 7, 6))
+        self.assertEqual(
+            merged.required_capabilities, ("edit_intent", "process", "install")
+        )
+        self.assertIn("semantic assessment:", merged.reasons[-1])
+
+        lower = SemanticTaskAssessment(
+            complexity=1,
+            scale=1,
+            reasons=("appears small",),
+        )
+        preserved = merge_semantic_assessment(
+            merged,
+            lower,
+            available_capabilities=("edit_intent", "process", "install"),
+        )
+        self.assertEqual((preserved.complexity, preserved.scale), (9, 7))
+
+    def test_semantic_assessment_rejects_unknown_capabilities(self) -> None:
+        deterministic = assess_task("Goal", run_id="run.semantic-invalid")
+        semantic = SemanticTaskAssessment(
+            complexity=2,
+            scale=1,
+            required_capabilities=("unavailable_tool",),
+            reasons=("requires an unavailable tool",),
+        )
+
+        with self.assertRaisesRegex(RoutingError, "unsupported capabilities"):
+            merge_semantic_assessment(
+                deterministic,
+                semantic,
+                available_capabilities=("edit_intent", "process"),
+            )
 
 
 if __name__ == "__main__":

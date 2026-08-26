@@ -315,8 +315,27 @@ class TaskDecompositionItem(EntityModel):
         return self
 
 
+class SemanticTaskAssessment(SchemaModel):
+    """Strict isolated LLM classification; deterministic policy remains authoritative."""
+
+    complexity: int = Field(ge=1, le=10)
+    scale: int = Field(ge=1, le=10)
+    required_capabilities: tuple[Identifier, ...] = Field(default=(), max_length=20)
+    reasons: tuple[str, ...] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def _valid_semantic_assessment(self) -> Self:
+        if len(set(self.required_capabilities)) != len(self.required_capabilities):
+            raise ValueError("required capabilities must be unique")
+        if any(not reason.strip() or len(reason) > 500 for reason in self.reasons):
+            raise ValueError("reasons must be non-blank and at most 500 characters")
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("reasons must be unique")
+        return self
+
+
 class TaskAssessment(EntityModel):
-    """Persisted deterministic assessment used as task-aware routing input."""
+    """Persisted bounded assessment used as task-aware routing input."""
 
     run_id: Identifier
     goal_digest: Digest

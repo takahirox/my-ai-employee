@@ -113,6 +113,11 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "run": _json_model(run),
         "routing": {
             "strategy_set": run.strategy_set,
+            "assessment_strategy": (
+                None
+                if run.assessment_strategy is None
+                else _json_model(run.assessment_strategy)
+            ),
             "assessment": (
                 None
                 if run.task_assessment is None
