@@ -512,6 +512,49 @@ def test_cli_worker_repairs_unmarked_new_file_diff_body() -> None:
     assert payload.unified_diff.endswith("+# Example\n+\n+- item\n")
 
 
+def test_cli_worker_expands_flattened_markdown_new_file_diff() -> None:
+    breaks = "<br>".join(f"section {index}" for index in range(11))
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["plan.md"],
+                        "summary": "Add plan.",
+                        "unified_diff": (
+                            "diff --git a/plan.md b/plan.md\n"
+                            "new file mode 100644\n"
+                            "--- /dev/null\n"
+                            "+++ b/plan.md\n"
+                            "@@ -0,0 +1 @@\n"
+                            f"+# Plan<br>{breaks}\n"
+                        ),
+                    },
+                    "reason": "Add the requested plan.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert "<br>" not in payload.unified_diff
+    assert payload.unified_diff.count("\n+") >= 11
+
+
 def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
     executor = CapturingExecutor()
 

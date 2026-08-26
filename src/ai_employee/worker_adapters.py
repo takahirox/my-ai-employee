@@ -465,7 +465,9 @@ def _bounded_prompt(
             "repository patch directly in proposals with all schema fields populated. Use the "
             "supplied run_id for both the proposal and payload run_id. Set assistant_note "
             "directly. Encode a usage object as JSON text in usage_json, or set usage_json to "
-            "null. Fleet will compute all omitted content digests locally."
+            "null. In unified_diff, use actual newline characters for line boundaries; do not "
+            "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
+            "content digests locally."
         )
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
@@ -514,6 +516,14 @@ def _normalize_new_file_diff(value: str) -> str:
         ending = "\n" if lines[hunk].endswith("\n") else ""
         lines[hunk] = f"{lines[hunk].rstrip()} @@{ending}"
     body = lines[hunk + 1 :]
+    if (
+        len(body) == 1
+        and body[0].startswith("+# ")
+        and body[0].count("<br>") >= 10
+    ):
+        content = body[0][1:].rstrip("\n").replace("<br>", "\n")
+        body = [f"+{line}\n" for line in content.split("\n")]
+        lines = [*lines[: hunk + 1], *body]
     if not body or all(line.startswith(("+", "\\")) for line in body):
         return "".join(lines)
     repaired = [line if line.startswith("\\") else f"+{line}" for line in body]
