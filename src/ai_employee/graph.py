@@ -40,6 +40,27 @@ def validate_graph(
         issues.append(
             GraphValidationIssue("attempt_budget_exceeded", graph.id, "attempt cap exceeds policy")
         )
+    totals = {
+        "worker_turns": sum(node.resource_budget.worker_turns for node in graph.nodes),
+        "processes": sum(node.resource_budget.processes for node in graph.nodes),
+        "wall_seconds": sum(node.resource_budget.wall_seconds for node in graph.nodes),
+        "artifact_bytes": sum(node.resource_budget.artifact_bytes for node in graph.nodes),
+    }
+    limits = {
+        "worker_turns": graph.budget.max_worker_turns,
+        "processes": graph.budget.max_processes,
+        "wall_seconds": graph.budget.max_wall_seconds,
+        "artifact_bytes": graph.budget.max_artifact_bytes,
+    }
+    for resource in sorted(totals):
+        if totals[resource] > limits[resource]:
+            issues.append(
+                GraphValidationIssue(
+                    "aggregate_resource_budget_insufficient",
+                    graph.id,
+                    f"declared {resource} reservations exceed the graph budget",
+                )
+            )
     if graph.budget.max_wall_seconds > policy.max_wall_seconds:
         issues.append(
             GraphValidationIssue("time_budget_exceeded", graph.id, "time cap exceeds policy")
@@ -167,12 +188,12 @@ def validate_task_graph(
             issues.append(
                 GraphValidationIssue("missing_completion_criteria", node.id, "criteria required")
             )
-        if node.retry_limit or node.max_iterations != 1 or node.generation or node.attempt:
+        if node.max_iterations != 1 or node.generation or node.attempt:
             issues.append(
                 GraphValidationIssue(
                     "unsupported_execution_fence",
                     node.id,
-                    "retries and loops are out of scope",
+                    "loops and pre-advanced execution fences are out of scope",
                 )
             )
     return tuple(sorted(set(issues)))
@@ -249,9 +270,10 @@ def accept_task_graph(
     candidate: Graph,
     policy: ExecutionPolicy,
     *,
+    previous: AcceptedGraphRevision | None = None,
     available_capabilities: Iterable[str] = (),
 ) -> AcceptedGraphRevision:
-    """Accept the non-replanning dependency-DAG slice deterministically."""
+    """Accept one strict dependency-DAG revision deterministically."""
 
     issues = validate_task_graph(
         candidate,
@@ -260,7 +282,10 @@ def accept_task_graph(
     )
     if issues:
         raise GraphValidationError(issues)
-    return AcceptedGraphRevision(revision_number=1, graph=candidate)
+    return AcceptedGraphRevision(
+        revision_number=1 if previous is None else previous.revision_number + 1,
+        graph=candidate,
+    )
 
 
 def replan(

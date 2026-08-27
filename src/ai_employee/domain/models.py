@@ -72,6 +72,22 @@ class Recommendation(EntityModel):
     references: tuple[Reference, ...] = ()
 
 
+class NodeResourceBudget(SchemaModel):
+    """Resources one node attempt asks the scheduler to reserve."""
+
+    worker_turns: int = Field(default=1, ge=0)
+    processes: int = Field(default=1, ge=0)
+    wall_seconds: float = Field(default=1.0, ge=0)
+    artifact_bytes: int = Field(default=1_000_000, ge=0)
+
+    @field_validator("wall_seconds")
+    @classmethod
+    def _finite_wall_seconds(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("resource durations must be finite")
+        return value
+
+
 class Budget(SchemaModel):
     max_attempts: int = Field(default=1, ge=1)
     max_retries: int = Field(default=0, ge=0)
@@ -79,6 +95,9 @@ class Budget(SchemaModel):
     max_loop_iterations: int = Field(default=1, ge=1)
     max_nodes: int = Field(default=100, ge=1)
     max_wall_seconds: float = Field(default=3600.0, gt=0)
+    max_worker_turns: int = Field(default=100, ge=1)
+    max_processes: int = Field(default=100, ge=0)
+    max_artifact_bytes: int = Field(default=100_000_000, ge=0)
 
     @field_validator("max_wall_seconds")
     @classmethod
@@ -167,6 +186,7 @@ class Node(EntityModel):
     scale: int = Field(default=1, ge=1, le=10)
     risk: int = Field(default=0, ge=0, le=10)
     retry_limit: int = Field(default=0, ge=0)
+    resource_budget: NodeResourceBudget = NodeResourceBudget()
     max_iterations: int = Field(default=1, ge=1)
     configuration: CanonicalData = None
     state: NodeState = NodeState.PENDING
@@ -245,7 +265,14 @@ class AcceptedGraphRevision(SchemaModel):
     def _bind_digest(self) -> Self:
         from ai_employee.serialization import canonical_digest
 
-        actual = canonical_digest(self.graph)
+        # Preserve the revision-one digest used by existing WorkRun records while
+        # making every later accepted revision a distinct execution authority,
+        # even when a replan deliberately submits identical graph content.
+        actual = (
+            canonical_digest(self.graph)
+            if self.revision_number == 1
+            else canonical_digest({"revision_number": self.revision_number, "graph": self.graph})
+        )
         if self.content_digest is not None and self.content_digest != actual:
             raise ValueError("content_digest does not match canonical graph content")
         object.__setattr__(self, "content_digest", actual)

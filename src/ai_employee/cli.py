@@ -14,18 +14,21 @@ from . import __version__
 from .config import WorkerName, load_operator_config
 from .demo import run_demo
 from .domain import (
+    CompletionCriterion,
     ContractKind,
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
     Graph,
     Node,
+    ProjectHarnessV2,
     ResultEnvelope,
     ResultStatus,
     RoutingMode,
     Run,
 )
 from .domain.base import freeze_json
+from .domain.evaluation import EvaluationDecision, EvaluationEvidenceLedger
 from .domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind, PolicyResolver
 from .domain.services_v2 import Cancellation, WorkerAdapter
 from .domain.v2 import (
@@ -35,6 +38,8 @@ from .domain.v2 import (
     ApprovalRecord,
     ArtifactDescriptor,
     ArtifactPutRequest,
+    EditIntentRequest,
+    ExecutionResult,
     PolicyDecision,
     ProcessRequest,
     PromotionRecord,
@@ -42,7 +47,14 @@ from .domain.v2 import (
     WorkspaceSnapshot,
 )
 from .graph import GraphValidationError, accept_graph
-from .inspector import compare_runs, inspect_any_run, serve
+from .graph_composition import GraphPatchComposer, GraphPatchCompositionRecord
+from .graph_evaluation import (
+    GraphCandidateEvaluator,
+    ParentCandidateEvaluationRecord,
+    ParentCandidateEvaluationRequest,
+)
+from .graph_execution import GraphExecutionService
+from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
 from .project import (
     discover_project,
     discover_project_harness,
@@ -62,7 +74,12 @@ from .services_v2 import (
 )
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
-from .task_orchestration import NodeExecutionResult, TaskOrchestrator
+from .task_orchestration import (
+    GoalEvaluatorRecord,
+    GraphRunRecord,
+    TaskGraphAcceptance,
+    one_node_graph,
+)
 from .task_planning import (
     CliProposedGraphPlanner,
     ProposedGraph,
@@ -162,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-concurrency",
         type=int,
         default=1,
-        help="bounded task-graph concurrency; values above one enable graph planning",
+        help="maximum number of accepted task-graph nodes scheduled concurrently",
     )
     work.add_argument("--non-interactive", action="store_true")
     work.add_argument("--json", action="store_true")
@@ -262,20 +279,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "inspect":
             print(canonical_json(inspect_any_run(store, args.run_id)))
         elif args.command == "replay":
-            report = DeterministicRuntime({}, store=store).replay(args.run_id)
-            print(canonical_json(report.__dict__))
+            try:
+                graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)
+            except KeyError:
+                report = DeterministicRuntime({}, store=store).replay(args.run_id)
+                print(canonical_json(report.__dict__))
+            else:
+                print(
+                    canonical_json(
+                        {
+                            "schema_version": "2",
+                            "kind": "graph_replay",
+                            "run_id": graph_run.id,
+                            "inspection": inspect_graph_run(store, graph_run.id),
+                            "worker_invocations": 0,
+                            "verification_invocations": 0,
+                            "composition_invocations": 0,
+                            "promotion_invocations": 0,
+                        }
+                    )
+                )
         elif args.command == "resume":
             try:
-                work_run = store.get_work_run(args.run_id)
+                graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)
             except KeyError:
-                run = store.get("run", args.run_id, Run)
-                handlers = {
-                    node.id: _declarative_handler for node in run.accepted_graph.graph.nodes
-                }
-                outcome = DeterministicRuntime(handlers, store=store).execute(run, resume=True)
-                print(canonical_json({"run_id": args.run_id, "state": outcome.run.state.value}))
+                try:
+                    work_run = store.get_work_run(args.run_id)
+                except KeyError:
+                    run = store.get("run", args.run_id, Run)
+                    handlers = {
+                        node.id: _declarative_handler for node in run.accepted_graph.graph.nodes
+                    }
+                    outcome = DeterministicRuntime(handlers, store=store).execute(run, resume=True)
+                    print(canonical_json({"run_id": args.run_id, "state": outcome.run.state.value}))
+                else:
+                    return _resume_work(store, work_run)
             else:
-                return _resume_work(store, work_run)
+                return _resume_graph(store, graph_run)
         elif args.command in {"pause", "cancel"}:
             store.request_control(args.run_id, args.command)
             print(canonical_json({"run_id": args.run_id, "requested": args.command}))
@@ -289,8 +329,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _work(args: argparse.Namespace) -> int:
     from .orchestration import WorkCoordinator, bind_service_decision
 
+    resume_run: GraphRunRecord | None = getattr(args, "resume_graph_run", None)
     repository = Path(args.repo).resolve()
-    run_id = identifier("work")
+    run_id = identifier("work") if resume_run is None else resume_run.id
     routing_enabled = args.routing_mode != "legacy"
     if args.routing_mode == "fixed" and args.strategy is None:
         raise ValueError("--routing-mode fixed requires --strategy")
@@ -313,25 +354,31 @@ def _work(args: argparse.Namespace) -> int:
     if args.max_concurrency > 1 and args.routing_mode != "adaptive":
         raise ValueError("task-graph planning requires adaptive routing")
     harness = discover_project_harness(repository)
-    if harness.verification.required_evaluators:
-        print(
-            canonical_json(
-                {
-                    "schema_version": "2",
-                    "run_id": run_id,
-                    "status": "failed",
-                    "stable_code": "EVALUATOR_EXECUTION_UNAVAILABLE",
-                    "next_actions": (),
-                }
-            )
-        )
-        return 3
+    goal = _work_goal(run_id, args.goal, harness) if resume_run is None else resume_run.goal
+    if resume_run is not None and canonical_digest(harness) != resume_run.harness_digest:
+        raise ValueError("Project Harness changed since the graph was accepted")
     capabilities = ["edit_intent", "process"]
     if harness.network.mode.value != "disabled":
         capabilities.append("download")
     if harness.install.ecosystems:
         capabilities.append("install")
-    operator_config = load_operator_config(args.operator_config)
+    operator_config_path = (
+        resume_run.operator_config_path
+        if resume_run is not None
+        else (
+            None
+            if args.operator_config is None
+            else str(Path(args.operator_config).expanduser().resolve())
+        )
+    )
+    if resume_run is not None and operator_config_path is None:
+        raise ValueError("authoritative operator configuration cannot be durably recovered")
+    operator_config = load_operator_config(operator_config_path)
+    if (
+        resume_run is not None
+        and canonical_digest(operator_config) != resume_run.operator_config_digest
+    ):
+        raise ValueError("operator configuration changed since the graph was accepted")
     worker_name = cast(WorkerName, args.worker or "codex_cli")
     worker_model = args.model
     worker_effort: str | None = None
@@ -344,10 +391,14 @@ def _work(args: argparse.Namespace) -> int:
     proposed_graph: ProposedGraph | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
-        effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
-        strategies = operator_config.execution_strategies(
-            routing_mode, effective_strategy_set
-        )
+        if resume_run is None:
+            effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
+            strategies = operator_config.execution_strategies(
+                routing_mode, effective_strategy_set
+            )
+        else:
+            effective_strategy_set = resume_run.strategy_set
+            strategies = resume_run.execution_strategies
         if not strategies:
             raise ValueError("routing requires operator-configured strategies")
         if not harness.worker.allowed_strategy_ids:
@@ -367,7 +418,7 @@ def _work(args: argparse.Namespace) -> int:
             risk=risk,
             required_capabilities=capabilities,
         )
-        if routing_mode is RoutingMode.ADAPTIVE:
+        if routing_mode is RoutingMode.ADAPTIVE and resume_run is None:
             assessment_strategy = operator_config.assessment_strategy(
                 routing_mode,
                 args.assessment_strategy,
@@ -382,6 +433,10 @@ def _work(args: argparse.Namespace) -> int:
                 )
             ):
                 raise ValueError("assessment strategy is denied by Project Harness")
+        elif routing_mode is RoutingMode.ADAPTIVE:
+            # Resume uses the persisted per-node strategies and must not reassess
+            # the top-level goal or invoke the probabilistic planner again.
+            pass
         else:
             selected_strategy = select_strategy(
                 strategies,
@@ -396,7 +451,8 @@ def _work(args: argparse.Namespace) -> int:
             worker_model = selected_strategy.model
             worker_effort = selected_strategy.effort
     worker_command = (
-        None if selected_strategy is None and routing_enabled
+        None
+        if selected_strategy is None and routing_enabled
         else operator_config.worker_command(worker_name)
     )
     assessment_command = (
@@ -429,10 +485,14 @@ def _work(args: argparse.Namespace) -> int:
     # Codex and Claude Code are Node-based today. Keep interpreter lookup explicit
     # and deterministic instead of inheriting the host PATH wholesale.
     add_executable_path("node")
+    for strategy in strategies:
+        strategy_command = operator_config.worker_command(cast(WorkerName, strategy.backend))
+        add_executable_path(strategy_command.executable)
     for command in harness.commands.values():
         add_executable_path(command.argv[0])
 
     with SQLiteStore(db_path) as store:
+
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(
                 (root,),
@@ -442,22 +502,25 @@ def _work(args: argparse.Namespace) -> int:
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
-        def prompt_writer(value: bytes) -> str:
+        def write_prompt(value: bytes, bound_run_id: str, bound_store: SQLiteStore) -> str:
             descriptor = artifacts.put(
                 io.BytesIO(value),
                 ArtifactPutRequest(
                     id=identifier("worker-prompt"),
-                    run_id=run_id,
+                    run_id=bound_run_id,
                     created_at=now(),
                     media_type="application/json",
                     logical_kind="worker_request",
-                    producer_action_id=run_id,
+                    producer_action_id=bound_run_id,
                     source=freeze_json({"bounded": True}),
                 ),
             )
             descriptors[descriptor.artifact_digest] = descriptor
-            store.put("artifact_descriptor_v2", descriptor, run_id=run_id)
+            bound_store.put("artifact_descriptor_v2", descriptor, run_id=bound_run_id)
             return descriptor.artifact_digest
+
+        def prompt_writer(value: bytes) -> str:
+            return write_prompt(value, run_id, store)
 
         def read_output(digest: str) -> bytes:
             path = artifacts.root / "sha256" / digest[:2] / digest
@@ -491,16 +554,30 @@ def _work(args: argparse.Namespace) -> int:
             max_artifact_bytes=harness.budgets.artifact_bytes,
             required_approvals=required_approvals,
         )
+        if resume_run is None:
+            store.put("policy_layer_v2", policy, run_id=run_id)
+        else:
+            persisted_layers = tuple(
+                layer
+                for layer in store.list_records("policy_layer_v2", PolicyLayer)
+                if canonical_digest((layer.content_digest,))
+                == resume_run.effective_policy_digest
+            )
+            if len(persisted_layers) != 1:
+                raise ValueError("authoritative graph policy is missing or ambiguous")
+            policy = persisted_layers[0]
 
-        def decide_worker_process(request: ProcessRequest) -> PolicyDecision:
+        def resolve_service_request(
+            request: ProcessRequest | EditIntentRequest, kind: ActionKind
+        ) -> PolicyDecision:
             proposal = ActionProposal(
                 id=identifier("worker-runtime-proposal"),
-                run_id=run_id,
+                run_id=request.run_id,
                 created_at=now(),
                 worker_id="runtime-worker-adapter",
-                kind=ActionKind.PROCESS,
+                kind=kind,
                 payload=request,
-                reason="invoke the selected subscription-authenticated worker CLI",
+                reason="invoke an existing policy-mediated graph service boundary",
             )
             resolution = PolicyResolver().resolve(
                 proposal,
@@ -508,7 +585,18 @@ def _work(args: argparse.Namespace) -> int:
                 decision_id=identifier("worker-runtime-policy"),
                 created_at=now(),
             )
-            return bind_service_decision(request, resolution.decision)
+            effective_decision = resolution.decision.model_copy(
+                update={
+                    "effective_policy_digest": canonical_digest(
+                        (policy.content_digest,)
+                    ),
+                    "content_digest": None,
+                }
+            )
+            return bind_service_decision(request, effective_decision)
+
+        def decide_worker_process(request: ProcessRequest) -> PolicyDecision:
+            return resolve_service_request(request, ActionKind.PROCESS)
 
         if assessment_strategy is not None:
             assert assessment_command is not None
@@ -554,69 +642,75 @@ def _work(args: argparse.Namespace) -> int:
             worker_model = selected_strategy.model
             worker_effort = selected_strategy.effort
             worker_command = operator_config.worker_command(worker_name)
-            if args.max_concurrency > 1:
-                planner_schema_path: str | None = None
-                if assessment_strategy.backend == "codex_cli":
-                    planner_schema = assessment_directory / "proposed-graph.json"
-                    planner_schema.write_bytes(proposed_graph_schema_json())
-                    planner_schema_path = str(planner_schema)
-                harness_digest = canonical_digest(harness)
-                effective_policy_digest = canonical_digest((policy.content_digest,))
-                try:
-                    proposed_graph = CliProposedGraphPlanner(
-                        executor_for(assessment_directory),
-                        read_output,
-                        decide_worker_process,
-                        run_id=run_id,
-                        strategy=assessment_strategy,
-                        executable=assessment_command.executable,
-                        cwd=".",
-                        prompt_writer=prompt_writer,
-                        output_schema_path=planner_schema_path,
-                        timeout_seconds=harness.budgets.wall_seconds,
-                    ).plan(
-                        Goal(id=f"goal-{run_id}", statement=args.goal),
-                        available_capabilities=tuple(capabilities),
-                        effective_policy_digest=effective_policy_digest,
-                        harness_digest=harness_digest,
-                        max_nodes=16,
-                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+            planner_schema_path: str | None = None
+            if assessment_strategy.backend == "codex_cli":
+                planner_schema = assessment_directory / "proposed-graph.json"
+                planner_schema.write_bytes(proposed_graph_schema_json())
+                planner_schema_path = str(planner_schema)
+            harness_digest = canonical_digest(harness)
+            effective_policy_digest = canonical_digest((policy.content_digest,))
+            try:
+                proposed_graph = CliProposedGraphPlanner(
+                    executor_for(assessment_directory),
+                    read_output,
+                    decide_worker_process,
+                    run_id=run_id,
+                    strategy=assessment_strategy,
+                    executable=assessment_command.executable,
+                    cwd=".",
+                    prompt_writer=prompt_writer,
+                    output_schema_path=planner_schema_path,
+                    timeout_seconds=harness.budgets.wall_seconds,
+                ).plan(
+                    goal,
+                    available_capabilities=tuple(capabilities),
+                    effective_policy_digest=effective_policy_digest,
+                    harness_digest=harness_digest,
+                    max_nodes=16,
+                    max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                )
+            except ValueError:
+                print(
+                    canonical_json(
+                        {
+                            "schema_version": "2",
+                            "run_id": run_id,
+                            "status": "failed",
+                            "stable_code": "GRAPH_PLANNER_FAILED",
+                            "next_actions": (),
+                        }
                     )
-                except ValueError:
-                    print(
-                        canonical_json(
-                            {
-                                "schema_version": "2",
-                                "run_id": run_id,
-                                "status": "failed",
-                                "stable_code": "GRAPH_PLANNER_FAILED",
-                                "next_actions": (),
-                            }
-                        )
-                    )
-                    return 7
+                )
+                return 7
             add_executable_path(worker_command.executable)
             for path_entry in worker_command.path_entries:
                 executable_paths.append(Path(path_entry))
 
-        def worker_factory(
-            snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
+        def build_worker_adapter(
+            snapshot: WorkspaceSnapshot | None,
+            cancellation: Cancellation,
+            *,
+            bound_run_id: str,
+            bound_worker_name: WorkerName,
+            bound_model: str | None,
+            bound_effort: str | None,
+            bound_store: SQLiteStore,
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
-            assert worker_command is not None
+            command = operator_config.worker_command(bound_worker_name)
             adapter_type = {
                 "codex_cli": CodexCliWorkerAdapter,
                 "claude_code_cli": ClaudeCodeCliWorkerAdapter,
                 "ollama_cli": OllamaCliWorkerAdapter,
-            }[worker_name]
+            }[bound_worker_name]
             scratch_directory: str | None = None
             output_schema_path: str | None = None
             if adapter_type is ClaudeCodeCliWorkerAdapter:
-                scratch = workspace_root / "worker-scratch" / run_id
+                scratch = workspace_root / "worker-scratch" / bound_run_id
                 scratch.mkdir(parents=True, exist_ok=True)
                 scratch_directory = str(scratch)
             elif adapter_type is CodexCliWorkerAdapter:
-                schema_directory = workspace_root / "worker-schema" / run_id
+                schema_directory = workspace_root / "worker-schema" / bound_run_id
                 schema_directory.mkdir(parents=True, exist_ok=True)
                 schema = schema_directory / "proposal-envelope.json"
                 schema.write_bytes(worker_proposal_schema_json())
@@ -625,17 +719,30 @@ def _work(args: argparse.Namespace) -> int:
                 executor_for(root),
                 read_output,
                 decide_worker_process,
-                run_id=run_id,
-                executable=worker_command.executable,
-                prompt_writer=prompt_writer,
+                run_id=bound_run_id,
+                executable=command.executable,
+                prompt_writer=lambda value: write_prompt(value, bound_run_id, bound_store),
                 scratch_directory=scratch_directory,
                 output_schema_path=output_schema_path,
-                model=worker_model,
-                effort=worker_effort,
+                model=bound_model,
+                effort=bound_effort,
                 inherit_environment=("HOME",) if adapter_type is OllamaCliWorkerAdapter else (),
                 include_response_schema=adapter_type is OllamaCliWorkerAdapter,
                 cancellation=cancellation,
                 timeout_seconds=harness.budgets.wall_seconds,
+            )
+
+        def worker_factory(
+            snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
+        ) -> WorkerAdapter:
+            return build_worker_adapter(
+                snapshot,
+                cancellation,
+                bound_run_id=run_id,
+                bound_worker_name=worker_name,
+                bound_model=worker_model,
+                bound_effort=worker_effort,
+                bound_store=store,
             )
 
         if harness.provisional or worker_name not in harness.worker.allowed:
@@ -666,6 +773,8 @@ def _work(args: argparse.Namespace) -> int:
             for name in harness.verification.required
         )
         workspace = GitWorkspaceManager(workspace_root, artifacts)
+        harness_digest = canonical_digest(harness)
+        effective_policy_digest = canonical_digest((policy.content_digest,))
         coordinator = WorkCoordinator(
             store,
             DeterministicRuntime({}, store=store),
@@ -674,10 +783,14 @@ def _work(args: argparse.Namespace) -> int:
             lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
-            task_assessment=task_assessment,
+            task_assessment=(
+                task_assessment if selected_strategy is not None else None
+            ),
             assessment_strategy=assessment_strategy,
             selected_strategy=selected_strategy,
-            strategy_set=effective_strategy_set,
+            strategy_set=(
+                effective_strategy_set if selected_strategy is not None else None
+            ),
             approval_service=DigestApprovalService(store, operator_label="local-operator"),
             download_client=RestrictedDownloadClient(
                 artifacts,
@@ -705,42 +818,158 @@ def _work(args: argparse.Namespace) -> int:
             )
             .stdout.strip()
         )
-        if proposed_graph is not None:
-            harness_digest = proposed_graph.harness_digest
-            effective_policy_digest = proposed_graph.effective_policy_digest
+        if resume_run is not None and head != resume_run.base_commit:
+            raise ValueError("repository HEAD changed since the graph was accepted")
+        if routing_enabled:
+            execution_strategies = (
+                strategies if routing_mode is RoutingMode.ADAPTIVE else (selected_strategy,)
+            )
+            assert all(item is not None for item in execution_strategies)
 
-            def execution_unavailable(
+            def coordinator_factory(
                 node: Node,
                 request: WorkerRequest,
                 strategy: ExecutionStrategy,
-            ) -> NodeExecutionResult:
-                del node, request, strategy
-                raise RuntimeError("graph execution is unavailable until safe composition exists")
+            ) -> WorkCoordinator:
+                inner_store = SQLiteStore(db_path)
+                node_worker_name = cast(WorkerName, strategy.backend)
+                node_assessment = assess_task(
+                    node.objective or node.name,
+                    run_id=request.run_id,
+                    risk=node.risk,
+                    required_capabilities=node.required_capabilities,
+                ).model_copy(update={"complexity": node.complexity, "scale": node.scale})
+                return WorkCoordinator(
+                    inner_store,
+                    DeterministicRuntime({}, store=inner_store),
+                    GitWorkspaceManager(workspace_root, artifacts),
+                    lambda snapshot, cancellation: build_worker_adapter(
+                        snapshot,
+                        cancellation,
+                        bound_run_id=request.run_id,
+                        bound_worker_name=node_worker_name,
+                        bound_model=strategy.model,
+                        bound_effort=strategy.effort,
+                        bound_store=inner_store,
+                    ),
+                    lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                    lambda descriptor: artifacts.open_verified(descriptor).read(),
+                    (policy,),
+                    task_assessment=node_assessment,
+                    selected_strategy=strategy,
+                    strategy_set=effective_strategy_set,
+                    request_promotion_approval=False,
+                    approval_service=DigestApprovalService(
+                        inner_store, operator_label="local-operator"
+                    ),
+                    download_client=RestrictedDownloadClient(
+                        artifacts,
+                        enabled=harness.network.mode.value != "disabled",
+                        allowed_domains=harness.network.https_domains,
+                        allowed_ports=harness.network.ports or (443,),
+                    ),
+                    installer_factory=lambda snapshot: ProjectLocalInstaller(
+                        snapshot.isolated_worktree,
+                        executor_for(Path(snapshot.isolated_worktree)),
+                        artifacts,
+                        network_mediated=harness.network.mode.value != "disabled",
+                    ),
+                    protected_paths=harness.paths.protected,
+                    allowed_processes=tuple(command.argv for command in harness.commands.values()),
+                )
 
-            orchestrator = TaskOrchestrator(
+            def decide_composition(edit: EditIntentRequest) -> PolicyDecision:
+                return resolve_service_request(edit, ActionKind.EDIT_INTENT)
+
+            declared_parent_processes = {command.argv for command in harness.commands.values()}
+
+            def decide_parent_process(request: ProcessRequest) -> PolicyDecision:
+                if request.argv not in declared_parent_processes:
+                    raise ValueError("parent process is not declared by Project Harness")
+                return decide_worker_process(request)
+
+            composer = GraphPatchComposer(store, workspace, artifacts, decide_composition)
+            parent_evaluator = GraphCandidateEvaluator(
                 store,
-                execution_unavailable,
-                strategies,
+                workspace,
+                harness,
+                lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                decide_parent_process,
+            )
+            fixed_strategy_id = None
+            if routing_mode is RoutingMode.FIXED:
+                assert selected_strategy is not None
+                fixed_strategy_id = selected_strategy.id
+            service = GraphExecutionService(
+                store,
+                coordinator_factory,
+                composer,
+                cast(tuple[ExecutionStrategy, ...], execution_strategies),
+                repository=str(repository),
+                base_commit=head,
                 max_concurrency=args.max_concurrency,
-                routing_mode=RoutingMode.ADAPTIVE,
+                routing_mode=cast(RoutingMode, routing_mode),
+                fixed_strategy_id=fixed_strategy_id,
                 allowed_strategy_ids=harness.worker.allowed_strategy_ids,
                 allowed_backends=harness.worker.allowed,
                 local_backend_allowed=harness.worker.local_backend,
+                parent_evaluator=parent_evaluator,
+                approval_service=DigestApprovalService(
+                    store, operator_label="local-operator"
+                ),
+                operator_config_digest=canonical_digest(operator_config),
+                operator_config_path=operator_config_path,
+                strategy_set=effective_strategy_set,
             )
+            graph_input: Graph | ProposedGraph
+            if resume_run is not None:
+                graph_input = store.list_records(
+                    "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+                )[-1].accepted_revision.graph
+                harness_digest = resume_run.harness_digest
+                effective_policy_digest = resume_run.effective_policy_digest
+            elif proposed_graph is not None:
+                graph_input = proposed_graph
+                harness_digest = proposed_graph.harness_digest
+                effective_policy_digest = proposed_graph.effective_policy_digest
+            else:
+                node_goal = Goal(
+                    id=f"node-goal-{run_id}",
+                    statement=args.goal,
+                    completion_criteria=(
+                        CompletionCriterion(
+                            id=f"node-patch-{run_id}",
+                            description="the node produced an exact mediated workspace patch",
+                            required_artifact_ids=("workspace_patch",),
+                        ),
+                    ),
+                )
+                graph_input = one_node_graph(
+                    node_goal,
+                    graph_id=f"graph-{run_id}",
+                    node_id=f"node-{run_id}",
+                    required_capabilities=tuple(capabilities),
+                    max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                )
             try:
-                graph_run = orchestrator.run(
-                    Goal(id=proposed_graph.goal_id, statement=args.goal),
-                    proposed_graph,
-                    ExecutionPolicy(
-                        max_nodes=16,
-                        max_attempts=16,
-                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                graph_run = service.run(
+                    goal,
+                    graph_input,
+                    (
+                        resume_run.execution_policy
+                        if resume_run is not None
+                        else ExecutionPolicy(
+                            max_nodes=16,
+                            max_attempts=16,
+                            max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                        )
                     ),
                     harness_digest=harness_digest,
                     effective_policy_digest=effective_policy_digest,
                     run_id=run_id,
                     available_capabilities=tuple(capabilities),
                     plan_only=args.plan_only,
+                    resume=resume_run is not None,
                 )
             except GraphValidationError:
                 print(
@@ -766,7 +995,7 @@ def _work(args: argparse.Namespace) -> int:
                     }
                 )
             )
-            return 0 if graph_run.status in {"planned", "completed"} else 5
+            return 0 if graph_run.status in {"planned", "completed", "ready_to_promote"} else 5
         run = coordinator.start(
             args.goal,
             str(repository),
@@ -811,24 +1040,47 @@ def _approvals(store: SQLiteStore, args: argparse.Namespace) -> int:
 
 
 def _diff(store: SQLiteStore, args: argparse.Namespace) -> int:
-    from .domain.v2 import ArtifactDescriptor
-
-    run = store.get_work_run(args.run_id)
-    if run.patch_artifact_id is None:
-        raise ValueError("run has no captured patch")
-    descriptor = store.get("artifact_descriptor_v2", run.patch_artifact_id, ArtifactDescriptor)
-    path = Path(descriptor.store_locator)
+    try:
+        graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)
+    except KeyError:
+        run = store.get_work_run(args.run_id)
+        if run.patch_artifact_id is None:
+            raise ValueError("run has no captured patch") from None
+        run_id = run.id
+        descriptor = store.get(
+            "artifact_descriptor_v2", run.patch_artifact_id, ArtifactDescriptor
+        )
+    else:
+        if graph_run.status == "completed" and graph_run.composition_id is None:
+            print(canonical_json({
+                "schema_version": "2",
+                "run_id": graph_run.id,
+                "status": graph_run.status,
+                "stable_code": "PATCHLESS_RUN_HAS_NO_DIFF",
+            }))
+            return 5
+        run_id = graph_run.id
+        descriptor, _, _ = _graph_candidate(store, graph_run)
     state_root = Path(store.path).resolve().parent
-    content = (state_root / "artifacts" / path).read_bytes()
+    artifacts = AtomicArtifactStore(state_root / "artifacts")
+    with artifacts.open_verified(descriptor) as stream:
+        content = stream.read()
     if args.stat:
-        print(canonical_json({"schema_version": "2", "run_id": run.id, "bytes": len(content)}))
+        print(canonical_json({"schema_version": "2", "run_id": run_id, "bytes": len(content)}))
     else:
         print(content.decode("utf-8", "replace"), end="")
     return 0
 
 
 def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
-    from .domain.v2 import ArtifactDescriptor
+    try:
+        graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)
+    except KeyError:
+        return _promote_work(store, args)
+    return _promote_graph(store, graph_run, args.patch_digest)
+
+
+def _promote_work(store: SQLiteStore, args: argparse.Namespace) -> int:
 
     run = store.get_work_run(args.run_id)
     if run.status == "completed":
@@ -898,6 +1150,209 @@ def _promote(store: SQLiteStore, args: argparse.Namespace) -> int:
             "policy_digest": completed.effective_policy_digest,
             "completed_action_digests": completed.completed_action_digests,
         },
+    )
+    print(canonical_json({"schema_version": "2", "run_id": run.id, "status": "completed"}))
+    return 0
+
+
+def _graph_candidate(
+    store: SQLiteStore, run: GraphRunRecord
+) -> tuple[ArtifactDescriptor, GraphPatchCompositionRecord, WorkspaceSnapshot]:
+    if (
+        run.composition_id is None
+        or run.composition_digest is None
+        or run.parent_candidate_artifact_id is None
+        or run.parent_candidate_digest is None
+    ):
+        raise ValueError("graph candidate bindings are incomplete")
+    composition = store.get(
+        "graph_patch_composition_v2", run.composition_id, GraphPatchCompositionRecord
+    )
+    if (
+        composition.content_digest != run.composition_digest
+        or composition.status != "succeeded"
+        or composition.candidate_patch is None
+        or composition.composition_workspace is None
+        or composition.candidate_patch.id != run.parent_candidate_artifact_id
+        or composition.candidate_patch.artifact_digest != run.parent_candidate_digest
+    ):
+        raise ValueError("graph composition is missing, failed, or stale")
+    descriptor = store.get(
+        "artifact_descriptor_v2", run.parent_candidate_artifact_id, ArtifactDescriptor
+    )
+    workspace = store.get(
+        "workspace_v2", composition.composition_workspace.id, WorkspaceSnapshot
+    )
+    if descriptor != composition.candidate_patch or workspace != composition.composition_workspace:
+        raise ValueError("graph candidate descriptor or workspace is stale")
+    return descriptor, composition, workspace
+
+
+def _graph_promotion_evidence(
+    store: SQLiteStore,
+    run: GraphRunRecord,
+    patch: ArtifactDescriptor,
+    composition: GraphPatchCompositionRecord,
+    workspace: WorkspaceSnapshot,
+) -> tuple[ParentCandidateEvaluationRecord, str]:
+    acceptances = tuple(
+        item
+        for item in store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id
+        )
+        if item.accepted_revision.content_digest == run.accepted_graph_revision_digest
+    )
+    if len(acceptances) != 1:
+        raise ValueError("graph acceptance is missing or ambiguous")
+    policy_digest = acceptances[0].effective_policy_digest
+    if run.parent_evaluation_id is None or run.parent_evaluation_digest is None:
+        raise ValueError("parent evaluation binding is missing")
+    evaluation = store.get(
+        "parent_candidate_evaluation_v2",
+        run.parent_evaluation_id,
+        ParentCandidateEvaluationRecord,
+    )
+    if (
+        evaluation.content_digest != run.parent_evaluation_digest
+        or evaluation.status != "ready_to_promote"
+        or evaluation.decision is not EvaluationDecision.PASS
+        or evaluation.accepted_graph_revision_digest != run.accepted_graph_revision_digest
+        or evaluation.composition_record_digest != composition.content_digest
+        or evaluation.composition_workspace_digest != workspace.content_digest
+        or evaluation.candidate_descriptor_digest != patch.content_digest
+        or evaluation.candidate_artifact_digest != patch.artifact_digest
+        or evaluation.effective_policy_digest != policy_digest
+        or not evaluation.verification_request_digests
+        or not evaluation.verification_result_digests
+        or not evaluation.evaluation_ledger_digests
+    ):
+        raise ValueError("parent evaluation is not an exact authoritative PASS")
+    requests = tuple(
+        item
+        for item in store.list_records(
+            "parent_candidate_evaluation_request_v2",
+            ParentCandidateEvaluationRequest,
+            run_id=run.id,
+        )
+        if item.content_digest == evaluation.request_digest
+    )
+    if len(requests) != 1:
+        raise ValueError("parent evaluation request is missing or ambiguous")
+    request = requests[0]
+    if (
+        request.composition_id != composition.id
+        or request.composition_record_digest != composition.content_digest
+        or request.composition_workspace != workspace
+        or request.candidate_artifact != patch
+        or request.effective_policy_digest != policy_digest
+        or tuple(
+            item.process_request.content_digest for item in request.verification_bindings
+        )
+        != evaluation.verification_request_digests
+    ):
+        raise ValueError("parent evaluation request bindings are stale")
+    ledger_digests = {
+        item.content_digest
+        for item in store.list_records(
+            "evaluation_evidence_ledger_v2",
+            EvaluationEvidenceLedger,
+            run_id=run.id,
+        )
+        if item.decision is EvaluationDecision.PASS
+    }
+    verification_digests = {
+        item.content_digest
+        for item in store.list_records(
+            "verification_result_v2", ExecutionResult, run_id=run.id
+        )
+        if item.status == "succeeded"
+    }
+    if not set(evaluation.evaluation_ledger_digests) <= ledger_digests or not set(
+        evaluation.verification_result_digests
+    ) <= verification_digests:
+        raise ValueError("parent PASS evidence is missing")
+    goal_evaluations = tuple(
+        item
+        for item in store.list_records(
+            "goal_evaluator_v2", GoalEvaluatorRecord, run_id=run.id
+        )
+        if item.content_digest == evaluation.goal_evaluator_digest
+    )
+    if (
+        len(goal_evaluations) != 1
+        or goal_evaluations[0].decision is not EvaluationDecision.PASS
+        or goal_evaluations[0].evidence_digests != evaluation.evaluation_ledger_digests
+    ):
+        raise ValueError("parent goal PASS evidence is missing or stale")
+    return evaluation, policy_digest
+
+
+def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -> int:
+    promotions = store.list_records("promotion_v2", PromotionRecord, run_id=run.id)
+    if run.status == "completed" and any(
+        item.reviewed_patch_digest == patch_digest for item in promotions
+    ):
+        print(canonical_json({"schema_version": "2", "run_id": run.id, "status": "completed"}))
+        return 0
+    if run.status == "completed" and run.composition_id is None:
+        _print_work_failure(run.id, run.status, "PATCHLESS_RUN_CANNOT_PROMOTE")
+        return 5
+    if run.status != "ready_to_promote":
+        _print_work_failure(run.id, run.status, "PROMOTION_NOT_READY")
+        return 5
+    if run.parent_candidate_digest != patch_digest:
+        _print_work_failure(run.id, run.status, "PATCH_DIGEST_MISMATCH")
+        return 8
+    try:
+        patch, composition, snapshot = _graph_candidate(store, run)
+        _, policy_digest = _graph_promotion_evidence(
+            store, run, patch, composition, snapshot
+        )
+    except (KeyError, ValueError):
+        _print_work_failure(run.id, run.status, "EVIDENCE_OR_REVIEW_BLOCKED")
+        return 5
+    if (
+        run.promotion_approval_id is None
+        or run.promotion_approval_request_digest != patch.artifact_digest
+    ):
+        _print_work_failure(run.id, run.status, "PROMOTION_APPROVAL_REQUIRED")
+        return 4
+    try:
+        approval = store.get("approval_v2", run.promotion_approval_id, ApprovalRecord)
+    except KeyError:
+        _print_work_failure(run.id, run.status, "PROMOTION_APPROVAL_REQUIRED")
+        return 4
+    if (
+        approval.request_digest != patch.artifact_digest
+        or approval.policy_digest != policy_digest
+        or approval.scope != (patch.artifact_digest,)
+    ):
+        _print_work_failure(run.id, run.status, "STALE_PROMOTION_APPROVAL")
+        return 8
+    if approval.decision == "pending":
+        _print_work_failure(run.id, run.status, "PROMOTION_APPROVAL_REQUIRED")
+        return 4
+    if approval.decision != "approved" or approval.expires_at <= now():
+        _print_work_failure(run.id, run.status, "STALE_PROMOTION_APPROVAL")
+        return 8
+    state_root = Path(store.path).resolve().parent
+    artifacts = AtomicArtifactStore(state_root / "artifacts")
+    workspace = GitWorkspaceManager(Path(snapshot.isolated_worktree).resolve().parent, artifacts)
+    try:
+        workspace.adopt(snapshot)
+        promotion = workspace.promote(snapshot, patch, approval)
+    except (OSError, ValueError):
+        _print_work_failure(run.id, run.status, "WORKSPACE_CONFLICT")
+        return 8
+    store.put("promotion_v2", promotion, run_id=run.id)
+    completed = run.model_copy(
+        update={"status": "completed", "generation": run.generation + 1}
+    )
+    store.put(
+        "graph_run_v2",
+        completed,
+        run_id=completed.id,
+        revision=completed.generation + 1,
     )
     print(canonical_json({"schema_version": "2", "run_id": run.id, "status": "completed"}))
     return 0
@@ -1018,6 +1473,31 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
     return 4 if resumed.status == "waiting_approval" else 0
 
 
+def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
+    if run.status != "paused" or run.repository is None:
+        raise ValueError("only an authoritative paused graph can resume")
+    return _work(
+        argparse.Namespace(
+            # Resume the exact explicit authority source; never discover a new default.
+            operator_config=run.operator_config_path,
+            repo=run.repository,
+            goal=run.goal.statement,
+            db=store.path,
+            worker=None,
+            model=None,
+            routing_mode=run.routing_mode.value,
+            strategy=run.fixed_strategy_id,
+            strategy_set=run.strategy_set,
+            assessment_strategy=None,
+            plan_only=False,
+            max_concurrency=run.max_concurrency,
+            non_interactive=True,
+            json=True,
+            resume_graph_run=run,
+        )
+    )
+
+
 def _next_actions(run: object) -> tuple[str, ...]:
     status = getattr(run, "status", "failed")
     run_id = getattr(run, "id", "")
@@ -1026,6 +1506,34 @@ def _next_actions(run: object) -> tuple[str, ...]:
     if status == "ready_to_promote":
         return (f"fleet diff {run_id}", f"fleet promote {run_id} --patch-digest <digest>")
     return ()
+
+
+def _work_goal(run_id: str, statement: str, harness: ProjectHarnessV2) -> Goal:
+    """Bind the original Goal to exact declared parent verification evidence."""
+
+    evaluators = {item.id: item for item in harness.evaluators}
+    criteria: list[CompletionCriterion] = []
+    for evaluator_id in harness.verification.required_evaluators:
+        evaluator = evaluators[evaluator_id]
+        if evaluator.command_ref is None:
+            raise ValueError("required parent evaluator has no Harness command")
+        for criterion_id in evaluator.criterion_ids:
+            criteria.append(
+                CompletionCriterion(
+                    id=criterion_id,
+                    description=(
+                        "the exact composed candidate passes declared Harness command "
+                        f"{evaluator.command_ref}"
+                    ),
+                    verification_requirement_ids=(evaluator.command_ref,),
+                    required_artifact_ids=("workspace_patch",),
+                )
+            )
+    return Goal(
+        id=f"goal-{run_id}",
+        statement=statement,
+        completion_criteria=tuple(criteria),
+    )
 
 
 def _declarative_handler(context: NodeExecutionContext) -> ResultEnvelope:

@@ -39,7 +39,9 @@ from .domain.v2 import (
     DecisionOutcome,
     DigestedRecordV2,
     DownloadRequest,
+    DownloadResult,
     EditIntentRequest,
+    ExecutionResult,
     InstallRequest,
     PolicyDecision,
     ProcessRequest,
@@ -119,6 +121,8 @@ class WorkRun(BaseModel):
     verification_result_digests: tuple[str, ...] = ()
     review_digest: str | None = None
     acceptance_ledger_id: str | None = None
+    capture_patch: bool = True
+    output_artifact_ids: tuple[Identifier, ...] = ()
     failure_code: str | None = None
 
 
@@ -188,6 +192,7 @@ class WorkCoordinator:
         assessment_strategy: ExecutionStrategy | None = None,
         selected_strategy: ExecutionStrategy | None = None,
         strategy_set: Identifier | None = None,
+        request_promotion_approval: bool = True,
         approval_service: ApprovalService | None = None,
         download_client: DownloadClient | None = None,
         installer_factory: Callable[[WorkspaceSnapshot], Installer] | None = None,
@@ -219,6 +224,7 @@ class WorkCoordinator:
         self.assessment_strategy = assessment_strategy
         self.selected_strategy = selected_strategy
         self.strategy_set = strategy_set
+        self.request_promotion_approval = request_promotion_approval
         self.approval_service = approval_service
         self.download_client = download_client
         self.installer_factory = installer_factory
@@ -235,6 +241,7 @@ class WorkCoordinator:
         base_commit: str,
         *,
         worker_name: str,
+        capture_patch: bool = True,
     ) -> WorkRun:
         """Execute one accepted graph request without creating another graph authority."""
 
@@ -246,6 +253,7 @@ class WorkCoordinator:
             run_id=request.run_id,
             _accepted_request=request,
             _completion_criteria=completion_criteria,
+            _capture_patch=capture_patch,
         )
 
     def start(
@@ -259,6 +267,7 @@ class WorkCoordinator:
         run_id: str | None = None,
         _accepted_request: WorkerRequest | None = None,
         _completion_criteria: tuple[CompletionCriterion, ...] = (),
+        _capture_patch: bool = True,
     ) -> WorkRun:
         policy_digest = canonical_digest([layer.content_digest for layer in self.policy_layers])
         if _accepted_request is not None:
@@ -338,6 +347,7 @@ class WorkCoordinator:
                 None if _accepted_request is None else _accepted_request.content_digest
             ),
             completion_criteria=_completion_criteria,
+            capture_patch=_capture_patch,
         )
         self.store.save_work_run(run)
         for layer in self.policy_layers:
@@ -499,6 +509,11 @@ class WorkCoordinator:
         executor = self.process_factory(snapshot)
         installer = None if self.installer_factory is None else self.installer_factory(snapshot)
         completed = list(run.completed_action_digests)
+        output_artifact_ids = list(run.output_artifact_ids)
+
+        def retain(descriptors: tuple[ArtifactDescriptor, ...]) -> None:
+            self._retain_artifacts(run.id, descriptors, output_artifact_ids)
+
         for proposal, decision in channel.decisions:
             digest = proposal.content_digest or ""
             if digest in completed:
@@ -542,6 +557,7 @@ class WorkCoordinator:
             else:
                 return self._update(run, status="failed", failure_code="UNSUPPORTED_ACTION")
             self.store.put("action_result_v2", result, run_id=run.id)
+            retain(_mediated_result_artifacts(result, executor))
             self._event(
                 run.id,
                 "action_finished",
@@ -561,7 +577,11 @@ class WorkCoordinator:
                 code = result.failure.code.value if result.failure else "PROCESS_FAILED"
                 return self._update(run, status="failed", failure_code=code)
             completed.append(digest)
-            run = self._update(run, completed_action_digests=tuple(completed))
+            run = self._update(
+                run,
+                completed_action_digests=tuple(completed),
+                output_artifact_ids=tuple(output_artifact_ids),
+            )
         run = self._update(run, status="verifying")
         verification_digests: list[str] = []
         for request in self.verification_requests:
@@ -588,11 +608,40 @@ class WorkCoordinator:
                 cancellation,
             )
             self.store.put("verification_result_v2", result, run_id=run.id)
+            retain(_mediated_result_artifacts(result, executor))
             if result.status != "succeeded":
                 return self._update(run, status="failed", failure_code="VERIFICATION_FAILED")
             verification_digests.append(result.content_digest or "")
+
+        if not run.capture_patch:
+            artifacts = tuple(
+                self.store.get("artifact_descriptor_v2", artifact_id, ArtifactDescriptor)
+                for artifact_id in output_artifact_ids
+            )
+            criteria = _declared_criterion_evidence(
+                run.completion_criteria,
+                self.verification_requests,
+                tuple(verification_digests),
+                artifacts,
+            )
+            ledger = AcceptanceLedger(
+                id=identifier("acceptance-ledger"),
+                run_id=run.id,
+                created_at=now(),
+                criteria=criteria,
+            )
+            self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
+            return self._update(
+                run,
+                status="completed",
+                verification_result_digests=tuple(verification_digests),
+                acceptance_ledger_id=ledger.id,
+                output_artifact_ids=tuple(output_artifact_ids),
+            )
+
         patch = self.workspace.capture_diff(snapshot)
         self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
+        retain((patch,))
         patch_bytes = self.artifact_reader(patch)
         if not patch_bytes.strip():
             return self._update(run, status="failed", failure_code="EMPTY_PATCH")
@@ -607,7 +656,7 @@ class WorkCoordinator:
         ):
             return self._update(run, status="failed", failure_code="REVIEW_BLOCKED")
         promotion_approval_id: str | None = None
-        if self.approval_service is not None:
+        if self.request_promotion_approval and self.approval_service is not None:
             promotion_decision = PolicyDecision(
                 id=identifier("promotion-policy"),
                 run_id=run.id,
@@ -639,7 +688,7 @@ class WorkCoordinator:
                 run.completion_criteria,
                 self.verification_requests,
                 tuple(verification_digests),
-                patch,
+                (patch,),
             )
             if run.completion_criteria
             else (
@@ -686,7 +735,18 @@ class WorkCoordinator:
             verification_result_digests=tuple(verification_digests),
             review_digest=review_digest,
             acceptance_ledger_id=ledger.id,
+            output_artifact_ids=tuple(output_artifact_ids),
         )
+
+    def _retain_artifacts(
+        self, run_id: str, descriptors: tuple[ArtifactDescriptor, ...], retained: list[str]
+    ) -> None:
+        for descriptor in descriptors:
+            if descriptor.run_id != run_id or descriptor.content_digest is None:
+                raise ValueError("mediated artifact descriptor has stale provenance")
+            self.store.put("artifact_descriptor_v2", descriptor, run_id=run_id)
+            if descriptor.id not in retained:
+                retained.append(descriptor.id)
 
     def _decide(self, proposal: ActionProposal) -> PolicyDecision:
         resolution = PolicyResolver().resolve(
@@ -790,7 +850,7 @@ def _declared_criterion_evidence(
     criteria: tuple[CompletionCriterion, ...],
     verification_requests: tuple[ProcessRequest, ...],
     verification_digests: tuple[str, ...],
-    patch: ArtifactDescriptor,
+    artifacts: tuple[ArtifactDescriptor, ...],
 ) -> tuple[CriterionEvidence, ...]:
     """Map declared criteria only to exact first-party results and artifacts."""
 
@@ -800,10 +860,21 @@ def _declared_criterion_evidence(
         request.id: digest
         for request, digest in zip(verification_requests, verification_digests, strict=True)
     }
-    artifact_refs = {
-        patch.id: (patch.content_digest or "", patch.artifact_digest),
-        patch.logical_kind: (patch.content_digest or "", patch.artifact_digest),
-    }
+    artifact_refs: dict[str, tuple[str, str]] = {}
+    kinds: dict[str, list[ArtifactDescriptor]] = {}
+    for artifact in artifacts:
+        artifact_refs[artifact.id] = (
+            artifact.content_digest or "",
+            artifact.artifact_digest,
+        )
+        kinds.setdefault(artifact.logical_kind, []).append(artifact)
+    # Logical-kind binding is authoritative only when it resolves uniquely.
+    for logical_kind, matches in kinds.items():
+        if len(matches) == 1:
+            artifact_refs[logical_kind] = (
+                matches[0].content_digest or "",
+                matches[0].artifact_digest,
+            )
     result: list[CriterionEvidence] = []
     for criterion in criteria:
         refs: list[str] = []
@@ -815,11 +886,11 @@ def _declared_criterion_evidence(
             else:
                 refs.append(digest)
         for artifact_id in criterion.required_artifact_ids:
-            artifact = artifact_refs.get(artifact_id)
-            if artifact is None:
+            artifact_ref = artifact_refs.get(artifact_id)
+            if artifact_ref is None:
                 missing = True
             else:
-                refs.extend(artifact)
+                refs.extend(artifact_ref)
         declared = bool(criterion.verification_requirement_ids or criterion.required_artifact_ids)
         unique_refs = tuple(dict.fromkeys(ref for ref in refs if ref))
         result.append(
@@ -832,3 +903,28 @@ def _declared_criterion_evidence(
             )
         )
     return tuple(result)
+
+
+def _mediated_result_artifacts(
+    result: ExecutionResult, service: object
+) -> tuple[ArtifactDescriptor, ...]:
+    """Resolve descriptors from the service that produced an authoritative result."""
+
+    descriptors: list[ArtifactDescriptor] = []
+    if isinstance(result, DownloadResult) and result.artifact is not None:
+        descriptors.append(result.artifact)
+    resolver = getattr(service, "output_descriptor", None)
+    if callable(resolver):
+        for digest, logical_kind in (
+            (result.stdout_artifact_digest, "process_stdout"),
+            (result.stderr_artifact_digest, "process_stderr"),
+        ):
+            if digest is not None:
+                descriptor = resolver(digest, logical_kind, result.id)
+                if not isinstance(descriptor, ArtifactDescriptor):
+                    raise TypeError("service returned a non-descriptor artifact reference")
+                descriptors.append(descriptor)
+    unique = {item.id: item for item in descriptors}
+    if len(unique) != len(descriptors):
+        raise ValueError("mediated result returned duplicate artifact descriptor IDs")
+    return tuple(unique.values())

@@ -28,6 +28,9 @@ class ProposedGraph(DigestedRecordV2):
     planner_strategy: ExecutionStrategy
     effective_policy_digest: Digest
     harness_digest: Digest
+    previous_accepted_revision_digest: Digest | None = None
+    replan_trigger: str | None = None
+    replan_evidence: tuple[Digest, ...] = ()
 
 
 class ProposedGraphPayload(BaseModel):
@@ -116,6 +119,8 @@ class CliProposedGraphPlanner:
                     "an output contract, bounded complexity/scale/risk, and only capabilities "
                     "from available_capabilities. Edges mean required dependencies only: do not "
                     "emit conditions, loops, retries, re-planning, or generalized control flow. "
+                    "For editing nodes, bind completion evidence to the workspace_patch artifact; "
+                    "do not invent verification command IDs. "
                     "Return only the supplied strict JSON schema."
                 ),
                 "goal": goal,
@@ -138,9 +143,7 @@ class CliProposedGraphPlanner:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(
-                ("HOME",) if self.strategy.backend == "ollama_cli" else ()
-            ),
+            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=1_000_000,
@@ -148,9 +151,7 @@ class CliProposedGraphPlanner:
             budget_class="worker",
             purpose="obtain a strict non-authoritative ProposedGraph",
         )
-        result = self.executor.execute(
-            request, self.policy_decider(request), _NeverCancelled()
-        )
+        result = self.executor.execute(request, self.policy_decider(request), _NeverCancelled())
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message
@@ -158,9 +159,7 @@ class CliProposedGraphPlanner:
                 else "graph planner invocation failed"
             )
             raise ValueError(message)
-        output = self.output_reader(result.stdout_artifact_digest).decode(
-            "utf-8", "replace"
-        )
+        output = self.output_reader(result.stdout_artifact_digest).decode("utf-8", "replace")
         try:
             payload = ProposedGraphPayload.model_validate_json(
                 self._extract_payload(output), strict=True
@@ -176,9 +175,7 @@ class CliProposedGraphPlanner:
             if capability not in allowed
         }
         if unknown:
-            raise ValueError(
-                f"ProposedGraph returned unsupported capabilities: {sorted(unknown)}"
-            )
+            raise ValueError(f"ProposedGraph returned unsupported capabilities: {sorted(unknown)}")
         return ProposedGraph(
             id=identifier("proposed-graph"),
             run_id=self.run_id,

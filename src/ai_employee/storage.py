@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -39,6 +39,7 @@ class SQLiteStore:
         self._connection = sqlite3.connect(self.path)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 10000")
         self._create_schema()
 
     def close(self) -> None:
@@ -138,6 +139,14 @@ class SQLiteStore:
                 "CREATE TABLE IF NOT EXISTS graph_claims_v2 ("
                 "run_id TEXT NOT NULL,node_id TEXT NOT NULL,"
                 "PRIMARY KEY(run_id,node_id))"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS graph_reservations_v2 ("
+                "run_id TEXT NOT NULL,node_id TEXT NOT NULL,generation INTEGER NOT NULL,"
+                "attempt INTEGER NOT NULL,worker_turns INTEGER NOT NULL,"
+                "processes INTEGER NOT NULL,wall_seconds REAL NOT NULL,"
+                "artifact_bytes INTEGER NOT NULL,"
+                "PRIMARY KEY(run_id,node_id,generation,attempt))"
             )
             connection.execute(
                 "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
@@ -305,10 +314,52 @@ class SQLiteStore:
     def request_control(self, run_id: str, action: str) -> None:
         if action not in {"pause", "cancel"}:
             raise ValueError("control action must be pause or cancel")
-        with self._connection:
-            self._connection.execute(
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
                 "INSERT OR REPLACE INTO controls(run_id, action) VALUES(?,?)", (run_id, action)
             )
+            if action == "cancel":
+                row = connection.execute(
+                    "SELECT revision,payload FROM records "
+                    "WHERE kind='graph_run_v2' AND record_id=? "
+                    "ORDER BY revision DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if row is not None:
+                    payload = json.loads(row["payload"])
+                    if not isinstance(payload, dict):
+                        raise ValueError("graph run payload must be an object")
+                    if payload.get("status") not in {
+                        "cancelled",
+                        "completed",
+                        "ready_to_promote",
+                        "failed",
+                    }:
+                        generation = int(payload.get("generation", 0)) + 1
+                        payload.update(
+                            {
+                                "generation": generation,
+                                "status": "cancelled",
+                                "failure_code": "GRAPH_CANCELLED",
+                            }
+                        )
+                        connection.execute(
+                            "INSERT OR REPLACE INTO records"
+                            "(kind,record_id,run_id,revision,payload) VALUES(?,?,?,?,?)",
+                            (
+                                "graph_run_v2",
+                                run_id,
+                                run_id,
+                                generation + 1,
+                                canonical_json(payload),
+                            ),
+                        )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     def control(self, run_id: str) -> str | None:
         row = self._connection.execute(
@@ -375,6 +426,95 @@ class SQLiteStore:
                 (run_id, node_id, run_id, max_claims),
             )
         return cursor.rowcount == 1
+
+    def reserve_graph_node(
+        self,
+        run_id: str,
+        node_id: str,
+        generation: int,
+        attempt: int,
+        *,
+        max_claims: int,
+        worker_turns: int,
+        processes: int,
+        wall_seconds: float,
+        artifact_bytes: int,
+        limits: dict[str, int | float],
+        record_factory: Callable[[dict[str, int | float]], BaseModel],
+    ) -> BaseModel | None:
+        """Atomically claim one attempt, reserve all resources, and record the snapshot."""
+
+        self.migrate_v2()
+        requested = {
+            "worker_turns": worker_turns,
+            "processes": processes,
+            "wall_seconds": wall_seconds,
+            "artifact_bytes": artifact_bytes,
+        }
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT 1 FROM graph_reservations_v2 "
+                "WHERE run_id=? AND node_id=? AND generation=? AND attempt=?",
+                (run_id, node_id, generation, attempt),
+            ).fetchone()
+            row = connection.execute(
+                "SELECT COUNT(*) AS claims,"
+                "COALESCE(SUM(worker_turns),0) AS worker_turns,"
+                "COALESCE(SUM(processes),0) AS processes,"
+                "COALESCE(SUM(wall_seconds),0) AS wall_seconds,"
+                "COALESCE(SUM(artifact_bytes),0) AS artifact_bytes "
+                "FROM graph_reservations_v2 WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            assert row is not None
+            if duplicate is not None or int(row["claims"]) >= max_claims or any(
+                float(row[name]) + float(value) > float(limits[name])
+                for name, value in requested.items()
+            ):
+                connection.rollback()
+                return None
+            connection.execute(
+                "INSERT INTO graph_reservations_v2"
+                "(run_id,node_id,generation,attempt,worker_turns,processes,"
+                "wall_seconds,artifact_bytes) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    node_id,
+                    generation,
+                    attempt,
+                    worker_turns,
+                    processes,
+                    wall_seconds,
+                    artifact_bytes,
+                ),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO graph_claims_v2(run_id,node_id) VALUES(?,?)",
+                (run_id, node_id),
+            )
+            remaining: dict[str, int | float] = {
+                "node_attempts": max_claims - int(row["claims"]) - 1,
+            }
+            for name, value in requested.items():
+                remaining[name] = limits[name] - float(row[name]) - float(value)
+                if name != "wall_seconds":
+                    remaining[name] = int(remaining[name])
+            record = record_factory(remaining)
+            record_id = getattr(record, "id", None)
+            if record_id is None:
+                raise ValueError("reservation record requires an id")
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('node_reservation_v2',?,?,1,?)",
+                (record_id, run_id, canonical_json(record)),
+            )
+            connection.commit()
+            return record
+        except BaseException:
+            connection.rollback()
+            raise
 
     def graph_claims(self, run_id: str) -> tuple[str, ...]:
         if self._schema_version() < 2:

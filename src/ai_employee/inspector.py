@@ -12,10 +12,12 @@ from pydantic import RootModel
 
 from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
 from .domain.base import FrozenDict
+from .domain.evaluation import EvaluationEvidenceLedger
 from .domain.policy_v2 import PolicyLayer
 from .domain.v2 import (
     AcceptanceLedger,
     ApprovalRecord,
+    ApprovalRequest,
     ArtifactDescriptor,
     DownloadResult,
     ExecutionResult,
@@ -26,9 +28,26 @@ from .domain.v2 import (
     WorkerResult,
     WorkspaceSnapshot,
 )
+from .graph_composition import GraphPatchCompositionRecord
+from .graph_evaluation import (
+    ParentCandidateEvaluationRecord,
+    ParentCandidateEvaluationRequest,
+)
 from .serialization import canonical_json
 from .storage import SQLiteStore
-from .task_orchestration import TaskGraphAcceptance
+from .task_orchestration import (
+    GoalEvaluatorRecord,
+    GraphControlFact,
+    GraphRunRecord,
+    NodeEvaluatorRecord,
+    NodeEvidenceRecord,
+    NodeExecutionRecord,
+    NodeReservationRecord,
+    NodeRouteRecord,
+    RetainedNodeBinding,
+    StaleNodeResultRecord,
+    TaskGraphAcceptance,
+)
 
 
 class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
@@ -190,13 +209,181 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     }
 
 
+def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Project exact graph handoff records without opening artifact bodies."""
+
+    run = store.get("graph_run_v2", run_id, GraphRunRecord)
+    acceptances = store.list_records(
+        "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+    )
+    acceptances = tuple(
+        sorted(acceptances, key=lambda item: item.accepted_revision.revision_number)
+    )
+    acceptance = next(
+        (
+            item
+            for item in reversed(acceptances)
+            if item.accepted_revision.content_digest == run.accepted_graph_revision_digest
+        ),
+        None,
+    )
+    node_records = store.list_records(
+        "node_execution_v2", NodeExecutionRecord, run_id=run_id
+    )
+    latest_nodes: dict[str, NodeExecutionRecord] = {}
+    for node_record in node_records:
+        previous = latest_nodes.get(node_record.node_id)
+        if previous is None or (
+            node_record.generation,
+            node_record.attempt,
+            node_record.sequence,
+            node_record.created_at,
+        ) > (
+            previous.generation,
+            previous.attempt,
+            previous.sequence,
+            previous.created_at,
+        ):
+            latest_nodes[node_record.node_id] = node_record
+    routes = store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
+    composition = (
+        None
+        if run.composition_id is None
+        else store.get(
+            "graph_patch_composition_v2", run.composition_id, GraphPatchCompositionRecord
+        )
+    )
+    evaluation = (
+        None
+        if run.parent_evaluation_id is None
+        else store.get(
+            "parent_candidate_evaluation_v2",
+            run.parent_evaluation_id,
+            ParentCandidateEvaluationRecord,
+        )
+    )
+    candidate = (
+        None
+        if run.parent_candidate_artifact_id is None
+        else store.get(
+            "artifact_descriptor_v2", run.parent_candidate_artifact_id, ArtifactDescriptor
+        )
+    )
+    return {
+        "schema_version": "2",
+        "run_id": run.id,
+        "kind": "graph_run",
+        "state": run.status,
+        "generation": run.generation,
+        "replan_count": run.replan_count,
+        "run": _json_model(run),
+        "graph_acceptance": None if acceptance is None else _json_model(acceptance),
+        "graph_revisions": [_json_model(item) for item in acceptances],
+        "retained_node_bindings": [
+            _json_model(item)
+            for item in sorted(
+                store.list_records(
+                    "retained_node_binding_v2", RetainedNodeBinding, run_id=run_id
+                ),
+                key=lambda item: (item.generation, item.node_id),
+            )
+        ],
+        "artifact_descriptors": [
+            _json_model(item)
+            for record in latest_nodes.values()
+            for item in record.artifact_descriptors
+        ],
+        "nodes": [_json_model(latest_nodes[node_id]) for node_id in sorted(latest_nodes)],
+        "node_history": [_json_model(item) for item in node_records],
+        "claims": list(store.graph_claims(run_id)),
+        "reservations": [
+            _json_model(item)
+            for item in store.list_records(
+                "node_reservation_v2", NodeReservationRecord, run_id=run_id
+            )
+        ],
+        "routes": [_json_model(item) for item in routes],
+        "worker_results": [
+            _json_model(store.get("worker_result_v2", item.worker_result_id, WorkerResult))
+            for item in node_records
+            if item.worker_result_id is not None
+        ],
+        "node_evidence": [
+            _json_model(store.get("node_evidence_v2", item.evidence_id, NodeEvidenceRecord))
+            for item in node_records
+            if item.evidence_id is not None
+        ],
+        "node_evaluator_decisions": [
+            _json_model(
+                store.get("node_evaluator_v2", item.evaluator_id, NodeEvaluatorRecord)
+            )
+            for item in node_records
+            if item.evaluator_id is not None
+        ],
+        "controls": [
+            _json_model(item)
+            for item in store.list_records(
+                "graph_control_fact_v2", GraphControlFact, run_id=run_id
+            )
+        ],
+        "stale_results": [
+            _json_model(item)
+            for item in store.list_records(
+                "stale_node_result_v2", StaleNodeResultRecord, run_id=run_id
+            )
+        ],
+        "composition": None if composition is None else _json_model(composition),
+        "candidate_patch": None if candidate is None else _json_model(candidate),
+        "parent_evaluation": None if evaluation is None else _json_model(evaluation),
+        "parent_evaluation_requests": [
+            _json_model(item)
+            for item in store.list_records(
+                "parent_candidate_evaluation_request_v2",
+                ParentCandidateEvaluationRequest,
+                run_id=run_id,
+            )
+        ],
+        "parent_goal_evaluations": [
+            _json_model(item)
+            for item in store.list_records(
+                "goal_evaluator_v2", GoalEvaluatorRecord, run_id=run_id
+            )
+        ],
+        "parent_evidence": [
+            _json_model(item)
+            for item in store.list_records(
+                "evaluation_evidence_ledger_v2",
+                EvaluationEvidenceLedger,
+                run_id=run_id,
+            )
+        ],
+        "approval_requests": [
+            _json_model(item)
+            for item in store.list_records(
+                "approval_request_v2", ApprovalRequest, run_id=run_id
+            )
+        ],
+        "approvals": [
+            _json_model(item)
+            for item in store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        ],
+        "promotions": [
+            _json_model(item)
+            for item in store.list_records("promotion_v2", PromotionRecord, run_id=run_id)
+        ],
+    }
+
+
 def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
-    """Read either runtime generation without mutating or migrating state."""
+    """Read any runtime generation without mutating or migrating state."""
 
     try:
-        return inspect_work_run(store, run_id)
+        return inspect_graph_run(store, run_id)
     except KeyError:
-        return inspect_run(store, run_id)
+        try:
+            return inspect_work_run(store, run_id)
+        except KeyError:
+            return inspect_run(store, run_id)
 
 
 def _json_model(value: object) -> dict[str, Any]:

@@ -28,6 +28,7 @@ from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKi
 from ai_employee.domain.v2 import (
     ActionKind,
     ActionProposal,
+    ArtifactDescriptor,
     DecisionOutcome,
     EditIntentRequest,
     ExecutionResult,
@@ -403,10 +404,43 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         )
         replay = service.replay(run.id)
         by_node = {item.node_id: item for item in replay.nodes}
+        evaluator_by_id = {item.id: item for item in replay.evaluator_decisions}
         assert requests["c"].prior_artifact_digests == (
             by_node["a"].patch_digest,
             by_node["b"].patch_digest,
         )
+        for reference in requests["c"].predecessor_outputs:
+            predecessor = by_node[reference.node_id]
+            evaluator = evaluator_by_id[reference.evaluator_id]
+            assert reference.accepted_graph_revision_digest == (
+                run.accepted_graph_revision_digest
+            )
+            assert reference.generation == predecessor.generation
+            assert reference.result_generation == predecessor.output_generation
+            assert reference.attempt == predecessor.attempt
+            assert reference.worker_result_id == predecessor.worker_result_id
+            assert reference.worker_result_digest == predecessor.worker_result_digest
+            assert reference.artifact_descriptor_id == predecessor.patch_artifact_id
+            assert reference.artifact_descriptor_digest == (
+                predecessor.patch_descriptor_digest
+            )
+            assert reference.artifact_digest == predecessor.patch_digest
+            assert reference.evaluator_id == predecessor.evaluator_id
+            assert reference.evaluator_digest == predecessor.evaluator_digest
+            assert evaluator.node_id == predecessor.node_id
+            assert evaluator.generation == predecessor.output_generation
+            assert evaluator.attempt == predecessor.attempt
+        for predecessor in (by_node["a"], by_node["b"]):
+            descriptor = store.get(
+                "artifact_descriptor_v2",
+                predecessor.patch_artifact_id or "missing",
+                ArtifactDescriptor,
+            )
+            inner_run = store.get_work_run(predecessor.work_run_id or "missing")
+            assert descriptor.run_id == inner_run.id == predecessor.work_run_id
+            assert descriptor in store.list_records(
+                "artifact_descriptor_v2", ArtifactDescriptor, run_id=inner_run.id
+            )
         assert len({by_node[name].workspace_id for name in ("a", "b")}) == 2
         assert all(item.status == "passed" for item in replay.nodes)
         assert service.replay(run.id) == replay

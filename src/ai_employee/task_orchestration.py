@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import ClassVar, Literal, Protocol, Self
+from typing import ClassVar, Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.main import BaseModel
@@ -25,8 +25,16 @@ from .domain import (
     RoutingMode,
     TaskAssessment,
 )
-from .domain.base import Digest, Identifier, freeze_json
-from .domain.v2 import CriterionEvidence, DigestedRecordV2, WorkerRequest, WorkerResult
+from .domain.base import CanonicalData, Digest, Identifier, freeze_json
+from .domain.v2 import (
+    ArtifactDescriptor,
+    ArtifactDescriptorReference,
+    CriterionEvidence,
+    DigestedRecordV2,
+    PredecessorOutputReference,
+    WorkerRequest,
+    WorkerResult,
+)
 from .graph import accept_task_graph
 from .graph_composition import NodePatchArtifact
 from .routing import RoutingError, assess_task, select_strategy
@@ -35,8 +43,12 @@ from .services_v2._common import identifier, now
 from .storage import SQLiteStore
 from .task_planning import ProposedGraph
 
-NodeExecutionStatus = Literal["pending", "routed", "running", "passed", "failed", "blocked"]
-GraphExecutionStatus = Literal["planned", "running", "completed", "ready_to_promote", "failed"]
+NodeExecutionStatus = Literal[
+    "pending", "routed", "running", "passed", "failed", "blocked", "cancelled"
+]
+GraphExecutionStatus = Literal[
+    "planned", "running", "paused", "cancelled", "completed", "ready_to_promote", "failed"
+]
 
 
 class TaskGraphAcceptance(DigestedRecordV2):
@@ -46,12 +58,63 @@ class TaskGraphAcceptance(DigestedRecordV2):
     harness_digest: Digest
     previous_revision_digest: Digest | None = None
     proposed_graph_digest: Digest | None = None
+    replan_trigger: str | None = None
+    replan_evidence: tuple[Digest, ...] = ()
 
     @model_validator(mode="after")
-    def _first_slice_has_no_revision_parent(self) -> Self:
-        if self.accepted_revision.revision_number != 1 or self.previous_revision_digest is not None:
-            raise ValueError("the initial orchestration slice does not support re-planning")
+    def _revision_ancestry_is_complete(self) -> Self:
+        initial = self.accepted_revision.revision_number == 1
+        if initial and (
+            self.previous_revision_digest is not None
+            or self.replan_trigger is not None
+            or self.replan_evidence
+        ):
+            raise ValueError("initial graph acceptance cannot carry replan ancestry")
+        if not initial and (
+            self.previous_revision_digest is None
+            or not self.replan_trigger
+            or not self.replan_evidence
+        ):
+            raise ValueError("replanned acceptance requires exact ancestry, trigger, and evidence")
         return self
+
+
+class RetainedNodeBinding(DigestedRecordV2):
+    schema_name: ClassVar[str] = "retained_node_binding"
+    node_id: Identifier
+    previous_revision_digest: Digest
+    accepted_graph_revision_digest: Digest
+    previous_generation: int = Field(ge=0)
+    generation: int = Field(ge=0)
+    node_contract_digest: Digest
+    node_execution_digest: Digest
+
+
+class NodeReservationRecord(DigestedRecordV2):
+    schema_name: ClassVar[str] = "node_reservation_record"
+    node_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    requested: CanonicalData
+    remaining_budgets: CanonicalData
+
+
+class GraphControlFact(DigestedRecordV2):
+    schema_name: ClassVar[str] = "graph_control_fact"
+    action: Literal["pause", "cancel", "resume"]
+    generation: int = Field(ge=0)
+
+
+class StaleNodeResultRecord(DigestedRecordV2):
+    schema_name: ClassVar[str] = "stale_node_result_record"
+    node_id: Identifier
+    accepted_graph_revision_digest: Digest
+    result_generation: int = Field(ge=0)
+    authoritative_generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    worker_request_digest: Digest
+    worker_result_digest: Digest
 
 
 class NodeRouteRecord(DigestedRecordV2):
@@ -92,6 +155,8 @@ class GoalEvaluatorRecord(DigestedRecordV2):
     goal_id: Identifier
     accepted_graph_revision_digest: Digest
     evidence_digests: tuple[Digest, ...]
+    artifact_descriptor_digests: tuple[Digest, ...] = ()
+    artifact_content_digests: tuple[Digest, ...] = ()
     decision: EvaluationDecision
 
 
@@ -105,8 +170,12 @@ class NodeExecutionRecord(DigestedRecordV2):
     status: NodeExecutionStatus
     route_digest: Digest | None = None
     worker_request_digest: Digest | None = None
+    output_generation: int | None = Field(default=None, ge=0)
+    worker_result_id: Identifier | None = None
     worker_result_digest: Digest | None = None
+    evidence_id: Identifier | None = None
     evidence_digest: Digest | None = None
+    evaluator_id: Identifier | None = None
     evaluator_digest: Digest | None = None
     evaluator_decision: EvaluationDecision | None = None
     failure_code: str | None = None
@@ -118,6 +187,8 @@ class NodeExecutionRecord(DigestedRecordV2):
     patch_digest: Digest | None = None
     acceptance_ledger_digest: Digest | None = None
     verification_result_digests: tuple[Digest, ...] = ()
+    artifact_descriptors: tuple[ArtifactDescriptor, ...] = ()
+    retained_from_revision_digest: Digest | None = None
 
 
 class GraphRunRecord(BaseModel):
@@ -125,11 +196,33 @@ class GraphRunRecord(BaseModel):
     schema_version: Literal["2"] = "2"
     id: Identifier
     goal_id: Identifier
+    goal: Goal
+    execution_policy: ExecutionPolicy
     accepted_graph_revision_digest: Digest
+    harness_digest: Digest
+    effective_policy_digest: Digest
+    available_capabilities: tuple[Identifier, ...]
+    execution_strategies: tuple[ExecutionStrategy, ...]
+    routing_mode: RoutingMode
+    fixed_strategy_id: Identifier | None = None
+    allowed_strategy_ids: tuple[Identifier, ...]
+    allowed_backends: tuple[str, ...]
+    local_backend_allowed: bool
     status: GraphExecutionStatus
     max_concurrency: int = Field(ge=1)
     max_claims: int = Field(ge=1)
+    max_replans: int = Field(default=0, ge=0)
+    replan_count: int = Field(default=0, ge=0)
+    max_worker_turns: int = Field(default=100, ge=1)
+    max_processes: int = Field(default=100, ge=0)
+    max_wall_seconds: float = Field(default=3600.0, gt=0)
+    max_artifact_bytes: int = Field(default=100_000_000, ge=0)
     generation: int = Field(default=0, ge=0)
+    repository: str | None = None
+    base_commit: str | None = None
+    operator_config_digest: Digest | None = None
+    operator_config_path: str | None = None
+    strategy_set: Identifier | None = None
     goal_evaluator_digest: Digest | None = None
     failure_code: str | None = None
     composition_id: Identifier | None = None
@@ -138,6 +231,8 @@ class GraphRunRecord(BaseModel):
     parent_candidate_digest: Digest | None = None
     parent_evaluation_id: Identifier | None = None
     parent_evaluation_digest: Digest | None = None
+    promotion_approval_id: Identifier | None = None
+    promotion_approval_request_digest: Digest | None = None
 
 
 class NodeExecutionResult(BaseModel):
@@ -148,6 +243,7 @@ class NodeExecutionResult(BaseModel):
     criterion_evidence: tuple[CriterionEvidence, ...]
     workspace_id: Identifier | None = None
     node_patch: NodePatchArtifact | None = None
+    artifact_descriptors: tuple[ArtifactDescriptor, ...] = ()
 
     @model_validator(mode="after")
     def _criterion_evidence_is_unique(self) -> Self:
@@ -156,7 +252,17 @@ class NodeExecutionResult(BaseModel):
             raise ValueError("criterion evidence must be unique per node result")
         if self.node_patch is not None and self.workspace_id != self.node_patch.workspace.id:
             raise ValueError("node patch and execution workspace must match")
+        descriptor_ids = tuple(item.id for item in self.artifact_descriptors)
+        if len(descriptor_ids) != len(set(descriptor_ids)):
+            raise ValueError("artifact descriptors must be unique per node result")
         return self
+
+
+class NodePatchRecord(DigestedRecordV2):
+    """Replayable wrapper for a body-free node patch descriptor."""
+
+    schema_name: ClassVar[str] = "node_patch_record"
+    node_patch: NodePatchArtifact
 
 
 class NodeRunner(Protocol):
@@ -173,8 +279,18 @@ class GraphReplay(BaseModel):
     schema_version: Literal["2"] = "2"
     run: GraphRunRecord
     acceptance: TaskGraphAcceptance
+    revision_history: tuple[TaskGraphAcceptance, ...]
+    retained_node_bindings: tuple[RetainedNodeBinding, ...]
     nodes: tuple[NodeExecutionRecord, ...]
+    node_history: tuple[NodeExecutionRecord, ...]
     claims: tuple[Identifier, ...]
+    reservations: tuple[NodeReservationRecord, ...]
+    routes: tuple[NodeRouteRecord, ...]
+    results: tuple[WorkerResult, ...]
+    evidence: tuple[NodeEvidenceRecord, ...]
+    evaluator_decisions: tuple[NodeEvaluatorRecord, ...]
+    controls: tuple[GraphControlFact, ...]
+    stale_results: tuple[StaleNodeResultRecord, ...]
     route_count: int
     worker_result_count: int
     evidence_count: int
@@ -234,11 +350,17 @@ class TaskOrchestrator:
         *,
         max_concurrency: int = 2,
         routing_mode: RoutingMode = RoutingMode.ADAPTIVE,
+        fixed_strategy_id: Identifier | None = None,
         allowed_strategy_ids: Iterable[str] = (),
         allowed_backends: Iterable[str] = (),
         local_backend_allowed: bool = False,
         bounded_graph_execution: bool = False,
         defer_parent_evaluation: bool = False,
+        repository: str | None = None,
+        base_commit: str | None = None,
+        operator_config_digest: Digest | None = None,
+        operator_config_path: str | None = None,
+        strategy_set: Identifier | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
@@ -249,6 +371,7 @@ class TaskOrchestrator:
             raise ValueError("at least one explicitly configured strategy is required")
         self.max_concurrency = max_concurrency
         self.routing_mode = routing_mode
+        self.fixed_strategy_id = fixed_strategy_id
         self.allowed_strategy_ids = tuple(allowed_strategy_ids) or tuple(
             item.id for item in self.strategies
         )
@@ -260,6 +383,11 @@ class TaskOrchestrator:
             raise ValueError("bounded graph execution must defer unavailable parent evaluation")
         self.bounded_graph_execution = bounded_graph_execution
         self.defer_parent_evaluation = defer_parent_evaluation
+        self.repository = repository
+        self.base_commit = base_commit
+        self.operator_config_digest = operator_config_digest
+        self.operator_config_path = operator_config_path
+        self.strategy_set = strategy_set
 
     def run(
         self,
@@ -272,7 +400,14 @@ class TaskOrchestrator:
         run_id: Identifier,
         available_capabilities: Iterable[str],
         plan_only: bool = False,
+        resume: bool = False,
+        replan: bool = False,
     ) -> GraphRunRecord:
+        if (resume or replan) and plan_only:
+            raise ValueError("a resumed graph must execute")
+        if resume and replan:
+            raise ValueError("resume and replan are mutually exclusive")
+        capabilities = tuple(available_capabilities)
         if isinstance(proposed_graph, ProposedGraph):
             proposal: ProposedGraph | None = proposed_graph
             candidate: Graph = proposed_graph.graph
@@ -290,37 +425,213 @@ class TaskOrchestrator:
             or proposal.harness_digest != harness_digest
         ):
             raise ValueError("ProposedGraph provenance does not match this run")
-        accepted = accept_task_graph(
+        if replan and proposal is None:
+            raise ValueError("replan requires an already-produced strict ProposedGraph")
+        previous_acceptance: TaskGraphAcceptance | None = None
+        previous_revision: AcceptedGraphRevision | None = None
+        if replan:
+            prior_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            acceptances = self.store.list_records(
+                "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+            )
+            acceptances = _ordered_revision_history(acceptances)
+            if not acceptances:
+                raise ValueError("replan requires an accepted revision")
+            _validate_revision_history(acceptances)
+            previous_acceptance = acceptances[-1]
+            previous_revision = previous_acceptance.accepted_revision
+            if (
+                prior_run.status not in {"failed", "paused"}
+                or prior_run.goal != goal
+                or prior_run.execution_policy != policy
+                or prior_run.harness_digest != harness_digest
+                or prior_run.effective_policy_digest != effective_policy_digest
+                or prior_run.available_capabilities != capabilities
+                or prior_run.execution_strategies != self.strategies
+                or prior_run.routing_mode is not self.routing_mode
+                or prior_run.fixed_strategy_id != self.fixed_strategy_id
+                or prior_run.allowed_strategy_ids != self.allowed_strategy_ids
+                or prior_run.allowed_backends != self.allowed_backends
+                or prior_run.local_backend_allowed != self.local_backend_allowed
+                or prior_run.max_concurrency != self.max_concurrency
+                or prior_run.repository != self.repository
+                or prior_run.base_commit != self.base_commit
+                or prior_run.operator_config_digest != self.operator_config_digest
+                or prior_run.operator_config_path != self.operator_config_path
+                or prior_run.strategy_set != self.strategy_set
+                or prior_run.replan_count >= prior_run.max_replans
+                or proposal is None
+                or proposal.previous_accepted_revision_digest
+                != previous_revision.content_digest
+                or not proposal.replan_trigger
+                or not proposal.replan_evidence
+                or len(proposal.replan_evidence) != len(set(proposal.replan_evidence))
+                or candidate.budget.max_replans > prior_run.max_replans
+                or candidate.budget.max_attempts > prior_run.max_claims
+                or candidate.budget.max_worker_turns > prior_run.max_worker_turns
+                or candidate.budget.max_processes > prior_run.max_processes
+                or candidate.budget.max_wall_seconds > prior_run.max_wall_seconds
+                or candidate.budget.max_artifact_bytes > prior_run.max_artifact_bytes
+            ):
+                raise ValueError("replan authority, ancestry, or budget is invalid")
+            authoritative_evidence = _authoritative_replan_evidence(
+                self.store,
+                run_id,
+                _required_digest(previous_revision.content_digest),
+            )
+            if not set(proposal.replan_evidence) <= authoritative_evidence:
+                raise ValueError("replan evidence is not authoritative for the previous revision")
+        validated = accept_task_graph(
             candidate,
             policy,
-            available_capabilities=available_capabilities,
+            previous=previous_revision,
+            available_capabilities=capabilities,
         )
-        if proposal is not None:
+        if resume:
+            graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            acceptances = self.store.list_records(
+                "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+            )
+            if (
+                graph_run.status != "paused"
+                or graph_run.goal_id != goal.id
+                or graph_run.goal != goal
+                or graph_run.execution_policy != policy
+                or graph_run.harness_digest != harness_digest
+                or graph_run.effective_policy_digest != effective_policy_digest
+                or graph_run.available_capabilities != capabilities
+                or graph_run.execution_strategies != self.strategies
+                or graph_run.routing_mode is not self.routing_mode
+                or graph_run.fixed_strategy_id != self.fixed_strategy_id
+                or graph_run.allowed_strategy_ids != self.allowed_strategy_ids
+                or graph_run.allowed_backends != self.allowed_backends
+                or graph_run.local_backend_allowed != self.local_backend_allowed
+                or graph_run.repository != self.repository
+                or graph_run.base_commit != self.base_commit
+                or graph_run.operator_config_digest != self.operator_config_digest
+                or graph_run.operator_config_path != self.operator_config_path
+                or graph_run.strategy_set != self.strategy_set
+                or not acceptances
+                or validated.content_digest != graph_run.accepted_graph_revision_digest
+                or acceptances[-1].accepted_revision.content_digest
+                != graph_run.accepted_graph_revision_digest
+            ):
+                raise ValueError("only the authoritative paused accepted graph can resume")
+            acceptance = acceptances[-1]
+            accepted = acceptance.accepted_revision
+            graph_digest = _required_digest(accepted.content_digest)
+            graph_run = graph_run.model_copy(
+                update={
+                    "status": "running",
+                    "generation": graph_run.generation + 1,
+                    "failure_code": None,
+                }
+            )
+            self.store.clear_control(run_id)
+            self.store.put(
+                "graph_control_fact_v2",
+                GraphControlFact(
+                    id=identifier("graph-control"),
+                    run_id=run_id,
+                    created_at=now(),
+                    action="resume",
+                    generation=graph_run.generation,
+                ),
+                run_id=run_id,
+            )
+            self._save_run(graph_run)
+        elif replan:
+            assert proposal is not None and previous_acceptance is not None
+            accepted = validated
+            graph_digest = _required_digest(accepted.content_digest)
             self.store.put("proposed_graph_v2", proposal, run_id=run_id)
-        acceptance = TaskGraphAcceptance(
-            id=identifier("graph-acceptance"),
-            run_id=run_id,
-            created_at=now(),
-            accepted_revision=accepted,
-            effective_policy_digest=effective_policy_digest,
-            harness_digest=harness_digest,
-            proposed_graph_digest=(None if proposal is None else proposal.content_digest),
-        )
-        graph_digest = _required_digest(accepted.content_digest)
-        self.store.save_graph(run_id, accepted)
-        self.store.put("task_graph_acceptance_v2", acceptance, run_id=run_id)
-        max_claims = min(candidate.budget.max_attempts, policy.max_attempts)
-        graph_run = GraphRunRecord(
-            id=run_id,
-            goal_id=goal.id,
-            accepted_graph_revision_digest=graph_digest,
-            status="planned" if plan_only else "running",
-            max_concurrency=self.max_concurrency,
-            max_claims=max_claims,
-        )
-        self._save_run(graph_run)
-
-        nodes = {node.id: node for node in candidate.nodes}
+            acceptance = TaskGraphAcceptance(
+                id=identifier("graph-acceptance"),
+                run_id=run_id,
+                created_at=now(),
+                accepted_revision=accepted,
+                effective_policy_digest=effective_policy_digest,
+                harness_digest=harness_digest,
+                previous_revision_digest=previous_acceptance.accepted_revision.content_digest,
+                proposed_graph_digest=proposal.content_digest,
+                replan_trigger=proposal.replan_trigger,
+                replan_evidence=proposal.replan_evidence,
+            )
+            self.store.save_graph(run_id, accepted)
+            self.store.put("task_graph_acceptance_v2", acceptance, run_id=run_id)
+            graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord).model_copy(
+                update={
+                    "accepted_graph_revision_digest": graph_digest,
+                    "status": "running",
+                    "generation": self.store.get(
+                        "graph_run_v2", run_id, GraphRunRecord
+                    ).generation + 1,
+                    "replan_count": self.store.get(
+                        "graph_run_v2", run_id, GraphRunRecord
+                    ).replan_count + 1,
+                    "failure_code": None,
+                    "goal_evaluator_digest": None,
+                    "composition_id": None,
+                    "composition_digest": None,
+                    "parent_candidate_artifact_id": None,
+                    "parent_candidate_digest": None,
+                    "parent_evaluation_id": None,
+                    "parent_evaluation_digest": None,
+                    "promotion_approval_id": None,
+                    "promotion_approval_request_digest": None,
+                }
+            )
+            self.store.clear_control(run_id)
+            self._save_run(graph_run)
+        else:
+            accepted = validated
+            if proposal is not None:
+                self.store.put("proposed_graph_v2", proposal, run_id=run_id)
+            acceptance = TaskGraphAcceptance(
+                id=identifier("graph-acceptance"),
+                run_id=run_id,
+                created_at=now(),
+                accepted_revision=accepted,
+                effective_policy_digest=effective_policy_digest,
+                harness_digest=harness_digest,
+                proposed_graph_digest=None if proposal is None else proposal.content_digest,
+            )
+            graph_digest = _required_digest(accepted.content_digest)
+            self.store.save_graph(run_id, accepted)
+            self.store.put("task_graph_acceptance_v2", acceptance, run_id=run_id)
+            max_claims = min(candidate.budget.max_attempts, policy.max_attempts)
+            graph_run = GraphRunRecord(
+                id=run_id,
+                goal_id=goal.id,
+                goal=goal,
+                execution_policy=policy,
+                accepted_graph_revision_digest=graph_digest,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                available_capabilities=capabilities,
+                execution_strategies=self.strategies,
+                routing_mode=self.routing_mode,
+                fixed_strategy_id=self.fixed_strategy_id,
+                allowed_strategy_ids=self.allowed_strategy_ids,
+                allowed_backends=self.allowed_backends,
+                local_backend_allowed=self.local_backend_allowed,
+                status="planned" if plan_only else "running",
+                max_concurrency=self.max_concurrency,
+                max_claims=max_claims,
+                max_replans=candidate.budget.max_replans,
+                max_worker_turns=candidate.budget.max_worker_turns,
+                max_processes=candidate.budget.max_processes,
+                max_wall_seconds=candidate.budget.max_wall_seconds,
+                max_artifact_bytes=candidate.budget.max_artifact_bytes,
+                repository=self.repository,
+                base_commit=self.base_commit,
+                operator_config_digest=self.operator_config_digest,
+                operator_config_path=self.operator_config_path,
+                strategy_set=self.strategy_set,
+            )
+            self._save_run(graph_run)
+        max_claims = graph_run.max_claims
+        nodes = {node.id: node for node in accepted.graph.nodes}
         predecessors: dict[str, tuple[str, ...]] = {}
         inbound: dict[str, list[str]] = defaultdict(list)
         for edge in candidate.edges:
@@ -328,20 +639,107 @@ class TaskOrchestrator:
         for node_id in nodes:
             predecessors[node_id] = tuple(sorted(inbound[node_id]))
 
-        records = {
-            node.id: NodeExecutionRecord(
-                id=identifier("node-execution"),
-                run_id=run_id,
-                created_at=now(),
-                node_id=node.id,
-                accepted_graph_revision_digest=graph_digest,
-                generation=node.generation,
-                attempt=node.attempt,
-                sequence=0,
-                status="pending",
+        if resume or replan:
+            history = self.store.list_records(
+                "node_execution_v2", NodeExecutionRecord, run_id=run_id
             )
-            for node in candidate.nodes
-        }
+            previous: dict[str, NodeExecutionRecord] = {}
+            for item in history:
+                prior = previous.get(item.node_id)
+                if prior is None or (item.generation, item.attempt, item.sequence) > (
+                    prior.generation,
+                    prior.attempt,
+                    prior.sequence,
+                ):
+                    previous[item.node_id] = item
+            records = {}
+            for node_id in sorted(nodes):
+                prior = previous.get(node_id)
+                previous_nodes = (
+                    {}
+                    if previous_revision is None
+                    else {item.id: item for item in previous_revision.graph.nodes}
+                )
+                previous_node = previous_nodes.get(node_id)
+                if (
+                    replan
+                    and previous_revision is not None
+                    and previous_node is not None
+                    and prior is not None
+                    and prior.status == "passed"
+                    and prior.accepted_graph_revision_digest == previous_revision.content_digest
+                    and _node_contract(previous_node) == _node_contract(nodes[node_id])
+                    and "edit_intent" not in nodes[node_id].required_capabilities
+                ):
+                    _validate_retained_node(self.store, prior)
+                    retained = prior.model_copy(
+                        update={
+                            "id": identifier("node-execution"),
+                            "created_at": now(),
+                            "accepted_graph_revision_digest": graph_digest,
+                            "generation": graph_run.generation,
+                            "sequence": 0,
+                            "retained_from_revision_digest": (
+                                prior.retained_from_revision_digest
+                                or prior.accepted_graph_revision_digest
+                            ),
+                            "content_digest": None,
+                        }
+                    )
+                    records[node_id] = retained
+                    binding = RetainedNodeBinding(
+                        id=identifier("retained-node"),
+                        run_id=run_id,
+                        created_at=now(),
+                        node_id=node_id,
+                        previous_revision_digest=prior.accepted_graph_revision_digest,
+                        accepted_graph_revision_digest=graph_digest,
+                        previous_generation=prior.generation,
+                        generation=graph_run.generation,
+                        node_contract_digest=_node_contract(nodes[node_id]),
+                        node_execution_digest=_required_digest(prior.content_digest),
+                    )
+                    self.store.put("retained_node_binding_v2", binding, run_id=run_id)
+                    continue
+                if replan:
+                    records[node_id] = NodeExecutionRecord(
+                        id=identifier("node-execution"), run_id=run_id, created_at=now(),
+                        node_id=node_id, accepted_graph_revision_digest=graph_digest,
+                        generation=graph_run.generation, attempt=0, sequence=0, status="pending",
+                    )
+                    continue
+                assert prior is not None
+                resumable = prior.status in {"pending", "blocked"}
+                records[node_id] = prior.model_copy(
+                    update={
+                        "id": identifier("node-execution"),
+                        "created_at": now(),
+                        "generation": graph_run.generation,
+                        "sequence": 0,
+                        "status": "pending" if resumable else prior.status,
+                        "route_digest": None if resumable else prior.route_digest,
+                        "worker_request_digest": (
+                            None if resumable else prior.worker_request_digest
+                        ),
+                        "failure_code": None if resumable else prior.failure_code,
+                        "content_digest": None,
+                    }
+                )
+        else:
+            records = {
+                node.id: NodeExecutionRecord(
+                    id=identifier("node-execution"),
+                    run_id=run_id,
+                    created_at=now(),
+                    node_id=node.id,
+                    accepted_graph_revision_digest=graph_digest,
+                    generation=graph_run.generation,
+                    attempt=0,
+                    sequence=0,
+                    status="pending",
+                )
+                for node in nodes.values()
+            }
         for record in records.values():
             self._save_node(record)
         if plan_only:
@@ -358,18 +756,53 @@ class TaskOrchestrator:
             return graph_run
 
         evidence_by_node: dict[str, NodeEvidenceRecord] = {}
-        active: dict[Future[NodeExecutionResult], tuple[str, WorkerRequest]] = {}
+        if resume or replan:
+            for node_id, record in records.items():
+                if record.status == "passed" and record.evidence_id is not None:
+                    evidence_by_node[node_id] = self.store.get(
+                "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
+                    )
+        active: dict[
+            Future[NodeExecutionResult],
+            tuple[str, Node, WorkerRequest, NodeReservationRecord],
+        ] = {}
+        stop_action: Literal["pause", "cancel"] | None = None
+        limits: dict[str, int | float] = {
+            "worker_turns": graph_run.max_worker_turns,
+            "processes": graph_run.max_processes,
+            "wall_seconds": graph_run.max_wall_seconds,
+            "artifact_bytes": graph_run.max_artifact_bytes,
+        }
         with ThreadPoolExecutor(
             max_workers=self.max_concurrency,
             thread_name_prefix=f"fleet-{run_id[:24]}",
         ) as pool:
             while active or any(item.status == "pending" for item in records.values()):
+                if stop_action is None:
+                    observed = self.store.control(run_id)
+                    if observed == "pause" or observed == "cancel":
+                        stop_action = cast(Literal["pause", "cancel"], observed)
+                        if stop_action == "cancel":
+                            graph_run = self.store.get(
+                                "graph_run_v2", run_id, GraphRunRecord
+                            )
+                        self.store.put(
+                            "graph_control_fact_v2",
+                            GraphControlFact(
+                                id=identifier("graph-control"),
+                                run_id=run_id,
+                                created_at=now(),
+                                action=stop_action,
+                                generation=graph_run.generation,
+                            ),
+                            run_id=run_id,
+                        )
                 for node_id in sorted(nodes):
                     record = records[node_id]
                     if record.status != "pending":
                         continue
                     if any(
-                        records[parent].status in {"failed", "blocked"}
+                        records[parent].status in {"failed", "blocked", "cancelled"}
                         for parent in predecessors[node_id]
                     ):
                         records[node_id] = self._advance(
@@ -378,7 +811,34 @@ class TaskOrchestrator:
                             failure_code="PREDECESSOR_NOT_PASS",
                         )
 
-                ready = [
+                if stop_action is not None and not active:
+                    if stop_action == "cancel":
+                        for node_id in sorted(nodes):
+                            if records[node_id].status in {
+                                "pending",
+                                "routed",
+                                "running",
+                                "blocked",
+                            }:
+                                records[node_id] = self._advance(
+                                    records[node_id],
+                                    status="cancelled",
+                                    failure_code="GRAPH_CANCELLED",
+                                )
+                    if stop_action == "pause":
+                        graph_run = graph_run.model_copy(
+                            update={
+                                "status": "paused",
+                                "failure_code": "GRAPH_PAUSED",
+                            }
+                        )
+                        self._save_run(graph_run)
+                    else:
+                        graph_run = self.store.get(
+                            "graph_run_v2", run_id, GraphRunRecord
+                        )
+                    return graph_run
+                ready = [] if stop_action is not None else [
                     node_id
                     for node_id in sorted(nodes)
                     if records[node_id].status == "pending"
@@ -386,7 +846,14 @@ class TaskOrchestrator:
                 ]
                 while ready and len(active) < self.max_concurrency:
                     node_id = ready.pop(0)
-                    node = nodes[node_id]
+                    base_node = nodes[node_id]
+                    record = records[node_id]
+                    node = base_node.model_copy(
+                        update={
+                            "generation": graph_run.generation,
+                            "attempt": record.attempt,
+                        }
+                    )
                     try:
                         route = self._route(
                             run_id,
@@ -408,28 +875,66 @@ class TaskOrchestrator:
                         status="routed",
                         route_digest=route.content_digest,
                     )
-                    if not self.store.claim_graph_node(
+                    def create_reservation(
+                        remaining: dict[str, int | float],
+                        bound_node: Node = node,
+                    ) -> BaseModel:
+                        return NodeReservationRecord(
+                            id=identifier("node-reservation"),
+                            run_id=run_id,
+                            created_at=now(),
+                            node_id=bound_node.id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=bound_node.generation,
+                            attempt=bound_node.attempt,
+                            requested=freeze_json(
+                                {
+                                    "worker_turns": bound_node.resource_budget.worker_turns,
+                                    "processes": bound_node.resource_budget.processes,
+                                    "wall_seconds": bound_node.resource_budget.wall_seconds,
+                                    "artifact_bytes": bound_node.resource_budget.artifact_bytes,
+                                    "node_attempts": 1,
+                                }
+                            ),
+                            remaining_budgets=freeze_json(remaining),
+                        )
+
+                    reservation = self.store.reserve_graph_node(
                         run_id,
                         node_id,
+                        node.generation,
+                        node.attempt,
                         max_claims=max_claims,
-                    ):
+                        worker_turns=node.resource_budget.worker_turns,
+                        processes=node.resource_budget.processes,
+                        wall_seconds=node.resource_budget.wall_seconds,
+                        artifact_bytes=node.resource_budget.artifact_bytes,
+                        limits=limits,
+                        record_factory=create_reservation,
+                    )
+                    if reservation is None:
                         records[node_id] = self._advance(
                             records[node_id],
                             status="failed",
                             failure_code="DUPLICATE_OR_BUDGETED_CLAIM",
                         )
                         continue
+                    reservation = cast(NodeReservationRecord, reservation)
+                    predecessor_outputs = self._predecessor_outputs(
+                        tuple(records[parent] for parent in predecessors[node_id]),
+                        graph_digest,
+                        graph_run.generation,
+                    )
                     prior_results = tuple(
-                        _required_digest(records[parent].worker_result_digest)
-                        for parent in predecessors[node_id]
+                        item.worker_result_digest for item in predecessor_outputs
                     )
                     prior_artifacts = tuple(
-                        digest
-                        for parent in predecessors[node_id]
-                        if (digest := records[parent].patch_digest) is not None
+                        artifact.artifact_digest
+                        for item in predecessor_outputs
+                        for artifact in item.artifact_descriptors
                     )
-                    if self.bounded_graph_execution and len(prior_artifacts) != len(
-                        predecessors[node_id]
+                    if self.bounded_graph_execution and any(
+                        not item.artifact_descriptors for item in predecessor_outputs
                     ):
                         records[node_id] = self._advance(
                             records[node_id],
@@ -450,15 +955,10 @@ class TaskOrchestrator:
                         attempt=node.attempt,
                         harness_digest=harness_digest,
                         effective_policy_digest=effective_policy_digest,
-                        remaining_budgets=freeze_json(
-                            {
-                                "worker_turns": 1,
-                                "aggregate_claims": max_claims
-                                - len(self.store.graph_claims(run_id)),
-                            }
-                        ),
+                        remaining_budgets=reservation.remaining_budgets,
                         prior_result_digests=prior_results,
                         prior_artifact_digests=prior_artifacts,
+                        predecessor_outputs=predecessor_outputs,
                     )
                     self.store.put("worker_request_v2", request, run_id=run_id)
                     records[node_id] = self._advance(
@@ -467,7 +967,7 @@ class TaskOrchestrator:
                         worker_request_digest=request.content_digest,
                     )
                     future = pool.submit(self.runner, node, request, route.selected_strategy)
-                    active[future] = (node_id, request)
+                    active[future] = (node_id, node, request, reservation)
 
                 if not active:
                     if any(item.status == "pending" for item in records.values()):
@@ -481,8 +981,7 @@ class TaskOrchestrator:
                     continue
                 completed, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
                 for future in sorted(completed, key=lambda item: active[item][0]):
-                    node_id, request = active.pop(future)
-                    node = nodes[node_id]
+                    node_id, node, request, reservation = active.pop(future)
                     try:
                         result = future.result()
                         self._persist_result(
@@ -493,19 +992,68 @@ class TaskOrchestrator:
                             evidence_by_node,
                             graph_digest,
                         )
+                        if stop_action == "cancel":
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="cancelled",
+                                failure_code="GRAPH_CANCELLED",
+                            )
                     except Exception as error:
-                        records[node_id] = self._advance(
-                            records[node_id],
-                            status="failed",
-                            failure_code=f"WORKER_BOUNDARY:{type(error).__name__}",
+                        if stop_action == "cancel":
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="cancelled",
+                                failure_code="GRAPH_CANCELLED",
+                            )
+                            continue
+                        remaining = cast(
+                            Mapping[str, int | float], reservation.remaining_budgets
                         )
+                        retry_cap = min(
+                            nodes[node_id].retry_limit,
+                            accepted.graph.budget.max_retries,
+                        )
+                        retry_resources_available = (
+                            int(remaining["node_attempts"]) > 0
+                            and int(remaining["worker_turns"])
+                            >= node.resource_budget.worker_turns
+                            and int(remaining["processes"])
+                            >= node.resource_budget.processes
+                            and float(remaining["wall_seconds"])
+                            >= node.resource_budget.wall_seconds
+                            and int(remaining["artifact_bytes"])
+                            >= node.resource_budget.artifact_bytes
+                        )
+                        if records[node_id].attempt < retry_cap and retry_resources_available:
+                            records[node_id] = NodeExecutionRecord(
+                                id=identifier("node-execution"),
+                                run_id=run_id,
+                                created_at=now(),
+                                node_id=node_id,
+                                accepted_graph_revision_digest=graph_digest,
+                                generation=graph_run.generation,
+                                attempt=records[node_id].attempt + 1,
+                                sequence=0,
+                                status="pending",
+                                failure_code=f"RETRY_AFTER:{type(error).__name__}",
+                            )
+                            self._save_node(records[node_id])
+                        else:
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="failed",
+                                failure_code=f"WORKER_BOUNDARY:{type(error).__name__}",
+                            )
 
+        authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+        if authoritative.generation != graph_run.generation:
+            return authoritative
         node_pass = all(item.status == "passed" for item in records.values())
-        if self.defer_parent_evaluation:
+        writing_graph = any("edit_intent" in node.required_capabilities for node in nodes.values())
+        if self.defer_parent_evaluation and writing_graph:
             graph_run = graph_run.model_copy(
                 update={
                     "status": "failed",
-                    "generation": graph_run.generation + 1,
                     "failure_code": (
                         "PARENT_EVALUATION_UNAVAILABLE" if node_pass else "NODE_EXECUTION_FAILED"
                     ),
@@ -515,7 +1063,14 @@ class TaskOrchestrator:
             return graph_run
 
         all_evidence = tuple(evidence_by_node[node_id] for node_id in sorted(evidence_by_node))
+        all_artifacts = tuple(
+            artifact for record in records.values() for artifact in record.artifact_descriptors
+        )
         goal_decision = (
+            _evaluate_goal_criteria(goal.completion_criteria, all_evidence, all_artifacts)
+            if node_pass
+            else EvaluationDecision.FAIL
+        ) if goal.completion_criteria else (
             _evaluate_criteria(
                 goal.completion_criteria,
                 tuple(item for record in all_evidence for item in record.criteria),
@@ -530,6 +1085,10 @@ class TaskOrchestrator:
             goal_id=goal.id,
             accepted_graph_revision_digest=graph_digest,
             evidence_digests=tuple(_required_digest(item.content_digest) for item in all_evidence),
+            artifact_descriptor_digests=tuple(
+                _required_digest(item.content_digest) for item in all_artifacts
+            ),
+            artifact_content_digests=tuple(item.artifact_digest for item in all_artifacts),
             decision=goal_decision,
         )
         self.store.put("goal_evaluator_v2", goal_evaluation, run_id=run_id)
@@ -540,7 +1099,6 @@ class TaskOrchestrator:
         graph_run = graph_run.model_copy(
             update={
                 "status": "completed" if completed_ok else "failed",
-                "generation": graph_run.generation + 1,
                 "goal_evaluator_digest": goal_evaluation.content_digest,
                 "failure_code": None if completed_ok else "GOAL_OR_NODE_EVALUATION_FAILED",
             }
@@ -552,22 +1110,107 @@ class TaskOrchestrator:
         """Reconstruct accepted orchestration facts without workers or services."""
 
         run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
-        acceptance = self.store.list_records(
+        acceptances = self.store.list_records(
             "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
-        )[-1]
+        )
+        acceptances = _ordered_revision_history(acceptances)
+        acceptance = acceptances[-1]
         history = self.store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run_id)
         latest: dict[str, NodeExecutionRecord] = {}
         for record in history:
-            if record.node_id not in latest or latest[record.node_id].sequence < record.sequence:
+            previous = latest.get(record.node_id)
+            if previous is None or (record.generation, record.attempt, record.sequence) > (
+                previous.generation,
+                previous.attempt,
+                previous.sequence,
+            ):
                 latest[record.node_id] = record
+        routes = tuple(
+            sorted(
+                self.store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id),
+                key=lambda item: (
+                    item.generation,
+                    item.attempt,
+                    item.node_id,
+                    item.created_at,
+                ),
+            )
+        )
+        reservations = tuple(
+            sorted(
+                self.store.list_records(
+                    "node_reservation_v2", NodeReservationRecord, run_id=run_id
+                ),
+                key=lambda item: (
+                    item.generation,
+                    item.attempt,
+                    item.node_id,
+                    item.created_at,
+                ),
+            )
+        )
+        evidence = {
+            item.evidence_id: self.store.get(
+                "node_evidence_v2", item.evidence_id, NodeEvidenceRecord
+            )
+            for item in history
+            if item.evidence_id is not None
+        }
+        evaluators = {
+            item.evaluator_id: self.store.get(
+                "node_evaluator_v2", item.evaluator_id, NodeEvaluatorRecord
+            )
+            for item in history
+            if item.evaluator_id is not None
+        }
+        results = {
+            item.worker_result_id: self.store.get(
+                "worker_result_v2", item.worker_result_id, WorkerResult
+            )
+            for item in history
+            if item.worker_result_id is not None
+        }
         return GraphReplay(
             run=run,
             acceptance=acceptance,
-            nodes=tuple(latest[node_id] for node_id in sorted(latest)),
-            claims=self.store.graph_claims(run_id),
-            route_count=len(
-                self.store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
+            revision_history=acceptances,
+            retained_node_bindings=tuple(
+                sorted(
+                    self.store.list_records(
+                        "retained_node_binding_v2", RetainedNodeBinding, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.node_id),
+                )
             ),
+            nodes=tuple(latest[node_id] for node_id in sorted(latest)),
+            node_history=history,
+            claims=self.store.graph_claims(run_id),
+            reservations=reservations,
+            routes=routes,
+            results=tuple(results.values()),
+            evidence=tuple(evidence.values()),
+            evaluator_decisions=tuple(evaluators.values()),
+            controls=tuple(
+                sorted(
+                    self.store.list_records(
+                        "graph_control_fact_v2", GraphControlFact, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.created_at, item.id),
+                )
+            ),
+            stale_results=tuple(
+                sorted(
+                    self.store.list_records(
+                        "stale_node_result_v2", StaleNodeResultRecord, run_id=run_id
+                    ),
+                    key=lambda item: (
+                        item.authoritative_generation,
+                        item.node_id,
+                        item.attempt,
+                    ),
+                )
+            ),
+            route_count=len(routes),
             worker_result_count=sum(
                 item.worker_result_digest is not None for item in latest.values()
             ),
@@ -610,6 +1253,7 @@ class TaskOrchestrator:
             mode=self.routing_mode,
             required_capabilities=node.required_capabilities,
             strategy_capabilities={item.id: item.capabilities for item in eligible},
+            fixed_strategy_id=self.fixed_strategy_id,
             assessment=assessment,
             allowed_strategy_ids=tuple(item.id for item in eligible),
             allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible)),
@@ -641,11 +1285,64 @@ class TaskOrchestrator:
     ) -> None:
         worker_result = result.worker_result
         patch = result.node_patch
+        authoritative = self.store.get(
+            "graph_run_v2", request.graph_run_id or "", GraphRunRecord
+        )
+        if (
+            authoritative.generation != request.generation
+            or authoritative.accepted_graph_revision_digest != graph_digest
+        ):
+            self.store.put(
+                "stale_node_result_v2",
+                StaleNodeResultRecord(
+                    id=identifier("stale-node-result"),
+                    run_id=request.graph_run_id or request.run_id,
+                    created_at=now(),
+                    node_id=node.id,
+                    accepted_graph_revision_digest=graph_digest,
+                    result_generation=request.generation,
+                    authoritative_generation=authoritative.generation,
+                    attempt=request.attempt,
+                    worker_request_digest=_required_digest(request.content_digest),
+                    worker_result_digest=_required_digest(worker_result.content_digest),
+                ),
+                run_id=request.graph_run_id or request.run_id,
+            )
+            return
         if worker_result.run_id != request.run_id:
             raise ValueError("worker result belongs to another run")
         if worker_result.request_digest != request.content_digest:
             raise ValueError("worker result is not bound to its node request")
+        if self.bounded_graph_execution:
+            if not result.artifact_descriptors:
+                raise ValueError("bounded node result has no authoritative artifact descriptor")
+            for descriptor in result.artifact_descriptors:
+                try:
+                    persisted = self.store.get(
+                        "artifact_descriptor_v2", descriptor.id, ArtifactDescriptor
+                    )
+                except KeyError:
+                    raise ValueError(
+                        "node artifact descriptor is absent or stale"
+                    ) from None
+                if (
+                    persisted != descriptor
+                    or descriptor.run_id != request.run_id
+                    or descriptor.content_digest is None
+                ):
+                    raise ValueError("node artifact descriptor is absent or stale")
         self.store.put("worker_result_v2", worker_result, run_id=request.run_id)
+        if patch is not None:
+            self.store.put(
+                "node_patch_v2",
+                NodePatchRecord(
+                    id=identifier("node-patch"),
+                    run_id=request.graph_run_id or request.run_id,
+                    created_at=now(),
+                    node_patch=patch,
+                ),
+                run_id=request.graph_run_id,
+            )
         evidence = NodeEvidenceRecord(
             id=identifier("node-evidence"),
             run_id=request.run_id,
@@ -659,7 +1356,11 @@ class TaskOrchestrator:
         self.store.put("node_evidence_v2", evidence, run_id=request.run_id)
         evidence_by_node[node.id] = evidence
         decision = (
-            _evaluate_criteria(node.completion_criteria, result.criterion_evidence)
+            _evaluate_node_criteria(
+                node.completion_criteria,
+                result.criterion_evidence,
+                result.artifact_descriptors,
+            )
             if worker_result.status == "succeeded"
             else EvaluationDecision.FAIL
         )
@@ -679,8 +1380,12 @@ class TaskOrchestrator:
         records[node.id] = self._advance(
             records[node.id],
             status="passed" if decision is EvaluationDecision.PASS else "failed",
+            output_generation=node.generation,
+            worker_result_id=worker_result.id,
             worker_result_digest=worker_result.content_digest,
+            evidence_id=evidence.id,
             evidence_digest=evidence.content_digest,
+            evaluator_id=evaluation.id,
             evaluator_digest=evaluation.content_digest,
             evaluator_decision=decision,
             failure_code=(
@@ -696,7 +1401,78 @@ class TaskOrchestrator:
             verification_result_digests=(
                 () if patch is None else patch.verification_result_digests
             ),
+            artifact_descriptors=result.artifact_descriptors,
         )
+
+    def _predecessor_outputs(
+        self,
+        predecessors: tuple[NodeExecutionRecord, ...],
+        graph_digest: Digest,
+        generation: int,
+    ) -> tuple[PredecessorOutputReference, ...]:
+        bindings: list[PredecessorOutputReference] = []
+        for record in predecessors:
+            if (
+                record.status != "passed"
+                or record.generation != generation
+                or record.accepted_graph_revision_digest != graph_digest
+                or record.output_generation is None
+                or record.worker_result_id is None
+                or record.worker_result_digest is None
+                or record.evaluator_id is None
+                or record.evaluator_digest is None
+                or record.evaluator_decision is not EvaluationDecision.PASS
+            ):
+                raise ValueError(
+                    "predecessor is not an authoritative current-generation PASS"
+                )
+            worker_result = self.store.get(
+                "worker_result_v2", record.worker_result_id, WorkerResult
+            )
+            evaluator = self.store.get(
+                "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
+            )
+            if (
+                worker_result.content_digest != record.worker_result_digest
+                or evaluator.content_digest != record.evaluator_digest
+                or evaluator.node_id != record.node_id
+                or evaluator.generation != record.output_generation
+                or evaluator.attempt != record.attempt
+                or evaluator.accepted_graph_revision_digest
+                != (record.retained_from_revision_digest or graph_digest)
+                or evaluator.decision is not EvaluationDecision.PASS
+            ):
+                raise ValueError("predecessor result or evaluator binding is stale")
+            artifacts = record.artifact_descriptors
+            for artifact in artifacts:
+                if (
+                    self.store.get(
+                        "artifact_descriptor_v2", artifact.id, ArtifactDescriptor
+                    )
+                    != artifact
+                ):
+                    raise ValueError("predecessor artifact descriptor is stale")
+            references = tuple(_artifact_reference(item) for item in artifacts)
+            bindings.append(
+                PredecessorOutputReference(
+                    node_id=record.node_id,
+                    accepted_graph_revision_digest=graph_digest,
+                    generation=generation,
+                    result_generation=record.output_generation,
+                    attempt=record.attempt,
+                    worker_result_id=worker_result.id,
+                    worker_result_digest=_required_digest(worker_result.content_digest),
+                    artifact_descriptor_id=None if not artifacts else artifacts[0].id,
+                    artifact_descriptor_digest=(
+                        None if not artifacts else artifacts[0].content_digest
+                    ),
+                    artifact_digest=None if not artifacts else artifacts[0].artifact_digest,
+                    artifact_descriptors=references,
+                    evaluator_id=evaluator.id,
+                    evaluator_digest=_required_digest(evaluator.content_digest),
+                )
+            )
+        return tuple(bindings)
 
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
         payload = record.model_dump(mode="python")
@@ -727,8 +1503,149 @@ def _evaluate_criteria(
     if any(item.id not in by_id for item in mandatory):
         return EvaluationDecision.FAIL
     if any(by_id[item.id].disposition != "satisfied" for item in mandatory):
-        return EvaluationDecision.FAIL
+            return EvaluationDecision.FAIL
     return EvaluationDecision.PASS
+
+
+def _ordered_revision_history(
+    acceptances: tuple[TaskGraphAcceptance, ...],
+) -> tuple[TaskGraphAcceptance, ...]:
+    return tuple(
+        sorted(
+            acceptances,
+            key=lambda item: item.accepted_revision.revision_number,
+        )
+    )
+
+
+def _validate_revision_history(acceptances: tuple[TaskGraphAcceptance, ...]) -> None:
+    expected = tuple(range(1, len(acceptances) + 1))
+    actual = tuple(item.accepted_revision.revision_number for item in acceptances)
+    if actual != expected:
+        raise ValueError("accepted revision history is missing, duplicated, or unordered")
+    for index, acceptance in enumerate(acceptances):
+        if index == 0:
+            if acceptance.previous_revision_digest is not None:
+                raise ValueError("initial accepted revision has an ancestor")
+            continue
+        previous = acceptances[index - 1]
+        if (
+            acceptance.previous_revision_digest
+            != previous.accepted_revision.content_digest
+            or acceptance.previous_revision_digest
+            == acceptance.accepted_revision.content_digest
+        ):
+            raise ValueError("accepted revision ancestry is missing or cyclic")
+
+
+def _authoritative_replan_evidence(
+    store: SQLiteStore,
+    run_id: Identifier,
+    previous_revision_digest: Digest,
+) -> set[Digest]:
+    authoritative: set[Digest] = set()
+    records = store.list_records(
+        "node_execution_v2", NodeExecutionRecord, run_id=run_id
+    )
+    for record in records:
+        if record.accepted_graph_revision_digest != previous_revision_digest:
+            continue
+        if record.content_digest is not None:
+            authoritative.add(record.content_digest)
+        if record.evidence_id is not None and record.evidence_digest is not None:
+            evidence = store.get(
+                "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
+            )
+            if (
+                evidence.content_digest == record.evidence_digest
+                and evidence.accepted_graph_revision_digest
+                in {
+                    previous_revision_digest,
+                    record.retained_from_revision_digest,
+                }
+            ):
+                authoritative.add(record.evidence_digest)
+        if record.evaluator_id is not None and record.evaluator_digest is not None:
+            evaluator = store.get(
+                "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
+            )
+            if (
+                evaluator.content_digest == record.evaluator_digest
+                and evaluator.accepted_graph_revision_digest
+                in {
+                    previous_revision_digest,
+                    record.retained_from_revision_digest,
+                }
+            ):
+                authoritative.add(record.evaluator_digest)
+    from .graph_evaluation import ParentCandidateEvaluationRecord
+
+    for evaluation in store.list_records(
+        "parent_candidate_evaluation_v2",
+        ParentCandidateEvaluationRecord,
+        run_id=run_id,
+    ):
+        if (
+            evaluation.accepted_graph_revision_digest == previous_revision_digest
+            and evaluation.content_digest is not None
+        ):
+            authoritative.add(evaluation.content_digest)
+    return authoritative
+
+
+def _validate_retained_node(
+    store: SQLiteStore,
+    record: NodeExecutionRecord,
+) -> None:
+    if (
+        record.content_digest is None
+        or record.worker_result_id is None
+        or record.worker_result_digest is None
+        or record.evidence_id is None
+        or record.evidence_digest is None
+        or record.evaluator_id is None
+        or record.evaluator_digest is None
+        or record.evaluator_decision is not EvaluationDecision.PASS
+    ):
+        raise ValueError("retained PASS node has an incomplete immutable contract")
+    worker_result = store.get(
+        "worker_result_v2", record.worker_result_id, WorkerResult
+    )
+    evidence = store.get(
+        "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
+    )
+    evaluator = store.get(
+        "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
+    )
+    evidence_revision = (
+        record.retained_from_revision_digest
+        or record.accepted_graph_revision_digest
+    )
+    if (
+        worker_result.content_digest != record.worker_result_digest
+        or evidence.content_digest != record.evidence_digest
+        or evidence.node_id != record.node_id
+        or evidence.accepted_graph_revision_digest != evidence_revision
+        or evaluator.content_digest != record.evaluator_digest
+        or evaluator.node_id != record.node_id
+        or evaluator.accepted_graph_revision_digest != evidence_revision
+        or evaluator.worker_result_digest != record.worker_result_digest
+        or evaluator.evidence_digest != record.evidence_digest
+        or evaluator.decision is not EvaluationDecision.PASS
+    ):
+        raise ValueError("retained PASS node contract is stale or tampered")
+    descriptor_ids = tuple(item.id for item in record.artifact_descriptors)
+    if len(descriptor_ids) != len(set(descriptor_ids)):
+        raise ValueError("retained PASS node has duplicate artifact descriptors")
+    for descriptor in record.artifact_descriptors:
+        if (
+            descriptor.content_digest is None
+            or store.get(
+                "artifact_descriptor_v2", descriptor.id, ArtifactDescriptor
+            )
+            != descriptor
+        ):
+            raise ValueError("retained PASS node artifact is stale or tampered")
 
 
 def _required_digest(value: str | None) -> str:
@@ -747,3 +1664,97 @@ def _node_worker_run_id(graph_run_id: str, node: Node) -> str:
         }
     )
     return f"node-{digest[:32]}"
+
+
+def _node_contract(node: Node) -> str:
+    return canonical_digest(
+        {
+            "objective": node.objective,
+            "required_capabilities": node.required_capabilities,
+            "output_contract": node.output_contract,
+            "completion_criteria": node.completion_criteria,
+            "resource_budget": node.resource_budget,
+            "risk": node.risk,
+            "complexity": node.complexity,
+            "scale": node.scale,
+            "retry_limit": node.retry_limit,
+            "max_iterations": node.max_iterations,
+        }
+    )
+
+
+def _artifact_reference(descriptor: ArtifactDescriptor) -> ArtifactDescriptorReference:
+    return ArtifactDescriptorReference(
+        descriptor_id=descriptor.id,
+        descriptor_digest=_required_digest(descriptor.content_digest),
+        artifact_digest=descriptor.artifact_digest,
+        logical_kind=descriptor.logical_kind,
+        media_type=descriptor.media_type,
+        size_bytes=descriptor.size_bytes,
+        producer_action_id=descriptor.producer_action_id,
+    )
+
+
+def _evaluate_node_criteria(
+    criteria: tuple[CompletionCriterion, ...],
+    evidence: tuple[CriterionEvidence, ...],
+    artifacts: tuple[ArtifactDescriptor, ...],
+) -> EvaluationDecision:
+    decision = _evaluate_criteria(criteria, evidence)
+    if decision is not EvaluationDecision.PASS:
+        return decision
+    evidence_by_id = {item.criterion_id: item for item in evidence}
+    artifacts_by_id = {item.id: item for item in artifacts}
+    artifacts_by_kind: dict[str, list[ArtifactDescriptor]] = defaultdict(list)
+    for artifact in artifacts:
+        artifacts_by_kind[artifact.logical_kind].append(artifact)
+    for criterion in criteria:
+        if not criterion.mandatory:
+            continue
+        covered = evidence_by_id[criterion.id]
+        for required in criterion.required_artifact_ids:
+            matching: tuple[ArtifactDescriptor, ...]
+            if required in artifacts_by_id:
+                matching = (artifacts_by_id[required],)
+            else:
+                matching = tuple(artifacts_by_kind[required])
+            if len(matching) != 1:
+                return EvaluationDecision.FAIL
+            descriptor = matching[0]
+            required_refs = {
+                _required_digest(descriptor.content_digest),
+                descriptor.artifact_digest,
+            }
+            if not required_refs <= set(covered.evidence_refs):
+                return EvaluationDecision.FAIL
+    return EvaluationDecision.PASS
+
+
+def _evaluate_goal_criteria(
+    criteria: tuple[CompletionCriterion, ...],
+    evidence: tuple[NodeEvidenceRecord, ...],
+    artifacts: tuple[ArtifactDescriptor, ...],
+) -> EvaluationDecision:
+    node_evidence = {
+        item.criterion_id: item
+        for record in evidence
+        for item in record.criteria
+    }
+    by_id = {item.id: item for item in artifacts}
+    by_kind: dict[str, list[ArtifactDescriptor]] = defaultdict(list)
+    for artifact in artifacts:
+        by_kind[artifact.logical_kind].append(artifact)
+    for criterion in criteria:
+        if not criterion.mandatory:
+            continue
+        if criterion.required_artifact_ids:
+            for required in criterion.required_artifact_ids:
+                if required in by_id:
+                    continue
+                if len(by_kind[required]) != 1:
+                    return EvaluationDecision.FAIL
+            continue
+        covered = node_evidence.get(criterion.id)
+        if covered is None or covered.disposition != "satisfied":
+            return EvaluationDecision.FAIL
+    return EvaluationDecision.PASS

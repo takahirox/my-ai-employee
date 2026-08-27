@@ -9,8 +9,12 @@ from typing import Any
 
 from .domain import ProjectProfile, ProvenancedValue, ProvenanceKind
 from .domain.base import freeze_json
-from .domain.harness import ProjectHarnessV2, project_profile_v1_to_harness
-from .serialization import dumps_yaml, loads_yaml_model
+from .domain.harness import (
+    HarnessEvaluator,
+    ProjectHarnessV2,
+    project_profile_v1_to_harness,
+)
+from .serialization import canonical_digest, dumps_yaml, loads_yaml_model
 
 PROFILE_PATHS = (".fleet/project.yaml", ".fleet/project.yml", ".fleet/project.json")
 CANONICAL_DOCUMENTS = ("AGENTS.md", "CLAUDE.md", "README.md", "CONTRIBUTING.md")
@@ -38,8 +42,10 @@ def discover_project(root: str | Path) -> ProjectProfile | ProjectHarnessV2:
             data = _load_mapping(candidate.read_text(encoding="utf-8"))
             version = data.get("schema_version", "1")
             if version == 2:
-                return ProjectHarnessV2.model_validate_json(
-                    json.dumps(data, ensure_ascii=False), strict=True
+                return _derive_required_process_evaluators(
+                    ProjectHarnessV2.model_validate_json(
+                        json.dumps(data, ensure_ascii=False), strict=True
+                    )
                 )
             if version == "1":
                 return ProjectProfile.model_validate_json(
@@ -56,6 +62,41 @@ def discover_project_harness(root: str | Path) -> ProjectHarnessV2:
     if isinstance(discovered, ProjectHarnessV2):
         return discovered
     return project_profile_v1_to_harness(discovered)
+
+
+def _derive_required_process_evaluators(harness: ProjectHarnessV2) -> ProjectHarnessV2:
+    """Bind legacy required commands to deterministic first-party process evaluators."""
+
+    verification = harness.verification
+    if verification.required_evaluators or not verification.required:
+        return harness
+    existing_ids = {item.id for item in harness.evaluators}
+    derived: list[HarnessEvaluator] = []
+    for command_ref in verification.required:
+        token = canonical_digest(
+            {"provider_id": "process.harness", "command_ref": command_ref}
+        )
+        evaluator_id = f"compat.process.harness.{token}"
+        if evaluator_id in existing_ids:
+            raise ValueError("derived process.harness evaluator ID collides with a declaration")
+        existing_ids.add(evaluator_id)
+        derived.append(
+            HarnessEvaluator(
+                id=evaluator_id,
+                provider_id="process.harness",
+                command_ref=command_ref,
+                criterion_ids=(f"compat.criterion.process.harness.{token}",),
+            )
+        )
+    required_evaluators = tuple(item.id for item in derived)
+    return harness.model_copy(
+        update={
+            "evaluators": (*harness.evaluators, *derived),
+            "verification": verification.model_copy(
+                update={"required_evaluators": required_evaluators}
+            ),
+        }
+    )
 
 
 def migration_candidate(root: str | Path) -> str:

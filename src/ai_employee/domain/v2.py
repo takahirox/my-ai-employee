@@ -252,6 +252,60 @@ class InstallRequest(DigestedRecordV2):
         return value
 
 
+class ArtifactDescriptorReference(SchemaModelV2):
+    """Body-free, digest-complete reference to an authoritative descriptor."""
+
+    schema_name: ClassVar[str] = "artifact_descriptor_reference"
+    descriptor_id: Identifier
+    descriptor_digest: Digest
+    artifact_digest: Digest
+    logical_kind: Identifier
+    media_type: str = Field(min_length=1, max_length=200)
+    size_bytes: int = Field(ge=0)
+    producer_action_id: Identifier
+
+
+class PredecessorOutputReference(SchemaModelV2):
+    """Body-free binding to one exact PASS predecessor output."""
+
+    schema_name: ClassVar[str] = "predecessor_output_reference"
+    node_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    result_generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    worker_result_id: Identifier
+    worker_result_digest: Digest
+    artifact_descriptor_id: Identifier | None = None
+    artifact_descriptor_digest: Digest | None = None
+    artifact_digest: Digest | None = None
+    artifact_descriptors: tuple[ArtifactDescriptorReference, ...] = ()
+    evaluator_id: Identifier
+    evaluator_digest: Digest
+    evaluator_decision: Literal["PASS"] = "PASS"
+
+    @model_validator(mode="after")
+    def _artifact_reference_is_complete(self) -> Self:
+        values = (
+            self.artifact_descriptor_id,
+            self.artifact_descriptor_digest,
+            self.artifact_digest,
+        )
+        if any(value is None for value in values) and any(
+            value is not None for value in values
+        ):
+            raise ValueError("artifact descriptor and content bindings are all-or-none")
+        if self.artifact_descriptors and self.artifact_descriptor_id is not None:
+            first = self.artifact_descriptors[0]
+            if (
+                first.descriptor_id != self.artifact_descriptor_id
+                or first.descriptor_digest != self.artifact_descriptor_digest
+                or first.artifact_digest != self.artifact_digest
+            ):
+                raise ValueError("compatibility artifact fields must bind the first descriptor")
+        return self
+
+
 class WorkerRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_request"
     goal: str = Field(min_length=1, max_length=20_000)
@@ -267,6 +321,7 @@ class WorkerRequest(DigestedRecordV2):
     remaining_budgets: CanonicalData
     prior_result_digests: tuple[Digest, ...] = ()
     prior_artifact_digests: tuple[Digest, ...] = ()
+    predecessor_outputs: tuple[PredecessorOutputReference, ...] = ()
 
     _context_paths = field_validator("workspace_context")(
         lambda values: tuple(_relative_path(value) for value in values)
@@ -281,6 +336,27 @@ class WorkerRequest(DigestedRecordV2):
             and self.accepted_graph_revision_digest != self.accepted_plan_digest
         ):
             raise ValueError("accepted graph binding must match accepted_plan_digest")
+        if self.predecessor_outputs:
+            if tuple(
+                item.worker_result_digest for item in self.predecessor_outputs
+            ) != self.prior_result_digests:
+                raise ValueError(
+                    "structured predecessor results must match compatibility digests"
+                )
+            if tuple(
+                item.artifact_digest
+                for item in self.predecessor_outputs
+                if item.artifact_digest is not None
+            ) != self.prior_artifact_digests:
+                raise ValueError(
+                    "structured predecessor artifacts must match compatibility digests"
+                )
+            if any(
+                item.accepted_graph_revision_digest != self.accepted_graph_revision_digest
+                or item.generation != self.generation
+                for item in self.predecessor_outputs
+            ):
+                raise ValueError("predecessor output is stale for this graph generation")
         return self
 
 

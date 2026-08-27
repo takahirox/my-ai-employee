@@ -138,9 +138,7 @@ def test_harness_rejects_inconsistent_evaluator_declarations(
         ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
 
 
-def test_required_evaluator_fails_work_closed_until_runtime_integration(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_required_evaluator_defines_parent_goal_criteria() -> None:
     data = valid_harness()
     data["evaluators"] = [
         {
@@ -151,16 +149,31 @@ def test_required_evaluator_fails_work_closed_until_runtime_integration(
         }
     ]
     data["verification"]["required_evaluators"] = ["unit-tests"]
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+    goal = cli._work_goal("run-evaluator", "evaluate", harness)
+
+    assert tuple(item.id for item in goal.completion_criteria) == ("tests-pass",)
+    assert goal.completion_criteria[0].verification_requirement_ids == ("test",)
+    assert goal.completion_criteria[0].required_artifact_ids == ("workspace_patch",)
+
+
+def test_discovery_derives_legacy_required_process_evaluators_once(tmp_path: Path) -> None:
     profile = tmp_path / ".fleet" / "project.json"
     profile.parent.mkdir()
-    profile.write_text(json.dumps(data), encoding="utf-8")
+    profile.write_text(json.dumps(valid_harness()), encoding="utf-8")
 
-    result = cli.main(["work", "evaluate", "--repo", str(tmp_path)])
+    first = discover_project_harness(tmp_path)
+    second = discover_project_harness(tmp_path)
 
-    assert result == 3
-    emitted = json.loads(capsys.readouterr().out)
-    assert emitted["status"] == "failed"
-    assert emitted["stable_code"] == "EVALUATOR_EXECUTION_UNAVAILABLE"
+    assert first == second
+    assert len(first.evaluators) == 1
+    evaluator = first.evaluators[0]
+    assert evaluator.provider_id == "process.harness"
+    assert evaluator.command_ref == "test"
+    assert first.verification.required_evaluators == (evaluator.id,)
+    goal = cli._work_goal("compat-run", "verify compatibility", first)
+    assert tuple(item.id for item in goal.completion_criteria) == evaluator.criterion_ids
+    assert goal.completion_criteria[0].verification_requirement_ids == ("test",)
 
 
 @pytest.mark.parametrize(

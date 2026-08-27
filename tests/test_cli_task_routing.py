@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -11,15 +12,15 @@ from ai_employee.domain import (
     Budget,
     CompletionCriterion,
     Edge,
+    Goal,
     Graph,
     Node,
     NodeKind,
     OutputContract,
 )
-from ai_employee.inspector import inspect_work_run
 from ai_employee.serialization import canonical_digest
 from ai_employee.storage import SQLiteStore
-from ai_employee.task_orchestration import NodeRouteRecord
+from ai_employee.task_orchestration import GraphRunRecord, TaskGraphAcceptance
 from ai_employee.task_planning import CliProposedGraphPlanner, ProposedGraph
 
 
@@ -126,7 +127,7 @@ exit 0
                             "max_scale": 10,
                             "max_risk": 10,
                         },
-                    ]
+                    ],
                 },
             }
         ),
@@ -135,7 +136,7 @@ exit 0
     return repository, operator_config, tmp_path / "fleet.db"
 
 
-def test_default_adaptive_routing_persists_selected_strategy(
+def test_fixed_routing_uses_the_degenerate_authoritative_graph(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
@@ -152,6 +153,10 @@ def test_default_adaptive_routing_persists_selected_strategy(
             "--db",
             str(db_path),
             "--plan-only",
+            "--routing-mode",
+            "fixed",
+            "--strategy",
+            "sol",
             "--max-concurrency",
             "1",
         ]
@@ -161,22 +166,18 @@ def test_default_adaptive_routing_persists_selected_strategy(
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["status"] == "planned"
     with SQLiteStore(db_path) as store:
-        projection = inspect_work_run(store, emitted["run_id"])
+        graph_run = store.get("graph_run_v2", emitted["run_id"], GraphRunRecord)
+        acceptance = store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=emitted["run_id"]
+        )[0]
+        with pytest.raises(KeyError):
+            store.get_work_run(emitted["run_id"])
 
-    assessment = projection["routing"]["assessment"]
-    selected = projection["routing"]["selected_strategy"]
-    assessor = projection["routing"]["assessment_strategy"]
-    assert projection["routing"]["strategy_set"] == "codex-all"
-    assert projection["state"] == "planned"
-    assert projection["run"]["worker"] == "codex_cli"
-    assert selected["backend"] == "codex_cli"
-    assert selected["model"] == "gpt-5.6-sol"
-    assert selected["effort"] == "high"
-    assert assessor["id"] == "sol"
-    assert assessor["model"] == "gpt-5.6-sol"
-    assert assessor["effort"] == "high"
-    assert assessment["complexity"] > 2
-    assert assessment["scale"] > 2
+    assert graph_run.status == "planned"
+    assert len(acceptance.accepted_revision.graph.nodes) == 1
+    assert acceptance.accepted_revision.graph.entry_node_ids == (
+        acceptance.accepted_revision.graph.nodes[0].id,
+    )
 
 
 @pytest.mark.parametrize(
@@ -218,7 +219,7 @@ def test_routing_rejects_conflicting_cli_overrides_before_execution(
         cli.main(["work", "route this task", *arguments])
 
 
-def test_default_adaptive_graph_execution_fails_closed_after_persisting_plan(
+def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -226,9 +227,7 @@ def test_default_adaptive_graph_execution_fails_closed_after_persisting_plan(
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
 
     def criterion(name: str) -> CompletionCriterion:
-        return CompletionCriterion(
-            id=f"criterion-{name}", description=f"{name} is complete"
-        )
+        return CompletionCriterion(id=f"criterion-{name}", description=f"{name} is complete")
 
     def node(name: str, complexity: int) -> Node:
         return Node(
@@ -257,17 +256,15 @@ def test_default_adaptive_graph_execution_fails_closed_after_persisting_plan(
 
     def fake_plan(
         self: CliProposedGraphPlanner,
-        goal: object,
+        goal: Goal,
         *,
-        available_capabilities: object,
+        available_capabilities: Sequence[str],
         effective_policy_digest: str,
         harness_digest: str,
         max_nodes: int,
         max_wall_seconds: float,
     ) -> ProposedGraph:
         del available_capabilities, max_nodes, max_wall_seconds
-        assert hasattr(goal, "id")
-        assert hasattr(goal, "statement")
         return ProposedGraph(
             id="proposal-fork-join",
             run_id=self.run_id,
@@ -292,23 +289,73 @@ def test_default_adaptive_graph_execution_fails_closed_after_persisting_plan(
             str(operator_config),
             "--db",
             str(db_path),
+            "--plan-only",
             "--max-concurrency",
-            "2",
+            "1",
         ]
     )
 
-    assert result == 5
+    assert result == 0
     emitted = json.loads(capsys.readouterr().out)
-    assert emitted["status"] == "failed"
-    assert emitted["stable_code"] == "GRAPH_EXECUTION_UNAVAILABLE"
+    assert emitted["status"] == "planned"
+    assert emitted["stable_code"] is None
     with SQLiteStore(db_path) as store:
-        routes = store.list_records(
-            "node_route_v2", NodeRouteRecord, run_id=emitted["run_id"]
-        )
-        proposal = store.list_records(
-            "proposed_graph_v2", ProposedGraph, run_id=emitted["run_id"]
+        proposal = store.list_records("proposed_graph_v2", ProposedGraph, run_id=emitted["run_id"])[
+            0
+        ]
+        acceptance = store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=emitted["run_id"]
         )[0]
-    assert routes == ()
     assert proposal.graph == graph
+    assert acceptance.proposed_graph_digest == proposal.content_digest
+    assert acceptance.accepted_revision.graph == graph
     assert proposal.planner_strategy.model == "gpt-5.6-sol"
     assert proposal.planner_strategy.effort == "high"
+
+
+def test_adaptive_planner_failure_is_closed_and_stable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+
+    def failed_plan(
+        self: CliProposedGraphPlanner,
+        goal: Goal,
+        *,
+        available_capabilities: Sequence[str],
+        effective_policy_digest: str,
+        harness_digest: str,
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> ProposedGraph:
+        del (
+            self,
+            goal,
+            available_capabilities,
+            effective_policy_digest,
+            harness_digest,
+            max_nodes,
+            max_wall_seconds,
+        )
+        raise ValueError("invalid planner schema")
+
+    monkeypatch.setattr(CliProposedGraphPlanner, "plan", failed_plan)
+    result = cli.main(
+        [
+            "work",
+            "plan this adaptively",
+            "--repo",
+            str(repository),
+            "--operator-config",
+            str(operator_config),
+            "--db",
+            str(db_path),
+        ]
+    )
+
+    assert result == 7
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "failed"
+    assert emitted["stable_code"] == "GRAPH_PLANNER_FAILED"
