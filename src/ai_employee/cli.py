@@ -295,6 +295,19 @@ def _work(args: argparse.Namespace) -> int:
     if args.worker == "ollama_cli" and not args.model:
         raise ValueError("--worker ollama_cli requires --model")
     harness = discover_project_harness(repository)
+    if harness.verification.required_evaluators:
+        print(
+            canonical_json(
+                {
+                    "schema_version": "2",
+                    "run_id": run_id,
+                    "status": "failed",
+                    "stable_code": "EVALUATOR_EXECUTION_UNAVAILABLE",
+                    "next_actions": (),
+                }
+            )
+        )
+        return 3
     capabilities = ["edit_intent", "process"]
     if harness.network.mode.value != "disabled":
         capabilities.append("download")

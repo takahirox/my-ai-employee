@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -140,6 +141,10 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     )
     result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
     assert result.status == "succeeded"
+    assert result.stdout_artifact_digest is not None
+    descriptor = executor.output_descriptor(result.stdout_artifact_digest)
+    assert descriptor.artifact_digest == result.stdout_artifact_digest
+    assert descriptor.logical_kind == "process_stdout"
     descriptor_path = (
         store.content_root
         / (result.stdout_artifact_digest or "")[:2]
@@ -159,6 +164,52 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     failed = executor.execute(noisy, allow(noisy.content_digest or ""), NeverCancelled())
     assert failed.failure is not None
     assert failed.failure.code.value == "BUDGET_EXCEEDED"
+
+
+def test_process_output_descriptor_requires_exact_provenance_when_digest_repeats(
+    tmp_path: Path,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store)
+    first_request = ProcessRequest(
+        id="process-same-1",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", "printf same"),
+        timeout_seconds=10.0,
+        stdout_bytes=100,
+        stderr_bytes=100,
+        purpose="produce first identical output",
+    )
+    second_request = first_request.model_copy(
+        update={"id": "process-same-2", "content_digest": None}
+    )
+    second_request = ProcessRequest.model_validate(second_request.model_dump(), strict=True)
+
+    first = executor.execute(
+        first_request,
+        allow(first_request.content_digest or ""),
+        NeverCancelled(),
+    )
+    second = executor.execute(
+        second_request,
+        allow(second_request.content_digest or ""),
+        NeverCancelled(),
+    )
+
+    assert first.stdout_artifact_digest == second.stdout_artifact_digest
+    assert first.stdout_artifact_digest is not None
+    with pytest.raises(ValueError, match="ambiguous"):
+        executor.output_descriptor(first.stdout_artifact_digest)
+    descriptor = executor.output_descriptor(
+        first.stdout_artifact_digest,
+        "process_stdout",
+        first.id,
+    )
+    assert descriptor.producer_action_id == first_request.id
+    assert isinstance(descriptor.source, Mapping)
+    assert descriptor.source["request_digest"] == first_request.content_digest
+    assert descriptor.source["execution_id"] == first.id
 
 
 def test_process_executor_reads_only_descriptor_bound_stdin(tmp_path: Path) -> None:

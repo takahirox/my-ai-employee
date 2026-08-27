@@ -15,6 +15,7 @@ from typing import BinaryIO, Literal
 from ai_employee.domain.base import freeze_json
 from ai_employee.domain.services_v2 import ArtifactStore, Cancellation
 from ai_employee.domain.v2 import (
+    ArtifactDescriptor,
     ArtifactPutRequest,
     DecisionOutcome,
     ExecutionResult,
@@ -63,6 +64,7 @@ class LocalProcessExecutor:
         self.stdin_resolver = stdin_resolver
         self.terminate_grace_seconds = terminate_grace_seconds
         self._slots = threading.BoundedSemaphore(maximum_processes)
+        self._output_descriptors: dict[tuple[str, str, str], ArtifactDescriptor] = {}
 
     def execute(
         self,
@@ -126,8 +128,13 @@ class LocalProcessExecutor:
             finally:
                 if stdin_handle is not None:
                     stdin_handle.close()
-            stdout_digest = self._store_output(request, stdout, "process_stdout")
-            stderr_digest = self._store_output(request, stderr, "process_stderr")
+            execution_id = identifier("execution")
+            stdout_digest = self._store_output(
+                request, execution_id, stdout, "process_stdout"
+            )
+            stderr_digest = self._store_output(
+                request, execution_id, stderr, "process_stderr"
+            )
             status: Literal["succeeded", "failed", "cancelled", "indeterminate"]
             if cancelled:
                 failure = self._failure(StableFailureCode.CANCELLED, "process was cancelled")
@@ -150,7 +157,7 @@ class LocalProcessExecutor:
                 failure = None
                 status = "succeeded"
             return ExecutionResult(
-                id=identifier("execution"),
+                id=execution_id,
                 run_id=request.run_id,
                 created_at=now(),
                 request_digest=request.content_digest or "",
@@ -285,7 +292,35 @@ class LocalProcessExecutor:
             environment[binding.name] = self.secret_resolver(binding.binding_ref)
         return environment
 
-    def _store_output(self, request: ProcessRequest, value: bytes, kind: str) -> str:
+    def output_descriptor(
+        self,
+        artifact_digest: str,
+        logical_kind: str | None = None,
+        producer_execution_id: str | None = None,
+    ) -> ArtifactDescriptor:
+        """Resolve one exact output descriptor, rejecting digest-only ambiguity."""
+
+        if (logical_kind is None) != (producer_execution_id is None):
+            raise ValueError("output provenance must be supplied together")
+        if logical_kind is not None and producer_execution_id is not None:
+            try:
+                return self._output_descriptors[
+                    (artifact_digest, logical_kind, producer_execution_id)
+                ]
+            except KeyError as error:
+                raise ValueError("unknown process output artifact provenance") from error
+        matches = tuple(
+            descriptor
+            for (digest, _kind, _execution_id), descriptor in self._output_descriptors.items()
+            if digest == artifact_digest
+        )
+        if len(matches) != 1:
+            raise ValueError("process output artifact digest is ambiguous")
+        return matches[0]
+
+    def _store_output(
+        self, request: ProcessRequest, execution_id: str, value: bytes, kind: str
+    ) -> str:
         descriptor = self.artifacts.put(
             io.BytesIO(value),
             ArtifactPutRequest(
@@ -295,10 +330,17 @@ class LocalProcessExecutor:
                 media_type="application/octet-stream",
                 logical_kind=kind,
                 producer_action_id=request.id,
-                source=freeze_json({"request_digest": request.content_digest, "bounded": True}),
+                source=freeze_json(
+                    {
+                        "request_digest": request.content_digest,
+                        "execution_id": execution_id,
+                        "bounded": True,
+                    }
+                ),
                 redacted=bool(request.secret_bindings),
             ),
         )
+        self._output_descriptors[(descriptor.artifact_digest, kind, execution_id)] = descriptor
         return descriptor.artifact_digest
 
     def _validate_policy(

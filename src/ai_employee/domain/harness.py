@@ -10,6 +10,7 @@ from pydantic import ConfigDict, Field, field_serializer, field_validator, model
 from pydantic.main import BaseModel
 
 from .base import FrozenDict, StableStrEnum
+from .evaluation import AVAILABLE_FIRST_PARTY_EVALUATOR_IDS, RESERVED_EVALUATOR_IDS
 from .models import ProjectProfile, ProvenancedValue
 
 
@@ -123,9 +124,32 @@ class HarnessReview(HarnessModel):
     )
 
 
+class HarnessEvaluator(HarnessModel):
+    schema_name: ClassVar[str] = "harness_evaluator"
+    id: str = Field(min_length=1, max_length=200)
+    provider_id: str = Field(min_length=1, max_length=200)
+    command_ref: str | None = Field(default=None, min_length=1, max_length=200)
+    criterion_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _provider_and_criteria_are_consistent(self) -> Self:
+        if len(self.criterion_ids) != len(set(self.criterion_ids)):
+            raise ValueError("evaluator criterion IDs must be unique")
+        if any(not value.strip() for value in self.criterion_ids):
+            raise ValueError("evaluator criterion IDs must be non-blank")
+        if self.provider_id in RESERVED_EVALUATOR_IDS:
+            raise ValueError(f"evaluator provider is reserved but unavailable: {self.provider_id}")
+        if self.provider_id not in AVAILABLE_FIRST_PARTY_EVALUATOR_IDS:
+            raise ValueError(f"unknown evaluator provider: {self.provider_id}")
+        if self.provider_id == "process.harness" and self.command_ref is None:
+            raise ValueError("process.harness evaluator requires a command reference")
+        return self
+
+
 class HarnessVerification(HarnessModel):
     schema_name: ClassVar[str] = "harness_verification"
     required: tuple[str, ...] = ()
+    required_evaluators: tuple[str, ...] = ()
     evidence_freshness: Literal["exact_diff", "exact_tree"] = "exact_diff"
     review: HarnessReview = HarnessReview()
 
@@ -238,6 +262,7 @@ class ProjectHarnessV2(HarnessModel):
     schema_name: ClassVar[str] = "project_harness"
     schema_version: Literal[2] = 2
     commands: Mapping[str, HarnessCommand] = Field(default_factory=lambda: FrozenDict({}))
+    evaluators: tuple[HarnessEvaluator, ...] = ()
     rules: tuple[ProvenancedValue, ...] = ()
     paths: HarnessPaths = HarnessPaths()
     verification: HarnessVerification = HarnessVerification()
@@ -265,13 +290,37 @@ class ProjectHarnessV2(HarnessModel):
         missing = set(self.verification.required) - set(self.commands)
         if missing:
             raise ValueError(f"verification references unknown commands: {sorted(missing)}")
+        evaluator_ids = tuple(item.id for item in self.evaluators)
+        if len(evaluator_ids) != len(set(evaluator_ids)):
+            raise ValueError("evaluator IDs must be unique")
+        criterion_ids = tuple(
+            criterion_id
+            for evaluator in self.evaluators
+            for criterion_id in evaluator.criterion_ids
+        )
+        if len(criterion_ids) != len(set(criterion_ids)):
+            raise ValueError("evaluator criterion IDs must be globally unique")
+        missing_evaluators = set(self.verification.required_evaluators) - set(evaluator_ids)
+        if missing_evaluators:
+            raise ValueError(
+                f"verification references unknown evaluators: {sorted(missing_evaluators)}"
+            )
+        missing_commands = {
+            item.command_ref
+            for item in self.evaluators
+            if item.command_ref is not None and item.command_ref not in self.commands
+        }
+        if missing_commands:
+            raise ValueError(f"evaluators reference unknown commands: {sorted(missing_commands)}")
         if self.provisional:
             if self.network.mode is not NetworkMode.DISABLED:
                 raise ValueError("provisional Harness cannot grant network authority")
             if self.install.ecosystems or self.install.existing_lock is not InstallDisposition.DENY:
                 raise ValueError("provisional Harness cannot grant install authority")
             if (
-                self.worker.allowed
+                self.evaluators
+                or self.verification.required_evaluators
+                or self.worker.allowed
                 or self.worker.allowed_strategy_ids
                 or self.worker.adaptive_routing
                 or self.worker.local_backend

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from ai_employee import cli
 from ai_employee.domain import ProjectHarnessV2, ProvenancedValue, ProvenanceKind
 from ai_employee.project import (
     discover_project,
@@ -69,6 +70,97 @@ def test_harness_allows_repeated_argv_but_rejects_overlapping_protected_paths() 
     data["paths"] = {"writable": ["src/**"], "protected": ["src/secrets/**"]}
     with pytest.raises(ValidationError, match="writable and protected"):
         ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+
+
+def test_harness_accepts_strict_process_evaluator_declarations() -> None:
+    data = valid_harness()
+    data["evaluators"] = [
+        {
+            "id": "unit-tests",
+            "provider_id": "process.harness",
+            "command_ref": "test",
+            "criterion_ids": ["tests-pass"],
+        }
+    ]
+    data["verification"]["required_evaluators"] = ["unit-tests"]
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+    assert harness.evaluators[0].command_ref == "test"
+    assert harness.verification.required_evaluators == ("unit-tests",)
+
+
+@pytest.mark.parametrize(
+    ("evaluators", "required", "message"),
+    [
+        (
+            [
+                {
+                    "id": "duplicate",
+                    "provider_id": "process.harness",
+                    "command_ref": "test",
+                    "criterion_ids": ["one"],
+                },
+                {
+                    "id": "duplicate",
+                    "provider_id": "process.harness",
+                    "command_ref": "test",
+                    "criterion_ids": ["two"],
+                },
+            ],
+            [],
+            "unique",
+        ),
+        (
+            [{"id": "x", "provider_id": "unknown", "criterion_ids": ["one"]}],
+            [],
+            "unknown evaluator provider",
+        ),
+        (
+            [
+                {
+                    "id": "browser",
+                    "provider_id": "browser.playwright",
+                    "criterion_ids": ["visual"],
+                }
+            ],
+            [],
+            "reserved but unavailable",
+        ),
+        ([], ["missing"], "unknown evaluators"),
+    ],
+)
+def test_harness_rejects_inconsistent_evaluator_declarations(
+    evaluators: list[dict[str, object]], required: list[str], message: str
+) -> None:
+    data = valid_harness()
+    data["evaluators"] = evaluators
+    data["verification"]["required_evaluators"] = required
+    with pytest.raises(ValidationError, match=message):
+        ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+
+
+def test_required_evaluator_fails_work_closed_until_runtime_integration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = valid_harness()
+    data["evaluators"] = [
+        {
+            "id": "unit-tests",
+            "provider_id": "process.harness",
+            "command_ref": "test",
+            "criterion_ids": ["tests-pass"],
+        }
+    ]
+    data["verification"]["required_evaluators"] = ["unit-tests"]
+    profile = tmp_path / ".fleet" / "project.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps(data), encoding="utf-8")
+
+    result = cli.main(["work", "evaluate", "--repo", str(tmp_path)])
+
+    assert result == 3
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "failed"
+    assert emitted["stable_code"] == "EVALUATOR_EXECUTION_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(

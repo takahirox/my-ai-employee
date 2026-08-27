@@ -154,6 +154,7 @@ def test_stable_failure_code_registry_contains_required_codes() -> None:
         "INSTALL_DENIED",
         "WORKER_UNAVAILABLE",
         "WORKER_PROTOCOL_ERROR",
+        "EVALUATOR_EXECUTION_UNAVAILABLE",
         "VERIFICATION_FAILED",
         "REVIEW_BLOCKED",
         "WORKSPACE_CONFLICT",

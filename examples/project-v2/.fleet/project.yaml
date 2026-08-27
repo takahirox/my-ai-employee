@@ -9,6 +9,15 @@ commands:
   typecheck:
     argv: ["uv", "run", "mypy"]
     cwd: "."
+evaluators:
+  - id: unit-tests
+    provider_id: process.harness
+    command_ref: test
+    criterion_ids: [tests-pass]
+  - id: static-analysis
+    provider_id: process.harness
+    command_ref: lint
+    criterion_ids: [lint-clean]
 rules: []
 paths:
   writable: ["src/**", "tests/**", "docs/**", "README.md", "CHANGELOG.md"]
