@@ -112,6 +112,72 @@ def validate_graph(
     return tuple(sorted(set(issues)))
 
 
+def validate_task_graph(
+    graph: Graph,
+    policy: ExecutionPolicy,
+    *,
+    available_capabilities: Iterable[str] = (),
+) -> tuple[GraphValidationIssue, ...]:
+    """Validate the initial task-orchestration subset: a bounded dependency DAG."""
+
+    issues = list(
+        validate_graph(
+            graph,
+            policy,
+            available_capabilities=available_capabilities,
+        )
+    )
+    incoming: dict[str, int] = {node.id: 0 for node in graph.nodes}
+    outgoing: dict[str, int] = {node.id: 0 for node in graph.nodes}
+    for edge in graph.edges:
+        incoming[edge.target_id] += 1
+        outgoing[edge.source_id] += 1
+        if edge.loop or edge.max_traversals is not None or edge.condition is not None:
+            issues.append(
+                GraphValidationIssue(
+                    "unsupported_edge_semantics",
+                    edge.id,
+                    "task orchestration initially supports required dependencies only",
+                )
+            )
+    expected_entries = tuple(sorted(node_id for node_id, count in incoming.items() if count == 0))
+    expected_terminals = tuple(
+        sorted(node_id for node_id, count in outgoing.items() if count == 0)
+    )
+    if tuple(sorted(graph.entry_node_ids)) != expected_entries:
+        issues.append(
+            GraphValidationIssue("invalid_entry_set", graph.id, "entries must be all DAG roots")
+        )
+    if tuple(sorted(graph.terminal_node_ids)) != expected_terminals:
+        issues.append(
+            GraphValidationIssue(
+                "invalid_terminal_set", graph.id, "terminals must be all DAG leaves"
+            )
+        )
+    if graph.budget.max_attempts < len(graph.nodes):
+        issues.append(
+            GraphValidationIssue(
+                "attempt_budget_insufficient", graph.id, "every DAG node needs one claim"
+            )
+        )
+    for node in graph.nodes:
+        if node.objective is None or not node.objective.strip():
+            issues.append(GraphValidationIssue("missing_objective", node.id, "objective required"))
+        if not node.completion_criteria:
+            issues.append(
+                GraphValidationIssue("missing_completion_criteria", node.id, "criteria required")
+            )
+        if node.retry_limit or node.max_iterations != 1 or node.generation or node.attempt:
+            issues.append(
+                GraphValidationIssue(
+                    "unsupported_execution_fence",
+                    node.id,
+                    "retries and loops are out of scope",
+                )
+            )
+    return tuple(sorted(set(issues)))
+
+
 def _walk(starts: Iterable[str], adjacency: dict[str, list[str]]) -> set[str]:
     seen: set[str] = set()
     queue = deque(sorted(starts))
@@ -177,6 +243,24 @@ def accept_graph(
         raise GraphValidationError(issues)
     revision = 1 if previous is None else previous.revision_number + 1
     return AcceptedGraphRevision(revision_number=revision, graph=candidate)
+
+
+def accept_task_graph(
+    candidate: Graph,
+    policy: ExecutionPolicy,
+    *,
+    available_capabilities: Iterable[str] = (),
+) -> AcceptedGraphRevision:
+    """Accept the non-replanning dependency-DAG slice deterministically."""
+
+    issues = validate_task_graph(
+        candidate,
+        policy,
+        available_capabilities=available_capabilities,
+    )
+    if issues:
+        raise GraphValidationError(issues)
+    return AcceptedGraphRevision(revision_number=1, graph=candidate)
 
 
 def replan(

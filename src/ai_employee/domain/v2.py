@@ -256,15 +256,32 @@ class WorkerRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_request"
     goal: str = Field(min_length=1, max_length=20_000)
     accepted_plan_digest: Digest
+    node_id: Identifier | None = None
+    accepted_graph_revision_digest: Digest | None = None
+    graph_run_id: Identifier | None = None
+    generation: int = Field(default=0, ge=0)
+    attempt: int = Field(default=0, ge=0)
     workspace_context: tuple[RelativePath, ...] = ()
     harness_digest: Digest
     effective_policy_digest: Digest
     remaining_budgets: CanonicalData
     prior_result_digests: tuple[Digest, ...] = ()
+    prior_artifact_digests: tuple[Digest, ...] = ()
 
     _context_paths = field_validator("workspace_context")(
         lambda values: tuple(_relative_path(value) for value in values)
     )
+
+    @model_validator(mode="after")
+    def _graph_binding_is_complete(self) -> Self:
+        if (self.node_id is None) != (self.accepted_graph_revision_digest is None):
+            raise ValueError("node and accepted graph bindings must be supplied together")
+        if (
+            self.accepted_graph_revision_digest is not None
+            and self.accepted_graph_revision_digest != self.accepted_plan_digest
+        ):
+            raise ValueError("accepted graph binding must match accepted_plan_digest")
+        return self
 
 
 class WorkspaceRequest(DigestedRecordV2):

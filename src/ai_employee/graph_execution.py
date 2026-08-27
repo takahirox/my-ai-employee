@@ -1,0 +1,407 @@
+"""Bounded accepted-graph execution over authoritative WorkCoordinator runs."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from hashlib import sha256
+from pathlib import Path
+from threading import Lock
+from typing import Protocol
+
+from .domain import ExecutionPolicy, ExecutionStrategy, Goal, Node, RoutingMode
+from .domain.base import Digest, Identifier
+from .domain.v2 import (
+    AcceptanceLedger,
+    ArtifactDescriptor,
+    ExecutionResult,
+    WorkerRequest,
+    WorkerResult,
+    WorkspaceSnapshot,
+)
+from .graph_composition import (
+    GraphPatchComposer,
+    GraphPatchCompositionRecord,
+    GraphPatchCompositionRequest,
+    NodePatchArtifact,
+)
+from .graph_evaluation import ParentCandidateEvaluationRecord
+from .orchestration import WorkCoordinator, WorkRun
+from .services_v2._common import identifier, now
+from .storage import SQLiteStore
+from .task_orchestration import (
+    GraphReplay,
+    GraphRunRecord,
+    NodeExecutionResult,
+    TaskOrchestrator,
+)
+from .task_planning import ProposedGraph
+
+
+class CoordinatorFactory(Protocol):
+    """Create a node-scoped coordinator whose store is owned by the caller."""
+
+    def __call__(
+        self, node: Node, request: WorkerRequest, strategy: ExecutionStrategy
+    ) -> WorkCoordinator: ...
+
+
+class PatchComposer(Protocol):
+    def compose(
+        self, request: GraphPatchCompositionRequest, cancellation: object
+    ) -> GraphPatchCompositionRecord: ...
+
+
+class ParentCandidateEvaluator(Protocol):
+    def evaluate(
+        self,
+        goal: Goal,
+        accepted_revision: object,
+        composition: GraphPatchCompositionRecord,
+        *,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+        cancellation: object,
+    ) -> ParentCandidateEvaluationRecord: ...
+
+
+class _NeverCancelled:
+    def cancelled(self) -> bool:
+        return False
+
+
+class _ExecutionSession:
+    def __init__(
+        self,
+        factory: CoordinatorFactory,
+        repository: str,
+        base_commit: str,
+    ) -> None:
+        self.factory = factory
+        self.repository = repository
+        self.base_commit = base_commit
+        self.node_patches: dict[str, NodePatchArtifact] = {}
+        self._lock = Lock()
+
+    def run_node(
+        self,
+        node: Node,
+        request: WorkerRequest,
+        strategy: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        coordinator = self.factory(node, request, strategy)
+        try:
+            if coordinator.selected_strategy != strategy:
+                raise ValueError("node coordinator is not bound to the routed strategy")
+            run = coordinator.execute_node(
+                request,
+                node.completion_criteria,
+                self.repository,
+                self.base_commit,
+                worker_name=strategy.backend,
+            )
+            result = _authoritative_node_result(coordinator, node, request, run)
+        finally:
+            coordinator.store.close()
+        assert result.node_patch is not None
+        with self._lock:
+            if node.id in self.node_patches:
+                raise ValueError("node patch was produced more than once")
+            self.node_patches[node.id] = result.node_patch
+        return result
+
+
+class GraphExecutionService:
+    """Schedule accepted nodes, compose exact patches, and stop before parent evaluation."""
+
+    def __init__(
+        self,
+        store: SQLiteStore,
+        coordinator_factory: CoordinatorFactory,
+        composer: GraphPatchComposer,
+        strategies: Iterable[ExecutionStrategy],
+        *,
+        repository: str,
+        base_commit: str,
+        max_concurrency: int = 2,
+        routing_mode: RoutingMode = RoutingMode.ADAPTIVE,
+        allowed_strategy_ids: Iterable[str] = (),
+        allowed_backends: Iterable[str] = (),
+        local_backend_allowed: bool = False,
+        parent_evaluator: ParentCandidateEvaluator | None = None,
+    ) -> None:
+        self.store = store
+        self.coordinator_factory = coordinator_factory
+        self.composer = composer
+        self.strategies = tuple(strategies)
+        self.repository = str(Path(repository).resolve())
+        self.base_commit = base_commit
+        self.max_concurrency = max_concurrency
+        self.routing_mode = routing_mode
+        self.allowed_strategy_ids = tuple(allowed_strategy_ids)
+        self.allowed_backends = tuple(allowed_backends)
+        self.local_backend_allowed = local_backend_allowed
+        self.parent_evaluator = parent_evaluator
+
+    def run(
+        self,
+        goal: Goal,
+        proposed_graph: ProposedGraph,
+        policy: ExecutionPolicy,
+        *,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+        run_id: Identifier,
+        available_capabilities: Iterable[str],
+        plan_only: bool = False,
+    ) -> GraphRunRecord:
+        session = _ExecutionSession(self.coordinator_factory, self.repository, self.base_commit)
+        orchestrator = self._orchestrator(session.run_node)
+        graph_run = orchestrator.run(
+            goal,
+            proposed_graph,
+            policy,
+            harness_digest=harness_digest,
+            effective_policy_digest=effective_policy_digest,
+            run_id=run_id,
+            available_capabilities=available_capabilities,
+            plan_only=plan_only,
+        )
+        if plan_only or graph_run.failure_code != "PARENT_EVALUATION_UNAVAILABLE":
+            return graph_run
+
+        acceptance = orchestrator.replay(run_id).acceptance
+        writing_nodes = tuple(
+            node
+            for node in acceptance.accepted_revision.graph.nodes
+            if "edit_intent" in node.required_capabilities
+        )
+        expected = {node.id for node in writing_nodes}
+        if not expected or not expected <= set(session.node_patches):
+            return self._update_run(
+                graph_run,
+                failure_code="NODE_PATCH_UNAVAILABLE",
+            )
+        composition_request = GraphPatchCompositionRequest(
+            id=identifier("graph-patch-composition-request"),
+            run_id=run_id,
+            created_at=now(),
+            accepted_revision=acceptance.accepted_revision,
+            repository=self.repository,
+            base_commit=self.base_commit,
+            effective_policy_digest=effective_policy_digest,
+            node_patches=tuple(session.node_patches[node.id] for node in writing_nodes),
+        )
+        composition = self.composer.compose(composition_request, _NeverCancelled())
+        if composition.status != "succeeded" or composition.candidate_patch is None:
+            return self._update_run(
+                graph_run,
+                failure_code="GRAPH_PATCH_COMPOSITION_FAILED",
+                composition_id=composition.id,
+                composition_digest=composition.content_digest,
+            )
+        candidate_fields = {
+            "composition_id": composition.id,
+            "composition_digest": composition.content_digest,
+            "parent_candidate_artifact_id": composition.candidate_patch.id,
+            "parent_candidate_digest": composition.candidate_patch.artifact_digest,
+        }
+        if self.parent_evaluator is None:
+            return self._update_run(
+                graph_run,
+                failure_code="PARENT_EVALUATION_UNAVAILABLE",
+                **candidate_fields,
+            )
+        try:
+            evaluation = self.parent_evaluator.evaluate(
+                goal,
+                acceptance.accepted_revision,
+                composition,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                cancellation=_NeverCancelled(),
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return self._update_run(
+                graph_run,
+                failure_code="PARENT_EVALUATION_UNAVAILABLE",
+                **candidate_fields,
+            )
+        evaluation_fields = {
+            **candidate_fields,
+            "parent_evaluation_id": evaluation.id,
+            "parent_evaluation_digest": evaluation.content_digest,
+            "goal_evaluator_digest": evaluation.goal_evaluator_digest,
+        }
+        if evaluation.status != "ready_to_promote":
+            return self._update_run(
+                graph_run,
+                failure_code=evaluation.failure_code or "PARENT_EVALUATION_FAILED",
+                **evaluation_fields,
+            )
+        return self._update_run(
+            graph_run,
+            status="ready_to_promote",
+            failure_code=None,
+            **evaluation_fields,
+        )
+
+    def replay(self, run_id: Identifier) -> GraphReplay:
+        """Read persisted graph facts without invoking coordinators or composition."""
+
+        return self._orchestrator(_replay_runner).replay(run_id)
+
+    def _orchestrator(self, runner: object) -> TaskOrchestrator:
+        return TaskOrchestrator(
+            self.store,
+            runner,  # type: ignore[arg-type]
+            self.strategies,
+            max_concurrency=self.max_concurrency,
+            routing_mode=self.routing_mode,
+            allowed_strategy_ids=self.allowed_strategy_ids,
+            allowed_backends=self.allowed_backends,
+            local_backend_allowed=self.local_backend_allowed,
+            bounded_graph_execution=True,
+            defer_parent_evaluation=True,
+        )
+
+    def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:
+        updated = run.model_copy(
+            update={"generation": run.generation + 1, "status": "failed", **changes}
+        )
+        self.store.put(
+            "graph_run_v2",
+            updated,
+            run_id=updated.id,
+            revision=updated.generation + 1,
+        )
+        return updated
+
+
+def _authoritative_node_result(
+    coordinator: WorkCoordinator,
+    node: Node,
+    request: WorkerRequest,
+    run: WorkRun,
+) -> NodeExecutionResult:
+    store = coordinator.store
+    persisted_run = store.get_work_run(run.id)
+    if persisted_run != run or run.status != "ready_to_promote":
+        raise ValueError("inner work run did not reach authoritative ready state")
+    if (
+        run.id != request.run_id
+        or run.accepted_graph_digest != request.accepted_graph_revision_digest
+        or run.node_id != node.id
+        or run.node_generation != node.generation
+        or run.node_attempt != node.attempt
+        or run.worker_request_digest != request.content_digest
+    ):
+        raise ValueError("inner work run has stale graph/node/attempt bindings")
+    if store.get("worker_request_v2", request.id, WorkerRequest) != request:
+        raise ValueError("exact worker request was not persisted")
+    if run.worker_result_id is None:
+        raise ValueError("inner work run has no worker result")
+    worker_result = store.get("worker_result_v2", run.worker_result_id, WorkerResult)
+    if (
+        worker_result.run_id != request.run_id
+        or worker_result.request_digest != request.content_digest
+        or worker_result.status != "succeeded"
+    ):
+        raise ValueError("worker result is not the successful result for the exact request")
+    if run.workspace_id is None:
+        raise ValueError("inner work run has no workspace")
+    workspace = store.get("workspace_v2", run.workspace_id, WorkspaceSnapshot)
+    if (
+        workspace.run_id != request.run_id
+        or workspace.head_commit != coordinator.store.get_work_run(run.id).base_commit
+        or Path(workspace.original_worktree).resolve() != Path(run.repository).resolve()
+    ):
+        raise ValueError("workspace snapshot is not bound to the inner work run")
+    if run.patch_artifact_id is None:
+        raise ValueError("inner work run has no patch artifact")
+    patch = store.get("artifact_descriptor_v2", run.patch_artifact_id, ArtifactDescriptor)
+    body = coordinator.artifact_reader(patch)
+    source = patch.source
+    if (
+        not body.strip()
+        or len(body) != patch.size_bytes
+        or sha256(body).hexdigest() != patch.artifact_digest
+        or patch.run_id != request.run_id
+        or patch.logical_kind != "workspace_patch"
+        or patch.media_type != "text/x-diff"
+        or patch.producer_action_id != workspace.id
+        or not isinstance(source, Mapping)
+        or source.get("base_tree") != workspace.base_tree
+        or source.get("workspace_digest") != workspace.content_digest
+    ):
+        raise ValueError("patch is empty or not bound to the exact workspace")
+
+    results = store.list_records("verification_result_v2", ExecutionResult, run_id=run.id)
+    result_by_request = {item.request_digest: item for item in results}
+    verification_digests: list[str] = []
+    for verification_request in coordinator.verification_requests:
+        persisted_request = store.get(
+            "verification_request_v2", verification_request.id, type(verification_request)
+        )
+        result = result_by_request.get(verification_request.content_digest or "")
+        if (
+            persisted_request != verification_request
+            or result is None
+            or result.status != "succeeded"
+            or result.run_id != run.id
+            or result.content_digest is None
+        ):
+            raise ValueError("required Harness verification is absent or stale")
+        verification_digests.append(result.content_digest)
+    if tuple(verification_digests) != run.verification_result_digests:
+        raise ValueError("WorkRun verification ledger does not match persisted results")
+    if run.acceptance_ledger_id is None:
+        raise ValueError("inner work run has no acceptance ledger")
+    ledger = store.get("acceptance_ledger_v2", run.acceptance_ledger_id, AcceptanceLedger)
+    if ledger.run_id != run.id or tuple(item.criterion_id for item in ledger.criteria) != tuple(
+        item.id for item in node.completion_criteria
+    ):
+        raise ValueError("acceptance ledger does not map the declared node criteria")
+    authoritative_refs = {
+        *verification_digests,
+        patch.content_digest,
+        patch.artifact_digest,
+        run.review_digest,
+    }
+    for evidence in ledger.criteria:
+        if evidence.disposition == "satisfied" and (
+            not evidence.evidence_refs
+            or not set(evidence.evidence_refs) <= {item for item in authoritative_refs if item}
+        ):
+            raise ValueError("criterion cites non-authoritative or empty evidence")
+    node_patch = NodePatchArtifact(
+        node_id=node.id,
+        graph_run_id=request.graph_run_id or request.run_id,
+        accepted_graph_revision_digest=request.accepted_graph_revision_digest
+        or request.accepted_plan_digest,
+        generation=node.generation,
+        attempt=node.attempt,
+        worker_request_digest=_required(request.content_digest),
+        worker_result_digest=_required(worker_result.content_digest),
+        acceptance_ledger_digest=_required(ledger.content_digest),
+        verification_result_digests=tuple(verification_digests),
+        workspace=workspace,
+        patch=patch,
+    )
+    return NodeExecutionResult(
+        worker_result=worker_result,
+        criterion_evidence=ledger.criteria,
+        workspace_id=workspace.id,
+        node_patch=node_patch,
+    )
+
+
+def _required(value: str | None) -> str:
+    if value is None:
+        raise ValueError("authoritative record is missing its digest")
+    return value
+
+
+def _replay_runner(
+    _node: Node, _request: WorkerRequest, _strategy: ExecutionStrategy
+) -> NodeExecutionResult:
+    raise AssertionError("replay must not invoke a worker")

@@ -121,8 +121,6 @@ class SQLiteStore:
 
     def migrate_v2(self) -> None:
         """Transactionally add v2 projections only when a v2 write is requested."""
-        if self._schema_version() == 2:
-            return
         with self.transaction() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS work_events_v2 ("
@@ -135,6 +133,11 @@ class SQLiteStore:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS work_checkpoints_v2 ("
                 "run_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,payload TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS graph_claims_v2 ("
+                "run_id TEXT NOT NULL,node_id TEXT NOT NULL,"
+                "PRIMARY KEY(run_id,node_id))"
             )
             connection.execute(
                 "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
@@ -357,6 +360,29 @@ class SQLiteStore:
                 "VALUES(?,?,?)",
                 (run_id, generation, canonical_json(payload)),
             )
+
+    def claim_graph_node(self, run_id: str, node_id: str, *, max_claims: int) -> bool:
+        """Atomically reserve one unique node claim within the aggregate attempt cap."""
+
+        if max_claims < 1:
+            return False
+        self.migrate_v2()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO graph_claims_v2(run_id,node_id) "
+                "SELECT ?,? WHERE "
+                "(SELECT COUNT(*) FROM graph_claims_v2 WHERE run_id=?) < ?",
+                (run_id, node_id, run_id, max_claims),
+            )
+        return cursor.rowcount == 1
+
+    def graph_claims(self, run_id: str) -> tuple[str, ...]:
+        if self._schema_version() < 2:
+            return ()
+        rows = self._connection.execute(
+            "SELECT node_id FROM graph_claims_v2 WHERE run_id=? ORDER BY node_id", (run_id,)
+        )
+        return tuple(str(row[0]) for row in rows)
 
     def load_work_checkpoint(self, run_id: str) -> tuple[int, dict[str, Any]]:
         if self._schema_version() < 2:

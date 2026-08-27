@@ -19,6 +19,7 @@ from .domain import (
     ExecutionStrategy,
     Goal,
     Graph,
+    Node,
     ResultEnvelope,
     ResultStatus,
     RoutingMode,
@@ -37,9 +38,10 @@ from .domain.v2 import (
     PolicyDecision,
     ProcessRequest,
     PromotionRecord,
+    WorkerRequest,
     WorkspaceSnapshot,
 )
-from .graph import accept_graph
+from .graph import GraphValidationError, accept_graph
 from .inspector import compare_runs, inspect_any_run, serve
 from .project import (
     discover_project,
@@ -49,7 +51,7 @@ from .project import (
 )
 from .routing import assess_task, merge_semantic_assessment, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
-from .serialization import canonical_json, loads_yaml_model
+from .serialization import canonical_digest, canonical_json, loads_yaml_model
 from .services_v2 import (
     AtomicArtifactStore,
     DigestApprovalService,
@@ -60,6 +62,12 @@ from .services_v2 import (
 )
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
+from .task_orchestration import NodeExecutionResult, TaskOrchestrator
+from .task_planning import (
+    CliProposedGraphPlanner,
+    ProposedGraph,
+    proposed_graph_schema_json,
+)
 from .worker_adapters import (
     ClaudeCodeCliWorkerAdapter,
     CliTaskAssessmentAdapter,
@@ -150,6 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     work.add_argument("--plan-only", action="store_true")
+    work.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=1,
+        help="bounded task-graph concurrency; values above one enable graph planning",
+    )
     work.add_argument("--non-interactive", action="store_true")
     work.add_argument("--json", action="store_true")
     work.add_argument("--db", default=".fleet/fleet.db")
@@ -294,6 +308,10 @@ def _work(args: argparse.Namespace) -> int:
         raise ValueError("--routing-mode cannot be combined with --worker")
     if args.worker == "ollama_cli" and not args.model:
         raise ValueError("--worker ollama_cli requires --model")
+    if args.max_concurrency < 1:
+        raise ValueError("--max-concurrency must be positive")
+    if args.max_concurrency > 1 and args.routing_mode != "adaptive":
+        raise ValueError("task-graph planning requires adaptive routing")
     harness = discover_project_harness(repository)
     if harness.verification.required_evaluators:
         print(
@@ -323,6 +341,7 @@ def _work(args: argparse.Namespace) -> int:
     effective_strategy_set = None
     routing_mode = None
     strategies: tuple[ExecutionStrategy, ...] = ()
+    proposed_graph: ProposedGraph | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
         effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
@@ -535,6 +554,47 @@ def _work(args: argparse.Namespace) -> int:
             worker_model = selected_strategy.model
             worker_effort = selected_strategy.effort
             worker_command = operator_config.worker_command(worker_name)
+            if args.max_concurrency > 1:
+                planner_schema_path: str | None = None
+                if assessment_strategy.backend == "codex_cli":
+                    planner_schema = assessment_directory / "proposed-graph.json"
+                    planner_schema.write_bytes(proposed_graph_schema_json())
+                    planner_schema_path = str(planner_schema)
+                harness_digest = canonical_digest(harness)
+                effective_policy_digest = canonical_digest((policy.content_digest,))
+                try:
+                    proposed_graph = CliProposedGraphPlanner(
+                        executor_for(assessment_directory),
+                        read_output,
+                        decide_worker_process,
+                        run_id=run_id,
+                        strategy=assessment_strategy,
+                        executable=assessment_command.executable,
+                        cwd=".",
+                        prompt_writer=prompt_writer,
+                        output_schema_path=planner_schema_path,
+                        timeout_seconds=harness.budgets.wall_seconds,
+                    ).plan(
+                        Goal(id=f"goal-{run_id}", statement=args.goal),
+                        available_capabilities=tuple(capabilities),
+                        effective_policy_digest=effective_policy_digest,
+                        harness_digest=harness_digest,
+                        max_nodes=16,
+                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    )
+                except ValueError:
+                    print(
+                        canonical_json(
+                            {
+                                "schema_version": "2",
+                                "run_id": run_id,
+                                "status": "failed",
+                                "stable_code": "GRAPH_PLANNER_FAILED",
+                                "next_actions": (),
+                            }
+                        )
+                    )
+                    return 7
             add_executable_path(worker_command.executable)
             for path_entry in worker_command.path_entries:
                 executable_paths.append(Path(path_entry))
@@ -645,6 +705,68 @@ def _work(args: argparse.Namespace) -> int:
             )
             .stdout.strip()
         )
+        if proposed_graph is not None:
+            harness_digest = proposed_graph.harness_digest
+            effective_policy_digest = proposed_graph.effective_policy_digest
+
+            def execution_unavailable(
+                node: Node,
+                request: WorkerRequest,
+                strategy: ExecutionStrategy,
+            ) -> NodeExecutionResult:
+                del node, request, strategy
+                raise RuntimeError("graph execution is unavailable until safe composition exists")
+
+            orchestrator = TaskOrchestrator(
+                store,
+                execution_unavailable,
+                strategies,
+                max_concurrency=args.max_concurrency,
+                routing_mode=RoutingMode.ADAPTIVE,
+                allowed_strategy_ids=harness.worker.allowed_strategy_ids,
+                allowed_backends=harness.worker.allowed,
+                local_backend_allowed=harness.worker.local_backend,
+            )
+            try:
+                graph_run = orchestrator.run(
+                    Goal(id=proposed_graph.goal_id, statement=args.goal),
+                    proposed_graph,
+                    ExecutionPolicy(
+                        max_nodes=16,
+                        max_attempts=16,
+                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    ),
+                    harness_digest=harness_digest,
+                    effective_policy_digest=effective_policy_digest,
+                    run_id=run_id,
+                    available_capabilities=tuple(capabilities),
+                    plan_only=args.plan_only,
+                )
+            except GraphValidationError:
+                print(
+                    canonical_json(
+                        {
+                            "schema_version": "2",
+                            "run_id": run_id,
+                            "status": "failed",
+                            "stable_code": "GRAPH_PLAN_REJECTED",
+                            "next_actions": (),
+                        }
+                    )
+                )
+                return 7
+            print(
+                canonical_json(
+                    {
+                        "schema_version": "2",
+                        "run_id": graph_run.id,
+                        "status": graph_run.status,
+                        "stable_code": graph_run.failure_code,
+                        "next_actions": (),
+                    }
+                )
+            )
+            return 0 if graph_run.status in {"planned", "completed"} else 5
         run = coordinator.start(
             args.goal,
             str(repository),

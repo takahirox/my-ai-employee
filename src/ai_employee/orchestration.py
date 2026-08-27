@@ -10,7 +10,13 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
-from .domain import ExecutionStrategy, TaskAssessment
+from .domain import (
+    CompletionCriterion,
+    ExecutionPolicy,
+    ExecutionStrategy,
+    Goal,
+    TaskAssessment,
+)
 from .domain.base import Identifier, freeze_json
 from .domain.policy_v2 import PolicyLayer, PolicyResolver
 from .domain.services_v2 import (
@@ -42,10 +48,12 @@ from .domain.v2 import (
     WorkspaceRequest,
     WorkspaceSnapshot,
 )
+from .graph import accept_task_graph
 from .runtime import DeterministicRuntime
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
+from .task_orchestration import TaskGraphAcceptance, one_node_graph
 
 WorkStatus = Literal[
     "planning",
@@ -97,6 +105,12 @@ class WorkRun(BaseModel):
     generation: int = Field(default=0, ge=0)
     plan_only: bool = False
     effective_policy_digest: str
+    accepted_graph_digest: str | None = None
+    node_id: str | None = None
+    node_generation: int = Field(default=0, ge=0)
+    node_attempt: int = Field(default=0, ge=0)
+    worker_request_digest: str | None = None
+    completion_criteria: tuple[CompletionCriterion, ...] = ()
     workspace_id: str | None = None
     worker_result_id: str | None = None
     pending_approval_id: str | None = None
@@ -189,9 +203,7 @@ class WorkCoordinator:
         if max_worker_turns < 1:
             raise ValueError("max_worker_turns must be positive")
         if (task_assessment is None) != (selected_strategy is None):
-            raise ValueError(
-                "task_assessment and selected_strategy must be provided together"
-            )
+            raise ValueError("task_assessment and selected_strategy must be provided together")
         if strategy_set is not None and selected_strategy is None:
             raise ValueError("strategy_set requires a selected strategy")
         if assessment_strategy is not None and task_assessment is None:
@@ -215,6 +227,27 @@ class WorkCoordinator:
         self.protected_paths = protected_paths
         self.allowed_processes = allowed_processes
 
+    def execute_node(
+        self,
+        request: WorkerRequest,
+        completion_criteria: tuple[CompletionCriterion, ...],
+        repository: str,
+        base_commit: str,
+        *,
+        worker_name: str,
+    ) -> WorkRun:
+        """Execute one accepted graph request without creating another graph authority."""
+
+        return self.start(
+            request.goal,
+            repository,
+            base_commit,
+            worker_name=worker_name,
+            run_id=request.run_id,
+            _accepted_request=request,
+            _completion_criteria=completion_criteria,
+        )
+
     def start(
         self,
         goal: str,
@@ -224,9 +257,67 @@ class WorkCoordinator:
         worker_name: str,
         plan_only: bool = False,
         run_id: str | None = None,
+        _accepted_request: WorkerRequest | None = None,
+        _completion_criteria: tuple[CompletionCriterion, ...] = (),
     ) -> WorkRun:
-        run_id = run_id or identifier("work")
         policy_digest = canonical_digest([layer.content_digest for layer in self.policy_layers])
+        if _accepted_request is not None:
+            if run_id is not None and run_id != _accepted_request.run_id:
+                raise ValueError("accepted node request run binding is stale")
+            if _accepted_request.effective_policy_digest != policy_digest:
+                raise ValueError("accepted node request policy binding is stale")
+            run_id = _accepted_request.run_id
+            harness_digest = _accepted_request.harness_digest
+        else:
+            run_id = run_id or identifier("work")
+            harness_digest = canonical_digest({"repository": repository})
+        wall_limits = tuple(
+            layer.max_wall_seconds
+            for layer in self.policy_layers
+            if layer.max_wall_seconds is not None
+        )
+        max_wall_seconds = min(wall_limits, default=3600.0)
+        accepted_graph_digest: str
+        node_id: str
+        if _accepted_request is None:
+            graph_goal = Goal(id=identifier("goal"), statement=goal)
+            graph = one_node_graph(
+                graph_goal,
+                graph_id=identifier("graph"),
+                node_id=identifier("node"),
+                max_wall_seconds=max_wall_seconds,
+            )
+            graph_policy = ExecutionPolicy(
+                max_nodes=1,
+                max_attempts=1,
+                max_wall_seconds=max_wall_seconds,
+            )
+            accepted_graph = accept_task_graph(
+                graph,
+                graph_policy,
+                available_capabilities=tuple(
+                    dict.fromkeys(
+                        capability
+                        for layer in self.policy_layers
+                        for capability in (layer.allowed_capabilities or ())
+                    )
+                ),
+            )
+            graph_acceptance = TaskGraphAcceptance(
+                id=identifier("graph-acceptance"),
+                run_id=run_id,
+                created_at=now(),
+                accepted_revision=accepted_graph,
+                effective_policy_digest=policy_digest,
+                harness_digest=harness_digest,
+            )
+            self.store.save_graph(run_id, accepted_graph)
+            self.store.put("task_graph_acceptance_v2", graph_acceptance, run_id=run_id)
+            accepted_graph_digest = graph_acceptance.content_digest or ""
+            node_id = graph.nodes[0].id
+        else:
+            accepted_graph_digest = _accepted_request.accepted_graph_revision_digest or ""
+            node_id = _accepted_request.node_id or ""
         run = WorkRun(
             id=run_id,
             goal=goal,
@@ -239,6 +330,14 @@ class WorkCoordinator:
             strategy_set=self.strategy_set,
             plan_only=plan_only,
             effective_policy_digest=policy_digest,
+            accepted_graph_digest=accepted_graph_digest,
+            node_id=node_id,
+            node_generation=(0 if _accepted_request is None else _accepted_request.generation),
+            node_attempt=(0 if _accepted_request is None else _accepted_request.attempt),
+            worker_request_digest=(
+                None if _accepted_request is None else _accepted_request.content_digest
+            ),
+            completion_criteria=_completion_criteria,
         )
         self.store.save_work_run(run)
         for layer in self.policy_layers:
@@ -265,6 +364,7 @@ class WorkCoordinator:
             repository=repository,
             base_commit=base_commit,
         )
+        self.store.put("workspace_request_v2", request, run_id=run.id)
         snapshot = self.workspace.create(request)
         self.store.put("workspace_v2", snapshot, run_id=run.id)
         self._event(
@@ -276,17 +376,21 @@ class WorkCoordinator:
         )
         run = self._update(run, status="running", workspace_id=snapshot.id)
         adapter = self.worker_factory(snapshot, cancellation)
-        worker_request = WorkerRequest(
+        worker_request = _accepted_request or WorkerRequest(
             id=identifier("worker-request"),
             run_id=run.id,
             created_at=now(),
             goal=goal,
-            accepted_plan_digest=canonical_digest({"goal": goal}),
+            accepted_plan_digest=run.accepted_graph_digest or canonical_digest({"goal": goal}),
+            node_id=run.node_id,
+            accepted_graph_revision_digest=run.accepted_graph_digest,
+            graph_run_id=run.id,
             workspace_context=(),
-            harness_digest=canonical_digest({"repository": repository}),
+            harness_digest=harness_digest,
             effective_policy_digest=run.effective_policy_digest,
             remaining_budgets=freeze_json({"worker_turns": self.max_worker_turns}),
         )
+        self.store.put("worker_request_v2", worker_request, run_id=run.id)
         channel = _Channel(self, run)
         result = adapter.propose(worker_request, channel)
         self.store.put("worker_result_v2", result, run_id=run.id)
@@ -474,6 +578,7 @@ class WorkCoordinator:
                 payload=request,
                 reason="required Harness verification",
             )
+            self.store.put("verification_request_v2", request, run_id=run.id)
             proposal_decision = self._decide(verification_proposal)
             if proposal_decision.outcome is not DecisionOutcome.ALLOW:
                 return self._update(run, status="failed", failure_code="VERIFICATION_POLICY_DENIED")
@@ -530,24 +635,33 @@ class WorkCoordinator:
         # commands are submitted as ordinary process proposals by the coordinator caller.
         review_digest = canonical_digest({"patch": patch.artifact_digest, "blocked": False})
         criteria = (
-            *(
+            _declared_criterion_evidence(
+                run.completion_criteria,
+                self.verification_requests,
+                tuple(verification_digests),
+                patch,
+            )
+            if run.completion_criteria
+            else (
+                *(
+                    CriterionEvidence(
+                        criterion_id=f"verification-{index}",
+                        disposition="satisfied",
+                        evidence_refs=(digest,),
+                    )
+                    for index, digest in enumerate(verification_digests, start=1)
+                ),
                 CriterionEvidence(
-                    criterion_id=f"verification-{index}",
+                    criterion_id="reviewed-patch",
                     disposition="satisfied",
-                    evidence_refs=(digest,),
-                )
-                for index, digest in enumerate(verification_digests, start=1)
-            ),
-            CriterionEvidence(
-                criterion_id="reviewed-patch",
-                disposition="satisfied",
-                evidence_refs=(patch.artifact_digest, review_digest),
-            ),
-            CriterionEvidence(
-                criterion_id="promotion-ready",
-                disposition="satisfied",
-                evidence_refs=(patch.artifact_digest, review_digest),
-            ),
+                    evidence_refs=(patch.artifact_digest, review_digest),
+                ),
+                CriterionEvidence(
+                    criterion_id="promotion-ready",
+                    disposition="satisfied",
+                    evidence_refs=(patch.artifact_digest, review_digest),
+                ),
+            )
         )
         ledger = AcceptanceLedger(
             id=identifier("acceptance-ledger"),
@@ -670,3 +784,51 @@ class WorkCoordinator:
             }
         )
         self.store.append_work_event(event)
+
+
+def _declared_criterion_evidence(
+    criteria: tuple[CompletionCriterion, ...],
+    verification_requests: tuple[ProcessRequest, ...],
+    verification_digests: tuple[str, ...],
+    patch: ArtifactDescriptor,
+) -> tuple[CriterionEvidence, ...]:
+    """Map declared criteria only to exact first-party results and artifacts."""
+
+    if len(verification_requests) != len(verification_digests):
+        raise ValueError("verification request/result cardinality mismatch")
+    verification_by_id = {
+        request.id: digest
+        for request, digest in zip(verification_requests, verification_digests, strict=True)
+    }
+    artifact_refs = {
+        patch.id: (patch.content_digest or "", patch.artifact_digest),
+        patch.logical_kind: (patch.content_digest or "", patch.artifact_digest),
+    }
+    result: list[CriterionEvidence] = []
+    for criterion in criteria:
+        refs: list[str] = []
+        missing = False
+        for requirement_id in criterion.verification_requirement_ids:
+            digest = verification_by_id.get(requirement_id)
+            if digest is None:
+                missing = True
+            else:
+                refs.append(digest)
+        for artifact_id in criterion.required_artifact_ids:
+            artifact = artifact_refs.get(artifact_id)
+            if artifact is None:
+                missing = True
+            else:
+                refs.extend(artifact)
+        declared = bool(criterion.verification_requirement_ids or criterion.required_artifact_ids)
+        unique_refs = tuple(dict.fromkeys(ref for ref in refs if ref))
+        result.append(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                disposition=(
+                    "satisfied" if declared and not missing and unique_refs else "uncovered"
+                ),
+                evidence_refs=unique_refs,
+            )
+        )
+    return tuple(result)

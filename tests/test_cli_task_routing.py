@@ -7,8 +7,20 @@ from pathlib import Path
 import pytest
 
 from ai_employee import cli
+from ai_employee.domain import (
+    Budget,
+    CompletionCriterion,
+    Edge,
+    Graph,
+    Node,
+    NodeKind,
+    OutputContract,
+)
 from ai_employee.inspector import inspect_work_run
+from ai_employee.serialization import canonical_digest
 from ai_employee.storage import SQLiteStore
+from ai_employee.task_orchestration import NodeRouteRecord
+from ai_employee.task_planning import CliProposedGraphPlanner, ProposedGraph
 
 
 def test_work_cli_defaults_to_adaptive_routing() -> None:
@@ -16,6 +28,7 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
 
     assert args.routing_mode == "adaptive"
     assert args.strategy_set is None
+    assert args.max_concurrency == 1
 
 
 def _write_routing_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -139,6 +152,8 @@ def test_default_adaptive_routing_persists_selected_strategy(
             "--db",
             str(db_path),
             "--plan-only",
+            "--max-concurrency",
+            "1",
         ]
     )
 
@@ -201,3 +216,99 @@ def test_routing_rejects_conflicting_cli_overrides_before_execution(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         cli.main(["work", "route this task", *arguments])
+
+
+def test_default_adaptive_graph_execution_fails_closed_after_persisting_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+
+    def criterion(name: str) -> CompletionCriterion:
+        return CompletionCriterion(
+            id=f"criterion-{name}", description=f"{name} is complete"
+        )
+
+    def node(name: str, complexity: int) -> Node:
+        return Node(
+            id=name,
+            kind=NodeKind.FUNCTION,
+            name=name,
+            objective=f"complete {name}",
+            output_contract=OutputContract(id=f"contract-{name}"),
+            required_capabilities=("edit_intent", "process"),
+            completion_criteria=(criterion(name),),
+            complexity=complexity,
+            scale=complexity,
+        )
+
+    graph = Graph(
+        id="planned-fork-join",
+        nodes=(node("a", 2), node("b", 8), node("c", 8)),
+        edges=(
+            Edge(id="a-c", source_id="a", target_id="c"),
+            Edge(id="b-c", source_id="b", target_id="c"),
+        ),
+        entry_node_ids=("a", "b"),
+        terminal_node_ids=("c",),
+        budget=Budget(max_attempts=3, max_nodes=3, max_wall_seconds=30.0),
+    )
+
+    def fake_plan(
+        self: CliProposedGraphPlanner,
+        goal: object,
+        *,
+        available_capabilities: object,
+        effective_policy_digest: str,
+        harness_digest: str,
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> ProposedGraph:
+        del available_capabilities, max_nodes, max_wall_seconds
+        assert hasattr(goal, "id")
+        assert hasattr(goal, "statement")
+        return ProposedGraph(
+            id="proposal-fork-join",
+            run_id=self.run_id,
+            created_at="2026-01-01T00:00:00Z",
+            goal_id=goal.id,
+            goal_digest=canonical_digest(goal),
+            graph=graph,
+            planner_strategy=self.strategy,
+            effective_policy_digest=effective_policy_digest,
+            harness_digest=harness_digest,
+        )
+
+    monkeypatch.setattr(CliProposedGraphPlanner, "plan", fake_plan)
+
+    result = cli.main(
+        [
+            "work",
+            "Run two independent changes, then join their verified results",
+            "--repo",
+            str(repository),
+            "--operator-config",
+            str(operator_config),
+            "--db",
+            str(db_path),
+            "--max-concurrency",
+            "2",
+        ]
+    )
+
+    assert result == 5
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "failed"
+    assert emitted["stable_code"] == "GRAPH_EXECUTION_UNAVAILABLE"
+    with SQLiteStore(db_path) as store:
+        routes = store.list_records(
+            "node_route_v2", NodeRouteRecord, run_id=emitted["run_id"]
+        )
+        proposal = store.list_records(
+            "proposed_graph_v2", ProposedGraph, run_id=emitted["run_id"]
+        )[0]
+    assert routes == ()
+    assert proposal.graph == graph
+    assert proposal.planner_strategy.model == "gpt-5.6-sol"
+    assert proposal.planner_strategy.effort == "high"

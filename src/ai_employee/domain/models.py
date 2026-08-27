@@ -159,8 +159,13 @@ class Plan(EntityModel):
 class Node(EntityModel):
     kind: NodeKind
     name: str = Field(min_length=1, max_length=500)
+    objective: str | None = Field(default=None, min_length=1, max_length=10_000)
     output_contract: OutputContract
     required_capabilities: tuple[Identifier, ...] = ()
+    completion_criteria: tuple[CompletionCriterion, ...] = ()
+    complexity: int = Field(default=1, ge=1, le=10)
+    scale: int = Field(default=1, ge=1, le=10)
+    risk: int = Field(default=0, ge=0, le=10)
     retry_limit: int = Field(default=0, ge=0)
     max_iterations: int = Field(default=1, ge=1)
     configuration: CanonicalData = None

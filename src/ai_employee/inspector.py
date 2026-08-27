@@ -28,6 +28,7 @@ from .domain.v2 import (
 )
 from .serialization import canonical_json
 from .storage import SQLiteStore
+from .task_orchestration import TaskGraphAcceptance
 
 
 class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
@@ -104,6 +105,9 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     run = store.get_work_run(run_id)
     artifacts = store.list_records("artifact_descriptor_v2", ArtifactDescriptor, run_id=run_id)
     patch = next((item for item in artifacts if item.id == run.patch_artifact_id), None)
+    graph_acceptances = store.list_records(
+        "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+    )
     return {
         "schema_version": "2",
         "run_id": run.id,
@@ -111,6 +115,9 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "state": run.status,
         "generation": run.generation,
         "run": _json_model(run),
+        "graph": (
+            None if not graph_acceptances else _json_model(graph_acceptances[-1])
+        ),
         "routing": {
             "strategy_set": run.strategy_set,
             "assessment_strategy": (
