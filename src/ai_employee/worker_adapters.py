@@ -44,8 +44,17 @@ class WorkerProposalEnvelope(BaseModel):
     usage: Mapping[str, object] | None = None
 
 
+def _semantic_assessment_schema() -> dict[str, object]:
+    schema = SemanticTaskAssessment.model_json_schema()
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("semantic assessment schema must define object properties")
+    schema["required"] = list(properties)
+    return schema
+
+
 def semantic_assessment_schema_json() -> bytes:
-    return canonical_json(SemanticTaskAssessment.model_json_schema()).encode()
+    return canonical_json(_semantic_assessment_schema()).encode()
 
 
 class ScriptedWorkerAdapter:
@@ -362,7 +371,7 @@ class CliTaskAssessmentAdapter:
                     "required_capabilities": deterministic.required_capabilities,
                 },
                 "available_capabilities": tuple(available_capabilities),
-                "response_schema": SemanticTaskAssessment.model_json_schema(),
+                "response_schema": _semantic_assessment_schema(),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)

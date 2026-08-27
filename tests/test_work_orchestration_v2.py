@@ -6,7 +6,12 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
-from ai_employee.domain import ExecutionStrategy, RoutingMode, TaskAssessment
+from ai_employee.domain import (
+    ExecutionStrategy,
+    RoutingMode,
+    SemanticTaskAssessment,
+    TaskAssessment,
+)
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
     ActionKind,
@@ -38,6 +43,7 @@ from ai_employee.worker_adapters import (
     WorkerProposalEnvelope,
     _bounded_prompt,
     _validate_worker_envelope,
+    semantic_assessment_schema_json,
     worker_proposal_schema_json,
 )
 
@@ -386,6 +392,30 @@ def test_ollama_worker_uses_local_model_and_inline_schema() -> None:
     assert argv[argv.index("--format") + 1] == "json"
     assert "--hidethinking" in argv
     assert argv[-1] == "prompt"
+
+
+def test_semantic_assessment_schema_requires_every_property() -> None:
+    schema = json.loads(semantic_assessment_schema_json())
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == [
+        "schema_version",
+        "complexity",
+        "scale",
+        "required_capabilities",
+        "reasons",
+    ]
+
+
+def test_semantic_assessment_runtime_defaults_remain_parseable() -> None:
+    assessment = SemanticTaskAssessment.model_validate_json(
+        '{"complexity":2,"scale":1,"reasons":["bounded change"]}',
+        strict=True,
+    )
+
+    assert assessment.schema_version == "1"
+    assert assessment.required_capabilities == ()
 
 
 def test_worker_proposal_schema_is_canonical_json() -> None:
