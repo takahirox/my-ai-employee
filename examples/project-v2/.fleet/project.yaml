@@ -42,7 +42,7 @@ approvals:
 worker:
   preferred: "codex_cli"
   allowed: ["codex_cli", "claude_code_cli", "ollama_cli"]
-  allowed_strategy_ids: [codex-luna-max, codex-sol-high, claude-exact, ollama-local]
+  allowed_strategy_ids: [codex-luna-max, codex-sol-high, claude-opus-high, claude-fable-high, ollama-local]
   adaptive_routing: true
   # Change to true only when this project explicitly allows a local model.
   local_backend: false

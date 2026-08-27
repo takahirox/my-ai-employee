@@ -94,6 +94,9 @@ class OperatorRoutingConfig(BaseModel):
     strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(
         default_factory=dict
     )
+    strategy_set_assessors: Mapping[Identifier, Identifier] = Field(
+        default_factory=dict
+    )
 
     @field_validator("strategy_sets")
     @classmethod
@@ -111,6 +114,19 @@ class OperatorRoutingConfig(BaseModel):
     def _serialize_strategy_sets(
         self, value: Mapping[Identifier, tuple[Identifier, ...]]
     ) -> dict[Identifier, tuple[Identifier, ...]]:
+        return dict(value)
+
+    @field_validator("strategy_set_assessors")
+    @classmethod
+    def _freeze_strategy_set_assessors(
+        cls, value: Mapping[Identifier, Identifier]
+    ) -> Mapping[Identifier, Identifier]:
+        return FrozenDict(value)
+
+    @field_serializer("strategy_set_assessors")
+    def _serialize_strategy_set_assessors(
+        self, value: Mapping[Identifier, Identifier]
+    ) -> dict[Identifier, Identifier]:
         return dict(value)
 
     @model_validator(mode="after")
@@ -140,6 +156,17 @@ class OperatorRoutingConfig(BaseModel):
             raise ValueError(
                 "default assessment strategy must name a configured strategy"
             )
+        unknown_sets = set(self.strategy_set_assessors) - set(self.strategy_sets)
+        if unknown_sets:
+            raise ValueError(
+                f"assessment strategies reference unknown strategy sets: {sorted(unknown_sets)}"
+            )
+        unknown_assessors = set(self.strategy_set_assessors.values()) - set(ids)
+        if unknown_assessors:
+            raise ValueError(
+                "strategy-set assessment strategies reference unknown strategy IDs: "
+                f"{sorted(unknown_assessors)}"
+            )
         return self
 
 
@@ -151,6 +178,11 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
         default_assessment_strategy="codex-sol-high",
         strategy_sets={
             "codex-balanced": ("codex-luna-max", "codex-sol-high"),
+            "claude-only": ("claude-opus-high", "claude-fable-high"),
+        },
+        strategy_set_assessors={
+            "codex-balanced": "codex-sol-high",
+            "claude-only": "claude-fable-high",
         },
         strategies=(
             OperatorStrategyConfig(
@@ -169,6 +201,30 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 id="codex-sol-high",
                 backend="codex_cli",
                 model="gpt-5.6-sol",
+                effort="high",
+                capabilities=("edit_intent", "process"),
+                min_complexity=1,
+                max_complexity=10,
+                min_scale=1,
+                max_scale=10,
+                max_risk=10,
+            ),
+            OperatorStrategyConfig(
+                id="claude-opus-high",
+                backend="claude_code_cli",
+                model="claude-opus-5",
+                effort="high",
+                capabilities=("edit_intent", "process"),
+                min_complexity=1,
+                max_complexity=3,
+                min_scale=1,
+                max_scale=3,
+                max_risk=0,
+            ),
+            OperatorStrategyConfig(
+                id="claude-fable-high",
+                backend="claude_code_cli",
+                model="claude-fable-5",
                 effort="high",
                 capabilities=("edit_intent", "process"),
                 min_complexity=1,
@@ -252,11 +308,23 @@ class OperatorConfig(BaseModel):
         return self.routing.default_strategy_set
 
     def assessment_strategy(
-        self, mode: RoutingMode, requested: str | None = None
+        self,
+        mode: RoutingMode,
+        requested: str | None = None,
+        strategy_set: str | None = None,
     ) -> ExecutionStrategy:
         if self.routing is None:
             raise ValueError("adaptive routing requires operator routing configuration")
-        selected_id = requested or self.routing.default_assessment_strategy
+        selected_set = self.strategy_set_name(strategy_set)
+        selected_id = (
+            requested
+            or (
+                None
+                if selected_set is None
+                else self.routing.strategy_set_assessors.get(selected_set)
+            )
+            or self.routing.default_assessment_strategy
+        )
         if selected_id is None:
             raise ValueError("adaptive routing requires an assessment strategy")
         configured = next(

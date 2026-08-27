@@ -89,6 +89,10 @@ fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker 
 Adaptive routing first obtains a repository-isolated strict-JSON semantic assessment. The
 built-in assessment strategy is `gpt-5.6-sol` with `high` effort; operators may replace
 the default or select an exact authorized strategy with `--assessment-strategy`.
+Each strategy set may define its own assessor. The built-in `claude-only` set uses
+`claude-fable-5` with `high` effort for assessment, then routes ordinary low-risk work
+to `claude-opus-5`/`high` and work outside the Opus bounds to
+`claude-fable-5`/`high`. This keeps every model call in that profile on Claude.
 Deterministic complexity/scale floors and Harness-derived risk/capabilities are merged
 afterward, and the LLM cannot lower them. Assessment failure is fail-closed and never
 falls back to another model or Local LLM.

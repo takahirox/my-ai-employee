@@ -9,6 +9,7 @@ from ai_employee.config import (
     OperatorStrategyConfig,
 )
 from ai_employee.domain import ExecutionStrategy, RoutingMode
+from ai_employee.routing import assess_task, select_strategy
 
 
 def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
@@ -33,6 +34,42 @@ def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
     assert strategies[0].max_complexity == 3
     assert strategies[0].max_scale == 3
     assert strategies[0].max_risk == 0
+
+    claude = config.execution_strategies(RoutingMode.ADAPTIVE, "claude-only")
+    assert tuple(
+        (strategy.id, strategy.model, strategy.effort) for strategy in claude
+    ) == (
+        ("claude-opus-high", "claude-opus-5", "high"),
+        ("claude-fable-high", "claude-fable-5", "high"),
+    )
+    claude_assessor = config.assessment_strategy(
+        RoutingMode.ADAPTIVE, strategy_set="claude-only"
+    )
+    assert claude_assessor.id == "claude-fable-high"
+
+
+def test_builtin_claude_only_routes_simple_to_opus_and_complex_to_fable() -> None:
+    strategies = OperatorConfig().execution_strategies(
+        RoutingMode.ADAPTIVE, "claude-only"
+    )
+    allowed_ids = tuple(strategy.id for strategy in strategies)
+
+    def selected(goal: str) -> str:
+        assessment = assess_task(
+            goal,
+            run_id="run.claude-only",
+            required_capabilities=("edit_intent", "process"),
+        )
+        return select_strategy(
+            strategies,
+            mode=RoutingMode.ADAPTIVE,
+            assessment=assessment,
+            allowed_strategy_ids=allowed_ids,
+            allowed_backends=("claude_code_cli",),
+        ).id
+
+    assert selected("Fix this bug") == "claude-opus-high"
+    assert selected("Inspect; design; implement; verify") == "claude-fable-high"
 
 
 def test_execution_strategy_conversion_preserves_every_configured_field() -> None:
@@ -82,6 +119,7 @@ def test_named_strategy_set_limits_available_strategies() -> None:
             default_strategy_set="claude-only",
             default_assessment_strategy="codex",
             strategy_sets={"claude-only": ("claude",), "mixed": ("codex", "claude")},
+            strategy_set_assessors={"claude-only": "claude"},
         )
     )
 
@@ -91,7 +129,10 @@ def test_named_strategy_set_limits_available_strategies() -> None:
     assert selected[0].backend == "claude_code_cli"
     assert config.strategy_set_name() == "claude-only"
     assert config.strategy_set_name("mixed") == "mixed"
-    assert config.assessment_strategy(RoutingMode.ADAPTIVE).id == "codex"
+    assert config.assessment_strategy(RoutingMode.ADAPTIVE).id == "claude"
+    assert config.assessment_strategy(
+        RoutingMode.ADAPTIVE, strategy_set="mixed"
+    ).id == "codex"
     assert config.assessment_strategy(RoutingMode.ADAPTIVE, "claude").id == "claude"
     with pytest.raises(ValueError, match="unknown strategy set"):
         config.execution_strategies(RoutingMode.ADAPTIVE, "missing")
@@ -136,6 +177,17 @@ def test_routing_rejects_empty_or_duplicate_strategies_and_capabilities() -> Non
     with pytest.raises(ValidationError, match="default assessment strategy"):
         OperatorRoutingConfig(
             strategies=(strategy,), default_assessment_strategy="missing"
+        )
+    with pytest.raises(ValidationError, match="unknown strategy sets"):
+        OperatorRoutingConfig(
+            strategies=(strategy,),
+            strategy_set_assessors={"missing": "strategy.codex"},
+        )
+    with pytest.raises(ValidationError, match="unknown strategy IDs"):
+        OperatorRoutingConfig(
+            strategies=(strategy,),
+            strategy_sets={"configured": ("strategy.codex",)},
+            strategy_set_assessors={"configured": "missing"},
         )
 
 

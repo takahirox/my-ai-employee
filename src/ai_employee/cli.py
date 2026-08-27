@@ -337,7 +337,9 @@ def _work(args: argparse.Namespace) -> int:
         )
         if routing_mode is RoutingMode.ADAPTIVE:
             assessment_strategy = operator_config.assessment_strategy(
-                routing_mode, args.assessment_strategy
+                routing_mode,
+                args.assessment_strategy,
+                effective_strategy_set,
             )
             if (
                 assessment_strategy.id not in harness.worker.allowed_strategy_ids
