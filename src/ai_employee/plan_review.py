@@ -7,9 +7,9 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from .domain import ExecutionStrategy, Goal
 from .domain.base import Digest, Identifier, StableStrEnum
@@ -174,6 +174,100 @@ class TrustedPlanReview(DigestedRecordV2):
     effective_policy_digest: Digest
     harness_digest: Digest
     findings: tuple[PlanReviewFinding, ...] = Field(max_length=16)
+
+
+class PlanReviewAttempt(DigestedRecordV2):
+    """Compact trusted evidence for one completed or failed review round."""
+
+    schema_name: ClassVar[str] = "plan_review_attempt"
+    goal_id: Identifier
+    goal_digest: Digest
+    proposed_graph_id: Identifier
+    proposed_graph_digest: Digest
+    review_round: Literal[0, 1]
+    reviewer_strategy: ExecutionStrategy
+    effective_policy_digest: Digest
+    harness_digest: Digest
+    outcome: Literal["completed", "failed"]
+    findings: tuple[PlanReviewFinding, ...] = Field(default=(), max_length=16)
+    action: PlanReviewAction
+    failure_code: Literal["PLAN_REVIEW_FAILED"] | None = None
+
+    @field_validator("findings")
+    @classmethod
+    def _canonical_findings(
+        cls, value: tuple[PlanReviewFinding, ...]
+    ) -> tuple[PlanReviewFinding, ...]:
+        return PlanReviewPayload(findings=value).findings
+
+    @model_validator(mode="after")
+    def _decision_is_deterministic(self) -> Self:
+        blocking = any(item.impact is PlanReviewImpact.BLOCKING for item in self.findings)
+        expected = (
+            PlanReviewAction.ACCEPT
+            if not blocking
+            else PlanReviewAction.REQUEST_REVISION
+            if self.review_round == 0
+            else PlanReviewAction.REJECT
+        )
+        if self.outcome == "completed":
+            if self.failure_code is not None or self.action is not expected:
+                raise ValueError("completed plan review has an invalid deterministic action")
+        elif (
+            self.findings
+            or self.action is not PlanReviewAction.REJECT
+            or self.failure_code != "PLAN_REVIEW_FAILED"
+        ):
+            raise ValueError("failed plan review must be an empty fail-closed rejection")
+        return self
+
+
+class PlanRevisionAttempt(DigestedRecordV2):
+    """One bounded pre-acceptance Planner correction and its exact trigger."""
+
+    schema_name: ClassVar[str] = "plan_revision_attempt"
+    source_proposed_graph_digest: Digest
+    triggering_review_digest: Digest
+    planner_strategy: ExecutionStrategy
+    status: Literal["completed", "failed"]
+    failure_code: Literal["GRAPH_PLANNER_FAILED"] | None = None
+    revised_proposed_graph_id: Identifier | None = None
+    revised_proposed_graph_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def _completion_binding_is_total(self) -> Self:
+        completed = self.status == "completed"
+        if completed != (self.failure_code is None):
+            raise ValueError("revision status and failure code disagree")
+        if completed != (self.revised_proposed_graph_id is not None):
+            raise ValueError("revision status and revised proposal ID disagree")
+        if completed != (self.revised_proposed_graph_digest is not None):
+            raise ValueError("revision status and revised proposal digest disagree")
+        if completed and self.revised_proposed_graph_digest == self.source_proposed_graph_digest:
+            raise ValueError("a completed correction must change the proposed graph")
+        return self
+
+
+class PlanReviewAcceptanceBinding(DigestedRecordV2):
+    """Bind graph acceptance to the sole final accepting semantic review."""
+
+    schema_name: ClassVar[str] = "plan_review_acceptance_binding"
+    task_graph_acceptance_digest: Digest
+    selected_proposed_graph_digest: Digest
+    accepting_review_digest: Digest
+    revision_attempt_digest: Digest | None = None
+
+
+class PlanReviewGateError(ValueError):
+    """Stable fail-closed result from the optional pre-acceptance gate."""
+
+    def __init__(
+        self,
+        stable_code: Literal["PLAN_REVIEW_FAILED", "PLAN_REVIEW_BLOCKED", "GRAPH_PLANNER_FAILED"],
+        message: str,
+    ) -> None:
+        self.stable_code = stable_code
+        super().__init__(message)
 
 
 def validate_plan_review(

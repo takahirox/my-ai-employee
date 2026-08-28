@@ -35,8 +35,20 @@ from .domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
-from .graph import accept_task_graph
+from .graph import GraphValidationError, accept_task_graph, validate_task_graph
 from .graph_composition import NodePatchArtifact
+from .plan_review import (
+    PlanReviewAcceptanceBinding,
+    PlanReviewAction,
+    PlanReviewAttempt,
+    PlanReviewFinding,
+    PlanReviewGateError,
+    PlanReviewPayload,
+    PlanRevisionAttempt,
+    TrustedPlanReview,
+    decide_plan_review_action,
+    validate_plan_review,
+)
 from .routing import RoutingError, assess_task, select_strategy
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
@@ -274,6 +286,36 @@ class NodeRunner(Protocol):
     ) -> NodeExecutionResult: ...
 
 
+class PlanReviewer(Protocol):
+    strategy: ExecutionStrategy
+
+    def review(
+        self,
+        goal: Goal,
+        proposed_graph: ProposedGraph,
+        *,
+        review_round: Literal[0, 1],
+        available_capabilities: tuple[str, ...],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> TrustedPlanReview: ...
+
+
+class PlanReviser(Protocol):
+    strategy: ExecutionStrategy
+
+    def revise(
+        self,
+        goal: Goal,
+        original: ProposedGraph,
+        blocking_findings: tuple[PlanReviewFinding, ...],
+        *,
+        available_capabilities: tuple[str, ...],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> ProposedGraph: ...
+
+
 class GraphReplay(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     schema_version: Literal["2"] = "2"
@@ -299,6 +341,9 @@ class GraphReplay(BaseModel):
     verification_invocations: Literal[0] = 0
     composition_invocations: Literal[0] = 0
     promotion_invocations: Literal[0] = 0
+    review_attempts: tuple[PlanReviewAttempt, ...] = ()
+    revision_attempts: tuple[PlanRevisionAttempt, ...] = ()
+    review_acceptance_binding: PlanReviewAcceptanceBinding | None = None
 
 
 def one_node_graph(
@@ -361,6 +406,8 @@ class TaskOrchestrator:
         operator_config_digest: Digest | None = None,
         operator_config_path: str | None = None,
         strategy_set: Identifier | None = None,
+        plan_reviewer: PlanReviewer | None = None,
+        plan_reviser: PlanReviser | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
@@ -388,6 +435,17 @@ class TaskOrchestrator:
         self.operator_config_digest = operator_config_digest
         self.operator_config_path = operator_config_path
         self.strategy_set = strategy_set
+        if (plan_reviewer is None) != (plan_reviser is None):
+            raise ValueError("plan reviewer and revision Planner must be configured together")
+        if plan_reviewer is not None and plan_reviser is not None:
+            configured = {item.id: item for item in self.strategies}
+            if (
+                plan_reviewer.strategy != plan_reviser.strategy
+                or configured.get(plan_reviewer.strategy.id) != plan_reviewer.strategy
+            ):
+                raise ValueError("plan-review callbacks must use one configured strategy")
+        self.plan_reviewer = plan_reviewer
+        self.plan_reviser = plan_reviser
 
     def run(
         self,
@@ -480,6 +538,16 @@ class TaskOrchestrator:
             )
             if not set(proposal.replan_evidence) <= authoritative_evidence:
                 raise ValueError("replan evidence is not authoritative for the previous revision")
+        final_review: PlanReviewAttempt | None = None
+        review_revision: PlanRevisionAttempt | None = None
+        if proposal is not None and self.plan_reviewer is not None and not resume and not replan:
+            issues = validate_task_graph(candidate, policy, available_capabilities=capabilities)
+            if issues:
+                raise GraphValidationError(issues)
+            proposal, final_review, review_revision = self._run_plan_review_gate(
+                goal, proposal, policy, capabilities
+            )
+            candidate = proposal.graph
         validated = accept_task_graph(
             candidate,
             policy,
@@ -491,6 +559,9 @@ class TaskOrchestrator:
             acceptances = self.store.list_records(
                 "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
             )
+            acceptances = _ordered_revision_history(acceptances)
+            _validate_revision_history(acceptances)
+            _load_plan_review_history(self.store, graph_run, acceptances)
             if (
                 graph_run.status != "paused"
                 or graph_run.goal_id != goal.id
@@ -598,6 +669,22 @@ class TaskOrchestrator:
             graph_digest = _required_digest(accepted.content_digest)
             self.store.save_graph(run_id, accepted)
             self.store.put("task_graph_acceptance_v2", acceptance, run_id=run_id)
+            if final_review is not None:
+                assert proposal is not None
+                review_binding = PlanReviewAcceptanceBinding(
+                    id=identifier("plan-review-acceptance"),
+                    run_id=run_id,
+                    created_at=now(),
+                    task_graph_acceptance_digest=_required_digest(acceptance.content_digest),
+                    selected_proposed_graph_digest=_required_digest(proposal.content_digest),
+                    accepting_review_digest=_required_digest(final_review.content_digest),
+                    revision_attempt_digest=(
+                        None
+                        if review_revision is None
+                        else _required_digest(review_revision.content_digest)
+                    ),
+                )
+                self.store.put("plan_review_acceptance_binding_v2", review_binding, run_id=run_id)
             max_claims = min(candidate.budget.max_attempts, policy.max_attempts)
             graph_run = GraphRunRecord(
                 id=run_id,
@@ -1112,6 +1199,142 @@ class TaskOrchestrator:
         self._save_run(graph_run)
         return graph_run
 
+    def _run_plan_review_gate(
+        self,
+        goal: Goal,
+        proposal: ProposedGraph,
+        policy: ExecutionPolicy,
+        capabilities: tuple[str, ...],
+    ) -> tuple[ProposedGraph, PlanReviewAttempt, PlanRevisionAttempt | None]:
+        assert self.plan_reviewer is not None and self.plan_reviser is not None
+        if (
+            self.plan_reviewer.strategy != proposal.planner_strategy
+            or self.plan_reviser.strategy != proposal.planner_strategy
+        ):
+            raise ValueError("review and revision must reuse the resolved Planner strategy")
+        max_nodes = min(proposal.graph.budget.max_nodes, policy.max_nodes)
+        max_wall_seconds = min(proposal.graph.budget.max_wall_seconds, policy.max_wall_seconds)
+        self.store.put("proposed_graph_v2", proposal, run_id=proposal.run_id)
+        first = self._invoke_plan_review(
+            goal,
+            proposal,
+            review_round=0,
+            capabilities=capabilities,
+            max_nodes=max_nodes,
+            max_wall_seconds=max_wall_seconds,
+        )
+        if first.action is PlanReviewAction.ACCEPT:
+            return proposal, first, None
+
+        blocking = tuple(item for item in first.findings if item.impact.value == "blocking")
+        try:
+            revised = self.plan_reviser.revise(
+                goal,
+                proposal,
+                blocking,
+                available_capabilities=capabilities,
+                max_nodes=max_nodes,
+                max_wall_seconds=max_wall_seconds,
+            )
+            if (
+                revised.run_id != proposal.run_id
+                or revised.goal_id != proposal.goal_id
+                or revised.goal_digest != proposal.goal_digest
+                or revised.planner_strategy != proposal.planner_strategy
+                or revised.effective_policy_digest != proposal.effective_policy_digest
+                or revised.harness_digest != proposal.harness_digest
+                or revised.previous_accepted_revision_digest
+                != proposal.previous_accepted_revision_digest
+                or revised.replan_trigger != proposal.replan_trigger
+                or revised.replan_evidence != proposal.replan_evidence
+            ):
+                raise ValueError("revised ProposedGraph provenance is stale")
+            issues = validate_task_graph(revised.graph, policy, available_capabilities=capabilities)
+            if issues:
+                raise GraphValidationError(issues)
+            revision = PlanRevisionAttempt(
+                id=identifier("plan-revision"),
+                run_id=proposal.run_id,
+                created_at=now(),
+                source_proposed_graph_digest=_required_digest(proposal.content_digest),
+                triggering_review_digest=_required_digest(first.content_digest),
+                planner_strategy=proposal.planner_strategy,
+                status="completed",
+                revised_proposed_graph_id=revised.id,
+                revised_proposed_graph_digest=_required_digest(revised.content_digest),
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            revision = PlanRevisionAttempt(
+                id=identifier("plan-revision"),
+                run_id=proposal.run_id,
+                created_at=now(),
+                source_proposed_graph_digest=_required_digest(proposal.content_digest),
+                triggering_review_digest=_required_digest(first.content_digest),
+                planner_strategy=proposal.planner_strategy,
+                status="failed",
+                failure_code="GRAPH_PLANNER_FAILED",
+            )
+            self.store.put("plan_revision_attempt_v2", revision, run_id=proposal.run_id)
+            raise PlanReviewGateError("GRAPH_PLANNER_FAILED", str(error)) from error
+
+        self.store.put("proposed_graph_v2", revised, run_id=proposal.run_id)
+        self.store.put("plan_revision_attempt_v2", revision, run_id=proposal.run_id)
+        second = self._invoke_plan_review(
+            goal,
+            revised,
+            review_round=1,
+            capabilities=capabilities,
+            max_nodes=max_nodes,
+            max_wall_seconds=max_wall_seconds,
+        )
+        if second.action is PlanReviewAction.REJECT:
+            raise PlanReviewGateError(
+                "PLAN_REVIEW_BLOCKED", "revised ProposedGraph retains blocking findings"
+            )
+        return revised, second, revision
+
+    def _invoke_plan_review(
+        self,
+        goal: Goal,
+        proposal: ProposedGraph,
+        *,
+        review_round: Literal[0, 1],
+        capabilities: tuple[str, ...],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> PlanReviewAttempt:
+        assert self.plan_reviewer is not None
+        try:
+            trusted = self.plan_reviewer.review(
+                goal,
+                proposal,
+                review_round=review_round,
+                available_capabilities=capabilities,
+                max_nodes=max_nodes,
+                max_wall_seconds=max_wall_seconds,
+            )
+            if not isinstance(trusted, TrustedPlanReview) or (
+                trusted.run_id != proposal.run_id
+                or trusted.goal_id != goal.id
+                or trusted.goal_digest != canonical_digest(goal)
+                or trusted.proposed_graph_id != proposal.id
+                or trusted.proposed_graph_digest != proposal.content_digest
+                or trusted.review_round != review_round
+                or trusted.reviewer_strategy != self.plan_reviewer.strategy
+                or trusted.effective_policy_digest != proposal.effective_policy_digest
+                or trusted.harness_digest != proposal.harness_digest
+            ):
+                raise ValueError("plan review returned stale or mismatched bindings")
+            attempt = _completed_plan_review_attempt(trusted)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            attempt = _failed_plan_review_attempt(
+                goal, proposal, review_round, self.plan_reviewer.strategy
+            )
+            self.store.put("plan_review_attempt_v2", attempt, run_id=proposal.run_id)
+            raise PlanReviewGateError("PLAN_REVIEW_FAILED", str(error)) from error
+        self.store.put("plan_review_attempt_v2", attempt, run_id=proposal.run_id)
+        return attempt
+
     def replay(self, run_id: Identifier) -> GraphReplay:
         """Reconstruct accepted orchestration facts without workers or services."""
 
@@ -1120,7 +1343,11 @@ class TaskOrchestrator:
             "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
         )
         acceptances = _ordered_revision_history(acceptances)
+        _validate_revision_history(acceptances)
         acceptance = acceptances[-1]
+        review_attempts, revision_attempts, review_binding = _load_plan_review_history(
+            self.store, run, acceptances
+        )
         history = self.store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run_id)
         latest: dict[str, NodeExecutionRecord] = {}
         for record in history:
@@ -1222,6 +1449,9 @@ class TaskOrchestrator:
             ),
             evidence_count=sum(item.evidence_digest is not None for item in latest.values()),
             evaluator_count=sum(item.evaluator_digest is not None for item in latest.values()),
+            review_attempts=review_attempts,
+            revision_attempts=revision_attempts,
+            review_acceptance_binding=review_binding,
         )
 
     def _route(
@@ -1509,6 +1739,145 @@ def _evaluate_criteria(
     if any(by_id[item.id].disposition != "satisfied" for item in mandatory):
         return EvaluationDecision.FAIL
     return EvaluationDecision.PASS
+
+
+def _completed_plan_review_attempt(review: TrustedPlanReview) -> PlanReviewAttempt:
+    return PlanReviewAttempt(
+        id=identifier("plan-review-attempt"),
+        run_id=review.run_id,
+        created_at=now(),
+        goal_id=review.goal_id,
+        goal_digest=review.goal_digest,
+        proposed_graph_id=review.proposed_graph_id,
+        proposed_graph_digest=review.proposed_graph_digest,
+        review_round=review.review_round,
+        reviewer_strategy=review.reviewer_strategy,
+        effective_policy_digest=review.effective_policy_digest,
+        harness_digest=review.harness_digest,
+        outcome="completed",
+        findings=review.findings,
+        action=decide_plan_review_action(review),
+    )
+
+
+def _failed_plan_review_attempt(
+    goal: Goal,
+    proposal: ProposedGraph,
+    review_round: Literal[0, 1],
+    strategy: ExecutionStrategy,
+) -> PlanReviewAttempt:
+    return PlanReviewAttempt(
+        id=identifier("plan-review-attempt"),
+        run_id=proposal.run_id,
+        created_at=now(),
+        goal_id=goal.id,
+        goal_digest=canonical_digest(goal),
+        proposed_graph_id=proposal.id,
+        proposed_graph_digest=_required_digest(proposal.content_digest),
+        review_round=review_round,
+        reviewer_strategy=strategy,
+        effective_policy_digest=proposal.effective_policy_digest,
+        harness_digest=proposal.harness_digest,
+        outcome="failed",
+        action=PlanReviewAction.REJECT,
+        failure_code="PLAN_REVIEW_FAILED",
+    )
+
+
+def _load_plan_review_history(
+    store: SQLiteStore,
+    run: GraphRunRecord,
+    acceptances: tuple[TaskGraphAcceptance, ...],
+) -> tuple[
+    tuple[PlanReviewAttempt, ...],
+    tuple[PlanRevisionAttempt, ...],
+    PlanReviewAcceptanceBinding | None,
+]:
+    reviews = tuple(
+        sorted(
+            store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run.id),
+            key=lambda item: item.review_round,
+        )
+    )
+    revisions = store.list_records("plan_revision_attempt_v2", PlanRevisionAttempt, run_id=run.id)
+    bindings = store.list_records(
+        "plan_review_acceptance_binding_v2",
+        PlanReviewAcceptanceBinding,
+        run_id=run.id,
+    )
+    if not reviews and not revisions and not bindings:
+        return (), (), None
+    if not acceptances or len(bindings) != 1 or len(revisions) > 1:
+        raise ValueError("plan-review acceptance history is missing or ambiguous")
+    if len(reviews) not in {1, 2} or any(item.outcome != "completed" for item in reviews):
+        raise ValueError("plan-review attempt history is incomplete")
+    if tuple(item.review_round for item in reviews) != tuple(range(len(reviews))):
+        raise ValueError("plan-review rounds are missing, duplicated, or out of order")
+
+    initial = acceptances[0]
+    binding = bindings[0]
+    proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run.id)
+    by_digest = {_required_digest(item.content_digest): item for item in proposals}
+    selected_digest = initial.proposed_graph_digest
+    if selected_digest is None or selected_digest not in by_digest:
+        raise ValueError("reviewed graph acceptance has no exact persisted proposal")
+    expected_goal_digest = canonical_digest(run.goal)
+    for review in reviews:
+        proposal = by_digest.get(review.proposed_graph_digest)
+        if (
+            review.run_id != run.id
+            or review.goal_id != run.goal_id
+            or review.goal_digest != expected_goal_digest
+            or review.effective_policy_digest != run.effective_policy_digest
+            or review.harness_digest != run.harness_digest
+            or review.reviewer_strategy not in run.execution_strategies
+            or proposal is None
+            or proposal.id != review.proposed_graph_id
+            or proposal.run_id != run.id
+            or proposal.goal_id != run.goal_id
+            or proposal.goal_digest != expected_goal_digest
+            or proposal.effective_policy_digest != run.effective_policy_digest
+            or proposal.harness_digest != run.harness_digest
+        ):
+            raise ValueError("plan-review evidence has stale run bindings")
+        if validate_plan_review(
+            PlanReviewPayload(findings=review.findings),
+            goal=run.goal,
+            proposed_graph=proposal,
+        ):
+            raise ValueError("plan-review findings have stale graph bindings")
+
+    final = reviews[-1]
+    revision_digest: Digest | None = None
+    if revisions:
+        revision = revisions[0]
+        if (
+            revision.run_id != run.id
+            or len(reviews) != 2
+            or reviews[0].action is not PlanReviewAction.REQUEST_REVISION
+            or final.action is not PlanReviewAction.ACCEPT
+            or revision.status != "completed"
+            or revision.source_proposed_graph_digest != reviews[0].proposed_graph_digest
+            or revision.triggering_review_digest != reviews[0].content_digest
+            or revision.revised_proposed_graph_digest != final.proposed_graph_digest
+            or revision.planner_strategy != reviews[0].reviewer_strategy
+        ):
+            raise ValueError("plan-review revision chain is invalid")
+        revision_digest = _required_digest(revision.content_digest)
+    elif len(reviews) != 1 or final.action is not PlanReviewAction.ACCEPT:
+        raise ValueError("plan-review acceptance has an invalid round chain")
+
+    if (
+        selected_digest != final.proposed_graph_digest
+        or binding.run_id != run.id
+        or binding.task_graph_acceptance_digest != initial.content_digest
+        or binding.selected_proposed_graph_digest != selected_digest
+        or binding.accepting_review_digest != final.content_digest
+        or binding.revision_attempt_digest != revision_digest
+        or by_digest[selected_digest].graph != initial.accepted_revision.graph
+    ):
+        raise ValueError("plan-review acceptance binding is stale or mismatched")
+    return reviews, revisions, binding
 
 
 def _ordered_revision_history(

@@ -18,6 +18,7 @@ from ai_employee.graph_evaluation import (
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
 )
+from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.project import discover_project_harness
 from ai_employee.serialization import canonical_digest
@@ -63,6 +64,8 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                     "ambiguity": "low",
                     "reasons": ["bounded fork and join"],
                 }
+            elif protocol == "fleet-plan-review/2":
+                structured = {"schema_version": "2", "findings": []}
             elif protocol == "fleet-proposed-graph/2":
                 def node(name, complexity):
                     return {
@@ -142,6 +145,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "ambiguity": "low",
                 "reasons": ["bounded fork and join"],
             }))
+            raise SystemExit(0)
+        if protocol == "fleet-plan-review/2":
+            print(json.dumps({"schema_version": "2", "findings": []}))
             raise SystemExit(0)
         if protocol == "fleet-proposed-graph/2":
             def node(node_name, complexity):
@@ -413,10 +419,12 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
             ParentCandidateEvaluationRequest,
         )
         approvals = store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        inspected = inspect_graph_run(store, run_id)
 
     assert graph_run.status == "ready_to_promote"
     assert acceptance.harness_digest == canonical_digest(harness)
     assert acceptance.proposed_graph_digest == proposal.content_digest
+    assert inspected["plan_review"]["status"] == "accepted"
     assert proposal.planner_strategy.id == "planner"
     assert proposal.planner_strategy.model == "planner-model"
     assert proposal.planner_strategy.effort == "high"
