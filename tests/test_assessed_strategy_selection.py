@@ -4,8 +4,18 @@ from datetime import UTC, datetime
 
 import pytest
 
-from ai_employee.domain import ExecutionStrategy, RoutingMode, StrategyPerformance, TaskAssessment
-from ai_employee.routing import RoutingError, select_strategy
+from ai_employee.domain import (
+    ExecutionStrategy,
+    RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
+    StrategyPerformance,
+    TaskAssessment,
+)
+from ai_employee.routing import RoutingError, assess_task, merge_semantic_profile, select_strategy
 
 
 def _assessment(
@@ -90,6 +100,23 @@ def test_assessment_fit_chooses_smallest_adequate_strategy() -> None:
     assert any("assessment headroom=" in reason for reason in selected.routing_reasons)
     for complexity, risk in ((8, 0), (2, 6)):
         assert _select(strategies, _assessment(complexity, risk)).id == "strategy.large"
+
+
+def test_short_open_ended_profile_selects_the_stronger_eligible_strategy() -> None:
+    profile = SemanticTaskProfile(
+        task_type=SemanticTaskType.OPEN_ENDED_STRATEGY,
+        reasoning_class=SemanticReasoningClass.DEEP,
+        scope=SemanticScope.BOUNDED,
+        ambiguity=SemanticAmbiguity.LOW,
+        reasons=("the success path is intentionally open",),
+    )
+    assessment = merge_semantic_profile(assess_task("Choose direction", run_id="run.open"), profile)
+    small = _strategy("strategy.small", max_complexity=3)
+    strong = _strategy("strategy.strong")
+
+    assert assessment.context_character_count == len("Choose direction")
+    assert assessment.complexity == 9
+    assert _select((small, strong), assessment).id == "strategy.strong"
 
 
 def test_authority_and_capabilities_are_an_exact_intersection() -> None:

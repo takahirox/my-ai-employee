@@ -10,7 +10,12 @@ from unicodedata import normalize
 from .domain import (
     ExecutionStrategy,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
     SemanticTaskAssessment,
+    SemanticTaskProfile,
+    SemanticTaskType,
     StrategyPerformance,
     TaskAssessment,
     TaskDecompositionItem,
@@ -18,10 +23,83 @@ from .domain import (
 from .serialization import canonical_digest
 
 MIN_ADAPTIVE_SAMPLES = 3
+SEMANTIC_PROFILE_RUBRIC = (
+    "task_type: mechanical is one specified transformation or operation; retrieval locates or "
+    "summarizes bounded existing facts; diagnosis determines a cause from evidence; "
+    "implementation changes behavior in a known surface; architecture chooses cross-component "
+    "contracts or trade-offs; research synthesizes evidence beyond a bounded source; planning "
+    "chooses and orders bounded work; open_ended_strategy has an intentionally unbounded solution "
+    "space or success path. reasoning_class: mechanical is a direct procedure; simple is one "
+    "obvious inference; moderate is several related inferences or trade-offs; deep is subtle, "
+    "cross-cutting, or adversarial reasoning; open_ended means no bounded solution path is known. "
+    "scope: bounded is one artifact or operation; local is one component; multi_component is "
+    "multiple interacting components; broad is system-wide or externally open. ambiguity: low "
+    "means success and inputs are explicit; medium means a bounded interpretation or missing fact "
+    "must be resolved; high means materially different valid interpretations or essential "
+    "unknowns remain."
+)
 
 
 class RoutingError(ValueError):
     pass
+
+
+def profile_compatibility_bands(profile: SemanticTaskProfile) -> tuple[int, int]:
+    """Map categorical semantic facts to exhaustive legacy compatibility bands."""
+
+    task_complexity = {
+        SemanticTaskType.MECHANICAL: 1,
+        SemanticTaskType.RETRIEVAL: 2,
+        SemanticTaskType.DIAGNOSIS: 4,
+        SemanticTaskType.IMPLEMENTATION: 3,
+        SemanticTaskType.ARCHITECTURE: 7,
+        SemanticTaskType.RESEARCH: 6,
+        SemanticTaskType.PLANNING: 4,
+        SemanticTaskType.OPEN_ENDED_STRATEGY: 9,
+    }[profile.task_type]
+    reasoning_complexity = {
+        SemanticReasoningClass.MECHANICAL: 1,
+        SemanticReasoningClass.SIMPLE: 2,
+        SemanticReasoningClass.MODERATE: 4,
+        SemanticReasoningClass.DEEP: 7,
+        SemanticReasoningClass.OPEN_ENDED: 9,
+    }[profile.reasoning_class]
+    ambiguity_complexity = {
+        SemanticAmbiguity.LOW: 1,
+        SemanticAmbiguity.MEDIUM: 4,
+        SemanticAmbiguity.HIGH: 7,
+    }[profile.ambiguity]
+    scale = {
+        SemanticScope.BOUNDED: 1,
+        SemanticScope.LOCAL: 2,
+        SemanticScope.MULTI_COMPONENT: 5,
+        SemanticScope.BROAD: 8,
+    }[profile.scope]
+    return max(task_complexity, reasoning_complexity, ambiguity_complexity), scale
+
+
+def merge_semantic_profile(
+    deterministic: TaskAssessment,
+    profile: SemanticTaskProfile,
+) -> TaskAssessment:
+    """Apply semantic bands without changing risk, capabilities, or identity facts."""
+
+    complexity, scale = profile_compatibility_bands(profile)
+    reasons = tuple(
+        dict.fromkeys(
+            (*deterministic.reasons, *(f"semantic profile: {reason}" for reason in profile.reasons))
+        )
+    )
+    if len(reasons) > 20:
+        raise RoutingError("combined assessment has too many reasons")
+    return deterministic.model_copy(
+        update={
+            "complexity": complexity,
+            "scale": scale,
+            "semantic_profile": profile,
+            "reasons": reasons,
+        }
+    )
 
 
 def merge_semantic_assessment(
@@ -60,6 +138,8 @@ def merge_semantic_assessment(
         risk=deterministic.risk,
         required_capabilities=required,
         decomposition=deterministic.decomposition,
+        semantic_profile=deterministic.semantic_profile,
+        context_character_count=deterministic.context_character_count,
         reasons=reasons,
     )
 
@@ -92,39 +172,23 @@ def assess_task(
     )[:20]
     if not segments:
         segments = (normalized_goal,)
-    item_count = len(segments)
-    capability_count = len(capabilities)
-    complexity = min(
-        10,
-        1 + len(normalized_goal) // 1_000 + capability_count + (item_count - 1) // 5,
-    )
-    scale = min(10, item_count)
     goal_digest = canonical_digest(normalized_goal)
 
     items = tuple(
         TaskDecompositionItem(
             id=f"assessment-item.{canonical_digest((goal_digest, position, segment))}",
             title=segment[:500],
-            complexity=min(10, 1 + len(segment) // 1_000 + capability_count),
+            complexity=1,
             scale=1,
             risk=risk,
             required_capabilities=capabilities,
-            reasons=(
-                (
-                    f"complexity from segment_length={len(segment)} "
-                    f"and capability_count={capability_count}"
-                ),
-                "scale=1 for one structural item; assessment only",
-            ),
+            reasons=("neutral compatibility values; assessment only",),
         )
         for position, segment in enumerate(segments, start=1)
     )
     reasons = (
-        (
-            f"complexity={complexity} from goal_length={len(normalized_goal)}, "
-            f"item_count={item_count}, and capability_count={capability_count}"
-        ),
-        f"scale={scale} from structural_item_count={item_count}",
+        "complexity=1 and scale=1 are neutral compatibility values before semantic profiling",
+        f"context_character_count={len(normalized_goal)} persisted as non-routing evidence",
         f"risk={risk} preserved from caller input",
     )
     identity = {
@@ -137,11 +201,12 @@ def assess_task(
         id=f"assessment.{canonical_digest(identity)}",
         run_id=run_id,
         goal_digest=goal_digest,
-        complexity=complexity,
-        scale=scale,
+        complexity=1,
+        scale=1,
         risk=risk,
         required_capabilities=capabilities,
         decomposition=items,
+        context_character_count=len(normalized_goal),
         reasons=reasons,
     )
 
@@ -180,9 +245,9 @@ def select_strategy(
             and item.backend in allowed_backend_names
             and (item.backend not in {"ollama", "ollama_cli"} or local_backend_allowed)
             and assessed_required <= set(item.capabilities)
+            and assessment.risk <= item.max_risk
             and item.min_complexity <= assessment.complexity <= item.max_complexity
             and item.min_scale <= assessment.scale <= item.max_scale
-            and assessment.risk <= item.max_risk
         )
     if not eligible:
         raise RoutingError("no strategy satisfies mandatory project and safety constraints")

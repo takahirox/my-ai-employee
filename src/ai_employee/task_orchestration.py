@@ -961,7 +961,7 @@ class TaskOrchestrator:
                         attempt=node.attempt,
                         harness_digest=harness_digest,
                         effective_policy_digest=effective_policy_digest,
-                        remaining_budgets=reservation.remaining_budgets,
+                        remaining_budgets=reservation.requested,
                         prior_result_digests=prior_results,
                         prior_artifact_digests=prior_artifacts,
                         predecessor_outputs=predecessor_outputs,
@@ -1237,7 +1237,13 @@ class TaskOrchestrator:
             run_id=run_id,
             risk=node.risk,
             required_capabilities=node.required_capabilities,
-        ).model_copy(update={"complexity": node.complexity, "scale": node.scale})
+        ).model_copy(
+            update={
+                "complexity": node.complexity,
+                "scale": node.scale,
+                "semantic_profile": node.semantic_profile,
+            }
+        )
         allowed_ids = set(self.allowed_strategy_ids)
         allowed_backends = set(self.allowed_backends)
         required = set(node.required_capabilities)
@@ -1248,9 +1254,9 @@ class TaskOrchestrator:
             and strategy.backend in allowed_backends
             and (strategy.backend not in {"ollama", "ollama_cli"} or self.local_backend_allowed)
             and required <= set(strategy.capabilities)
+            and assessment.risk <= strategy.max_risk
             and strategy.min_complexity <= assessment.complexity <= strategy.max_complexity
             and strategy.min_scale <= assessment.scale <= strategy.max_scale
-            and assessment.risk <= strategy.max_risk
         )
         if not eligible:
             raise RoutingError("no strategy satisfies node assessment and policy")

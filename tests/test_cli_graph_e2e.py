@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from ai_employee import cli
+from ai_employee.domain import SemanticTaskType
 from ai_employee.domain.v2 import ApprovalRecord, PromotionRecord, WorkerRequest
 from ai_employee.graph_composition import GraphPatchCompositionRecord
 from ai_employee.graph_evaluation import (
@@ -53,14 +54,16 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 
             prompt = json.load(sys.stdin)
             protocol = prompt["protocol"]
-            if protocol == "fleet-semantic-task-assessment/1":
+            if protocol == "fleet-semantic-task-assessment/2":
                 structured = {
-                    "complexity": 8,
-                    "scale": 6,
-                    "required_capabilities": ["edit_intent", "process"],
+                    "schema_version": "1",
+                    "task_type": "architecture",
+                    "reasoning_class": "deep",
+                    "scope": "multi_component",
+                    "ambiguity": "low",
                     "reasons": ["bounded fork and join"],
                 }
-            elif protocol == "fleet-proposed-graph/1":
+            elif protocol == "fleet-proposed-graph/2":
                 def node(name, complexity):
                     return {
                         "id": name,
@@ -76,6 +79,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                                 "required_artifact_ids": ["workspace_patch"],
                             }
                         ],
+                        "semantic_profile": {
+                            "task_type": "mechanical" if name == "a" else "architecture",
+                            "reasoning_class": "mechanical" if name == "a" else "deep",
+                            "scope": "bounded" if name == "a" else "broad",
+                            "ambiguity": "low",
+                            "reasons": ["bounded fixture route"],
+                        },
                         "complexity": complexity,
                         "scale": complexity,
                     }
@@ -123,15 +133,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             raise SystemExit(0)
         prompt = json.load(sys.stdin)
         protocol = prompt["protocol"]
-        if protocol == "fleet-semantic-task-assessment/1":
+        if protocol == "fleet-semantic-task-assessment/2":
             print(json.dumps({
-                "complexity": 8,
-                "scale": 6,
-                "required_capabilities": ["edit_intent", "process"],
+                "schema_version": "1",
+                "task_type": "architecture",
+                "reasoning_class": "deep",
+                "scope": "multi_component",
+                "ambiguity": "low",
                 "reasons": ["bounded fork and join"],
             }))
             raise SystemExit(0)
-        if protocol == "fleet-proposed-graph/1":
+        if protocol == "fleet-proposed-graph/2":
             def node(node_name, complexity):
                 return {
                     "id": node_name,
@@ -145,6 +157,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                         "description": f"{node_name} produced an exact patch",
                         "required_artifact_ids": ["workspace_patch"],
                     }],
+                    "semantic_profile": {
+                        "task_type": "mechanical" if node_name == "a" else "architecture",
+                        "reasoning_class": "mechanical" if node_name == "a" else "deep",
+                        "scope": "bounded" if node_name == "a" else "broad",
+                        "ambiguity": "low",
+                        "reasons": ["bounded fixture route"],
+                    },
                     "complexity": complexity,
                     "scale": complexity,
                 }
@@ -404,10 +423,13 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     route_by_node = {item.node_id: item for item in routes}
     assert set(route_by_node) == {"a", "b", "c"}
     assert route_by_node["a"].selected_strategy.model == "low-model"
+    assert route_by_node["a"].assessment.semantic_profile is not None
+    assert route_by_node["a"].assessment.semantic_profile.task_type is SemanticTaskType.MECHANICAL
     assert route_by_node["a"].selected_strategy.effort == "medium"
     for name in ("b", "c"):
         assert route_by_node[name].selected_strategy.model == "high-model"
         assert route_by_node[name].selected_strategy.effort == "high"
+        assert route_by_node[name].assessment.semantic_profile is not None
     request_by_node = {item.node_id: item for item in requests if item.graph_run_id == run_id}
     assert set(request_by_node) == {"a", "b", "c"}
     assert len({item.id for item in request_by_node.values()}) == 3
@@ -453,6 +475,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     assert inspected["kind"] == "graph_run"
     assert inspected["state"] == "ready_to_promote"
     assert {item["node_id"] for item in inspected["routes"]} == {"a", "b", "c"}
+    assert all(item["assessment"]["semantic_profile"] is not None for item in inspected["routes"])
     assert inspected["candidate_patch"]["id"] == graph_run.parent_candidate_artifact_id
     assert len(inspected["approvals"]) == 1
 

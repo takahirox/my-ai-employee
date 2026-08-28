@@ -8,6 +8,11 @@ import ai_employee.domain as domain
 from ai_employee.domain import (
     ExecutionStrategy,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
     TaskAssessment,
     TaskDecompositionItem,
 )
@@ -77,6 +82,13 @@ class TaskRoutingDomainTests(unittest.TestCase):
             required_capabilities=("repository_read",),
             reasons=("The affected surface is limited to domain contracts",),
         )
+        profile = SemanticTaskProfile(
+            task_type=SemanticTaskType.IMPLEMENTATION,
+            reasoning_class=SemanticReasoningClass.MODERATE,
+            scope=SemanticScope.LOCAL,
+            ambiguity=SemanticAmbiguity.LOW,
+            reasons=("a bounded domain implementation",),
+        )
         assessment = TaskAssessment(
             id="assessment.route",
             run_id="run.route",
@@ -86,6 +98,8 @@ class TaskRoutingDomainTests(unittest.TestCase):
             risk=2,
             required_capabilities=("repository_read", "python_edit"),
             decomposition=(item,),
+            semantic_profile=profile,
+            context_character_count=42,
             reasons=("Two bounded domain changes and focused tests are required",),
         )
         restored = TaskAssessment.model_validate_json(
@@ -94,10 +108,28 @@ class TaskRoutingDomainTests(unittest.TestCase):
         )
         self.assertEqual(restored, assessment)
         self.assertIsInstance(restored.decomposition[0], TaskDecompositionItem)
+        self.assertEqual(restored.semantic_profile, profile)
         self.assertLessEqual(
-            {"TaskAssessment", "TaskDecompositionItem"} - set(domain.__all__),
+            {
+                "SemanticAmbiguity",
+                "SemanticReasoningClass",
+                "SemanticScope",
+                "SemanticTaskProfile",
+                "SemanticTaskType",
+                "TaskAssessment",
+                "TaskDecompositionItem",
+            }
+            - set(domain.__all__),
             set(),
         )
+        legacy = TaskAssessment.model_validate_json(
+            '{"id":"assessment.legacy","run_id":"run.route","goal_digest":"'
+            + "b" * 64
+            + '","complexity":2,"scale":1,"risk":0,"reasons":["legacy"]}',
+            strict=True,
+        )
+        self.assertIsNone(legacy.semantic_profile)
+        self.assertIsNone(legacy.context_character_count)
 
     def test_task_assessment_rejects_invalid_or_unbounded_decomposition(self) -> None:
         with self.assertRaisesRegex(ValidationError, "reasons must be non-blank"):

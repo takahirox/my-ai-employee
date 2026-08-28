@@ -19,6 +19,11 @@ from ai_employee.domain import (
     NodeKind,
     OutputContract,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
 )
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
@@ -49,6 +54,13 @@ def _node(name: str) -> Node:
         output_contract=OutputContract(id=f"contract-{name}"),
         required_capabilities=("process",),
         completion_criteria=(_criterion(name),),
+        semantic_profile=SemanticTaskProfile(
+            task_type=SemanticTaskType.IMPLEMENTATION,
+            reasoning_class=SemanticReasoningClass.MODERATE,
+            scope=SemanticScope.LOCAL,
+            ambiguity=SemanticAmbiguity.LOW,
+            reasons=("bounded orchestration fixture",),
+        ),
         complexity=2 if name == "a" else 3,
         scale=1,
         risk=1,
@@ -159,6 +171,17 @@ def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> N
         assert set(requests) == {"a", "b", "c"}
         assert len({request.content_digest for request in requests.values()}) == 3
         assert len({request.node_id for request in requests.values()}) == 3
+        assert all(
+            request.remaining_budgets
+            == {
+                "worker_turns": 1,
+                "processes": 1,
+                "wall_seconds": 1.0,
+                "artifact_bytes": 1_000_000,
+                "node_attempts": 1,
+            }
+            for request in requests.values()
+        )
         graph_digests = {request.accepted_graph_revision_digest for request in requests.values()}
         assert graph_digests == {run.accepted_graph_revision_digest}
         assert starts["c"] >= max(finishes["a"], finishes["b"])
@@ -645,6 +668,7 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
     assert len({item.run_id for item in requests}) == 2
     assert [(item.generation, item.attempt) for item in replay.reservations] == [(0, 0), (0, 1)]
     assert [(item.generation, item.attempt) for item in replay.routes] == [(0, 0), (0, 1)]
+    assert all(item.assessment.semantic_profile is not None for item in replay.routes)
     assert len({item.id for item in replay.routes}) == 2
 
 

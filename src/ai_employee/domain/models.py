@@ -12,7 +12,15 @@ from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
-from .base import CanonicalData, Digest, EntityModel, Identifier, SchemaModel, UtcTimestamp
+from .base import (
+    CanonicalData,
+    Digest,
+    EntityModel,
+    Identifier,
+    SchemaModel,
+    StableStrEnum,
+    UtcTimestamp,
+)
 from .enums import (
     ContextRole,
     ContractKind,
@@ -149,6 +157,55 @@ class TaskProfile(EntityModel):
     output_contract_id: Identifier | None = None
 
 
+class SemanticTaskType(StableStrEnum):
+    MECHANICAL = "mechanical"
+    RETRIEVAL = "retrieval"
+    DIAGNOSIS = "diagnosis"
+    IMPLEMENTATION = "implementation"
+    ARCHITECTURE = "architecture"
+    RESEARCH = "research"
+    PLANNING = "planning"
+    OPEN_ENDED_STRATEGY = "open_ended_strategy"
+
+
+class SemanticReasoningClass(StableStrEnum):
+    MECHANICAL = "mechanical"
+    SIMPLE = "simple"
+    MODERATE = "moderate"
+    DEEP = "deep"
+    OPEN_ENDED = "open_ended"
+
+
+class SemanticScope(StableStrEnum):
+    BOUNDED = "bounded"
+    LOCAL = "local"
+    MULTI_COMPONENT = "multi_component"
+    BROAD = "broad"
+
+
+class SemanticAmbiguity(StableStrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class SemanticTaskProfile(SchemaModel):
+    """Strict semantic facts with no execution or policy authority."""
+
+    task_type: SemanticTaskType
+    reasoning_class: SemanticReasoningClass
+    scope: SemanticScope
+    ambiguity: SemanticAmbiguity
+    reasons: tuple[str, ...] = Field(min_length=1, max_length=10)
+
+    @field_validator("reasons")
+    @classmethod
+    def _bounded_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not reason.strip() or len(reason) > 500 for reason in value):
+            raise ValueError("reasons must be non-blank and at most 500 characters")
+        return value
+
+
 class Task(EntityModel):
     title: str = Field(min_length=1, max_length=500)
     profile: TaskProfile
@@ -182,6 +239,7 @@ class Node(EntityModel):
     output_contract: OutputContract
     required_capabilities: tuple[Identifier, ...] = ()
     completion_criteria: tuple[CompletionCriterion, ...] = ()
+    semantic_profile: SemanticTaskProfile | None = None
     complexity: int = Field(default=1, ge=1, le=10)
     scale: int = Field(default=1, ge=1, le=10)
     risk: int = Field(default=0, ge=0, le=10)
@@ -376,6 +434,8 @@ class TaskAssessment(EntityModel):
     risk: int = Field(ge=0, le=10)
     required_capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
     decomposition: tuple[TaskDecompositionItem, ...] = Field(default=(), max_length=100)
+    semantic_profile: SemanticTaskProfile | None = None
+    context_character_count: int | None = Field(default=None, ge=0, le=10_000)
     reasons: tuple[str, ...] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
