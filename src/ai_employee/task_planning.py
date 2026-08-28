@@ -321,7 +321,7 @@ class CliProposedGraphPlanner:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
+            inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=1_000_000,

@@ -137,6 +137,12 @@ def test_reviewer_argv_keeps_codex_and_claude_ephemeral_and_tool_restricted() ->
     def allow(request: ProcessRequest) -> PolicyDecision:
         return _decision(request, DecisionOutcome.ALLOW)
 
+    denied_requests: list[ProcessRequest] = []
+
+    def deny(request: ProcessRequest) -> PolicyDecision:
+        denied_requests.append(request)
+        return _decision(request, DecisionOutcome.DENY)
+
     codex = CliPlanReviewer(
         executor,
         lambda _digest: b"",
@@ -151,7 +157,7 @@ def test_reviewer_argv_keeps_codex_and_claude_ephemeral_and_tool_restricted() ->
     claude = CliPlanReviewer(
         executor,
         lambda _digest: b"",
-        allow,
+        deny,
         run_id="adapter-run",
         strategy=_strategy("claude_code_cli"),
         executable="claude",
@@ -165,7 +171,23 @@ def test_reviewer_argv_keeps_codex_and_claude_ephemeral_and_tool_restricted() ->
     assert codex_argv[codex_argv.index("--sandbox") + 1] == "read-only"
     assert codex_argv[codex_argv.index("--ask-for-approval") + 1] == "never"
     assert "--no-session-persistence" in claude_argv
-    assert claude_argv[claude_argv.index("--tools") + 1] == ""
+    assert "--tools=" in claude_argv
+    assert "" not in claude_argv
+
+    goal, proposal = _proposal()
+    with pytest.raises(ValueError, match="plan-review policy did not allow execution"):
+        claude.review(
+            goal,  # type: ignore[arg-type]
+            proposal,
+            review_round=0,
+            available_capabilities=("process",),
+            max_nodes=4,
+            max_wall_seconds=30.0,
+        )
+
+    assert len(denied_requests) == 1
+    assert denied_requests[0].inherit_environment == ("HOME", "USER")
+    assert all(denied_requests[0].argv)
 
 
 @pytest.mark.parametrize("mode", ["denied", "malformed"])

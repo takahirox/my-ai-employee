@@ -906,7 +906,22 @@ def test_cli_worker_repairs_missing_existing_file_context_markers() -> None:
     assert "\n body{margin:0}\n" in payload.unified_diff
 
 
-def test_cli_worker_repairs_unmarked_multiline_replacements() -> None:
+@pytest.mark.parametrize(
+    "hunk",
+    (
+        (
+            "@@ -1,2 +1,2 @@\n"
+            "-:root{color:black}\n"
+            "body{margin:0}\n"
+            "+:root{color:white}\n"
+            "body{margin:1px}\n"
+        ),
+        ("@@ -1,3 +1,3 @@\n :root{color:black}\n-body{margin:0}\n+body{margin:1px}\n"),
+    ),
+)
+def test_cli_worker_rejects_ambiguous_or_count_inconsistent_existing_hunks(
+    hunk: str,
+) -> None:
     raw = json.dumps(
         {
             "schema_version": "2",
@@ -928,12 +943,7 @@ def test_cli_worker_repairs_unmarked_multiline_replacements() -> None:
                         "unified_diff": (
                             "diff --git a/example.css b/example.css\n"
                             "--- a/example.css\n"
-                            "+++ b/example.css\n"
-                            "@@ -1,2 +1,2 @@\n"
-                            "-:root{color:black}\n"
-                            "body{margin:0}\n"
-                            "+:root{color:white}\n"
-                            "body{margin:1px}\n"
+                            "+++ b/example.css\n" + hunk
                         ),
                     },
                     "reason": "Implement the requested style.",
@@ -942,12 +952,8 @@ def test_cli_worker_repairs_unmarked_multiline_replacements() -> None:
         }
     )
 
-    envelope = _validate_worker_envelope(raw)
-
-    payload = envelope.proposals[0].payload
-    assert isinstance(payload, EditIntentRequest)
-    assert "\n-body{margin:0}\n" in payload.unified_diff
-    assert "\n+body{margin:1px}\n" in payload.unified_diff
+    with pytest.raises(ValueError, match="ambiguous or inconsistent line counts"):
+        _validate_worker_envelope(raw)
 
 
 def test_cli_worker_recounts_incorrect_new_file_hunk_length() -> None:
