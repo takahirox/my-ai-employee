@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import io
 import shutil
 from collections.abc import Sequence
@@ -96,6 +97,7 @@ from .worker_adapters import (
     CodexCliWorkerAdapter,
     OllamaCliWorkerAdapter,
     ScriptedWorkerAdapter,
+    cli_inherit_environment,
     semantic_assessment_schema_json,
     worker_proposal_schema_json,
 )
@@ -503,7 +505,7 @@ def _work(args: argparse.Namespace) -> int:
                 (root,),
                 artifacts,
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
-                inherited_environment={"HOME": str(Path.home())},
+                inherited_environment={"HOME": str(Path.home()), "USER": getpass.getuser()},
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
@@ -744,7 +746,7 @@ def _work(args: argparse.Namespace) -> int:
                 output_schema_path=output_schema_path,
                 model=bound_model,
                 effort=bound_effort,
-                inherit_environment=("HOME",) if adapter_type is OllamaCliWorkerAdapter else (),
+                inherit_environment=cli_inherit_environment(bound_worker_name),
                 include_response_schema=adapter_type is OllamaCliWorkerAdapter,
                 cancellation=cancellation,
                 timeout_seconds=harness.budgets.wall_seconds,

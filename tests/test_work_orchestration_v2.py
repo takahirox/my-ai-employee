@@ -49,13 +49,21 @@ from ai_employee.worker_adapters import (
     ScriptedWorkerAdapter,
     WorkerProposalEnvelope,
     _bounded_prompt,
+    _claude_envelope_schema,
     _validate_worker_envelope,
+    cli_inherit_environment,
     semantic_assessment_schema_json,
     worker_proposal_schema_json,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
+
+
+def test_cli_environment_inherits_only_required_local_state() -> None:
+    assert cli_inherit_environment("claude_code_cli") == ("HOME", "USER")
+    assert cli_inherit_environment("ollama_cli") == ("HOME",)
+    assert cli_inherit_environment("codex_cli") == ()
 
 
 class Channel:
@@ -341,6 +349,17 @@ def test_codex_semantic_assessor_binds_sol_high_without_tools() -> None:
 
 
 def test_claude_semantic_assessor_disables_tools_without_empty_argv() -> None:
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="assessment-policy-1",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            effective_policy_digest=ZERO,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
     strategy = ExecutionStrategy(
         id="claude-fable-high",
         routing_mode=RoutingMode.ADAPTIVE,
@@ -348,10 +367,11 @@ def test_claude_semantic_assessor_disables_tools_without_empty_argv() -> None:
         model="claude-fable-5",
         effort="high",
     )
+    executor = CapturingExecutor()
     adapter = CliTaskAssessmentAdapter(
-        CapturingExecutor(),
+        executor,
         lambda _digest: b"",
-        lambda _request: (_ for _ in ()).throw(AssertionError("must not execute")),
+        allow,
         run_id="run-1",
         strategy=strategy,
         executable="claude",
@@ -365,6 +385,23 @@ def test_claude_semantic_assessor_disables_tools_without_empty_argv() -> None:
     assert "" not in argv
     assert argv[argv.index("--model") + 1] == "claude-fable-5"
     assert argv[argv.index("--effort") + 1] == "high"
+
+    with pytest.raises(ValueError, match="denied by injected runtime policy"):
+        adapter.assess(
+            "render an articulated arm in 3D",
+            TaskAssessment(
+                id="assessment-claude-home",
+                run_id="run-1",
+                goal_digest=ZERO,
+                complexity=1,
+                scale=1,
+                risk=0,
+                required_capabilities=("process",),
+                reasons=("test",),
+            ),
+        )
+    assert executor.request is not None
+    assert executor.request.inherit_environment == ("HOME", "USER")
 
 
 def test_claude_worker_binds_exact_model_and_effort() -> None:
@@ -390,10 +427,30 @@ def test_claude_worker_binds_exact_model_and_effort() -> None:
 
     argv = adapter._proposal_argv("prompt")
 
-    assert "--tools=" in argv
+    assert "--tools=Read,Glob,Grep" in argv
     assert "" not in argv
+    assert "--safe-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "manual"
     assert argv[argv.index("--model") + 1] == "claude-exact-model"
     assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_claude_worker_schema_exposes_only_edit_intents() -> None:
+    schema = _claude_envelope_schema()
+    encoded = json.dumps(schema)
+
+    assert "prefixItems" not in encoded
+    assert "ProcessRequest" not in encoded
+    assert "InstallRequest" not in encoded
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    proposals = properties["proposals"]
+    assert isinstance(proposals, dict)
+    action = proposals["items"]
+    assert isinstance(action, dict)
+    action_properties = action["properties"]
+    assert isinstance(action_properties, dict)
+    assert action_properties["kind"] == {"type": "string", "enum": ["edit_intent"]}
 
 
 def test_ollama_worker_binds_thinking_effort() -> None:
@@ -804,6 +861,93 @@ def test_cli_worker_repairs_only_new_file_sections_in_multi_file_diff() -> None:
     assert "\ndiff --git a/example.ts b/example.ts\n" in payload.unified_diff
     assert "\n+diff --git" not in payload.unified_diff
     assert payload.unified_diff.endswith("+export const answer = 42;\n+\n")
+
+
+def test_cli_worker_repairs_missing_existing_file_context_markers() -> None:
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.css"],
+                        "summary": "Update styles.",
+                        "unified_diff": (
+                            "diff --git a/example.css b/example.css\n"
+                            "--- a/example.css\n"
+                            "+++ b/example.css\n"
+                            "@@ -1,3 +1,3 @@\n"
+                            " :root{color:black}\n"
+                            "body{margin:0}\n"
+                            "-canvas{display:none}\n"
+                            "+canvas{display:block}\n"
+                        ),
+                    },
+                    "reason": "Implement the requested style.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert "\n body{margin:0}\n" in payload.unified_diff
+
+
+def test_cli_worker_repairs_unmarked_multiline_replacements() -> None:
+    raw = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-1",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-1",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.css"],
+                        "summary": "Replace multiline styles.",
+                        "unified_diff": (
+                            "diff --git a/example.css b/example.css\n"
+                            "--- a/example.css\n"
+                            "+++ b/example.css\n"
+                            "@@ -1,2 +1,2 @@\n"
+                            "-:root{color:black}\n"
+                            "body{margin:0}\n"
+                            "+:root{color:white}\n"
+                            "body{margin:1px}\n"
+                        ),
+                    },
+                    "reason": "Implement the requested style.",
+                }
+            ],
+        }
+    )
+
+    envelope = _validate_worker_envelope(raw)
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert "\n-body{margin:0}\n" in payload.unified_diff
+    assert "\n+body{margin:1px}\n" in payload.unified_diff
 
 
 def test_cli_worker_recounts_incorrect_new_file_hunk_length() -> None:

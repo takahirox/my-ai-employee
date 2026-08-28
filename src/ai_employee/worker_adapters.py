@@ -1,4 +1,4 @@
-"""Normalized, tool-disabled worker adapters for supported local CLIs."""
+"""Normalized, least-privilege worker adapters for supported local CLIs."""
 
 from __future__ import annotations
 
@@ -33,6 +33,14 @@ from .services_v2._common import identifier, now
 class _NeverCancelled:
     def cancelled(self) -> bool:
         return False
+
+
+def cli_inherit_environment(backend: str) -> tuple[str, ...]:
+    """Return the minimal environment required by a supported CLI backend."""
+
+    if backend == "claude_code_cli":
+        return ("HOME", "USER")
+    return ("HOME",) if backend == "ollama_cli" else ()
 
 
 class WorkerProposalEnvelope(BaseModel):
@@ -376,7 +384,7 @@ class CliTaskAssessmentAdapter:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
+            inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=100_000,
@@ -560,8 +568,11 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
             "--output-format",
             "json",
             "--json-schema",
-            json.dumps(_envelope_schema(), separators=(",", ":")),
-            "--tools=",
+            json.dumps(_claude_envelope_schema(), separators=(",", ":")),
+            "--tools=Read,Glob,Grep",
+            "--safe-mode",
+            "--permission-mode",
+            "manual",
             "--no-session-persistence",
         ]
         if self.model is not None:
@@ -699,13 +710,47 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
                 request.pop("digest_metadata", None)
                 unified_diff = request.get("unified_diff")
                 if proposal.get("kind") == "edit_intent" and isinstance(unified_diff, str):
-                    request["unified_diff"] = _normalize_new_file_diff(unified_diff)
+                    request["unified_diff"] = _normalize_unified_diff(unified_diff)
     normalized = json.dumps(raw, separators=(",", ":"))
     return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
 
 
 def _envelope_schema() -> dict[str, object]:
     return WorkerProposalEnvelope.model_json_schema()
+
+
+def _claude_envelope_schema() -> dict[str, object]:
+    """Return Claude's minimal edit-only proposal contract.
+
+    Claude can inspect the isolated repository with its read-only tools. Harness commands run
+    deterministically after the proposed patch is applied, so exposing process, download, install,
+    or review action shapes here only enlarges and weakens the structured-output boundary.
+    """
+
+    transport = json.loads(worker_proposal_schema_json())
+    properties = transport["properties"]
+    edit_action = properties["proposals"]["items"]["anyOf"][0]
+    return {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["2"]},
+            "proposals": {"type": "array", "items": edit_action},
+            "assistant_note": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 20_000},
+                    {"type": "null"},
+                ]
+            },
+            "usage": {
+                "anyOf": [
+                    {"type": "object", "additionalProperties": True},
+                    {"type": "null"},
+                ]
+            },
+        },
+        "required": ["schema_version", "proposals", "assistant_note", "usage"],
+        "additionalProperties": False,
+    }
 
 
 def _normalize_new_file_diff(value: str) -> str:
@@ -720,6 +765,30 @@ def _normalize_new_file_diff(value: str) -> str:
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
         chunks.append(_normalize_new_file_section("".join(lines[start:end])))
     return "".join(chunks)
+
+
+def _normalize_unified_diff(value: str) -> str:
+    """Repair omitted context markers while preserving file and hunk headers."""
+
+    lines = _normalize_new_file_diff(value).splitlines(keepends=True)
+    normalized: list[str] = []
+    in_hunk = False
+    continuation_marker = " "
+    for line in lines:
+        if line.startswith("diff --git "):
+            in_hunk = False
+            continuation_marker = " "
+        elif line.startswith("@@ "):
+            in_hunk = True
+            continuation_marker = " "
+        elif in_hunk and not line.startswith((" ", "+", "-", "\\")):
+            line = f"{continuation_marker}{line}"
+        if in_hunk and line.startswith(("+", "-")):
+            continuation_marker = line[0]
+        elif in_hunk and line.startswith(" "):
+            continuation_marker = " "
+        normalized.append(line)
+    return "".join(normalized)
 
 
 def _normalize_new_file_section(value: str) -> str:

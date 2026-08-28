@@ -17,6 +17,7 @@ from .domain.v2 import DecisionOutcome, DigestedRecordV2, PolicyDecision, Proces
 from .routing import SEMANTIC_PROFILE_RUBRIC, profile_compatibility_bands
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .worker_adapters import cli_inherit_environment
 
 if TYPE_CHECKING:
     from .plan_review import PlanReviewFinding
@@ -203,7 +204,7 @@ class CliProposedGraphPlanner:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
+            inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=1_000_000,
