@@ -28,14 +28,29 @@ from ai_employee.domain import (
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
 from ai_employee.graph import GraphValidationError, accept_task_graph
+from ai_employee.inspector import inspect_graph_run
+from ai_employee.plan_review import (
+    PlanReviewAcceptanceBinding,
+    PlanReviewAttempt,
+    PlanReviewFinding,
+    PlanReviewFindingType,
+    PlanReviewGateError,
+    PlanReviewImpact,
+    PlanReviewPayload,
+    PlanRevisionAttempt,
+    bind_plan_review,
+)
+from ai_employee.serialization import canonical_digest
 from ai_employee.services_v2._common import identifier
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     NodeExecutionResult,
     NodeReservationRecord,
+    TaskGraphAcceptance,
     TaskOrchestrator,
     one_node_graph,
 )
+from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
@@ -304,6 +319,492 @@ def test_task_graph_acceptance_rejects_cycles_general_edges_and_tight_budget() -
     with pytest.raises(GraphValidationError) as caught:
         accept_task_graph(tight, policy, available_capabilities=("process",))
     assert "attempt_budget_insufficient" in {item.code for item in caught.value.issues}
+
+
+class _ScriptedPlanReviewer:
+    def __init__(
+        self,
+        strategy: ExecutionStrategy,
+        findings: dict[int, tuple[PlanReviewFinding, ...]],
+        events: list[str],
+    ) -> None:
+        self.strategy = strategy
+        self.findings = findings
+        self.events = events
+        self.calls: list[int] = []
+
+    def review(
+        self,
+        goal: Goal,
+        proposed_graph: ProposedGraph,
+        *,
+        review_round: int,
+        available_capabilities: tuple[str, ...],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ):
+        assert available_capabilities == ("process",)
+        assert max_nodes == 1
+        assert max_wall_seconds == 30.0
+        self.calls.append(review_round)
+        self.events.append(f"review-{review_round}")
+        return bind_plan_review(
+            PlanReviewPayload(findings=self.findings[review_round]),
+            record_id=f"trusted-review-{review_round}",
+            run_id=proposed_graph.run_id,
+            created_at=NOW,
+            review_round=review_round,  # type: ignore[arg-type]
+            goal=goal,
+            proposed_graph=proposed_graph,
+            reviewer_strategy=self.strategy,
+        )
+
+
+class _ScriptedPlanReviser:
+    def __init__(
+        self,
+        strategy: ExecutionStrategy,
+        revised_graph: Graph,
+        events: list[str],
+    ) -> None:
+        self.strategy = strategy
+        self.revised_graph = revised_graph
+        self.events = events
+        self.calls = 0
+
+    def revise(
+        self,
+        goal: Goal,
+        original: ProposedGraph,
+        blocking_findings: tuple[PlanReviewFinding, ...],
+        *,
+        available_capabilities: tuple[str, ...],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ) -> ProposedGraph:
+        del goal, available_capabilities, max_nodes, max_wall_seconds
+        assert len(blocking_findings) == 1
+        self.calls += 1
+        self.events.append("revision")
+        return ProposedGraph.model_validate(
+            {
+                **original.model_dump(
+                    mode="python", exclude={"id", "created_at", "content_digest"}
+                ),
+                "id": "revised-proposal",
+                "created_at": NOW,
+                "graph": self.revised_graph,
+            },
+            strict=True,
+        )
+
+
+def _review_proposal(run_id: str, goal: Goal, graph: Graph) -> ProposedGraph:
+    return ProposedGraph(
+        id="original-proposal",
+        run_id=run_id,
+        created_at=NOW,
+        goal_id=goal.id,
+        goal_digest=canonical_digest(goal),
+        graph=graph,
+        planner_strategy=_strategy(),
+        effective_policy_digest="1" * 64,
+        harness_digest=ZERO,
+    )
+
+
+def _blocking_review_finding(node_id: str = "a") -> PlanReviewFinding:
+    return PlanReviewFinding(
+        id="finding-a",
+        finding_type=PlanReviewFindingType.PREMATURE_GENERALIZATION,
+        impact=PlanReviewImpact.BLOCKING,
+        affected_node_ids=(node_id,),
+        goal_relation="The original objective generalizes beyond the accepted goal.",
+        smallest_correction="Use the bounded accepted-goal objective only.",
+    )
+
+
+def test_blocking_review_revises_once_and_persists_acceptance_chain(tmp_path: Path) -> None:
+    events: list[str] = []
+    goal = Goal(id="review-goal", statement="complete one bounded task")
+    original = one_node_graph(
+        goal,
+        graph_id="over-engineered",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    routed_profile = _node("a").semantic_profile
+    original = original.model_copy(
+        update={
+            "nodes": (
+                original.nodes[0].model_copy(
+                    update={
+                        "semantic_profile": routed_profile,
+                        "complexity": 2,
+                        "scale": 1,
+                    }
+                ),
+            )
+        }
+    )
+    revised = original.model_copy(
+        update={
+            "id": "minimal-revision",
+            "nodes": (
+                original.nodes[0].model_copy(update={"objective": "complete the bounded task"}),
+            ),
+        }
+    )
+    finding = _blocking_review_finding()
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: (finding,), 1: ()}, events)
+    reviser = _ScriptedPlanReviser(_strategy(), revised, events)
+
+    database = tmp_path / "review-gate.db"
+    with SQLiteStore(database) as store:
+
+        def runner(
+            _node_value: Node,
+            request: WorkerRequest,
+            _strategy_value: ExecutionStrategy,
+        ) -> NodeExecutionResult:
+            with SQLiteStore(database) as reader:
+                bindings = reader.list_records(
+                    "plan_review_acceptance_binding_v2",
+                    PlanReviewAcceptanceBinding,
+                    run_id="review-run",
+                )
+            assert len(bindings) == 1
+            events.append("worker")
+            return NodeExecutionResult(
+                worker_result=WorkerResult(
+                    id="review-worker-result",
+                    run_id=request.run_id,
+                    created_at=NOW,
+                    request_digest=request.content_digest or ZERO,
+                    status="succeeded",
+                    duration_seconds=0.01,
+                ),
+                criterion_evidence=(
+                    CriterionEvidence(
+                        criterion_id="criterion-a",
+                        disposition="satisfied",
+                        evidence_refs=(ZERO,),
+                    ),
+                ),
+            )
+
+        orchestrator = TaskOrchestrator(
+            store,
+            runner,
+            (_strategy(),),
+            bounded_graph_execution=True,
+            defer_parent_evaluation=True,
+            plan_reviewer=reviewer,
+            plan_reviser=reviser,
+        )
+        run = orchestrator.run(
+            goal,
+            _review_proposal("review-run", goal, original),
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="review-run",
+            available_capabilities=("process",),
+        )
+        replay = orchestrator.replay(run.id)
+        inspected = inspect_graph_run(store, run.id)
+
+        assert events == ["review-0", "revision", "review-1", "worker"], (
+            events,
+            tuple((item.status, item.failure_code) for item in replay.nodes),
+        )
+        assert reviewer.calls == [0, 1]
+        assert reviser.calls == 1
+        assert replay.acceptance.accepted_revision.graph == revised
+        assert replay.acceptance.proposed_graph_digest == (
+            replay.review_attempts[-1].proposed_graph_digest
+        )
+        assert len(replay.review_attempts) == 2
+        assert len(replay.revision_attempts) == 1
+        assert replay.review_acceptance_binding is not None
+        assert inspected["plan_review"]["status"] == "revised"
+        assert orchestrator.replay(run.id) == replay
+
+
+def test_advisory_review_accepts_justified_breadth_without_revision(tmp_path: Path) -> None:
+    events: list[str] = []
+    goal = Goal(
+        id="broad-review-goal",
+        statement="Exhaustively inspect every authentication path",
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="justified-broad-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    advisory = PlanReviewFinding(
+        id="finding-advisory",
+        finding_type=PlanReviewFindingType.UNCLEAR_GOAL_TRACEABILITY,
+        impact=PlanReviewImpact.ADVISORY,
+        affected_node_ids=("a",),
+        goal_relation="The breadth is required, but traceability could be clearer.",
+        smallest_correction="Clarify traceability only if the graph is edited later.",
+    )
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: (advisory,)}, events)
+    reviser = _ScriptedPlanReviser(_strategy(), graph, events)
+
+    with SQLiteStore(tmp_path / "advisory-review.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("plan-only must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=reviser,
+        )
+        run = orchestrator.run(
+            goal,
+            _review_proposal("advisory-review-run", goal, graph),
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="advisory-review-run",
+            available_capabilities=("process",),
+            plan_only=True,
+        )
+
+        replay = orchestrator.replay(run.id)
+        assert events == ["review-0"]
+        assert reviser.calls == 0
+        assert replay.acceptance.accepted_revision.graph == graph
+        assert replay.review_attempts[0].findings == (advisory,)
+        assert replay.revision_attempts == ()
+        assert inspect_graph_run(store, run.id)["plan_review"]["status"] == "accepted"
+
+
+def test_round_one_blockers_and_review_failures_stop_before_acceptance(tmp_path: Path) -> None:
+    goal = Goal(id="blocked-review-goal", statement="complete one bounded task")
+    original = one_node_graph(
+        goal,
+        graph_id="blocked-original",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    revised = original.model_copy(update={"id": "still-overengineered"})
+    finding = _blocking_review_finding()
+    events: list[str] = []
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: (finding,), 1: (finding,)}, events)
+    reviser = _ScriptedPlanReviser(_strategy(), revised, events)
+
+    with SQLiteStore(tmp_path / "blocked-review.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("a blocked plan must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=reviser,
+        )
+        with pytest.raises(PlanReviewGateError) as caught:
+            orchestrator.run(
+                goal,
+                _review_proposal("blocked-review-run", goal, original),
+                ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id="blocked-review-run",
+                available_capabilities=("process",),
+            )
+        assert caught.value.stable_code == "PLAN_REVIEW_BLOCKED"
+        assert events == ["review-0", "revision", "review-1"]
+        assert (
+            len(
+                store.list_records(
+                    "plan_review_attempt_v2", PlanReviewAttempt, run_id="blocked-review-run"
+                )
+            )
+            == 2
+        )
+        assert (
+            len(
+                store.list_records(
+                    "plan_revision_attempt_v2",
+                    PlanRevisionAttempt,
+                    run_id="blocked-review-run",
+                )
+            )
+            == 1
+        )
+        assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
+
+
+def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path) -> None:
+    goal = Goal(id="failed-review-goal", statement="complete one bounded task")
+    graph = one_node_graph(
+        goal,
+        graph_id="failed-review-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, [])
+
+    def fail_review(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("malformed reviewer output")
+
+    reviewer.review = fail_review  # type: ignore[method-assign]
+    with SQLiteStore(tmp_path / "failed-review.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("a failed review must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=_ScriptedPlanReviser(_strategy(), graph, []),
+        )
+        with pytest.raises(PlanReviewGateError) as caught:
+            orchestrator.run(
+                goal,
+                _review_proposal("failed-review-run", goal, graph),
+                ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id="failed-review-run",
+                available_capabilities=("process",),
+            )
+        attempts = store.list_records(
+            "plan_review_attempt_v2", PlanReviewAttempt, run_id="failed-review-run"
+        )
+        assert caught.value.stable_code == "PLAN_REVIEW_FAILED"
+        assert len(attempts) == 1
+        assert attempts[0].outcome == "failed"
+        assert attempts[0].failure_code == "PLAN_REVIEW_FAILED"
+        assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
+
+
+def test_tampered_review_binding_fails_replay_and_resume(tmp_path: Path) -> None:
+    goal = Goal(id="tampered-review-goal", statement="complete one bounded task")
+    graph = one_node_graph(
+        goal,
+        graph_id="tampered-review-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, [])
+    policy = ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0)
+    with SQLiteStore(tmp_path / "tampered-review.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("plan-only or rejected resume must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=_ScriptedPlanReviser(_strategy(), graph, []),
+        )
+        run = orchestrator.run(
+            goal,
+            _review_proposal("tampered-review-run", goal, graph),
+            policy,
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="tampered-review-run",
+            available_capabilities=("process",),
+            plan_only=True,
+        )
+        binding = orchestrator.replay(run.id).review_acceptance_binding
+        assert binding is not None
+        store.put(
+            "plan_review_acceptance_binding_v2",
+            binding.model_copy(
+                update={
+                    "selected_proposed_graph_digest": "f" * 64,
+                    "content_digest": None,
+                }
+            ),
+            run_id=run.id,
+        )
+        store.put(
+            "graph_run_v2",
+            run.model_copy(update={"status": "paused"}),
+            run_id=run.id,
+            revision=run.generation + 1,
+        )
+
+        with pytest.raises(ValueError, match="acceptance binding is stale"):
+            orchestrator.replay(run.id)
+        with pytest.raises(ValueError, match="acceptance binding is stale"):
+            orchestrator.run(
+                goal,
+                graph,
+                policy,
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id=run.id,
+                available_capabilities=("process",),
+                resume=True,
+            )
+        assert inspect_graph_run(store, run.id)["plan_review"]["status"] == "failed"
+
+
+def test_invalid_initial_graph_never_invokes_optional_reviewer(tmp_path: Path) -> None:
+    events: list[str] = []
+    goal = Goal(id="invalid-review-goal", statement="reject the invalid graph")
+    graph = _fork_join_graph().model_copy(
+        update={"budget": _fork_join_graph().budget.model_copy(update={"max_attempts": 2})}
+    )
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, events)
+    reviser = _ScriptedPlanReviser(_strategy(), graph, events)
+    with SQLiteStore(tmp_path / "invalid-review.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("invalid graph must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=reviser,
+        )
+        with pytest.raises(GraphValidationError):
+            orchestrator.run(
+                goal,
+                _review_proposal("invalid-review-run", goal, graph),
+                ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id="invalid-review-run",
+                available_capabilities=("process",),
+            )
+        assert events == []
+        assert store.list_records("plan_review_attempt_v2", PlanReviewPayload) == ()
+
+
+def test_old_direct_callers_remain_not_configured_and_missing_binding_fails_replay(
+    tmp_path: Path,
+) -> None:
+    goal = Goal(id="legacy-review-goal", statement="keep direct callers compatible")
+    graph = one_node_graph(
+        goal,
+        graph_id="legacy-graph",
+        node_id="legacy",
+        max_wall_seconds=30.0,
+    )
+    database = tmp_path / "legacy-review.db"
+    with SQLiteStore(database) as store:
+        orchestrator = TaskOrchestrator(store, lambda *_args: pytest.fail(), (_strategy(),))
+        run = orchestrator.run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="legacy-review-run",
+            available_capabilities=(),
+            plan_only=True,
+        )
+        replay = orchestrator.replay(run.id)
+        assert replay.review_attempts == ()
+        assert replay.revision_attempts == ()
+        assert replay.review_acceptance_binding is None
+        assert inspect_graph_run(store, run.id)["plan_review"]["status"] == "not_configured"
 
 
 def test_graph_claim_budget_is_atomic_across_connections(tmp_path: Path) -> None:

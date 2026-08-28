@@ -40,6 +40,8 @@ from .task_orchestration import (
     NodeExecutionResult,
     NodePatchRecord,
     NodeRunner,
+    PlanReviewer,
+    PlanReviser,
     TaskOrchestrator,
 )
 from .task_planning import ProposedGraph
@@ -142,6 +144,8 @@ class GraphExecutionService:
         operator_config_digest: Digest | None = None,
         operator_config_path: str | None = None,
         strategy_set: Identifier | None = None,
+        plan_reviewer: PlanReviewer | None = None,
+        plan_reviser: PlanReviser | None = None,
     ) -> None:
         self.store = store
         self.coordinator_factory = coordinator_factory
@@ -159,6 +163,8 @@ class GraphExecutionService:
         self.operator_config_path = operator_config_path
         self.strategy_set = strategy_set
         self.parent_evaluator = parent_evaluator
+        self.plan_reviewer = plan_reviewer
+        self.plan_reviser = plan_reviser
         self.approval_service = approval_service or DigestApprovalService(
             store, operator_label="local-operator"
         )
@@ -377,6 +383,8 @@ class GraphExecutionService:
             operator_config_digest=self.operator_config_digest,
             operator_config_path=self.operator_config_path,
             strategy_set=self.strategy_set,
+            plan_reviewer=self.plan_reviewer,
+            plan_reviser=self.plan_reviser,
         )
 
     def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:

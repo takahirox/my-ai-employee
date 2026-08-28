@@ -33,6 +33,12 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
 )
+from .plan_review import (
+    PlanReviewAcceptanceBinding,
+    PlanReviewAction,
+    PlanReviewAttempt,
+    PlanRevisionAttempt,
+)
 from .serialization import canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
@@ -47,6 +53,7 @@ from .task_orchestration import (
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
+    _load_plan_review_history,
 )
 
 
@@ -217,6 +224,37 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ),
         None,
     )
+    review_attempts = tuple(
+        sorted(
+            store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id),
+            key=lambda item: item.review_round,
+        )
+    )
+    revision_attempts = store.list_records(
+        "plan_revision_attempt_v2", PlanRevisionAttempt, run_id=run_id
+    )
+    review_bindings = store.list_records(
+        "plan_review_acceptance_binding_v2",
+        PlanReviewAcceptanceBinding,
+        run_id=run_id,
+    )
+    if not review_attempts and not revision_attempts and not review_bindings:
+        review_status = "not_configured"
+    elif len(review_bindings) == 1:
+        try:
+            _load_plan_review_history(store, run, acceptances)
+        except ValueError:
+            review_status = "failed"
+        else:
+            review_status = "revised" if revision_attempts else "accepted"
+    elif (
+        review_attempts
+        and review_attempts[-1].outcome == "completed"
+        and review_attempts[-1].action is PlanReviewAction.REJECT
+    ):
+        review_status = "blocked"
+    else:
+        review_status = "failed"
     node_records = store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run_id)
     latest_nodes: dict[str, NodeExecutionRecord] = {}
     for node_record in node_records:
@@ -267,6 +305,14 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "run": _json_model(run),
         "graph_acceptance": None if acceptance is None else _json_model(acceptance),
         "graph_revisions": [_json_model(item) for item in acceptances],
+        "plan_review": {
+            "status": review_status,
+            "attempts": [_json_model(item) for item in review_attempts],
+            "revision_attempts": [_json_model(item) for item in revision_attempts],
+            "acceptance_binding": (
+                None if len(review_bindings) != 1 else _json_model(review_bindings[0])
+            ),
+        },
         "retained_node_bindings": [
             _json_model(item)
             for item in sorted(

@@ -55,6 +55,11 @@ from .graph_evaluation import (
 )
 from .graph_execution import GraphExecutionService
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
+from .plan_review import (
+    CliPlanReviewer,
+    PlanReviewGateError,
+    plan_review_schema_json,
+)
 from .project import (
     discover_project,
     discover_project_harness,
@@ -389,6 +394,8 @@ def _work(args: argparse.Namespace) -> int:
     routing_mode = None
     strategies: tuple[ExecutionStrategy, ...] = ()
     proposed_graph: ProposedGraph | None = None
+    graph_planner: CliProposedGraphPlanner | None = None
+    plan_reviewer: CliPlanReviewer | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
         if resume_run is None:
@@ -640,10 +647,15 @@ def _work(args: argparse.Namespace) -> int:
                 planner_schema = assessment_directory / "proposed-graph.json"
                 planner_schema.write_bytes(proposed_graph_schema_json())
                 planner_schema_path = str(planner_schema)
+                reviewer_schema = assessment_directory / "plan-review.json"
+                reviewer_schema.write_bytes(plan_review_schema_json())
+                reviewer_schema_path: str | None = str(reviewer_schema)
+            else:
+                reviewer_schema_path = None
             harness_digest = canonical_digest(harness)
             effective_policy_digest = canonical_digest((policy.content_digest,))
             try:
-                proposed_graph = CliProposedGraphPlanner(
+                graph_planner = CliProposedGraphPlanner(
                     executor_for(assessment_directory),
                     read_output,
                     decide_worker_process,
@@ -654,7 +666,20 @@ def _work(args: argparse.Namespace) -> int:
                     prompt_writer=prompt_writer,
                     output_schema_path=planner_schema_path,
                     timeout_seconds=harness.budgets.wall_seconds,
-                ).plan(
+                )
+                plan_reviewer = CliPlanReviewer(
+                    executor_for(assessment_directory),
+                    read_output,
+                    decide_worker_process,
+                    run_id=run_id,
+                    strategy=assessment_strategy,
+                    executable=assessment_command.executable,
+                    cwd=".",
+                    prompt_writer=prompt_writer,
+                    output_schema_path=reviewer_schema_path,
+                    timeout_seconds=harness.budgets.wall_seconds,
+                )
+                proposed_graph = graph_planner.plan(
                     goal,
                     available_capabilities=tuple(capabilities),
                     effective_policy_digest=effective_policy_digest,
@@ -913,6 +938,8 @@ def _work(args: argparse.Namespace) -> int:
                 operator_config_digest=canonical_digest(operator_config),
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
+                plan_reviewer=plan_reviewer,
+                plan_reviser=graph_planner,
             )
             graph_input: Graph | ProposedGraph
             if resume_run is not None:
@@ -964,6 +991,19 @@ def _work(args: argparse.Namespace) -> int:
                     plan_only=args.plan_only,
                     resume=resume_run is not None,
                 )
+            except PlanReviewGateError as error:
+                print(
+                    canonical_json(
+                        {
+                            "schema_version": "2",
+                            "run_id": run_id,
+                            "status": "failed",
+                            "stable_code": error.stable_code,
+                            "next_actions": (),
+                        }
+                    )
+                )
+                return 7
             except GraphValidationError:
                 print(
                     canonical_json(

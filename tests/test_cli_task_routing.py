@@ -32,6 +32,7 @@ from ai_employee.domain.v2 import (
     PolicyDecision,
     ProcessRequest,
 )
+from ai_employee.plan_review import CliPlanReviewer, PlanReviewPayload, bind_plan_review
 from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import GraphRunRecord, TaskGraphAcceptance
@@ -460,6 +461,30 @@ def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
         )
 
     monkeypatch.setattr(CliProposedGraphPlanner, "plan", fake_plan)
+
+    def fake_review(
+        self: CliPlanReviewer,
+        goal: Goal,
+        proposed_graph: ProposedGraph,
+        *,
+        review_round: int,
+        available_capabilities: Sequence[str],
+        max_nodes: int,
+        max_wall_seconds: float,
+    ):
+        del available_capabilities, max_nodes, max_wall_seconds
+        return bind_plan_review(
+            PlanReviewPayload(findings=()),
+            record_id="cli-plan-review",
+            run_id=self.run_id,
+            created_at="2026-01-01T00:00:00Z",
+            review_round=review_round,  # type: ignore[arg-type]
+            goal=goal,
+            proposed_graph=proposed_graph,
+            reviewer_strategy=self.strategy,
+        )
+
+    monkeypatch.setattr(CliPlanReviewer, "review", fake_review)
 
     result = cli.main(
         [
