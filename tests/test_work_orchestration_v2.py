@@ -340,6 +340,33 @@ def test_codex_semantic_assessor_binds_sol_high_without_tools() -> None:
     assert "--output-schema" in argv
 
 
+def test_claude_semantic_assessor_disables_tools_without_empty_argv() -> None:
+    strategy = ExecutionStrategy(
+        id="claude-fable-high",
+        routing_mode=RoutingMode.ADAPTIVE,
+        backend="claude_code_cli",
+        model="claude-fable-5",
+        effort="high",
+    )
+    adapter = CliTaskAssessmentAdapter(
+        CapturingExecutor(),
+        lambda _digest: b"",
+        lambda _request: (_ for _ in ()).throw(AssertionError("must not execute")),
+        run_id="run-1",
+        strategy=strategy,
+        executable="claude",
+        cwd=".",
+        prompt_writer=lambda _value: ZERO,
+    )
+
+    argv = adapter._argv()
+
+    assert "--tools=" in argv
+    assert "" not in argv
+    assert argv[argv.index("--model") + 1] == "claude-fable-5"
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
 def test_claude_worker_binds_exact_model_and_effort() -> None:
     def allow(request: ProcessRequest) -> PolicyDecision:
         return PolicyDecision(
@@ -363,6 +390,8 @@ def test_claude_worker_binds_exact_model_and_effort() -> None:
 
     argv = adapter._proposal_argv("prompt")
 
+    assert "--tools=" in argv
+    assert "" not in argv
     assert argv[argv.index("--model") + 1] == "claude-exact-model"
     assert argv[argv.index("--effort") + 1] == "high"
 

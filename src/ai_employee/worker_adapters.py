@@ -431,8 +431,7 @@ class CliTaskAssessmentAdapter:
                 "json",
                 "--json-schema",
                 schema,
-                "--tools",
-                "",
+                "--tools=",
                 "--no-session-persistence",
                 "--model",
                 self.strategy.model,
@@ -562,8 +561,7 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
             "json",
             "--json-schema",
             json.dumps(_envelope_schema(), separators=(",", ":")),
-            "--tools",
-            "",
+            "--tools=",
             "--no-session-persistence",
         ]
         if self.model is not None:

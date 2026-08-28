@@ -52,6 +52,33 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert args.max_concurrency == 1
 
 
+def test_claude_graph_planner_disables_tools_without_empty_argv() -> None:
+    planner = CliProposedGraphPlanner(
+        object(),  # type: ignore[arg-type]
+        lambda _digest: b"",
+        lambda _request: (_ for _ in ()).throw(AssertionError("must not execute")),
+        run_id="planner-run",
+        strategy=ExecutionStrategy(
+            id="claude-fable-high",
+            routing_mode=RoutingMode.ADAPTIVE,
+            backend="claude_code_cli",
+            model="claude-fable-5",
+            effort="high",
+            capabilities=("process",),
+        ),
+        executable="claude",
+        cwd=".",
+        prompt_writer=lambda _value: "8" * 64,
+    )
+
+    argv = planner._argv()
+
+    assert "--tools=" in argv
+    assert "" not in argv
+    assert argv[argv.index("--model") + 1] == "claude-fable-5"
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
 def _capture_planner_prompt(
     goal: Goal,
     *,
