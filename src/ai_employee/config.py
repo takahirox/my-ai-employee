@@ -91,12 +91,8 @@ class OperatorRoutingConfig(BaseModel):
     strategies: tuple[OperatorStrategyConfig, ...] = Field(min_length=1)
     default_strategy_set: Identifier | None = None
     default_assessment_strategy: Identifier | None = None
-    strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(
-        default_factory=dict
-    )
-    strategy_set_assessors: Mapping[Identifier, Identifier] = Field(
-        default_factory=dict
-    )
+    strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(default_factory=dict)
+    strategy_set_assessors: Mapping[Identifier, Identifier] = Field(default_factory=dict)
 
     @field_validator("strategy_sets")
     @classmethod
@@ -141,9 +137,7 @@ class OperatorRoutingConfig(BaseModel):
             if strategy_id not in ids
         }
         if unknown:
-            raise ValueError(
-                f"strategy sets reference unknown strategy IDs: {sorted(unknown)}"
-            )
+            raise ValueError(f"strategy sets reference unknown strategy IDs: {sorted(unknown)}")
         if (
             self.default_strategy_set is not None
             and self.default_strategy_set not in self.strategy_sets
@@ -153,9 +147,7 @@ class OperatorRoutingConfig(BaseModel):
             self.default_assessment_strategy is not None
             and self.default_assessment_strategy not in ids
         ):
-            raise ValueError(
-                "default assessment strategy must name a configured strategy"
-            )
+            raise ValueError("default assessment strategy must name a configured strategy")
         unknown_sets = set(self.strategy_set_assessors) - set(self.strategy_sets)
         if unknown_sets:
             raise ValueError(
@@ -244,9 +236,7 @@ class OperatorConfig(BaseModel):
 
     schema_version: Literal[1] = 1
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
-    routing: OperatorRoutingConfig | None = Field(
-        default_factory=default_operator_routing_config
-    )
+    routing: OperatorRoutingConfig | None = Field(default_factory=default_operator_routing_config)
 
     @field_validator("workers")
     @classmethod
@@ -280,9 +270,7 @@ class OperatorConfig(BaseModel):
             if selected_ids is None:
                 raise ValueError(f"unknown strategy set: {selected_set}")
             selected = set(selected_ids)
-            configured = tuple(
-                strategy for strategy in configured if strategy.id in selected
-            )
+            configured = tuple(strategy for strategy in configured if strategy.id in selected)
         return tuple(
             ExecutionStrategy(
                 id=strategy.id,

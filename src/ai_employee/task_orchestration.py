@@ -461,8 +461,7 @@ class TaskOrchestrator:
                 or prior_run.strategy_set != self.strategy_set
                 or prior_run.replan_count >= prior_run.max_replans
                 or proposal is None
-                or proposal.previous_accepted_revision_digest
-                != previous_revision.content_digest
+                or proposal.previous_accepted_revision_digest != previous_revision.content_digest
                 or not proposal.replan_trigger
                 or not proposal.replan_evidence
                 or len(proposal.replan_evidence) != len(set(proposal.replan_evidence))
@@ -563,12 +562,12 @@ class TaskOrchestrator:
                 update={
                     "accepted_graph_revision_digest": graph_digest,
                     "status": "running",
-                    "generation": self.store.get(
-                        "graph_run_v2", run_id, GraphRunRecord
-                    ).generation + 1,
+                    "generation": self.store.get("graph_run_v2", run_id, GraphRunRecord).generation
+                    + 1,
                     "replan_count": self.store.get(
                         "graph_run_v2", run_id, GraphRunRecord
-                    ).replan_count + 1,
+                    ).replan_count
+                    + 1,
                     "failure_code": None,
                     "goal_evaluator_digest": None,
                     "composition_id": None,
@@ -703,9 +702,15 @@ class TaskOrchestrator:
                     continue
                 if replan:
                     records[node_id] = NodeExecutionRecord(
-                        id=identifier("node-execution"), run_id=run_id, created_at=now(),
-                        node_id=node_id, accepted_graph_revision_digest=graph_digest,
-                        generation=graph_run.generation, attempt=0, sequence=0, status="pending",
+                        id=identifier("node-execution"),
+                        run_id=run_id,
+                        created_at=now(),
+                        node_id=node_id,
+                        accepted_graph_revision_digest=graph_digest,
+                        generation=graph_run.generation,
+                        attempt=0,
+                        sequence=0,
+                        status="pending",
                     )
                     continue
                 assert prior is not None
@@ -760,7 +765,7 @@ class TaskOrchestrator:
             for node_id, record in records.items():
                 if record.status == "passed" and record.evidence_id is not None:
                     evidence_by_node[node_id] = self.store.get(
-                "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
+                        "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
                     )
         active: dict[
             Future[NodeExecutionResult],
@@ -783,9 +788,7 @@ class TaskOrchestrator:
                     if observed == "pause" or observed == "cancel":
                         stop_action = cast(Literal["pause", "cancel"], observed)
                         if stop_action == "cancel":
-                            graph_run = self.store.get(
-                                "graph_run_v2", run_id, GraphRunRecord
-                            )
+                            graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
                         self.store.put(
                             "graph_control_fact_v2",
                             GraphControlFact(
@@ -834,16 +837,20 @@ class TaskOrchestrator:
                         )
                         self._save_run(graph_run)
                     else:
-                        graph_run = self.store.get(
-                            "graph_run_v2", run_id, GraphRunRecord
-                        )
+                        graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
                     return graph_run
-                ready = [] if stop_action is not None else [
-                    node_id
-                    for node_id in sorted(nodes)
-                    if records[node_id].status == "pending"
-                    and all(records[parent].status == "passed" for parent in predecessors[node_id])
-                ]
+                ready = (
+                    []
+                    if stop_action is not None
+                    else [
+                        node_id
+                        for node_id in sorted(nodes)
+                        if records[node_id].status == "pending"
+                        and all(
+                            records[parent].status == "passed" for parent in predecessors[node_id]
+                        )
+                    ]
+                )
                 while ready and len(active) < self.max_concurrency:
                     node_id = ready.pop(0)
                     base_node = nodes[node_id]
@@ -875,6 +882,7 @@ class TaskOrchestrator:
                         status="routed",
                         route_digest=route.content_digest,
                     )
+
                     def create_reservation(
                         remaining: dict[str, int | float],
                         bound_node: Node = node,
@@ -925,9 +933,7 @@ class TaskOrchestrator:
                         graph_digest,
                         graph_run.generation,
                     )
-                    prior_results = tuple(
-                        item.worker_result_digest for item in predecessor_outputs
-                    )
+                    prior_results = tuple(item.worker_result_digest for item in predecessor_outputs)
                     prior_artifacts = tuple(
                         artifact.artifact_digest
                         for item in predecessor_outputs
@@ -1006,19 +1012,15 @@ class TaskOrchestrator:
                                 failure_code="GRAPH_CANCELLED",
                             )
                             continue
-                        remaining = cast(
-                            Mapping[str, int | float], reservation.remaining_budgets
-                        )
+                        remaining = cast(Mapping[str, int | float], reservation.remaining_budgets)
                         retry_cap = min(
                             nodes[node_id].retry_limit,
                             accepted.graph.budget.max_retries,
                         )
                         retry_resources_available = (
                             int(remaining["node_attempts"]) > 0
-                            and int(remaining["worker_turns"])
-                            >= node.resource_budget.worker_turns
-                            and int(remaining["processes"])
-                            >= node.resource_budget.processes
+                            and int(remaining["worker_turns"]) >= node.resource_budget.worker_turns
+                            and int(remaining["processes"]) >= node.resource_budget.processes
                             and float(remaining["wall_seconds"])
                             >= node.resource_budget.wall_seconds
                             and int(remaining["artifact_bytes"])
@@ -1067,16 +1069,20 @@ class TaskOrchestrator:
             artifact for record in records.values() for artifact in record.artifact_descriptors
         )
         goal_decision = (
-            _evaluate_goal_criteria(goal.completion_criteria, all_evidence, all_artifacts)
-            if node_pass
-            else EvaluationDecision.FAIL
-        ) if goal.completion_criteria else (
-            _evaluate_criteria(
-                goal.completion_criteria,
-                tuple(item for record in all_evidence for item in record.criteria),
+            (
+                _evaluate_goal_criteria(goal.completion_criteria, all_evidence, all_artifacts)
+                if node_pass
+                else EvaluationDecision.FAIL
             )
-            if node_pass
-            else EvaluationDecision.FAIL
+            if goal.completion_criteria
+            else (
+                _evaluate_criteria(
+                    goal.completion_criteria,
+                    tuple(item for record in all_evidence for item in record.criteria),
+                )
+                if node_pass
+                else EvaluationDecision.FAIL
+            )
         )
         goal_evaluation = GoalEvaluatorRecord(
             id=identifier("goal-evaluation"),
@@ -1285,9 +1291,7 @@ class TaskOrchestrator:
     ) -> None:
         worker_result = result.worker_result
         patch = result.node_patch
-        authoritative = self.store.get(
-            "graph_run_v2", request.graph_run_id or "", GraphRunRecord
-        )
+        authoritative = self.store.get("graph_run_v2", request.graph_run_id or "", GraphRunRecord)
         if (
             authoritative.generation != request.generation
             or authoritative.accepted_graph_revision_digest != graph_digest
@@ -1322,9 +1326,7 @@ class TaskOrchestrator:
                         "artifact_descriptor_v2", descriptor.id, ArtifactDescriptor
                     )
                 except KeyError:
-                    raise ValueError(
-                        "node artifact descriptor is absent or stale"
-                    ) from None
+                    raise ValueError("node artifact descriptor is absent or stale") from None
                 if (
                     persisted != descriptor
                     or descriptor.run_id != request.run_id
@@ -1423,9 +1425,7 @@ class TaskOrchestrator:
                 or record.evaluator_digest is None
                 or record.evaluator_decision is not EvaluationDecision.PASS
             ):
-                raise ValueError(
-                    "predecessor is not an authoritative current-generation PASS"
-                )
+                raise ValueError("predecessor is not an authoritative current-generation PASS")
             worker_result = self.store.get(
                 "worker_result_v2", record.worker_result_id, WorkerResult
             )
@@ -1446,9 +1446,7 @@ class TaskOrchestrator:
             artifacts = record.artifact_descriptors
             for artifact in artifacts:
                 if (
-                    self.store.get(
-                        "artifact_descriptor_v2", artifact.id, ArtifactDescriptor
-                    )
+                    self.store.get("artifact_descriptor_v2", artifact.id, ArtifactDescriptor)
                     != artifact
                 ):
                     raise ValueError("predecessor artifact descriptor is stale")
@@ -1503,7 +1501,7 @@ def _evaluate_criteria(
     if any(item.id not in by_id for item in mandatory):
         return EvaluationDecision.FAIL
     if any(by_id[item.id].disposition != "satisfied" for item in mandatory):
-            return EvaluationDecision.FAIL
+        return EvaluationDecision.FAIL
     return EvaluationDecision.PASS
 
 
@@ -1530,10 +1528,8 @@ def _validate_revision_history(acceptances: tuple[TaskGraphAcceptance, ...]) -> 
             continue
         previous = acceptances[index - 1]
         if (
-            acceptance.previous_revision_digest
-            != previous.accepted_revision.content_digest
-            or acceptance.previous_revision_digest
-            == acceptance.accepted_revision.content_digest
+            acceptance.previous_revision_digest != previous.accepted_revision.content_digest
+            or acceptance.previous_revision_digest == acceptance.accepted_revision.content_digest
         ):
             raise ValueError("accepted revision ancestry is missing or cyclic")
 
@@ -1544,18 +1540,14 @@ def _authoritative_replan_evidence(
     previous_revision_digest: Digest,
 ) -> set[Digest]:
     authoritative: set[Digest] = set()
-    records = store.list_records(
-        "node_execution_v2", NodeExecutionRecord, run_id=run_id
-    )
+    records = store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run_id)
     for record in records:
         if record.accepted_graph_revision_digest != previous_revision_digest:
             continue
         if record.content_digest is not None:
             authoritative.add(record.content_digest)
         if record.evidence_id is not None and record.evidence_digest is not None:
-            evidence = store.get(
-                "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
-            )
+            evidence = store.get("node_evidence_v2", record.evidence_id, NodeEvidenceRecord)
             if (
                 evidence.content_digest == record.evidence_digest
                 and evidence.accepted_graph_revision_digest
@@ -1566,9 +1558,7 @@ def _authoritative_replan_evidence(
             ):
                 authoritative.add(record.evidence_digest)
         if record.evaluator_id is not None and record.evaluator_digest is not None:
-            evaluator = store.get(
-                "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
-            )
+            evaluator = store.get("node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord)
             if (
                 evaluator.content_digest == record.evaluator_digest
                 and evaluator.accepted_graph_revision_digest
@@ -1608,18 +1598,11 @@ def _validate_retained_node(
         or record.evaluator_decision is not EvaluationDecision.PASS
     ):
         raise ValueError("retained PASS node has an incomplete immutable contract")
-    worker_result = store.get(
-        "worker_result_v2", record.worker_result_id, WorkerResult
-    )
-    evidence = store.get(
-        "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
-    )
-    evaluator = store.get(
-        "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
-    )
+    worker_result = store.get("worker_result_v2", record.worker_result_id, WorkerResult)
+    evidence = store.get("node_evidence_v2", record.evidence_id, NodeEvidenceRecord)
+    evaluator = store.get("node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord)
     evidence_revision = (
-        record.retained_from_revision_digest
-        or record.accepted_graph_revision_digest
+        record.retained_from_revision_digest or record.accepted_graph_revision_digest
     )
     if (
         worker_result.content_digest != record.worker_result_digest
@@ -1640,10 +1623,7 @@ def _validate_retained_node(
     for descriptor in record.artifact_descriptors:
         if (
             descriptor.content_digest is None
-            or store.get(
-                "artifact_descriptor_v2", descriptor.id, ArtifactDescriptor
-            )
-            != descriptor
+            or store.get("artifact_descriptor_v2", descriptor.id, ArtifactDescriptor) != descriptor
         ):
             raise ValueError("retained PASS node artifact is stale or tampered")
 
@@ -1735,11 +1715,7 @@ def _evaluate_goal_criteria(
     evidence: tuple[NodeEvidenceRecord, ...],
     artifacts: tuple[ArtifactDescriptor, ...],
 ) -> EvaluationDecision:
-    node_evidence = {
-        item.criterion_id: item
-        for record in evidence
-        for item in record.criteria
-    }
+    node_evidence = {item.criterion_id: item for record in evidence for item in record.criteria}
     by_id = {item.id: item for item in artifacts}
     by_kind: dict[str, list[ArtifactDescriptor]] = defaultdict(list)
     for artifact in artifacts:

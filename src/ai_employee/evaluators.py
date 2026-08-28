@@ -80,9 +80,7 @@ class HarnessProcessEvaluationServices:
             command = self._execution_requests[producer_execution_id]
         except KeyError as error:
             raise ValueError("artifact names an unknown process execution") from error
-        descriptor = self._artifact_resolver(
-            artifact_digest, logical_kind, producer_execution_id
-        )
+        descriptor = self._artifact_resolver(artifact_digest, logical_kind, producer_execution_id)
         if descriptor.artifact_digest != artifact_digest:
             raise ValueError("artifact resolver returned a mismatched descriptor")
         if descriptor.logical_kind != logical_kind:
@@ -172,10 +170,7 @@ class ProcessEvaluator:
             and request.remaining_budget.remaining_artifact_bytes < 1
         ):
             raise ValueError("evaluation artifact budget is exhausted")
-        if (
-            specification.requested_observation_kinds
-            and limits.maximum_artifact_bytes < 1
-        ):
+        if specification.requested_observation_kinds and limits.maximum_artifact_bytes < 1:
             raise ValueError("evaluator artifact limit is exhausted")
         if len(specification.requested_observation_kinds) > limits.maximum_observations:
             raise ValueError("evaluator observation limit would be exceeded")
@@ -190,14 +185,9 @@ class ProcessEvaluator:
             ("process_stdout", execution.stdout_artifact_digest),
             ("process_stderr", execution.stderr_artifact_digest),
         ):
-            if (
-                digest is None
-                or logical_kind not in specification.requested_observation_kinds
-            ):
+            if digest is None or logical_kind not in specification.requested_observation_kinds:
                 continue
-            descriptor = services.artifact_descriptor(
-                digest, logical_kind, execution.id
-            )
+            descriptor = services.artifact_descriptor(digest, logical_kind, execution.id)
             if descriptor.run_id != request.run_id:
                 raise ValueError("process artifact belongs to another run")
             if descriptor.logical_kind != logical_kind:
@@ -217,9 +207,7 @@ class ProcessEvaluator:
             raise ValueError("evaluation artifact byte budget was exceeded")
         if artifact_bytes > limits.maximum_artifact_bytes:
             raise ValueError("evaluator artifact byte limit was exceeded")
-        artifact_digests = tuple(
-            dict.fromkeys(item.artifact_digest for item in artifacts)
-        )
+        artifact_digests = tuple(dict.fromkeys(item.artifact_digest for item in artifacts))
         manifest = ObservationManifest(
             id=services.new_id("observation-manifest"),
             run_id=request.run_id,

@@ -203,10 +203,7 @@ class EvaluationResult(DigestedRecordV2):
             != self.evaluator_specification_digest
         ):
             raise ValueError("observation manifest belongs to another evaluator specification")
-        if (
-            self.observation_manifest.effective_policy_digest
-            != self.effective_policy_digest
-        ):
+        if self.observation_manifest.effective_policy_digest != self.effective_policy_digest:
             raise ValueError("observation manifest belongs to another effective policy")
         if len(self.expected_criterion_ids) != len(set(self.expected_criterion_ids)):
             raise ValueError("expected evaluation criterion IDs must be unique")
@@ -298,9 +295,8 @@ def decide_evaluation(
     if not freshness.fresh:
         return EvaluationDecision.FAIL
     criterion_ids = tuple(item.criterion_id for item in criterion_results)
-    if (
-        len(criterion_ids) != len(set(criterion_ids))
-        or set(criterion_ids) != set(expected_criterion_ids)
+    if len(criterion_ids) != len(set(criterion_ids)) or set(criterion_ids) != set(
+        expected_criterion_ids
     ):
         return EvaluationDecision.FAIL
     if any(item.severity is FindingSeverity.CRITICAL for item in findings):

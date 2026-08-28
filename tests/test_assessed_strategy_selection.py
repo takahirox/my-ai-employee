@@ -125,9 +125,7 @@ def test_assessed_fixed_mode_requires_the_exact_eligible_id() -> None:
     large = _strategy("strategy.large")
     assessment = _assessment(complexity=8)
 
-    selected = _select(
-        (tight, large), assessment, mode=RoutingMode.FIXED, fixed="strategy.large"
-    )
+    selected = _select((tight, large), assessment, mode=RoutingMode.FIXED, fixed="strategy.large")
 
     assert selected.id == "strategy.large"
     assert "assessment authority and suitability satisfied" in selected.routing_reasons

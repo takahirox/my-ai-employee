@@ -479,10 +479,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     )
     rejected = json.loads(capsys.readouterr().out)
     assert rejected["stable_code"] == "PROMOTION_APPROVAL_REQUIRED"
-    assert all(
-        (repository / f"{name}.txt").read_text() == f"{name}-before\n"
-        for name in "abc"
-    )
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
 
     assert (
         cli.main(
@@ -509,9 +506,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     ]
     assert cli.main(promote_argv) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
-    assert all(
-        (repository / f"{name}.txt").read_text() == f"{name}-after\n" for name in "abc"
-    )
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-after\n" for name in "abc")
     promoted_diff = subprocess.check_output(
         ("git", "-C", str(repository), "diff", "--binary", "HEAD", "--"), text=True
     )
@@ -576,9 +571,7 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
     with SQLiteStore(database) as store:
         paused = store.get("graph_run_v2", run_id, GraphRunRecord)
         requests_before = store.list_records("worker_request_v2", WorkerRequest)
-        proposals_before = store.list_records(
-            "proposed_graph_v2", ProposedGraph, run_id=run_id
-        )
+        proposals_before = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
         compositions_before = store.list_records(
             "graph_patch_composition_v2",
             GraphPatchCompositionRecord,
@@ -655,9 +648,7 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
     run_id = emitted["run_id"]
     with SQLiteStore(database) as store:
         run = store.get("graph_run_v2", run_id, GraphRunRecord)
-        approval = store.get(
-            "approval_v2", run.promotion_approval_id or "missing", ApprovalRecord
-        )
+        approval = store.get("approval_v2", run.promotion_approval_id or "missing", ApprovalRecord)
     assert (
         cli.main(
             [

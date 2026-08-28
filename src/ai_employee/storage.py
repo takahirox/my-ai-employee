@@ -469,9 +469,13 @@ class SQLiteStore:
                 (run_id,),
             ).fetchone()
             assert row is not None
-            if duplicate is not None or int(row["claims"]) >= max_claims or any(
-                float(row[name]) + float(value) > float(limits[name])
-                for name, value in requested.items()
+            if (
+                duplicate is not None
+                or int(row["claims"]) >= max_claims
+                or any(
+                    float(row[name]) + float(value) > float(limits[name])
+                    for name, value in requested.items()
+                )
             ):
                 connection.rollback()
                 return None

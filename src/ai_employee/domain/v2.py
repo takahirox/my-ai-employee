@@ -291,9 +291,7 @@ class PredecessorOutputReference(SchemaModelV2):
             self.artifact_descriptor_digest,
             self.artifact_digest,
         )
-        if any(value is None for value in values) and any(
-            value is not None for value in values
-        ):
+        if any(value is None for value in values) and any(value is not None for value in values):
             raise ValueError("artifact descriptor and content bindings are all-or-none")
         if self.artifact_descriptors and self.artifact_descriptor_id is not None:
             first = self.artifact_descriptors[0]
@@ -337,17 +335,19 @@ class WorkerRequest(DigestedRecordV2):
         ):
             raise ValueError("accepted graph binding must match accepted_plan_digest")
         if self.predecessor_outputs:
-            if tuple(
-                item.worker_result_digest for item in self.predecessor_outputs
-            ) != self.prior_result_digests:
-                raise ValueError(
-                    "structured predecessor results must match compatibility digests"
+            if (
+                tuple(item.worker_result_digest for item in self.predecessor_outputs)
+                != self.prior_result_digests
+            ):
+                raise ValueError("structured predecessor results must match compatibility digests")
+            if (
+                tuple(
+                    item.artifact_digest
+                    for item in self.predecessor_outputs
+                    if item.artifact_digest is not None
                 )
-            if tuple(
-                item.artifact_digest
-                for item in self.predecessor_outputs
-                if item.artifact_digest is not None
-            ) != self.prior_artifact_digests:
+                != self.prior_artifact_digests
+            ):
                 raise ValueError(
                     "structured predecessor artifacts must match compatibility digests"
                 )

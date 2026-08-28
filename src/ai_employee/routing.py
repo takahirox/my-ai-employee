@@ -39,9 +39,7 @@ def merge_semantic_assessment(
             f"semantic assessment returned unsupported capabilities: {sorted(unknown)}"
         )
     required = tuple(
-        dict.fromkeys(
-            (*deterministic.required_capabilities, *semantic.required_capabilities)
-        )
+        dict.fromkeys((*deterministic.required_capabilities, *semantic.required_capabilities))
     )
     reasons = tuple(
         dict.fromkeys(
@@ -98,10 +96,7 @@ def assess_task(
     capability_count = len(capabilities)
     complexity = min(
         10,
-        1
-        + len(normalized_goal) // 1_000
-        + capability_count
-        + (item_count - 1) // 5,
+        1 + len(normalized_goal) // 1_000 + capability_count + (item_count - 1) // 5,
     )
     scale = min(10, item_count)
     goal_digest = canonical_digest(normalized_goal)
@@ -183,9 +178,7 @@ def select_strategy(
             for item in eligible
             if item.id in allowed_ids
             and item.backend in allowed_backend_names
-            and (
-                item.backend not in {"ollama", "ollama_cli"} or local_backend_allowed
-            )
+            and (item.backend not in {"ollama", "ollama_cli"} or local_backend_allowed)
             and assessed_required <= set(item.capabilities)
             and item.min_complexity <= assessment.complexity <= item.max_complexity
             and item.min_scale <= assessment.scale <= item.max_scale
@@ -195,9 +188,7 @@ def select_strategy(
         raise RoutingError("no strategy satisfies mandatory project and safety constraints")
     if mode is RoutingMode.FIXED:
         selected_id = (
-            fixed_strategy_id
-            if assessment is not None
-            else fixed_strategy_id or eligible[0].id
+            fixed_strategy_id if assessment is not None else fixed_strategy_id or eligible[0].id
         )
         selected = next((item for item in eligible if item.id == selected_id), None)
         if selected is None:
@@ -209,13 +200,9 @@ def select_strategy(
 
     fit_reasons: tuple[str, ...] = ()
     if assessment is not None:
-        best_headroom = min(
-            _assessment_headroom(item, assessment) for item in eligible
-        )
+        best_headroom = min(_assessment_headroom(item, assessment) for item in eligible)
         eligible = tuple(
-            item
-            for item in eligible
-            if _assessment_headroom(item, assessment) == best_headroom
+            item for item in eligible if _assessment_headroom(item, assessment) == best_headroom
         )
         fit_reasons = (f"assessment headroom={best_headroom}",)
     if mode is RoutingMode.POLICY:
@@ -233,9 +220,7 @@ def select_strategy(
             "insufficient history; deterministic policy fallback",
             *fit_reasons,
         )
-        return eligible[0].model_copy(
-            update={"routing_reasons": fallback_reasons}
-        )
+        return eligible[0].model_copy(update={"routing_reasons": fallback_reasons})
     ranked = sorted(
         mature,
         key=lambda item: (
@@ -253,9 +238,7 @@ def select_strategy(
         "mandatory constraints applied before optimization",
         *fit_reasons,
     )
-    return winner.model_copy(
-        update={"routing_reasons": adaptive_reasons}
-    )
+    return winner.model_copy(update={"routing_reasons": adaptive_reasons})
 
 
 def record_outcome(

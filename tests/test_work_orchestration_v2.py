@@ -213,9 +213,7 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
     broad_goal = "Exhaustively audit every authentication path for security defects"
     payloads = [
         json.loads(
-            _bounded_prompt(
-                worker_request(goal), scratch_directory="/tmp/fleet-worker-run-1"
-            )
+            _bounded_prompt(worker_request(goal), scratch_directory="/tmp/fleet-worker-run-1")
         )
         for goal in (local_goal, broad_goal)
     ]
@@ -730,7 +728,7 @@ def test_cli_worker_repairs_only_new_file_sections_in_multi_file_diff() -> None:
                             "+++ b/package.json\n"
                             "@@ -1 +1 @@\n"
                             "-{}\n"
-                            "+{\"private\":true}\n"
+                            '+{"private":true}\n'
                             "diff --git a/example.ts b/example.ts\n"
                             "new file mode 100644\n"
                             "--- /dev/null\n"

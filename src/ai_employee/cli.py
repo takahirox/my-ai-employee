@@ -393,9 +393,7 @@ def _work(args: argparse.Namespace) -> int:
         routing_mode = RoutingMode(args.routing_mode)
         if resume_run is None:
             effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
-            strategies = operator_config.execution_strategies(
-                routing_mode, effective_strategy_set
-            )
+            strategies = operator_config.execution_strategies(routing_mode, effective_strategy_set)
         else:
             effective_strategy_set = resume_run.strategy_set
             strategies = resume_run.execution_strategies
@@ -560,8 +558,7 @@ def _work(args: argparse.Namespace) -> int:
             persisted_layers = tuple(
                 layer
                 for layer in store.list_records("policy_layer_v2", PolicyLayer)
-                if canonical_digest((layer.content_digest,))
-                == resume_run.effective_policy_digest
+                if canonical_digest((layer.content_digest,)) == resume_run.effective_policy_digest
             )
             if len(persisted_layers) != 1:
                 raise ValueError("authoritative graph policy is missing or ambiguous")
@@ -587,9 +584,7 @@ def _work(args: argparse.Namespace) -> int:
             )
             effective_decision = resolution.decision.model_copy(
                 update={
-                    "effective_policy_digest": canonical_digest(
-                        (policy.content_digest,)
-                    ),
+                    "effective_policy_digest": canonical_digest((policy.content_digest,)),
                     "content_digest": None,
                 }
             )
@@ -783,14 +778,10 @@ def _work(args: argparse.Namespace) -> int:
             lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
-            task_assessment=(
-                task_assessment if selected_strategy is not None else None
-            ),
+            task_assessment=(task_assessment if selected_strategy is not None else None),
             assessment_strategy=assessment_strategy,
             selected_strategy=selected_strategy,
-            strategy_set=(
-                effective_strategy_set if selected_strategy is not None else None
-            ),
+            strategy_set=(effective_strategy_set if selected_strategy is not None else None),
             approval_service=DigestApprovalService(store, operator_label="local-operator"),
             download_client=RestrictedDownloadClient(
                 artifacts,
@@ -914,9 +905,7 @@ def _work(args: argparse.Namespace) -> int:
                 allowed_backends=harness.worker.allowed,
                 local_backend_allowed=harness.worker.local_backend,
                 parent_evaluator=parent_evaluator,
-                approval_service=DigestApprovalService(
-                    store, operator_label="local-operator"
-                ),
+                approval_service=DigestApprovalService(store, operator_label="local-operator"),
                 operator_config_digest=canonical_digest(operator_config),
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
@@ -1047,17 +1036,19 @@ def _diff(store: SQLiteStore, args: argparse.Namespace) -> int:
         if run.patch_artifact_id is None:
             raise ValueError("run has no captured patch") from None
         run_id = run.id
-        descriptor = store.get(
-            "artifact_descriptor_v2", run.patch_artifact_id, ArtifactDescriptor
-        )
+        descriptor = store.get("artifact_descriptor_v2", run.patch_artifact_id, ArtifactDescriptor)
     else:
         if graph_run.status == "completed" and graph_run.composition_id is None:
-            print(canonical_json({
-                "schema_version": "2",
-                "run_id": graph_run.id,
-                "status": graph_run.status,
-                "stable_code": "PATCHLESS_RUN_HAS_NO_DIFF",
-            }))
+            print(
+                canonical_json(
+                    {
+                        "schema_version": "2",
+                        "run_id": graph_run.id,
+                        "status": graph_run.status,
+                        "stable_code": "PATCHLESS_RUN_HAS_NO_DIFF",
+                    }
+                )
+            )
             return 5
         run_id = graph_run.id
         descriptor, _, _ = _graph_candidate(store, graph_run)
@@ -1180,9 +1171,7 @@ def _graph_candidate(
     descriptor = store.get(
         "artifact_descriptor_v2", run.parent_candidate_artifact_id, ArtifactDescriptor
     )
-    workspace = store.get(
-        "workspace_v2", composition.composition_workspace.id, WorkspaceSnapshot
-    )
+    workspace = store.get("workspace_v2", composition.composition_workspace.id, WorkspaceSnapshot)
     if descriptor != composition.candidate_patch or workspace != composition.composition_workspace:
         raise ValueError("graph candidate descriptor or workspace is stale")
     return descriptor, composition, workspace
@@ -1245,9 +1234,7 @@ def _graph_promotion_evidence(
         or request.composition_workspace != workspace
         or request.candidate_artifact != patch
         or request.effective_policy_digest != policy_digest
-        or tuple(
-            item.process_request.content_digest for item in request.verification_bindings
-        )
+        or tuple(item.process_request.content_digest for item in request.verification_bindings)
         != evaluation.verification_request_digests
     ):
         raise ValueError("parent evaluation request bindings are stale")
@@ -1262,20 +1249,17 @@ def _graph_promotion_evidence(
     }
     verification_digests = {
         item.content_digest
-        for item in store.list_records(
-            "verification_result_v2", ExecutionResult, run_id=run.id
-        )
+        for item in store.list_records("verification_result_v2", ExecutionResult, run_id=run.id)
         if item.status == "succeeded"
     }
-    if not set(evaluation.evaluation_ledger_digests) <= ledger_digests or not set(
-        evaluation.verification_result_digests
-    ) <= verification_digests:
+    if (
+        not set(evaluation.evaluation_ledger_digests) <= ledger_digests
+        or not set(evaluation.verification_result_digests) <= verification_digests
+    ):
         raise ValueError("parent PASS evidence is missing")
     goal_evaluations = tuple(
         item
-        for item in store.list_records(
-            "goal_evaluator_v2", GoalEvaluatorRecord, run_id=run.id
-        )
+        for item in store.list_records("goal_evaluator_v2", GoalEvaluatorRecord, run_id=run.id)
         if item.content_digest == evaluation.goal_evaluator_digest
     )
     if (
@@ -1305,9 +1289,7 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
         return 8
     try:
         patch, composition, snapshot = _graph_candidate(store, run)
-        _, policy_digest = _graph_promotion_evidence(
-            store, run, patch, composition, snapshot
-        )
+        _, policy_digest = _graph_promotion_evidence(store, run, patch, composition, snapshot)
     except (KeyError, ValueError):
         _print_work_failure(run.id, run.status, "EVIDENCE_OR_REVIEW_BLOCKED")
         return 5
@@ -1345,9 +1327,7 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
         _print_work_failure(run.id, run.status, "WORKSPACE_CONFLICT")
         return 8
     store.put("promotion_v2", promotion, run_id=run.id)
-    completed = run.model_copy(
-        update={"status": "completed", "generation": run.generation + 1}
-    )
+    completed = run.model_copy(update={"status": "completed", "generation": run.generation + 1})
     store.put(
         "graph_run_v2",
         completed,

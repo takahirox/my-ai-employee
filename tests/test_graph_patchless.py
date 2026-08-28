@@ -381,9 +381,9 @@ def _execute_patchless(tmp_path: Path, run_id: str) -> _PatchlessExecution:
             lambda _snapshot: executor,
             body_reader,
             (policy,),
-            task_assessment=__import__(
-                "ai_employee.routing", fromlist=["assess_task"]
-            ).assess_task(selected_node.objective or selected_node.name, run_id=request.run_id),
+            task_assessment=__import__("ai_employee.routing", fromlist=["assess_task"]).assess_task(
+                selected_node.objective or selected_node.name, run_id=request.run_id
+            ),
             selected_strategy=selected_strategy,
             request_promotion_approval=False,
             allowed_processes=(("produce", selected_node.id),),
@@ -451,8 +451,7 @@ def test_patchless_fork_join_persists_body_free_artifact_evidence(tmp_path: Path
     replay_by_node = {item.node_id: item for item in execution.replay.nodes}
     assert all(item.status == "passed" for item in replay_by_node.values())
     assert all(
-        item.evaluator_decision is EvaluationDecision.PASS
-        for item in replay_by_node.values()
+        item.evaluator_decision is EvaluationDecision.PASS for item in replay_by_node.values()
     )
     for reference in join_request.predecessor_outputs:
         predecessor = replay_by_node[reference.node_id]
@@ -490,9 +489,7 @@ def test_patchless_fork_join_persists_body_free_artifact_evidence(tmp_path: Path
         )
 
         for node_id, request in execution.requests.items():
-            worker_result = store.get(
-                "worker_result_v2", f"worker-result-{node_id}", WorkerResult
-            )
+            worker_result = store.get("worker_result_v2", f"worker-result-{node_id}", WorkerResult)
             action = worker_result.proposals[0]
             action_results = store.list_records(
                 "action_result_v2", ExecutionResult, run_id=request.run_id
@@ -506,15 +503,12 @@ def test_patchless_fork_join_persists_body_free_artifact_evidence(tmp_path: Path
             assert descriptor.source["execution_id"] == result.id
             assert result.stdout_artifact_digest == descriptor.artifact_digest
 
-        assert store.list_records(
-            "approval_request_v2", ApprovalRequest, run_id=execution.run.id
-        ) == ()
-        assert store.list_records(
-            "approval_v2", ApprovalRecord, run_id=execution.run.id
-        ) == ()
-        assert store.list_records(
-            "promotion_v2", PromotionRecord, run_id=execution.run.id
-        ) == ()
+        assert (
+            store.list_records("approval_request_v2", ApprovalRequest, run_id=execution.run.id)
+            == ()
+        )
+        assert store.list_records("approval_v2", ApprovalRecord, run_id=execution.run.id) == ()
+        assert store.list_records("promotion_v2", PromotionRecord, run_id=execution.run.id) == ()
 
     assert execution.replay.worker_invocations == 0
     assert execution.replay.verification_invocations == 0
@@ -580,9 +574,7 @@ def _descriptor(index: int, run_id: str) -> ArtifactDescriptor:
 
 
 @pytest.mark.parametrize("case", ["tampered", "unpersisted", "wrong_run"])
-def test_patchless_descriptor_provenance_failures_are_closed(
-    tmp_path: Path, case: str
-) -> None:
+def test_patchless_descriptor_provenance_failures_are_closed(tmp_path: Path, case: str) -> None:
     goal, graph, strategy = _boundary_graph()
     database = tmp_path / f"{case}.db"
 
@@ -595,14 +587,10 @@ def test_patchless_descriptor_provenance_failures_are_closed(
             if case == "wrong_run":
                 descriptor = _descriptor(1, "another-run")
                 with SQLiteStore(database) as writer:
-                    writer.put(
-                        "artifact_descriptor_v2", descriptor, run_id=request.run_id
-                    )
+                    writer.put("artifact_descriptor_v2", descriptor, run_id=request.run_id)
             elif case == "tampered":
                 with SQLiteStore(database) as writer:
-                    writer.put(
-                        "artifact_descriptor_v2", descriptor, run_id=request.run_id
-                    )
+                    writer.put("artifact_descriptor_v2", descriptor, run_id=request.run_id)
                 descriptor = descriptor.model_copy(update={"source": {"tampered": True}})
             worker = WorkerResult(
                 id="worker-result-only",
@@ -652,9 +640,7 @@ def test_patchless_descriptor_provenance_failures_are_closed(
 
 
 @pytest.mark.parametrize("case", ["duplicate_kind", "missing_descriptor_digest"])
-def test_patchless_criterion_artifact_ambiguity_fails_evaluation(
-    tmp_path: Path, case: str
-) -> None:
+def test_patchless_criterion_artifact_ambiguity_fails_evaluation(tmp_path: Path, case: str) -> None:
     goal, graph, strategy = _boundary_graph()
     database = tmp_path / f"{case}.db"
 
@@ -670,9 +656,7 @@ def test_patchless_criterion_artifact_ambiguity_fails_evaluation(
             )
             with SQLiteStore(database) as writer:
                 for descriptor in descriptors:
-                    writer.put(
-                        "artifact_descriptor_v2", descriptor, run_id=request.run_id
-                    )
+                    writer.put("artifact_descriptor_v2", descriptor, run_id=request.run_id)
             refs = tuple(
                 reference
                 for descriptor in descriptors
@@ -832,9 +816,7 @@ class _PassingParentEvaluator:
             request_digest=canonical_digest({"composition": composition.content_digest}),
             accepted_graph_revision_digest=revision.content_digest or ZERO,
             composition_record_digest=composition.content_digest or ZERO,
-            composition_workspace_digest=(
-                composition.composition_workspace.content_digest or ZERO
-            ),
+            composition_workspace_digest=(composition.composition_workspace.content_digest or ZERO),
             candidate_digest=canonical_digest(
                 {"artifact": composition.candidate_patch.artifact_digest}
             ),
@@ -854,9 +836,7 @@ class _CountingApprovalService:
         self.store = store
         self.calls = 0
 
-    def request(
-        self, request: ApprovalRequest, _decision: PolicyDecision
-    ) -> ApprovalRecord:
+    def request(self, request: ApprovalRequest, _decision: PolicyDecision) -> ApprovalRecord:
         self.calls += 1
         record = ApprovalRecord(
             id="mixed-promotion-approval",
@@ -953,9 +933,7 @@ def test_mixed_graph_composes_only_writing_nodes_and_preserves_artifact_refs(
         if selected_node.id == "facts":
             executor = _ProcessExecutor(artifacts, selected_node.id, finished, lock)
 
-            def worker_factory(
-                _snapshot: object, _cancellation: object
-            ) -> _ProcessAdapter:
+            def worker_factory(_snapshot: object, _cancellation: object) -> _ProcessAdapter:
                 return _ProcessAdapter(
                     selected_node.id,
                     request.run_id,
@@ -970,9 +948,8 @@ def test_mixed_graph_composes_only_writing_nodes_and_preserves_artifact_refs(
 
             allowed_processes = (("produce", "facts"),)
         else:
-            def worker_factory(
-                _snapshot: object, _cancellation: object
-            ) -> _EditAdapter:
+
+            def worker_factory(_snapshot: object, _cancellation: object) -> _EditAdapter:
                 return _EditAdapter(selected_node.id, request.run_id, requests)
 
             def process_factory(_snapshot: object) -> _UnusedProcessExecutor:
@@ -987,9 +964,9 @@ def test_mixed_graph_composes_only_writing_nodes_and_preserves_artifact_refs(
             process_factory,  # type: ignore[arg-type]
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
-            task_assessment=__import__(
-                "ai_employee.routing", fromlist=["assess_task"]
-            ).assess_task(selected_node.objective or selected_node.name, run_id=request.run_id),
+            task_assessment=__import__("ai_employee.routing", fromlist=["assess_task"]).assess_task(
+                selected_node.objective or selected_node.name, run_id=request.run_id
+            ),
             selected_strategy=selected_strategy,
             request_promotion_approval=False,
             allowed_processes=allowed_processes,
@@ -1064,12 +1041,16 @@ def test_mixed_graph_composes_only_writing_nodes_and_preserves_artifact_refs(
             facts_descriptor.content_digest
         )
 
-    assert subprocess.check_output(
-        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
-    ).strip() == head
-    assert subprocess.check_output(
-        ("git", "-C", str(repository), "status", "--porcelain"), text=True
-    ) == ""
+    assert (
+        subprocess.check_output(
+            ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+        ).strip()
+        == head
+    )
+    assert (
+        subprocess.check_output(("git", "-C", str(repository), "status", "--porcelain"), text=True)
+        == ""
+    )
     assert (repository / "a.txt").read_text(encoding="utf-8") == "a-before\n"
     assert (repository / "b.txt").read_text(encoding="utf-8") == "b-before\n"
 
@@ -1100,13 +1081,17 @@ def test_cli_rejects_diff_and_promotion_for_completed_patchless_graph(
     assert promote_output["stable_code"] == "PATCHLESS_RUN_CANNOT_PROMOTE"
     assert execution.body_reader.calls == 0
 
-    assert subprocess.check_output(
-        ("git", "-C", str(execution.repository), "rev-parse", "HEAD"), text=True
-    ).strip() == execution.head
-    assert subprocess.check_output(
-        ("git", "-C", str(execution.repository), "status", "--porcelain"), text=True
-    ) == ""
+    assert (
+        subprocess.check_output(
+            ("git", "-C", str(execution.repository), "rev-parse", "HEAD"), text=True
+        ).strip()
+        == execution.head
+    )
+    assert (
+        subprocess.check_output(
+            ("git", "-C", str(execution.repository), "status", "--porcelain"), text=True
+        )
+        == ""
+    )
     with SQLiteStore(execution.database) as store:
-        assert store.list_records(
-            "promotion_v2", PromotionRecord, run_id=execution.run.id
-        ) == ()
+        assert store.list_records("promotion_v2", PromotionRecord, run_id=execution.run.id) == ()

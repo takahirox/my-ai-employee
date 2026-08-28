@@ -435,9 +435,7 @@ def test_cross_run_specification_and_nested_evidence_fail_closed() -> None:
         purpose="declared verification",
     )
     with pytest.raises(ValueError, match="different runs"):
-        ProcessEvaluator().evaluate(
-            foreign_request, foreign_spec, evaluation_services(command)
-        )
+        ProcessEvaluator().evaluate(foreign_request, foreign_spec, evaluation_services(command))
 
     result_payload = result.model_dump(exclude={"content_digest", "digest_metadata"})
     manifest_payload = result_payload["observation_manifest"]

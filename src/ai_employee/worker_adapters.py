@@ -381,9 +381,7 @@ class CliTaskAssessmentAdapter:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(
-                ("HOME",) if self.strategy.backend == "ollama_cli" else ()
-            ),
+            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=100_000,
@@ -391,9 +389,7 @@ class CliTaskAssessmentAdapter:
             budget_class="worker",
             purpose="obtain strict repository-isolated semantic task assessment",
         )
-        result = self.executor.execute(
-            request, self.policy_decider(request), _NeverCancelled()
-        )
+        result = self.executor.execute(request, self.policy_decider(request), _NeverCancelled())
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message
@@ -401,9 +397,7 @@ class CliTaskAssessmentAdapter:
                 else "assessment worker invocation failed"
             )
             raise ValueError(message)
-        output = self.output_reader(result.stdout_artifact_digest).decode(
-            "utf-8", "replace"
-        )
+        output = self.output_reader(result.stdout_artifact_digest).decode("utf-8", "replace")
         try:
             payload = self._extract_payload(output)
             assessment = SemanticTaskAssessment.model_validate_json(payload, strict=True)
@@ -753,11 +747,7 @@ def _normalize_new_file_section(value: str) -> str:
         ending = "\n" if lines[hunk].endswith("\n") else ""
         lines[hunk] = f"{lines[hunk].rstrip()} @@{ending}"
     body = lines[hunk + 1 :]
-    if (
-        len(body) == 1
-        and body[0].startswith("+# ")
-        and body[0].count("<br>") >= 10
-    ):
+    if len(body) == 1 and body[0].startswith("+# ") and body[0].count("<br>") >= 10:
         content = body[0][1:].rstrip("\n").replace("<br>", "\n")
         body = [f"+{line}\n" for line in content.split("\n")]
         lines = [*lines[: hunk + 1], *body]

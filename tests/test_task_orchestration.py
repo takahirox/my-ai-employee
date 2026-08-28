@@ -159,9 +159,7 @@ def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> N
         assert set(requests) == {"a", "b", "c"}
         assert len({request.content_digest for request in requests.values()}) == 3
         assert len({request.node_id for request in requests.values()}) == 3
-        graph_digests = {
-            request.accepted_graph_revision_digest for request in requests.values()
-        }
+        graph_digests = {request.accepted_graph_revision_digest for request in requests.values()}
         assert graph_digests == {run.accepted_graph_revision_digest}
         assert starts["c"] >= max(finishes["a"], finishes["b"])
         assert starts["a"] <= finishes["b"] and starts["b"] <= finishes["a"]
@@ -277,13 +275,9 @@ def test_task_graph_acceptance_rejects_cycles_general_edges_and_tight_budget() -
     )
     with pytest.raises(GraphValidationError) as caught:
         accept_task_graph(conditional, policy, available_capabilities=("process",))
-    assert "unsupported_edge_semantics" in {
-        item.code for item in caught.value.issues
-    }
+    assert "unsupported_edge_semantics" in {item.code for item in caught.value.issues}
 
-    tight = graph.model_copy(
-        update={"budget": graph.budget.model_copy(update={"max_attempts": 2})}
-    )
+    tight = graph.model_copy(update={"budget": graph.budget.model_copy(update={"max_attempts": 2})})
     with pytest.raises(GraphValidationError) as caught:
         accept_task_graph(tight, policy, available_capabilities=("process",))
     assert "attempt_budget_insufficient" in {item.code for item in caught.value.issues}
@@ -338,24 +332,27 @@ def test_graph_reservations_are_atomic_across_connections(tmp_path: Path) -> Non
                     remaining_budgets=remaining,
                 )
 
-            return store.reserve_graph_node(
-                "reservation-run",
-                f"node-{index}",
-                0,
-                0,
-                max_claims=3,
-                worker_turns=1,
-                processes=1,
-                wall_seconds=1.0,
-                artifact_bytes=10,
-                limits={
-                    "worker_turns": 3,
-                    "processes": 3,
-                    "wall_seconds": 3.0,
-                    "artifact_bytes": 30,
-                },
-                record_factory=record,
-            ) is not None
+            return (
+                store.reserve_graph_node(
+                    "reservation-run",
+                    f"node-{index}",
+                    0,
+                    0,
+                    max_claims=3,
+                    worker_turns=1,
+                    processes=1,
+                    wall_seconds=1.0,
+                    artifact_bytes=10,
+                    limits={
+                        "worker_turns": 3,
+                        "processes": 3,
+                        "wall_seconds": 3.0,
+                        "artifact_bytes": 30,
+                    },
+                    record_factory=record,
+                )
+                is not None
+            )
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         reserved = tuple(pool.map(reserve, range(8)))
@@ -695,9 +692,7 @@ def test_evaluator_failure_and_exhausted_resources_do_not_retry(
             max_wall_seconds=2.0,
             max_worker_turns=1 if failure_kind == "budget" else 2,
             max_processes=1 if failure_kind == "budget" else 2,
-            max_artifact_bytes=(
-                1_000_000 if failure_kind == "budget" else 2_000_000
-            ),
+            max_artifact_bytes=(1_000_000 if failure_kind == "budget" else 2_000_000),
         ),
     )
     with SQLiteStore(tmp_path / f"{failure_kind}.db") as store:

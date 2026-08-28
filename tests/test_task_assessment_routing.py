@@ -31,10 +31,7 @@ class TaskAssessmentRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             normalized.decomposition[0].id,
-            (
-                "assessment-item."
-                f"{canonical_digest((normalized.goal_digest, 1, 'Fix tests'))}"
-            ),
+            (f"assessment-item.{canonical_digest((normalized.goal_digest, 1, 'Fix tests'))}"),
         )
 
     def test_structurally_splits_unicode_line_breaks_and_semicolons(self) -> None:
@@ -48,10 +45,7 @@ class TaskAssessmentRoutingTests(unittest.TestCase):
             ("Inspect", "Implement", "Test", "Document", "Report"),
         )
         self.assertTrue(
-            all(
-                "assessment only" in item.reasons[-1]
-                for item in assessment.decomposition
-            )
+            all("assessment only" in item.reasons[-1] for item in assessment.decomposition)
         )
 
     def test_decomposition_is_bounded_to_twenty_items(self) -> None:
@@ -81,10 +75,7 @@ class TaskAssessmentRoutingTests(unittest.TestCase):
         self.assertEqual(
             assessment.reasons,
             (
-                (
-                    "complexity=4 from goal_length=1008, item_count=2, "
-                    "and capability_count=2"
-                ),
+                ("complexity=4 from goal_length=1008, item_count=2, and capability_count=2"),
                 "scale=2 from structural_item_count=2",
                 "risk=7 preserved from caller input",
             ),
@@ -135,9 +126,7 @@ class TaskAssessmentRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual((merged.complexity, merged.scale, merged.risk), (9, 7, 6))
-        self.assertEqual(
-            merged.required_capabilities, ("edit_intent", "process", "install")
-        )
+        self.assertEqual(merged.required_capabilities, ("edit_intent", "process", "install"))
         self.assertIn("semantic assessment:", merged.reasons[-1])
 
         lower = SemanticTaskAssessment(

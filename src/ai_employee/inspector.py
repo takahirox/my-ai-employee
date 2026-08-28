@@ -134,25 +134,17 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "state": run.status,
         "generation": run.generation,
         "run": _json_model(run),
-        "graph": (
-            None if not graph_acceptances else _json_model(graph_acceptances[-1])
-        ),
+        "graph": (None if not graph_acceptances else _json_model(graph_acceptances[-1])),
         "routing": {
             "strategy_set": run.strategy_set,
             "assessment_strategy": (
-                None
-                if run.assessment_strategy is None
-                else _json_model(run.assessment_strategy)
+                None if run.assessment_strategy is None else _json_model(run.assessment_strategy)
             ),
             "assessment": (
-                None
-                if run.task_assessment is None
-                else _json_model(run.task_assessment)
+                None if run.task_assessment is None else _json_model(run.task_assessment)
             ),
             "selected_strategy": (
-                None
-                if run.selected_strategy is None
-                else _json_model(run.selected_strategy)
+                None if run.selected_strategy is None else _json_model(run.selected_strategy)
             ),
         },
         "events": [_json_model(item) for item in store.work_events(run_id)],
@@ -213,9 +205,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     """Project exact graph handoff records without opening artifact bodies."""
 
     run = store.get("graph_run_v2", run_id, GraphRunRecord)
-    acceptances = store.list_records(
-        "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
-    )
+    acceptances = store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id)
     acceptances = tuple(
         sorted(acceptances, key=lambda item: item.accepted_revision.revision_number)
     )
@@ -227,9 +217,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ),
         None,
     )
-    node_records = store.list_records(
-        "node_execution_v2", NodeExecutionRecord, run_id=run_id
-    )
+    node_records = store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run_id)
     latest_nodes: dict[str, NodeExecutionRecord] = {}
     for node_record in node_records:
         previous = latest_nodes.get(node_record.node_id)
@@ -282,9 +270,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "retained_node_bindings": [
             _json_model(item)
             for item in sorted(
-                store.list_records(
-                    "retained_node_binding_v2", RetainedNodeBinding, run_id=run_id
-                ),
+                store.list_records("retained_node_binding_v2", RetainedNodeBinding, run_id=run_id),
                 key=lambda item: (item.generation, item.node_id),
             )
         ],
@@ -314,17 +300,13 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             if item.evidence_id is not None
         ],
         "node_evaluator_decisions": [
-            _json_model(
-                store.get("node_evaluator_v2", item.evaluator_id, NodeEvaluatorRecord)
-            )
+            _json_model(store.get("node_evaluator_v2", item.evaluator_id, NodeEvaluatorRecord))
             for item in node_records
             if item.evaluator_id is not None
         ],
         "controls": [
             _json_model(item)
-            for item in store.list_records(
-                "graph_control_fact_v2", GraphControlFact, run_id=run_id
-            )
+            for item in store.list_records("graph_control_fact_v2", GraphControlFact, run_id=run_id)
         ],
         "stale_results": [
             _json_model(item)
@@ -345,9 +327,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ],
         "parent_goal_evaluations": [
             _json_model(item)
-            for item in store.list_records(
-                "goal_evaluator_v2", GoalEvaluatorRecord, run_id=run_id
-            )
+            for item in store.list_records("goal_evaluator_v2", GoalEvaluatorRecord, run_id=run_id)
         ],
         "parent_evidence": [
             _json_model(item)
@@ -359,9 +339,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ],
         "approval_requests": [
             _json_model(item)
-            for item in store.list_records(
-                "approval_request_v2", ApprovalRequest, run_id=run_id
-            )
+            for item in store.list_records("approval_request_v2", ApprovalRequest, run_id=run_id)
         ],
         "approvals": [
             _json_model(item)

@@ -197,9 +197,7 @@ class GraphExecutionService:
         current_digest = graph_run.accepted_graph_revision_digest
         replay = orchestrator.replay(run_id)
         latest_nodes = {item.node_id: item for item in replay.nodes}
-        for record in self.store.list_records(
-            "node_patch_v2", NodePatchRecord, run_id=run_id
-        ):
+        for record in self.store.list_records("node_patch_v2", NodePatchRecord, run_id=run_id):
             patch = record.node_patch
             node_record = latest_nodes.get(patch.node_id)
             if (
@@ -522,19 +520,23 @@ def _authoritative_node_result(
             or not set(evidence.evidence_refs) <= {item for item in authoritative_refs if item}
         ):
             raise ValueError("criterion cites non-authoritative or empty evidence")
-    node_patch = None if patch is None else NodePatchArtifact(
-        node_id=node.id,
-        graph_run_id=request.graph_run_id or request.run_id,
-        accepted_graph_revision_digest=request.accepted_graph_revision_digest
-        or request.accepted_plan_digest,
-        generation=node.generation,
-        attempt=node.attempt,
-        worker_request_digest=_required(request.content_digest),
-        worker_result_digest=_required(worker_result.content_digest),
-        acceptance_ledger_digest=_required(ledger.content_digest),
-        verification_result_digests=tuple(verification_digests),
-        workspace=workspace,
-        patch=patch,
+    node_patch = (
+        None
+        if patch is None
+        else NodePatchArtifact(
+            node_id=node.id,
+            graph_run_id=request.graph_run_id or request.run_id,
+            accepted_graph_revision_digest=request.accepted_graph_revision_digest
+            or request.accepted_plan_digest,
+            generation=node.generation,
+            attempt=node.attempt,
+            worker_request_digest=_required(request.content_digest),
+            worker_result_digest=_required(worker_result.content_digest),
+            acceptance_ledger_digest=_required(ledger.content_digest),
+            verification_result_digests=tuple(verification_digests),
+            workspace=workspace,
+            patch=patch,
+        )
     )
     return NodeExecutionResult(
         worker_result=worker_result,

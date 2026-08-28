@@ -193,9 +193,7 @@ def _start(
         calls.append(key)
         requests[key] = request
         blocked = node.id == "broken" and request.generation == 0
-        artifact_digest = canonical_digest(
-            {"node_id": node.id, "generation": request.generation}
-        )
+        artifact_digest = canonical_digest({"node_id": node.id, "generation": request.generation})
         descriptor = ArtifactDescriptor(
             id=f"artifact-{node.id}-{request.generation}",
             run_id=request.run_id,
@@ -209,9 +207,7 @@ def _start(
             store_locator=f"sha256/{artifact_digest[:2]}/{artifact_digest}",
         )
         with SQLiteStore(Path(store.path)) as writer:
-            writer.put(
-                "artifact_descriptor_v2", descriptor, run_id=request.run_id
-            )
+            writer.put("artifact_descriptor_v2", descriptor, run_id=request.run_id)
         return NodeExecutionResult(
             worker_result=WorkerResult(
                 id=f"result-{node.id}-{request.generation}",
@@ -354,9 +350,10 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         assert run.promotion_approval_id is None
         assert run.promotion_approval_request_digest is None
         assert run.accepted_graph_revision_digest != revision_one_digest
-        assert [
-            item.accepted_revision.revision_number for item in replay.revision_history
-        ] == [1, 2]
+        assert [item.accepted_revision.revision_number for item in replay.revision_history] == [
+            1,
+            2,
+        ]
         revision_two = replay.revision_history[1]
         assert revision_two.previous_revision_digest == revision_one_digest
         assert revision_two.replan_trigger == "repair failed node"
@@ -391,9 +388,7 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
             run.accepted_graph_revision_digest
         )
         revision_two_routes = [item for item in replay.routes if item.generation == 1]
-        revision_two_reservations = [
-            item for item in replay.reservations if item.generation == 1
-        ]
+        revision_two_reservations = [item for item in replay.reservations if item.generation == 1]
         assert [item.node_id for item in revision_two_routes] == ["broken", "join"]
         assert [item.node_id for item in revision_two_reservations] == ["broken", "join"]
         assert all(
@@ -402,9 +397,7 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         )
 
         join_request = scenario.requests[("join", 1)]
-        predecessor_by_node = {
-            item.node_id: item for item in join_request.predecessor_outputs
-        }
+        predecessor_by_node = {item.node_id: item for item in join_request.predecessor_outputs}
         assert set(predecessor_by_node) == {"broken", "keep"}
         assert predecessor_by_node["keep"].generation == 1
         assert predecessor_by_node["keep"].result_generation == 0
@@ -417,15 +410,10 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
 
         assert inspected["replan_count"] == 1
         assert [
-            item["accepted_revision"]["revision_number"]
-            for item in inspected["graph_revisions"]
+            item["accepted_revision"]["revision_number"] for item in inspected["graph_revisions"]
         ] == [1, 2]
-        assert inspected["graph_revisions"][1]["replan_trigger"] == (
-            "repair failed node"
-        )
-        assert inspected["graph_revisions"][1]["replan_evidence"] == [
-            scenario.evidence
-        ]
+        assert inspected["graph_revisions"][1]["replan_trigger"] == ("repair failed node")
+        assert inspected["graph_revisions"][1]["replan_evidence"] == [scenario.evidence]
         assert inspected["retained_node_bindings"][0]["node_id"] == "keep"
         assert {item["generation"] for item in inspected["node_history"]} == {0, 1}
 
@@ -468,9 +456,7 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         assert after_stale.run == run
         assert after_by_node["broken"].worker_result_id != late_result.id
         assert len(after_stale.stale_results) == 1
-        assert after_stale.stale_results[0].accepted_graph_revision_digest == (
-            revision_one_digest
-        )
+        assert after_stale.stale_results[0].accepted_graph_revision_digest == (revision_one_digest)
         assert after_stale.stale_results[0].authoritative_generation == 1
         approvals = store.list_records("approval_v2", ApprovalRecord, run_id=RUN_ID)
         assert approvals == (stale_approval,)
@@ -584,9 +570,7 @@ def test_replan_rejects_invalid_authority_and_graphs(
         replay = scenario.orchestrator.replay(RUN_ID)
         assert tuple(scenario.calls) == calls_before
         assert replay.run.replan_count == 0
-        assert [
-            item.accepted_revision.revision_number for item in replay.revision_history
-        ] == [1]
+        assert [item.accepted_revision.revision_number for item in replay.revision_history] == [1]
 
 
 def test_changed_pass_contract_is_rerun_instead_of_retained(tmp_path: Path) -> None:
@@ -688,6 +672,4 @@ def test_replan_limits_and_aggregate_budgets_do_not_reset(tmp_path: Path) -> Non
             )
         final = scenario.orchestrator.replay(RUN_ID)
         assert final.run.replan_count == 1
-        assert [
-            item.accepted_revision.revision_number for item in final.revision_history
-        ] == [1, 2]
+        assert [item.accepted_revision.revision_number for item in final.revision_history] == [1, 2]

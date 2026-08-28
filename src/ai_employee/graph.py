@@ -162,9 +162,7 @@ def validate_task_graph(
                 )
             )
     expected_entries = tuple(sorted(node_id for node_id, count in incoming.items() if count == 0))
-    expected_terminals = tuple(
-        sorted(node_id for node_id, count in outgoing.items() if count == 0)
-    )
+    expected_terminals = tuple(sorted(node_id for node_id, count in outgoing.items() if count == 0))
     if tuple(sorted(graph.entry_node_ids)) != expected_entries:
         issues.append(
             GraphValidationIssue("invalid_entry_set", graph.id, "entries must be all DAG roots")

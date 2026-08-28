@@ -68,10 +68,14 @@ class ProjectLocalInstaller:
                     message=f"{request.ecosystem} installs require project-local {expected_target}",
                 ),
             )
-        if request.ecosystem == "node_project" and request.operation == "existing_lock" and (
-            request.argv != ("ci", "--ignore-scripts")
-            or request.lifecycle_scripts
-            or request.expected_mutations
+        if (
+            request.ecosystem == "node_project"
+            and request.operation == "existing_lock"
+            and (
+                request.argv != ("ci", "--ignore-scripts")
+                or request.lifecycle_scripts
+                or request.expected_mutations
+            )
         ):
             return self._failed(
                 request,

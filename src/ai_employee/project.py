@@ -73,9 +73,7 @@ def _derive_required_process_evaluators(harness: ProjectHarnessV2) -> ProjectHar
     existing_ids = {item.id for item in harness.evaluators}
     derived: list[HarnessEvaluator] = []
     for command_ref in verification.required:
-        token = canonical_digest(
-            {"provider_id": "process.harness", "command_ref": command_ref}
-        )
+        token = canonical_digest({"provider_id": "process.harness", "command_ref": command_ref})
         evaluator_id = f"compat.process.harness.{token}"
         if evaluator_id in existing_ids:
             raise ValueError("derived process.harness evaluator ID collides with a declaration")

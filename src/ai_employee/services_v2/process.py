@@ -129,12 +129,8 @@ class LocalProcessExecutor:
                 if stdin_handle is not None:
                     stdin_handle.close()
             execution_id = identifier("execution")
-            stdout_digest = self._store_output(
-                request, execution_id, stdout, "process_stdout"
-            )
-            stderr_digest = self._store_output(
-                request, execution_id, stderr, "process_stderr"
-            )
+            stdout_digest = self._store_output(request, execution_id, stdout, "process_stdout")
+            stderr_digest = self._store_output(request, execution_id, stderr, "process_stderr")
             status: Literal["succeeded", "failed", "cancelled", "indeterminate"]
             if cancelled:
                 failure = self._failure(StableFailureCode.CANCELLED, "process was cancelled")

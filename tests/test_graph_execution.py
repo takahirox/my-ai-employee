@@ -412,18 +412,14 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         for reference in requests["c"].predecessor_outputs:
             predecessor = by_node[reference.node_id]
             evaluator = evaluator_by_id[reference.evaluator_id]
-            assert reference.accepted_graph_revision_digest == (
-                run.accepted_graph_revision_digest
-            )
+            assert reference.accepted_graph_revision_digest == (run.accepted_graph_revision_digest)
             assert reference.generation == predecessor.generation
             assert reference.result_generation == predecessor.output_generation
             assert reference.attempt == predecessor.attempt
             assert reference.worker_result_id == predecessor.worker_result_id
             assert reference.worker_result_digest == predecessor.worker_result_digest
             assert reference.artifact_descriptor_id == predecessor.patch_artifact_id
-            assert reference.artifact_descriptor_digest == (
-                predecessor.patch_descriptor_digest
-            )
+            assert reference.artifact_descriptor_digest == (predecessor.patch_descriptor_digest)
             assert reference.artifact_digest == predecessor.patch_digest
             assert reference.evaluator_id == predecessor.evaluator_id
             assert reference.evaluator_digest == predecessor.evaluator_digest
