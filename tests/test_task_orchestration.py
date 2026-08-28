@@ -29,6 +29,7 @@ from ai_employee.task_orchestration import (
     NodeExecutionResult,
     NodeReservationRecord,
     TaskOrchestrator,
+    one_node_graph,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -181,6 +182,83 @@ def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> N
         assert replay.worker_result_count == 3
         assert replay.evidence_count == 3
         assert replay.evaluator_count == 3
+
+
+def test_explicit_breadth_objective_propagates_to_worker_request(tmp_path: Path) -> None:
+    objective = "Exhaustively inspect every authentication path and report every defect"
+    requests: list[WorkerRequest] = []
+
+    def runner(
+        _node_value: Node,
+        request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="worker-result-audit",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id="criterion-audit",
+                    disposition="satisfied",
+                    evidence_refs=(ZERO,),
+                ),
+            ),
+        )
+
+    node = Node(
+        id="audit",
+        kind=NodeKind.FUNCTION,
+        name="Audit authentication",
+        objective=objective,
+        output_contract=OutputContract(id="contract-audit"),
+        required_capabilities=("process",),
+        completion_criteria=(
+            CompletionCriterion(
+                id="criterion-audit",
+                description="every authentication path is inspected",
+            ),
+        ),
+    )
+    graph = Graph(
+        id="audit-graph",
+        nodes=(node,),
+        entry_node_ids=(node.id,),
+        terminal_node_ids=(node.id,),
+        budget=Budget(max_attempts=1, max_nodes=1, max_wall_seconds=30.0),
+    )
+    goal = Goal(id="goal-audit", statement="Complete the accepted exhaustive audit")
+
+    with SQLiteStore(tmp_path / "objective-propagation.db") as store:
+        run = TaskOrchestrator(store, runner, (_strategy(),), max_concurrency=1).run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="objective-propagation-run",
+            available_capabilities=("process",),
+        )
+
+    assert run.status == "completed"
+    assert len(requests) == 1
+    assert requests[0].goal == objective
+    assert requests[0].accepted_plan_digest == run.accepted_graph_revision_digest
+    assert "scope_mode" not in requests[0].model_dump()
+
+    compatibility_goal = Goal(id="goal-compatibility", statement=objective)
+    compatibility_graph = one_node_graph(
+        compatibility_goal,
+        graph_id="compatibility-graph",
+        node_id="compatibility-node",
+    )
+    assert compatibility_graph.nodes[0].objective == objective
 
 
 def test_task_graph_acceptance_rejects_cycles_general_edges_and_tight_budget() -> None:

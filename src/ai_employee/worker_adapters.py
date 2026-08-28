@@ -652,13 +652,23 @@ def _bounded_prompt(
         "writable_scratch_directory": scratch_directory,
         "instruction": (
             "Return only the strict JSON envelope. The repository is the current working "
-            "directory; you may inspect its files with read-only tools. Do not edit the "
-            "repository or run commands that change repository "
-            "state; express every requested repository action only as a typed proposal. If a "
-            "writable_scratch_directory is supplied, you may create temporary candidate files "
-            "only below that exact directory and use them for deterministic diff generation and "
-            "read-only validation against the repository. Every proposal and nested request must "
-            "use the supplied run_id."
+            "directory; you may inspect its files with read-only tools. Use minimal_sufficient as "
+            "the default: propose the smallest change sufficient for the supplied node goal and "
+            "accepted plan, prefer existing mechanisms, stay within both, and omit optional "
+            "follow-on work. Broader investigation depth or coverage is required only when it is "
+            "explicit in the supplied node goal; do not infer it from importance, security "
+            "relevance, or audit-like subject matter. Explicit breadth permits deeper inspection "
+            "needed by the goal, not unrelated implementation. Do not add speculative framework, "
+            "abstraction, extension point, optimization, cleanup, or unrelated refactor work. "
+            "Minimality must not weaken correctness, security, safety, required verification, "
+            "error handling, compatibility, policy, approval, or budget constraints. If a "
+            "proposal expands beyond the obvious local change, its reason must tie that expansion "
+            "to a current goal requirement or concrete repository evidence. Do not edit the "
+            "repository or run commands that change repository state; express every requested "
+            "repository action only as a typed proposal. If a writable_scratch_directory is "
+            "supplied, you may create temporary candidate files only below that exact directory "
+            "and use them for deterministic diff generation and read-only validation against the "
+            "repository. Every proposal and nested request must use the supplied run_id."
         ),
     }
     if include_response_schema:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,16 +13,29 @@ from ai_employee.domain import (
     Budget,
     CompletionCriterion,
     Edge,
+    ExecutionStrategy,
     Goal,
     Graph,
     Node,
     NodeKind,
     OutputContract,
+    RoutingMode,
 )
-from ai_employee.serialization import canonical_digest
+from ai_employee.domain.v2 import (
+    DecisionOutcome,
+    ExecutionResult,
+    PolicyDecision,
+    ProcessRequest,
+)
+from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import GraphRunRecord, TaskGraphAcceptance
-from ai_employee.task_planning import CliProposedGraphPlanner, ProposedGraph
+from ai_employee.task_planning import (
+    CliProposedGraphPlanner,
+    ProposedGraph,
+    ProposedGraphPayload,
+    proposed_graph_schema_json,
+)
 
 
 def test_work_cli_defaults_to_adaptive_routing() -> None:
@@ -30,6 +44,130 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert args.routing_mode == "adaptive"
     assert args.strategy_set is None
     assert args.max_concurrency == 1
+
+
+def _capture_planner_prompt(goal: Goal) -> dict[str, object]:
+    graph = Graph(
+        id=f"graph-{goal.id}",
+        nodes=(
+            Node(
+                id=f"node-{goal.id}",
+                kind=NodeKind.FUNCTION,
+                name="Complete accepted goal",
+                objective=goal.statement,
+                output_contract=OutputContract(id=f"contract-{goal.id}"),
+                required_capabilities=("process",),
+                completion_criteria=(
+                    CompletionCriterion(
+                        id=f"criterion-{goal.id}",
+                        description="the accepted goal is complete",
+                    ),
+                ),
+            ),
+        ),
+        entry_node_ids=(f"node-{goal.id}",),
+        terminal_node_ids=(f"node-{goal.id}",),
+        budget=Budget(max_attempts=1, max_nodes=1, max_wall_seconds=30.0),
+    )
+    output_digest = "9" * 64
+    output = canonical_json(ProposedGraphPayload(goal_id=goal.id, graph=graph)).encode()
+    captured: list[bytes] = []
+
+    class ScriptedPlannerExecutor:
+        def execute(
+            self,
+            request: ProcessRequest,
+            decision: PolicyDecision,
+            _cancellation: object,
+        ) -> ExecutionResult:
+            assert all(request.argv)
+            assert decision.request_digest == request.content_digest
+            return ExecutionResult(
+                id="planner-execution-1",
+                run_id=request.run_id,
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                request_digest=request.content_digest or "0" * 64,
+                status="succeeded",
+                exit_code=0,
+                duration_seconds=0.01,
+                stdout_artifact_digest=output_digest,
+            )
+
+    def write_prompt(value: bytes) -> str:
+        captured.append(value)
+        return "8" * 64
+
+    def read_output(digest: str) -> bytes:
+        assert digest == output_digest
+        return output
+
+    def allow(request: ProcessRequest) -> PolicyDecision:
+        return PolicyDecision(
+            id="planner-policy-1",
+            run_id=request.run_id,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            request_digest=request.content_digest or "0" * 64,
+            effective_policy_digest="1" * 64,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="policy_allowed",
+        )
+
+    planner = CliProposedGraphPlanner(
+        ScriptedPlannerExecutor(),
+        read_output,
+        allow,
+        run_id="planner-run",
+        strategy=ExecutionStrategy(
+            id="planner-strategy",
+            routing_mode=RoutingMode.ADAPTIVE,
+            backend="ollama_cli",
+            model="scripted-model",
+            effort="low",
+            capabilities=("process",),
+        ),
+        executable="ollama",
+        cwd=".",
+        prompt_writer=write_prompt,
+    )
+    proposal = planner.plan(
+        goal,
+        available_capabilities=("process",),
+        effective_policy_digest="1" * 64,
+        harness_digest="2" * 64,
+        max_nodes=1,
+        max_wall_seconds=30.0,
+    )
+
+    assert proposal.graph == graph
+    assert len(captured) == 1
+    return json.loads(captured[0])
+
+
+def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_breadth() -> None:
+    local_goal = Goal(id="goal-local-fix", statement="Fix the local parser bug")
+    broad_goal = Goal(
+        id="goal-exhaustive-audit",
+        statement="Exhaustively audit every authentication path for security defects",
+    )
+
+    local_prompt = _capture_planner_prompt(local_goal)
+    broad_prompt = _capture_planner_prompt(broad_goal)
+    instruction = local_prompt["instruction"]
+
+    assert local_prompt["protocol"] == broad_prompt["protocol"] == "fleet-proposed-graph/1"
+    assert local_prompt["goal"] == local_goal.model_dump(mode="json")
+    assert broad_prompt["goal"] == broad_goal.model_dump(mode="json")
+    assert local_prompt["response_schema"] == broad_prompt["response_schema"]
+    assert local_prompt["response_schema"] == json.loads(proposed_graph_schema_json())
+    assert isinstance(instruction, str)
+    assert instruction == broad_prompt["instruction"]
+    assert "minimal_sufficient is the default" in instruction
+    assert "speculative framework, abstraction, extension point" in instruction
+    assert "required tests, verification, error handling, or compatibility" in instruction
+    assert "current accepted-Goal criterion" in instruction
+    assert "concrete repository evidence" in instruction
+    assert "explicit in the accepted Goal" in instruction
+    assert "relevant node objectives and completion criteria" in instruction
 
 
 def _write_routing_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:

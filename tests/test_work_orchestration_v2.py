@@ -158,12 +158,12 @@ class FakeWorkspace:
         raise AssertionError("coordinator never promotes implicitly")
 
 
-def worker_request() -> WorkerRequest:
+def worker_request(goal: str = "make a bounded change") -> WorkerRequest:
     return WorkerRequest(
         id="worker-request-1",
         run_id="run-1",
         created_at=NOW,
-        goal="make a bounded change",
+        goal=goal,
         accepted_plan_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=ZERO,
@@ -209,19 +209,41 @@ def test_scripted_adapter_rejects_prose_command_injection() -> None:
 
 
 def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
-    payload = json.loads(
-        _bounded_prompt(worker_request(), scratch_directory="/tmp/fleet-worker-run-1")
-    )
+    local_goal = "Fix the local parser bug"
+    broad_goal = "Exhaustively audit every authentication path for security defects"
+    payloads = [
+        json.loads(
+            _bounded_prompt(
+                worker_request(goal), scratch_directory="/tmp/fleet-worker-run-1"
+            )
+        )
+        for goal in (local_goal, broad_goal)
+    ]
 
-    assert payload["protocol"] == "fleet-worker-proposal/2"
-    assert payload["run_id"] == "run-1"
-    assert payload["response_contract"].startswith("fleet-worker-proposal/2")
-    assert "response_schema" not in payload
-    assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
-    assert "read-only tools" in payload["instruction"]
-    assert "current working directory" in payload["instruction"]
-    assert "only below that exact directory" in payload["instruction"]
-    assert "supplied run_id" in payload["instruction"]
+    for payload, goal in zip(payloads, (local_goal, broad_goal), strict=True):
+        assert payload["protocol"] == "fleet-worker-proposal/2"
+        assert payload["run_id"] == "run-1"
+        assert payload["goal"] == goal
+        assert payload["response_contract"].startswith("fleet-worker-proposal/2")
+        assert "response_schema" not in payload
+        assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
+        assert "Return only the strict JSON envelope" in payload["instruction"]
+        assert "read-only tools" in payload["instruction"]
+        assert "current working directory" in payload["instruction"]
+        assert "only below that exact directory" in payload["instruction"]
+        assert "supplied run_id" in payload["instruction"]
+
+    instruction = payloads[0]["instruction"]
+    assert instruction == payloads[1]["instruction"]
+    assert "minimal_sufficient as the default" in instruction
+    assert "prefer existing mechanisms" in instruction
+    assert "explicit in the supplied node goal" in instruction
+    assert "do not infer it from importance, security relevance" in instruction
+    assert "not unrelated implementation" in instruction
+    assert "correctness, security, safety, required verification" in instruction
+    assert "error handling, compatibility" in instruction
+    assert "its reason must tie that expansion" in instruction
+    assert "current goal requirement or concrete repository evidence" in instruction
 
 
 def test_codex_worker_uses_explicit_scratch_as_its_only_workspace() -> None:
