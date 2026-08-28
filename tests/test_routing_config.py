@@ -8,8 +8,16 @@ from ai_employee.config import (
     OperatorRoutingConfig,
     OperatorStrategyConfig,
 )
-from ai_employee.domain import ExecutionStrategy, RoutingMode
-from ai_employee.routing import assess_task, select_strategy
+from ai_employee.domain import (
+    ExecutionStrategy,
+    RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
+)
+from ai_employee.routing import assess_task, merge_semantic_profile, select_strategy
 
 
 def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
@@ -40,15 +48,18 @@ def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
     assert claude_assessor.id == "claude-fable-high"
 
 
-def test_builtin_claude_only_routes_simple_to_opus_and_complex_to_fable() -> None:
+def test_builtin_claude_only_routes_simple_to_opus_and_deep_to_fable() -> None:
     strategies = OperatorConfig().execution_strategies(RoutingMode.ADAPTIVE, "claude-only")
     allowed_ids = tuple(strategy.id for strategy in strategies)
 
-    def selected(goal: str) -> str:
-        assessment = assess_task(
-            goal,
-            run_id="run.claude-only",
-            required_capabilities=("edit_intent", "process"),
+    def selected(profile: SemanticTaskProfile) -> str:
+        assessment = merge_semantic_profile(
+            assess_task(
+                "Route the profiled task",
+                run_id="run.claude-only",
+                required_capabilities=("edit_intent", "process"),
+            ),
+            profile,
         )
         return select_strategy(
             strategies,
@@ -58,8 +69,23 @@ def test_builtin_claude_only_routes_simple_to_opus_and_complex_to_fable() -> Non
             allowed_backends=("claude_code_cli",),
         ).id
 
-    assert selected("Fix this bug") == "claude-opus-high"
-    assert selected("Inspect; design; implement; verify") == "claude-fable-high"
+    simple_profile = SemanticTaskProfile(
+        task_type=SemanticTaskType.IMPLEMENTATION,
+        reasoning_class=SemanticReasoningClass.SIMPLE,
+        scope=SemanticScope.BOUNDED,
+        ambiguity=SemanticAmbiguity.LOW,
+        reasons=("bounded implementation with one obvious inference",),
+    )
+    deep_profile = SemanticTaskProfile(
+        task_type=SemanticTaskType.IMPLEMENTATION,
+        reasoning_class=SemanticReasoningClass.DEEP,
+        scope=SemanticScope.BOUNDED,
+        ambiguity=SemanticAmbiguity.LOW,
+        reasons=("bounded implementation requiring deep reasoning",),
+    )
+
+    assert selected(simple_profile) == "claude-opus-high"
+    assert selected(deep_profile) == "claude-fable-high"
 
 
 def test_execution_strategy_conversion_preserves_every_configured_field() -> None:
