@@ -24,6 +24,7 @@ from .domain.v2 import (
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import ProposedGraph, _strict_schema
+from .worker_adapters import cli_inherit_environment
 
 
 class PlanReviewFindingType(StableStrEnum):
@@ -445,7 +446,7 @@ class CliPlanReviewer:
             created_at=now(),
             argv=self._argv(),
             cwd=self.cwd,
-            inherit_environment=(("HOME",) if self.strategy.backend == "ollama_cli" else ()),
+            inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=self.timeout_seconds,
             stdout_bytes=100_000,
@@ -524,8 +525,7 @@ class CliPlanReviewer:
                 "json",
                 "--json-schema",
                 schema,
-                "--tools",
-                "",
+                "--tools=",
                 "--no-session-persistence",
                 "--model",
                 self.strategy.model,

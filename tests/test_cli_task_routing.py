@@ -32,10 +32,21 @@ from ai_employee.domain.v2 import (
     PolicyDecision,
     ProcessRequest,
 )
-from ai_employee.plan_review import CliPlanReviewer, PlanReviewPayload, bind_plan_review
+from ai_employee.plan_review import (
+    CliPlanReviewer,
+    PlanReviewFinding,
+    PlanReviewFindingType,
+    PlanReviewImpact,
+    PlanReviewPayload,
+    bind_plan_review,
+)
 from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.storage import SQLiteStore
-from ai_employee.task_orchestration import GraphRunRecord, TaskGraphAcceptance
+from ai_employee.task_orchestration import (
+    GraphRunRecord,
+    TaskGraphAcceptance,
+    one_node_graph,
+)
 from ai_employee.task_planning import (
     CliProposedGraphPlanner,
     ProposedGraph,
@@ -77,6 +88,82 @@ def test_claude_graph_planner_disables_tools_without_empty_argv() -> None:
     assert "" not in argv
     assert argv[argv.index("--model") + 1] == "claude-fable-5"
     assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_claude_planner_revision_uses_minimal_environment_and_nonempty_argv() -> None:
+    goal = Goal(id="revision-goal", statement="Complete one bounded task")
+    strategy = ExecutionStrategy(
+        id="claude-revision",
+        routing_mode=RoutingMode.ADAPTIVE,
+        backend="claude_code_cli",
+        model="claude-fable-5",
+        effort="high",
+        capabilities=("process",),
+    )
+    original = ProposedGraph(
+        id="revision-proposal",
+        run_id="planner-run",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        goal_id=goal.id,
+        goal_digest=canonical_digest(goal),
+        graph=one_node_graph(
+            goal,
+            graph_id="revision-graph",
+            node_id="revision-node",
+            required_capabilities=("process",),
+            max_wall_seconds=30.0,
+        ),
+        planner_strategy=strategy,
+        effective_policy_digest="1" * 64,
+        harness_digest="2" * 64,
+    )
+    finding = PlanReviewFinding(
+        id="revision-finding",
+        finding_type=PlanReviewFindingType.PREMATURE_GENERALIZATION,
+        impact=PlanReviewImpact.BLOCKING,
+        affected_node_ids=("revision-node",),
+        goal_relation="The node is broader than the accepted goal.",
+        smallest_correction="Limit the node to the accepted goal.",
+    )
+    requests: list[ProcessRequest] = []
+
+    def deny(request: ProcessRequest) -> PolicyDecision:
+        requests.append(request)
+        return PolicyDecision(
+            id="revision-policy",
+            run_id=request.run_id,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            request_digest=request.content_digest or "0" * 64,
+            effective_policy_digest=original.effective_policy_digest,
+            outcome=DecisionOutcome.DENY,
+            reason_code="scripted_denial",
+        )
+
+    planner = CliProposedGraphPlanner(
+        object(),  # type: ignore[arg-type]
+        lambda _digest: b"",
+        deny,
+        run_id="planner-run",
+        strategy=strategy,
+        executable="claude",
+        cwd=".",
+        prompt_writer=lambda _value: "8" * 64,
+    )
+
+    with pytest.raises(ValueError, match="revision policy did not allow execution"):
+        planner.revise(
+            goal,
+            original,
+            (finding,),
+            available_capabilities=("process",),
+            max_nodes=1,
+            max_wall_seconds=30.0,
+        )
+
+    assert len(requests) == 1
+    assert "--tools=" in requests[0].argv
+    assert "" not in requests[0].argv
+    assert requests[0].inherit_environment == ("HOME", "USER")
 
 
 def _capture_planner_prompt(

@@ -768,26 +768,55 @@ def _normalize_new_file_diff(value: str) -> str:
 
 
 def _normalize_unified_diff(value: str) -> str:
-    """Repair omitted context markers while preserving file and hunk headers."""
+    """Repair only unambiguous omitted context markers in existing-file hunks."""
 
     lines = _normalize_new_file_diff(value).splitlines(keepends=True)
     normalized: list[str] = []
     in_hunk = False
-    continuation_marker = " "
+    new_file = False
+    expected_old = 0
+    expected_new = 0
+    observed_old = 0
+    observed_new = 0
+
+    def validate_hunk() -> None:
+        if (
+            in_hunk
+            and not new_file
+            and (observed_old != expected_old or observed_new != expected_new)
+        ):
+            raise ValueError("existing-file hunk has ambiguous or inconsistent line counts")
+
     for line in lines:
         if line.startswith("diff --git "):
+            validate_hunk()
             in_hunk = False
-            continuation_marker = " "
+            new_file = False
+        elif not in_hunk and line.startswith("--- /dev/null"):
+            new_file = True
         elif line.startswith("@@ "):
+            validate_hunk()
+            match = re.match(
+                r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@",
+                line,
+            )
+            if match is None:
+                raise ValueError("unified diff has an invalid hunk header")
             in_hunk = True
-            continuation_marker = " "
-        elif in_hunk and not line.startswith((" ", "+", "-", "\\")):
-            line = f"{continuation_marker}{line}"
-        if in_hunk and line.startswith(("+", "-")):
-            continuation_marker = line[0]
-        elif in_hunk and line.startswith(" "):
-            continuation_marker = " "
+            expected_old = int(match.group(1) or "1")
+            expected_new = int(match.group(2) or "1")
+            observed_old = 0
+            observed_new = 0
+        elif in_hunk and not line.startswith("\\"):
+            if not line.startswith((" ", "+", "-")):
+                line = f" {line}"
+            marker = line[0]
+            if marker in (" ", "-"):
+                observed_old += 1
+            if marker in (" ", "+"):
+                observed_new += 1
         normalized.append(line)
+    validate_hunk()
     return "".join(normalized)
 
 
