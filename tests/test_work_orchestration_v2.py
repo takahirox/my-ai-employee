@@ -237,6 +237,15 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
         assert payload["protocol"] == "fleet-worker-proposal/2"
         assert payload["run_id"] == "run-1"
         assert payload["goal"] == goal
+        assert payload["non_mutating_result_binding"] == {
+            "run_id": "run-1",
+            "graph_run_id": None,
+            "worker_request_digest": worker_request(goal).content_digest,
+            "node_id": None,
+            "accepted_graph_revision_digest": None,
+            "generation": 0,
+            "attempt": 0,
+        }
         assert payload["response_contract"].startswith("fleet-worker-proposal/2")
         assert "response_schema" not in payload
         assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
@@ -451,6 +460,10 @@ def test_claude_worker_schema_exposes_only_edit_intents() -> None:
     action_properties = action["properties"]
     assert isinstance(action_properties, dict)
     assert action_properties["kind"] == {"type": "string", "enum": ["edit_intent"]}
+    assert (
+        properties["non_mutating_result"]
+        == json.loads(worker_proposal_schema_json())["properties"]["non_mutating_result"]
+    )
 
 
 def test_ollama_worker_binds_thinking_effort() -> None:
@@ -704,6 +717,8 @@ def test_codex_prompt_describes_edit_transport() -> None:
     assert "response_schema" not in prompt
     assert "edit_intent" in prompt["transport_instruction"]
     assert "existing_lock" in prompt["transport_instruction"]
+    assert "non_mutating_result" in prompt["transport_instruction"]
+    assert "copy every supplied binding exactly" in prompt["transport_instruction"]
     assert "diff --git" in prompt["transport_instruction"]
     assert "never use *** Begin Patch" in prompt["transport_instruction"]
 

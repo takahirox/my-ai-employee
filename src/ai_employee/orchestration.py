@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import io
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from typing import Literal
@@ -21,6 +22,7 @@ from .domain.base import Identifier, freeze_json
 from .domain.policy_v2 import PolicyLayer, PolicyResolver
 from .domain.services_v2 import (
     ApprovalService,
+    ArtifactStore,
     Cancellation,
     DownloadClient,
     Installer,
@@ -35,6 +37,7 @@ from .domain.v2 import (
     ApprovalRecord,
     ApprovalRequest,
     ArtifactDescriptor,
+    ArtifactPutRequest,
     CriterionEvidence,
     DecisionOutcome,
     DigestedRecordV2,
@@ -43,8 +46,10 @@ from .domain.v2 import (
     EditIntentRequest,
     ExecutionResult,
     InstallRequest,
+    NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
+    StableFailureCode,
     WorkerRequest,
     WorkerResult,
     WorkspaceRequest,
@@ -52,7 +57,7 @@ from .domain.v2 import (
 )
 from .graph import accept_task_graph
 from .runtime import DeterministicRuntime
-from .serialization import canonical_digest
+from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
 from .task_orchestration import TaskGraphAcceptance, one_node_graph
@@ -200,6 +205,7 @@ class WorkCoordinator:
         verification_requests: tuple[ProcessRequest, ...] = (),
         protected_paths: tuple[str, ...] = (".git/**",),
         allowed_processes: tuple[tuple[str, ...], ...] = (),
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         if runtime.store is not store:
             raise ValueError(
@@ -232,6 +238,7 @@ class WorkCoordinator:
         self.verification_requests = verification_requests
         self.protected_paths = protected_paths
         self.allowed_processes = allowed_processes
+        self.artifact_store = artifact_store
 
     def execute_node(
         self,
@@ -403,6 +410,8 @@ class WorkCoordinator:
         self.store.put("worker_request_v2", worker_request, run_id=run.id)
         channel = _Channel(self, run)
         result = adapter.propose(worker_request, channel)
+        if not isinstance(result, WorkerResult):
+            raise TypeError("worker adapter returned a non-WorkerResult value")
         self.store.put("worker_result_v2", result, run_id=run.id)
         self._event(
             run.id,
@@ -423,6 +432,28 @@ class WorkCoordinator:
         if result.status != "succeeded":
             code = result.failure.code.value if result.failure else "WORKER_PROTOCOL_ERROR"
             return self._update(run, status="failed", failure_code=code)
+        result_acceptance = self._accept_non_mutating_result(
+            worker_request, result, len(channel.decisions)
+        )
+        if result_acceptance is not None:
+            if result_acceptance.status == "rejected":
+                assert result_acceptance.failure_code is not None
+                return self._update(
+                    run,
+                    status="failed",
+                    failure_code=result_acceptance.failure_code.value,
+                )
+            assert result_acceptance.artifact is not None
+            run = self._update(run, output_artifact_ids=(result_acceptance.artifact.id,))
+        elif (
+            result.run_id != worker_request.run_id
+            or result.request_digest != worker_request.content_digest
+        ):
+            return self._update(
+                run,
+                status="failed",
+                failure_code=StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+            )
         return self._execute_actions(run, snapshot, channel, cancellation)
 
     def resume(self, run_id: str) -> WorkRun:
@@ -498,6 +529,135 @@ class WorkCoordinator:
                 resumed, snapshot, channel, _Cancellation(self.store, run.id)
             )
         return self._update(run, generation=run.generation + 1, status="running")
+
+    def _accept_non_mutating_result(
+        self,
+        request: WorkerRequest,
+        worker_result: WorkerResult,
+        submitted_action_count: int,
+    ) -> NonMutatingResultAcceptance | None:
+        typed_result = worker_result.non_mutating_result
+        if typed_result is None:
+            return None
+        failure_code: StableFailureCode | None = None
+        bindings = (
+            typed_result.graph_run_id,
+            typed_result.worker_request_digest,
+            typed_result.node_id,
+            typed_result.accepted_graph_revision_digest,
+            typed_result.generation,
+            typed_result.attempt,
+        )
+        if any(value is None for value in bindings):
+            failure_code = StableFailureCode.TYPED_RESULT_UNBOUND
+        elif (
+            worker_result.run_id != request.run_id
+            or worker_result.request_digest != request.content_digest
+            or typed_result.run_id != request.run_id
+            or typed_result.graph_run_id != request.graph_run_id
+            or typed_result.worker_request_digest != request.content_digest
+            or typed_result.node_id != request.node_id
+            or typed_result.accepted_graph_revision_digest != request.accepted_graph_revision_digest
+            or typed_result.generation != request.generation
+            or typed_result.attempt != request.attempt
+        ):
+            failure_code = StableFailureCode.TYPED_RESULT_STALE
+        elif worker_result.proposals or submitted_action_count:
+            failure_code = StableFailureCode.TYPED_RESULT_ACTIONS_FORBIDDEN
+
+        artifact: ArtifactDescriptor | None = None
+        payload = canonical_json(typed_result).encode("utf-8")
+        budget = request.remaining_budgets
+        artifact_limit = budget.get("artifact_bytes") if isinstance(budget, Mapping) else None
+        valid_artifact_limit = (
+            artifact_limit
+            if isinstance(artifact_limit, int)
+            and not isinstance(artifact_limit, bool)
+            and artifact_limit >= 0
+            else None
+        )
+        policy_limits = tuple(
+            layer.max_artifact_bytes
+            for layer in self.policy_layers
+            if layer.max_artifact_bytes is not None
+        )
+        if failure_code is None and valid_artifact_limit is None:
+            failure_code = StableFailureCode.TYPED_RESULT_UNBOUND
+        if (
+            failure_code is None
+            and valid_artifact_limit is not None
+            and len(payload) > min((valid_artifact_limit, *policy_limits))
+        ):
+            failure_code = StableFailureCode.TYPED_RESULT_OVERSIZED
+        if failure_code is None:
+            if self.artifact_store is None:
+                raise ValueError("typed results require an authoritative artifact store")
+            put_request = ArtifactPutRequest(
+                id=identifier("typed-result-put"),
+                run_id=request.run_id,
+                created_at=now(),
+                media_type=typed_result.media_type,
+                logical_kind=typed_result.logical_kind,
+                producer_action_id=worker_result.id,
+                source=freeze_json(
+                    {
+                        "graph_run_id": request.graph_run_id,
+                        "worker_request_digest": request.content_digest,
+                        "node_id": request.node_id,
+                        "accepted_graph_revision_digest": (request.accepted_graph_revision_digest),
+                        "generation": request.generation,
+                        "attempt": request.attempt,
+                        "result_digest": typed_result.content_digest,
+                    }
+                ),
+            )
+            try:
+                artifact = self.artifact_store.put(io.BytesIO(payload), put_request)
+            except ValueError:
+                failure_code = StableFailureCode.TYPED_RESULT_OVERSIZED
+            else:
+                self.store.put("artifact_descriptor_v2", artifact, run_id=request.run_id)
+
+        acceptance = NonMutatingResultAcceptance(
+            id=identifier("typed-result-acceptance"),
+            run_id=request.run_id,
+            created_at=now(),
+            graph_run_id=request.graph_run_id or request.run_id,
+            node_id=request.node_id or "",
+            accepted_graph_revision_digest=(
+                request.accepted_graph_revision_digest or request.accepted_plan_digest
+            ),
+            generation=request.generation,
+            attempt=request.attempt,
+            worker_request_digest=request.content_digest or "",
+            worker_result_id=worker_result.id,
+            worker_result_digest=worker_result.content_digest or "",
+            result_id=typed_result.id,
+            result_digest=typed_result.content_digest or "",
+            status="accepted" if failure_code is None else "rejected",
+            artifact=artifact,
+            failure_code=failure_code,
+        )
+        self.store.put(
+            "non_mutating_result_acceptance_v2",
+            acceptance,
+            run_id=request.run_id,
+        )
+        self._event(
+            request.run_id,
+            f"typed_result_{acceptance.status}",
+            "runtime",
+            request_digest=request.content_digest,
+            result_digest=acceptance.content_digest,
+            artifact_digests=(() if artifact is None else (artifact.artifact_digest,)),
+            details={
+                "status": acceptance.status,
+                "failure_code": (
+                    None if acceptance.failure_code is None else acceptance.failure_code.value
+                ),
+            },
+        )
+        return acceptance
 
     def _execute_actions(
         self,

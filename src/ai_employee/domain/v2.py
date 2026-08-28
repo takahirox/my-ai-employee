@@ -53,6 +53,11 @@ class StableFailureCode(StableStrEnum):
     HOST_INSTALL_DENIED = "HOST_INSTALL_DENIED"
     WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
     WORKER_PROTOCOL_ERROR = "WORKER_PROTOCOL_ERROR"
+    TYPED_RESULT_MALFORMED = "TYPED_RESULT_MALFORMED"
+    TYPED_RESULT_UNBOUND = "TYPED_RESULT_UNBOUND"
+    TYPED_RESULT_STALE = "TYPED_RESULT_STALE"
+    TYPED_RESULT_OVERSIZED = "TYPED_RESULT_OVERSIZED"
+    TYPED_RESULT_ACTIONS_FORBIDDEN = "TYPED_RESULT_ACTIONS_FORBIDDEN"
     EVALUATOR_EXECUTION_UNAVAILABLE = "EVALUATOR_EXECUTION_UNAVAILABLE"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     REVIEW_BLOCKED = "REVIEW_BLOCKED"
@@ -252,6 +257,40 @@ class InstallRequest(DigestedRecordV2):
         return value
 
 
+class NonMutatingResult(DigestedRecordV2):
+    """A worker-authored diagnosis or research result with no action authority."""
+
+    schema_name: ClassVar[str] = "non_mutating_result"
+    graph_run_id: Identifier | None = None
+    worker_request_digest: Digest | None = None
+    node_id: Identifier | None = None
+    accepted_graph_revision_digest: Digest | None = None
+    generation: int | None = Field(default=None, ge=0)
+    attempt: int | None = Field(default=None, ge=0)
+    logical_kind: Literal["diagnosis", "research"]
+    media_type: Literal["text/plain", "text/markdown"]
+    content: str = Field(min_length=1, max_length=64_000)
+    summary: str | None = Field(default=None, min_length=1, max_length=4_000)
+    findings: tuple[Annotated[str, Field(min_length=1, max_length=4_000)], ...] = Field(
+        default=(), max_length=64
+    )
+    evidence_refs: tuple[Digest, ...] = Field(default=(), max_length=64)
+
+    @model_validator(mode="after")
+    def _content_is_bounded_data(self) -> Self:
+        if not self.content.strip() or "\x00" in self.content:
+            raise ValueError("non-mutating result content must be non-empty and NUL-free")
+        if self.summary is not None and "\x00" in self.summary:
+            raise ValueError("non-mutating result summary must be NUL-free")
+        if any("\x00" in item for item in self.findings):
+            raise ValueError("non-mutating result findings must be NUL-free")
+        if len(self.findings) != len(set(self.findings)):
+            raise ValueError("non-mutating result findings must be unique")
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("non-mutating result evidence references must be unique")
+        return self
+
+
 class ArtifactDescriptorReference(SchemaModelV2):
     """Body-free, digest-complete reference to an authoritative descriptor."""
 
@@ -283,6 +322,9 @@ class PredecessorOutputReference(SchemaModelV2):
     evaluator_id: Identifier
     evaluator_digest: Digest
     evaluator_decision: Literal["PASS"] = "PASS"
+    result_acceptance_id: Identifier | None = None
+    result_acceptance_digest: Digest | None = None
+    non_mutating_result: NonMutatingResult | None = None
 
     @model_validator(mode="after")
     def _artifact_reference_is_complete(self) -> Self:
@@ -301,6 +343,23 @@ class PredecessorOutputReference(SchemaModelV2):
                 or first.artifact_digest != self.artifact_digest
             ):
                 raise ValueError("compatibility artifact fields must bind the first descriptor")
+        result_values = (
+            self.result_acceptance_id,
+            self.result_acceptance_digest,
+            self.non_mutating_result,
+        )
+        if any(value is None for value in result_values) and any(
+            value is not None for value in result_values
+        ):
+            raise ValueError("predecessor typed-result bindings are all-or-none")
+        result = self.non_mutating_result
+        if result is not None and (
+            result.node_id != self.node_id
+            or result.accepted_graph_revision_digest != self.accepted_graph_revision_digest
+            or result.generation != self.result_generation
+            or result.attempt != self.attempt
+        ):
+            raise ValueError("predecessor typed result is stale")
         return self
 
 
@@ -501,6 +560,40 @@ class ArtifactDescriptor(DigestedRecordV2):
     store_locator: str = Field(min_length=1, max_length=4_096)
 
 
+class NonMutatingResultAcceptance(DigestedRecordV2):
+    """The deterministic decision for one exact worker-authored result."""
+
+    schema_name: ClassVar[str] = "non_mutating_result_acceptance"
+    graph_run_id: Identifier
+    node_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    worker_request_digest: Digest
+    worker_result_id: Identifier
+    worker_result_digest: Digest
+    result_id: Identifier
+    result_digest: Digest
+    status: Literal["accepted", "rejected"]
+    artifact: ArtifactDescriptor | None = None
+    failure_code: StableFailureCode | None = None
+
+    @model_validator(mode="after")
+    def _status_is_complete(self) -> Self:
+        accepted = self.status == "accepted"
+        if accepted != (self.artifact is not None):
+            raise ValueError("accepted typed result requires exactly one artifact")
+        if accepted == (self.failure_code is not None):
+            raise ValueError("typed-result status and failure code disagree")
+        if self.artifact is not None and (
+            self.artifact.run_id != self.run_id
+            or self.artifact.producer_action_id != self.worker_result_id
+            or self.artifact.logical_kind not in {"diagnosis", "research"}
+        ):
+            raise ValueError("typed-result artifact provenance is stale")
+        return self
+
+
 class ExecutionResult(DigestedRecordV2):
     schema_name: ClassVar[str] = "execution_result"
     request_digest: Digest
@@ -547,6 +640,7 @@ class WorkerAvailability(DigestedRecordV2):
 class WorkerResult(ExecutionResult):
     schema_name: ClassVar[str] = "worker_result"
     proposals: tuple[ActionProposal, ...] = ()
+    non_mutating_result: NonMutatingResult | None = None
     assistant_note: str | None = Field(default=None, max_length=20_000)
     usage: CanonicalData = None
 

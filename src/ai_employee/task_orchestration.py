@@ -31,6 +31,7 @@ from .domain.v2 import (
     ArtifactDescriptorReference,
     CriterionEvidence,
     DigestedRecordV2,
+    NonMutatingResultAcceptance,
     PredecessorOutputReference,
     WorkerRequest,
     WorkerResult,
@@ -198,6 +199,8 @@ class NodeExecutionRecord(DigestedRecordV2):
     patch_descriptor_digest: Digest | None = None
     patch_digest: Digest | None = None
     acceptance_ledger_digest: Digest | None = None
+    result_acceptance_id: Identifier | None = None
+    result_acceptance_digest: Digest | None = None
     verification_result_digests: tuple[Digest, ...] = ()
     artifact_descriptors: tuple[ArtifactDescriptor, ...] = ()
     retained_from_revision_digest: Digest | None = None
@@ -256,6 +259,8 @@ class NodeExecutionResult(BaseModel):
     workspace_id: Identifier | None = None
     node_patch: NodePatchArtifact | None = None
     artifact_descriptors: tuple[ArtifactDescriptor, ...] = ()
+    result_acceptance: NonMutatingResultAcceptance | None = None
+    acceptance_ledger_digest: Digest | None = None
 
     @model_validator(mode="after")
     def _criterion_evidence_is_unique(self) -> Self:
@@ -267,6 +272,26 @@ class NodeExecutionResult(BaseModel):
         descriptor_ids = tuple(item.id for item in self.artifact_descriptors)
         if len(descriptor_ids) != len(set(descriptor_ids)):
             raise ValueError("artifact descriptors must be unique per node result")
+        typed_result = self.worker_result.non_mutating_result
+        acceptance = self.result_acceptance
+        if (typed_result is None) != (acceptance is None):
+            raise ValueError("typed result and explicit acceptance must be present together")
+        if acceptance is not None:
+            if (
+                acceptance.worker_result_id != self.worker_result.id
+                or acceptance.worker_result_digest != self.worker_result.content_digest
+                or typed_result is None
+                or acceptance.result_id != typed_result.id
+                or acceptance.result_digest != typed_result.content_digest
+            ):
+                raise ValueError("typed-result acceptance is not bound to the worker result")
+            if (
+                acceptance.status == "accepted"
+                and acceptance.artifact not in self.artifact_descriptors
+            ):
+                raise ValueError("accepted typed result lacks its authoritative artifact")
+            if acceptance.status == "rejected" and self.criterion_evidence:
+                raise ValueError("rejected typed result cannot satisfy node criteria")
         return self
 
 
@@ -329,6 +354,7 @@ class GraphReplay(BaseModel):
     reservations: tuple[NodeReservationRecord, ...]
     routes: tuple[NodeRouteRecord, ...]
     results: tuple[WorkerResult, ...]
+    result_acceptances: tuple[NonMutatingResultAcceptance, ...]
     evidence: tuple[NodeEvidenceRecord, ...]
     evaluator_decisions: tuple[NodeEvaluatorRecord, ...]
     controls: tuple[GraphControlFact, ...]
@@ -756,6 +782,7 @@ class TaskOrchestrator:
                     and prior.accepted_graph_revision_digest == previous_revision.content_digest
                     and _node_contract(previous_node) == _node_contract(nodes[node_id])
                     and "edit_intent" not in nodes[node_id].required_capabilities
+                    and prior.result_acceptance_id is None
                 ):
                     _validate_retained_node(self.store, prior)
                     retained = prior.model_copy(
@@ -1403,6 +1430,15 @@ class TaskOrchestrator:
             for item in history
             if item.worker_result_id is not None
         }
+        result_acceptances = {
+            item.result_acceptance_id: self.store.get(
+                "non_mutating_result_acceptance_v2",
+                item.result_acceptance_id,
+                NonMutatingResultAcceptance,
+            )
+            for item in history
+            if item.result_acceptance_id is not None
+        }
         return GraphReplay(
             run=run,
             acceptance=acceptance,
@@ -1421,6 +1457,7 @@ class TaskOrchestrator:
             reservations=reservations,
             routes=routes,
             results=tuple(results.values()),
+            result_acceptances=tuple(result_acceptances.values()),
             evidence=tuple(evidence.values()),
             evaluator_decisions=tuple(evaluators.values()),
             controls=tuple(
@@ -1527,6 +1564,7 @@ class TaskOrchestrator:
     ) -> None:
         worker_result = result.worker_result
         patch = result.node_patch
+        result_acceptance = result.result_acceptance
         authoritative = self.store.get("graph_run_v2", request.graph_run_id or "", GraphRunRecord)
         if (
             authoritative.generation != request.generation
@@ -1553,6 +1591,68 @@ class TaskOrchestrator:
             raise ValueError("worker result belongs to another run")
         if worker_result.request_digest != request.content_digest:
             raise ValueError("worker result is not bound to its node request")
+        typed_result = worker_result.non_mutating_result
+        if (typed_result is None) != (result_acceptance is None):
+            raise ValueError("typed result lacks exactly one explicit acceptance")
+        if result_acceptance is not None:
+            if worker_result.status != "succeeded":
+                raise ValueError("typed-result acceptance requires worker success")
+            try:
+                persisted_acceptance = self.store.get(
+                    "non_mutating_result_acceptance_v2",
+                    result_acceptance.id,
+                    NonMutatingResultAcceptance,
+                )
+            except KeyError:
+                raise ValueError("typed-result acceptance is absent or stale") from None
+            if (
+                persisted_acceptance != result_acceptance
+                or result_acceptance.run_id != request.run_id
+                or result_acceptance.graph_run_id != request.graph_run_id
+                or result_acceptance.node_id != node.id
+                or result_acceptance.accepted_graph_revision_digest != graph_digest
+                or result_acceptance.generation != node.generation
+                or result_acceptance.attempt != node.attempt
+                or result_acceptance.worker_request_digest != request.content_digest
+                or result_acceptance.worker_result_id != worker_result.id
+                or result_acceptance.worker_result_digest != worker_result.content_digest
+                or typed_result is None
+                or result_acceptance.result_id != typed_result.id
+                or result_acceptance.result_digest != typed_result.content_digest
+            ):
+                raise ValueError("typed-result acceptance is absent or stale")
+            self.store.put(
+                "non_mutating_result_acceptance_v2",
+                result_acceptance,
+                run_id=request.graph_run_id,
+            )
+            if result_acceptance.status == "rejected":
+                if result_acceptance.failure_code is None:
+                    raise ValueError("rejected typed result has no stable failure code")
+                self.store.put("worker_result_v2", worker_result, run_id=request.graph_run_id)
+                records[node.id] = self._advance(
+                    records[node.id],
+                    status="failed",
+                    output_generation=node.generation,
+                    worker_result_id=worker_result.id,
+                    worker_result_digest=worker_result.content_digest,
+                    result_acceptance_id=result_acceptance.id,
+                    result_acceptance_digest=result_acceptance.content_digest,
+                    failure_code=result_acceptance.failure_code.value,
+                )
+                return
+            if (
+                typed_result.run_id != request.run_id
+                or typed_result.graph_run_id != request.graph_run_id
+                or typed_result.worker_request_digest != request.content_digest
+                or typed_result.node_id != node.id
+                or typed_result.accepted_graph_revision_digest != graph_digest
+                or typed_result.generation != node.generation
+                or typed_result.attempt != node.attempt
+            ):
+                raise ValueError("accepted typed-result binding is stale")
+            if result_acceptance.artifact not in result.artifact_descriptors:
+                raise ValueError("accepted typed-result artifact is absent or stale")
         if self.bounded_graph_execution:
             if not result.artifact_descriptors:
                 raise ValueError("bounded node result has no authoritative artifact descriptor")
@@ -1635,7 +1735,15 @@ class TaskOrchestrator:
             patch_artifact_id=(None if patch is None else patch.patch.id),
             patch_descriptor_digest=(None if patch is None else patch.patch.content_digest),
             patch_digest=(None if patch is None else patch.patch.artifact_digest),
-            acceptance_ledger_digest=(None if patch is None else patch.acceptance_ledger_digest),
+            acceptance_ledger_digest=(
+                result.acceptance_ledger_digest
+                if result.acceptance_ledger_digest is not None
+                else (None if patch is None else patch.acceptance_ledger_digest)
+            ),
+            result_acceptance_id=(None if result_acceptance is None else result_acceptance.id),
+            result_acceptance_digest=(
+                None if result_acceptance is None else result_acceptance.content_digest
+            ),
             verification_result_digests=(
                 () if patch is None else patch.verification_result_digests
             ),
@@ -1686,6 +1794,44 @@ class TaskOrchestrator:
                     != artifact
                 ):
                     raise ValueError("predecessor artifact descriptor is stale")
+            result_acceptance = (
+                None
+                if record.result_acceptance_id is None
+                else self.store.get(
+                    "non_mutating_result_acceptance_v2",
+                    record.result_acceptance_id,
+                    NonMutatingResultAcceptance,
+                )
+            )
+            typed_result = worker_result.non_mutating_result
+            if (typed_result is None) != (result_acceptance is None):
+                raise ValueError("predecessor typed result lacks explicit acceptance")
+            if result_acceptance is not None and (
+                result_acceptance.content_digest != record.result_acceptance_digest
+                or result_acceptance.status != "accepted"
+                or result_acceptance.graph_run_id != record.run_id
+                or result_acceptance.node_id != record.node_id
+                or result_acceptance.accepted_graph_revision_digest
+                != record.accepted_graph_revision_digest
+                or result_acceptance.generation != record.output_generation
+                or result_acceptance.attempt != record.attempt
+                or result_acceptance.worker_request_digest != record.worker_request_digest
+                or result_acceptance.worker_result_id != worker_result.id
+                or result_acceptance.worker_result_digest != worker_result.content_digest
+                or typed_result is None
+                or typed_result.run_id != worker_result.run_id
+                or typed_result.graph_run_id != record.run_id
+                or typed_result.worker_request_digest != record.worker_request_digest
+                or typed_result.node_id != record.node_id
+                or typed_result.accepted_graph_revision_digest
+                != record.accepted_graph_revision_digest
+                or typed_result.generation != record.output_generation
+                or typed_result.attempt != record.attempt
+                or result_acceptance.result_id != typed_result.id
+                or result_acceptance.result_digest != typed_result.content_digest
+                or result_acceptance.artifact not in artifacts
+            ):
+                raise ValueError("predecessor typed-result acceptance is stale")
             references = tuple(_artifact_reference(item) for item in artifacts)
             bindings.append(
                 PredecessorOutputReference(
@@ -1704,6 +1850,13 @@ class TaskOrchestrator:
                     artifact_descriptors=references,
                     evaluator_id=evaluator.id,
                     evaluator_digest=_required_digest(evaluator.content_digest),
+                    result_acceptance_id=(
+                        None if result_acceptance is None else result_acceptance.id
+                    ),
+                    result_acceptance_digest=(
+                        None if result_acceptance is None else result_acceptance.content_digest
+                    ),
+                    non_mutating_result=typed_result,
                 )
             )
         return tuple(bindings)
@@ -2001,6 +2154,24 @@ def _validate_retained_node(
             or store.get("artifact_descriptor_v2", descriptor.id, ArtifactDescriptor) != descriptor
         ):
             raise ValueError("retained PASS node artifact is stale or tampered")
+    if record.result_acceptance_id is not None:
+        acceptance = store.get(
+            "non_mutating_result_acceptance_v2",
+            record.result_acceptance_id,
+            NonMutatingResultAcceptance,
+        )
+        typed_result = worker_result.non_mutating_result
+        if (
+            acceptance.content_digest != record.result_acceptance_digest
+            or acceptance.status != "accepted"
+            or typed_result is None
+            or acceptance.result_id != typed_result.id
+            or acceptance.result_digest != typed_result.content_digest
+            or acceptance.artifact not in record.artifact_descriptors
+        ):
+            raise ValueError("retained PASS typed-result acceptance is stale or tampered")
+    elif worker_result.non_mutating_result is not None:
+        raise ValueError("retained PASS typed result lacks explicit acceptance")
 
 
 def _required_digest(value: str | None) -> str:
