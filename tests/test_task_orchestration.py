@@ -19,6 +19,11 @@ from ai_employee.domain import (
     NodeKind,
     OutputContract,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
 )
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
@@ -49,6 +54,13 @@ def _node(name: str) -> Node:
         output_contract=OutputContract(id=f"contract-{name}"),
         required_capabilities=("process",),
         completion_criteria=(_criterion(name),),
+        semantic_profile=SemanticTaskProfile(
+            task_type=SemanticTaskType.IMPLEMENTATION,
+            reasoning_class=SemanticReasoningClass.MODERATE,
+            scope=SemanticScope.LOCAL,
+            ambiguity=SemanticAmbiguity.LOW,
+            reasons=("bounded orchestration fixture",),
+        ),
         complexity=2 if name == "a" else 3,
         scale=1,
         risk=1,
@@ -656,6 +668,7 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
     assert len({item.run_id for item in requests}) == 2
     assert [(item.generation, item.attempt) for item in replay.reservations] == [(0, 0), (0, 1)]
     assert [(item.generation, item.attempt) for item in replay.routes] == [(0, 0), (0, 1)]
+    assert all(item.assessment.semantic_profile is not None for item in replay.routes)
     assert len({item.id for item in replay.routes}) == 2
 
 

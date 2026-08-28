@@ -89,13 +89,24 @@ fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker 
 Adaptive routing first obtains a repository-isolated strict-JSON semantic assessment. The
 built-in assessment strategy is `gpt-5.6-sol` with `high` effort; operators may replace
 the default or select an exact authorized strategy with `--assessment-strategy`.
+The tool-disabled classifier returns only a categorical profile: task type (`mechanical`,
+`retrieval`, `diagnosis`, `implementation`, `architecture`, `research`, `planning`, or
+`open_ended_strategy`), reasoning class (`mechanical`, `simple`, `moderate`, `deep`, or
+`open_ended`), scope (`bounded`, `local`, `multi_component`, or `broad`), ambiguity
+(`low`, `medium`, or `high`), and bounded reasons. It cannot return risk, capabilities,
+strategy, model, effort, cost, policy, or a routing decision.
 Each strategy set may define its own assessor. The built-in `claude-only` set uses
 `claude-fable-5` with `high` effort for assessment, then routes ordinary low-risk work
 to `claude-opus-5`/`high` and work outside the Opus bounds to
 `claude-fable-5`/`high`. This keeps every model call in that profile on Claude.
-Deterministic complexity/scale floors and Harness-derived risk/capabilities are merged
-afterward, and the LLM cannot lower them. Assessment failure is fail-closed and never
-falls back to another model or Local LLM.
+Deterministic code maps task-type floors to `1/2/4/3/7/6/4/9`, reasoning floors to
+`1/2/4/7/9`, and ambiguity floors to `1/4/7`; complexity is their maximum. Scope maps
+to scale as `bounded=1`, `local=2`, `multi_component=5`, and `broad=8`. These numeric
+bands preserve existing strategy configuration compatibility and contain no model-authored
+score or hidden weight. Harness-derived risk and effective capabilities remain independent
+mandatory floors. Normalized goal length is persisted as `context_character_count` evidence
+but never affects eligibility, fit, headroom, or tie-breaking. Assessment failure is
+fail-closed and never falls back to another model or Local LLM.
 
 Routing never automatically falls back to another model, backend, or local
 strategy; an unsatisfied selection fails closed. Routed execution binds the configured
@@ -106,6 +117,9 @@ still requires both an operator-defined set and Project Harness `local_backend: 
 Inspector persists the strategy-set name, assessment strategy, merged task assessment,
 and selected execution strategy for evaluation. Decomposition is top-level assessment
 data only, not a set of independently executed subtasks.
+Adaptive planner nodes must also contain a categorical profile; deterministic code overwrites
+their numeric compatibility fields from that profile before graph acceptance. Existing
+profile-less fixed, policy, hand-authored, and replayed graphs retain their stored bands.
 
 When both `--routing-mode` and `--strategy-set` are omitted, adaptive routing uses the
 operator-configured `default_strategy_set`. The built-in and example default is

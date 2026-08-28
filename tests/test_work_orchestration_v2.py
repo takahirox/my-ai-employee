@@ -6,10 +6,17 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
+
 from ai_employee.domain import (
     ExecutionStrategy,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
     SemanticTaskAssessment,
+    SemanticTaskProfile,
+    SemanticTaskType,
     TaskAssessment,
 )
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
@@ -421,14 +428,15 @@ def test_semantic_assessment_schema_requires_every_property() -> None:
     assert schema["additionalProperties"] is False
     assert schema["required"] == [
         "schema_version",
-        "complexity",
-        "scale",
-        "required_capabilities",
+        "task_type",
+        "reasoning_class",
+        "scope",
+        "ambiguity",
         "reasons",
     ]
 
 
-def test_semantic_assessment_runtime_defaults_remain_parseable() -> None:
+def test_version_one_semantic_assessment_remains_parseable() -> None:
     assessment = SemanticTaskAssessment.model_validate_json(
         '{"complexity":2,"scale":1,"reasons":["bounded change"]}',
         strict=True,
@@ -436,6 +444,22 @@ def test_semantic_assessment_runtime_defaults_remain_parseable() -> None:
 
     assert assessment.schema_version == "1"
     assert assessment.required_capabilities == ()
+
+
+def test_semantic_profile_rejects_unknown_enums_and_extra_fields() -> None:
+    valid = {
+        "task_type": "mechanical",
+        "reasoning_class": "simple",
+        "scope": "bounded",
+        "ambiguity": "low",
+        "reasons": ["bounded operation"],
+    }
+    with pytest.raises(ValueError):
+        SemanticTaskProfile.model_validate({**valid, "task_type": "unknown"})
+    with pytest.raises(ValueError):
+        SemanticTaskProfile.model_validate({**valid, "risk": 0})
+    with pytest.raises(ValueError):
+        SemanticTaskProfile.model_validate({**valid, "reasons": [""]})
 
 
 def test_worker_proposal_schema_is_canonical_json() -> None:
@@ -880,6 +904,14 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
             complexity=1,
             scale=1,
             risk=0,
+            semantic_profile=SemanticTaskProfile(
+                task_type=SemanticTaskType.MECHANICAL,
+                reasoning_class=SemanticReasoningClass.SIMPLE,
+                scope=SemanticScope.BOUNDED,
+                ambiguity=SemanticAmbiguity.LOW,
+                reasons=("bounded plan",),
+            ),
+            context_character_count=11,
             reasons=("plan-only routing",),
         )
         strategy = ExecutionStrategy(
@@ -915,6 +947,8 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
         routing = inspect_work_run(store, run.id)["routing"]
         assert routing["assessment"]["complexity"] == 1
         assert routing["assessment"]["run_id"] == run.id
+        assert routing["assessment"]["context_character_count"] == 11
+        assert routing["assessment"]["semantic_profile"]["task_type"] == "mechanical"
         assert routing["selected_strategy"]["backend"] == "codex_cli"
         assert routing["selected_strategy"]["model"] == "gpt-5.6-luna"
         assert routing["selected_strategy"]["effort"] == "medium"

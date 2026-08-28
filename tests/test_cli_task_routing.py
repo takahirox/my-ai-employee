@@ -20,6 +20,11 @@ from ai_employee.domain import (
     NodeKind,
     OutputContract,
     RoutingMode,
+    SemanticAmbiguity,
+    SemanticReasoningClass,
+    SemanticScope,
+    SemanticTaskProfile,
+    SemanticTaskType,
 )
 from ai_employee.domain.v2 import (
     DecisionOutcome,
@@ -46,7 +51,21 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert args.max_concurrency == 1
 
 
-def _capture_planner_prompt(goal: Goal) -> dict[str, object]:
+def _capture_planner_prompt(
+    goal: Goal,
+    *,
+    semantic_profile: SemanticTaskProfile | None = None,
+    include_profile: bool = True,
+    complexity: int = 1,
+    scale: int = 1,
+) -> tuple[dict[str, object], ProposedGraph]:
+    profile = semantic_profile or SemanticTaskProfile(
+        task_type=SemanticTaskType.MECHANICAL,
+        reasoning_class=SemanticReasoningClass.MECHANICAL,
+        scope=SemanticScope.BOUNDED,
+        ambiguity=SemanticAmbiguity.LOW,
+        reasons=("one explicit operation",),
+    )
     graph = Graph(
         id=f"graph-{goal.id}",
         nodes=(
@@ -57,6 +76,9 @@ def _capture_planner_prompt(goal: Goal) -> dict[str, object]:
                 objective=goal.statement,
                 output_contract=OutputContract(id=f"contract-{goal.id}"),
                 required_capabilities=("process",),
+                semantic_profile=profile if include_profile else None,
+                complexity=complexity,
+                scale=scale,
                 completion_criteria=(
                     CompletionCriterion(
                         id=f"criterion-{goal.id}",
@@ -138,9 +160,8 @@ def _capture_planner_prompt(goal: Goal) -> dict[str, object]:
         max_wall_seconds=30.0,
     )
 
-    assert proposal.graph == graph
     assert len(captured) == 1
-    return json.loads(captured[0])
+    return json.loads(captured[0]), proposal
 
 
 def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_breadth() -> None:
@@ -150,11 +171,11 @@ def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_br
         statement="Exhaustively audit every authentication path for security defects",
     )
 
-    local_prompt = _capture_planner_prompt(local_goal)
-    broad_prompt = _capture_planner_prompt(broad_goal)
+    local_prompt, _ = _capture_planner_prompt(local_goal)
+    broad_prompt, _ = _capture_planner_prompt(broad_goal)
     instruction = local_prompt["instruction"]
 
-    assert local_prompt["protocol"] == broad_prompt["protocol"] == "fleet-proposed-graph/1"
+    assert local_prompt["protocol"] == broad_prompt["protocol"] == "fleet-proposed-graph/2"
     assert local_prompt["goal"] == local_goal.model_dump(mode="json")
     assert broad_prompt["goal"] == broad_goal.model_dump(mode="json")
     assert local_prompt["response_schema"] == broad_prompt["response_schema"]
@@ -168,6 +189,29 @@ def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_br
     assert "concrete repository evidence" in instruction
     assert "explicit in the accepted Goal" in instruction
     assert "relevant node objectives and completion criteria" in instruction
+
+
+def test_planner_requires_profiles_and_overwrites_numeric_compatibility() -> None:
+    profile = SemanticTaskProfile(
+        task_type=SemanticTaskType.ARCHITECTURE,
+        reasoning_class=SemanticReasoningClass.DEEP,
+        scope=SemanticScope.BROAD,
+        ambiguity=SemanticAmbiguity.LOW,
+        reasons=("cross-component contracts",),
+    )
+    _, proposal = _capture_planner_prompt(
+        Goal(id="goal-profiled", statement="Choose compatible contracts"),
+        semantic_profile=profile,
+        complexity=1,
+        scale=1,
+    )
+    node = proposal.graph.nodes[0]
+    assert (node.complexity, node.scale) == (7, 8)
+    with pytest.raises(ValueError, match="missing semantic_profile"):
+        _capture_planner_prompt(
+            Goal(id="goal-unprofiled", statement="Choose compatible contracts"),
+            include_profile=False,
+        )
 
 
 def _write_routing_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -218,8 +262,8 @@ if [ "$1" = "--help" ]; then
   printf '%s\n' 'Usage: codex exec'
   exit 0
 fi
-printf '%s' '{"complexity":8,"scale":6,'
-printf '%s' '"required_capabilities":["edit_intent","process"],'
+printf '%s' '{"schema_version":"1","task_type":"architecture",'
+printf '%s' '"reasoning_class":"deep","scope":"broad","ambiguity":"low",'
 printf '%s\n' '"reasons":["multiple dependent implementation steps"]}'
 exit 0
 """,

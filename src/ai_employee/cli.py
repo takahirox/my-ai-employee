@@ -61,7 +61,7 @@ from .project import (
     migration_candidate,
     write_migration_candidate,
 )
-from .routing import assess_task, merge_semantic_assessment, select_strategy
+from .routing import assess_task, merge_semantic_profile, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import canonical_digest, canonical_json, loads_yaml_model
 from .services_v2 import (
@@ -618,12 +618,10 @@ def _work(args: argparse.Namespace) -> int:
             ).assess(
                 args.goal,
                 task_assessment,
-                available_capabilities=capabilities,
             )
-            task_assessment = merge_semantic_assessment(
+            task_assessment = merge_semantic_profile(
                 task_assessment,
                 semantic,
-                available_capabilities=capabilities,
             )
             selected_strategy = select_strategy(
                 strategies,
@@ -829,7 +827,13 @@ def _work(args: argparse.Namespace) -> int:
                     run_id=request.run_id,
                     risk=node.risk,
                     required_capabilities=node.required_capabilities,
-                ).model_copy(update={"complexity": node.complexity, "scale": node.scale})
+                ).model_copy(
+                    update={
+                        "complexity": node.complexity,
+                        "scale": node.scale,
+                        "semantic_profile": node.semantic_profile,
+                    }
+                )
                 return WorkCoordinator(
                     inner_store,
                     DeterministicRuntime({}, store=inner_store),
