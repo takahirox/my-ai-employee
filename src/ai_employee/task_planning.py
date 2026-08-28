@@ -44,6 +44,14 @@ class ProposedGraphPayload(BaseModel):
 
 def _strict_schema(value: object) -> None:
     if isinstance(value, dict):
+        if not value:
+            value["type"] = "null"
+            return
+        if "$ref" in value:
+            reference = value["$ref"]
+            value.clear()
+            value["$ref"] = reference
+            return
         properties = value.get("properties")
         if isinstance(properties, dict):
             value["required"] = list(properties)
@@ -129,10 +137,15 @@ class CliProposedGraphPlanner:
                     "are the worker-facing scope. Nodes and edges are the only dependency "
                     "authority. Every node needs an objective, completion criteria, an output "
                     "contract, bounded complexity/scale/risk, and only capabilities from "
-                    "available_capabilities. Edges mean required dependencies only: do not emit "
-                    "conditions, loops, retries, re-planning, or generalized control flow. For "
-                    "editing nodes, bind completion evidence to the workspace_patch artifact; do "
-                    "not invent verification command IDs. "
+                    "available_capabilities. Set graph max_attempts to at least the node count, "
+                    "and make every aggregate graph resource budget cover the sum of its node "
+                    "reservations without exceeding the supplied bounds. Edges mean required "
+                    "dependencies only: do not emit conditions, loops, retries, re-planning, or "
+                    "generalized control flow. The runtime evaluates declared Harness commands "
+                    "against the composed parent candidate, so do not add a verification-only "
+                    "node or copy those goal-level criteria into individual node completion "
+                    "criteria. For editing nodes, bind completion evidence to the workspace_patch "
+                    "artifact; do not invent verification command IDs. "
                     "Return only the supplied strict JSON schema."
                 ),
                 "goal": goal,

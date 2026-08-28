@@ -159,6 +159,17 @@ def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> N
         assert set(requests) == {"a", "b", "c"}
         assert len({request.content_digest for request in requests.values()}) == 3
         assert len({request.node_id for request in requests.values()}) == 3
+        assert all(
+            request.remaining_budgets
+            == {
+                "worker_turns": 1,
+                "processes": 1,
+                "wall_seconds": 1.0,
+                "artifact_bytes": 1_000_000,
+                "node_attempts": 1,
+            }
+            for request in requests.values()
+        )
         graph_digests = {request.accepted_graph_revision_digest for request in requests.values()}
         assert graph_digests == {run.accepted_graph_revision_digest}
         assert starts["c"] >= max(finishes["a"], finishes["b"])
