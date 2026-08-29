@@ -1229,6 +1229,12 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
     assert len({item.run_id for item in requests}) == 2
     assert [(item.generation, item.attempt) for item in replay.reservations] == [(0, 0), (0, 1)]
     assert [(item.generation, item.attempt) for item in replay.routes] == [(0, 0), (0, 1)]
+    assert [(item.generation, item.attempt) for item in replay.context_manifests] == [
+        (0, 0),
+        (0, 1),
+    ]
+    assert len({item.worker_request_digest for item in replay.context_manifests}) == 2
+    assert all(not item.conversation_history_included for item in replay.context_manifests)
     assert all(item.assessment.semantic_profile is not None for item in replay.routes)
     assert len({item.id for item in replay.routes}) == 2
 

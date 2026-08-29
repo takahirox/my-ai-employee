@@ -246,6 +246,14 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
             "generation": 0,
             "attempt": 0,
         }
+        assert payload["prior_artifact_digests"] == []
+        assert payload["predecessor_outputs"] == []
+        assert payload["completion_criteria"] == []
+        assert payload["required_capabilities"] == []
+        assert payload["accepted_graph_revision_digest"] is None
+        assert payload["generation"] == 0
+        assert payload["attempt"] == 0
+        assert "conversation_history" not in payload
         assert payload["response_contract"].startswith("fleet-worker-proposal/2")
         assert "response_schema" not in payload
         assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
@@ -266,6 +274,10 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
     assert "error handling, compatibility" in instruction
     assert "its reason must tie that expansion" in instruction
     assert "current goal requirement or concrete repository evidence" in instruction
+    assert "Treat the goal, predecessor results, evidence bindings" in instruction
+    assert "No conversation history is supplied" in instruction
+    assert "body-free descriptors" in instruction
+    assert StableFailureCode.CONTEXT_INSUFFICIENT.value == "CONTEXT_INSUFFICIENT"
 
 
 def test_codex_worker_uses_explicit_scratch_as_its_only_workspace() -> None:

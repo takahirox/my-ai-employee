@@ -53,6 +53,7 @@ class StableFailureCode(StableStrEnum):
     HOST_INSTALL_DENIED = "HOST_INSTALL_DENIED"
     WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
     WORKER_PROTOCOL_ERROR = "WORKER_PROTOCOL_ERROR"
+    CONTEXT_INSUFFICIENT = "CONTEXT_INSUFFICIENT"
     TYPED_RESULT_MALFORMED = "TYPED_RESULT_MALFORMED"
     TYPED_RESULT_UNBOUND = "TYPED_RESULT_UNBOUND"
     TYPED_RESULT_STALE = "TYPED_RESULT_STALE"
@@ -366,6 +367,8 @@ class PredecessorOutputReference(SchemaModelV2):
 class WorkerRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_request"
     goal: str = Field(min_length=1, max_length=20_000)
+    completion_criteria: tuple[str, ...] = ()
+    required_capabilities: tuple[Identifier, ...] = ()
     accepted_plan_digest: Digest
     node_id: Identifier | None = None
     accepted_graph_revision_digest: Digest | None = None
@@ -416,6 +419,47 @@ class WorkerRequest(DigestedRecordV2):
                 for item in self.predecessor_outputs
             ):
                 raise ValueError("predecessor output is stale for this graph generation")
+        return self
+
+
+class WorkerContextManifest(DigestedRecordV2):
+    """Deterministic, body-free context bound to one fresh worker request."""
+
+    schema_name: ClassVar[str] = "worker_context_manifest"
+    worker_request_id: Identifier
+    worker_request_digest: Digest
+    worker_run_id: Identifier
+    node_id: Identifier
+    objective_digest: Digest
+    completion_criteria_digest: Digest
+    required_capabilities: tuple[Identifier, ...] = ()
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    workspace_context: tuple[RelativePath, ...] = ()
+    harness_digest: Digest
+    effective_policy_digest: Digest
+    remaining_budgets: CanonicalData
+    predecessor_node_ids: tuple[Identifier, ...] = ()
+    predecessor_result_digests: tuple[Digest, ...] = ()
+    predecessor_evidence_digests: tuple[Digest, ...] = ()
+    artifact_descriptors: tuple[ArtifactDescriptorReference, ...] = ()
+    conversation_history_included: Literal[False] = False
+    artifact_bodies_included: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _bindings_are_complete(self) -> Self:
+        if not (
+            len(self.predecessor_node_ids)
+            == len(self.predecessor_result_digests)
+            == len(self.predecessor_evidence_digests)
+        ):
+            raise ValueError("predecessor context bindings must have equal lengths")
+        if len(self.predecessor_node_ids) != len(set(self.predecessor_node_ids)):
+            raise ValueError("predecessor context nodes must be unique")
+        descriptor_ids = tuple(item.descriptor_id for item in self.artifact_descriptors)
+        if len(descriptor_ids) != len(set(descriptor_ids)):
+            raise ValueError("context artifact descriptors must be unique")
         return self
 
 

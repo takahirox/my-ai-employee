@@ -26,6 +26,7 @@ from .domain.v2 import (
     PolicyDecision,
     PromotionRecord,
     WorkerAvailability,
+    WorkerContextManifest,
     WorkerResult,
     WorkspaceSnapshot,
 )
@@ -356,6 +357,12 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             )
         ],
         "routes": [_json_model(item) for item in routes],
+        "worker_context_manifests": [
+            _json_model(item)
+            for item in store.list_records(
+                "worker_context_manifest_v2", WorkerContextManifest, run_id=run_id
+            )
+        ],
         "worker_results": [
             _json_model(store.get("worker_result_v2", item.worker_result_id, WorkerResult))
             for item in node_records
