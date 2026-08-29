@@ -4,6 +4,8 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -20,13 +22,23 @@ from ai_employee.domain import (
     RoutingMode,
 )
 from ai_employee.domain.base import freeze_json
+from ai_employee.domain.browser import (
+    BrowserAction,
+    BrowserCapture,
+    BrowserObservation,
+    BrowserScenario,
+)
 from ai_employee.domain.evaluation import (
     CriterionOutcome,
     CriterionResult,
     EvaluationBudget,
     EvaluationEvidenceLedger,
     EvaluationFreshness,
+    EvaluationRequest,
+    EvaluationResult,
     EvaluatorBehavior,
+    EvaluatorSpecification,
+    ObservationManifest,
 )
 from ai_employee.domain.models import AcceptedGraphRevision
 from ai_employee.domain.v2 import (
@@ -37,7 +49,11 @@ from ai_employee.domain.v2 import (
     PolicyDecision,
     ProcessRequest,
 )
-from ai_employee.graph_evaluation import GraphCandidateEvaluator
+from ai_employee.graph_evaluation import (
+    GraphCandidateEvaluator,
+    ParentCandidateEvaluationRequest,
+    ParentVerificationBinding,
+)
 from ai_employee.parent_review import (
     CliParentSemanticReviewer,
     ParentNodeReviewBinding,
@@ -54,7 +70,7 @@ from ai_employee.parent_review import (
     parse_parent_semantic_review_payload,
     validate_parent_semantic_review_result,
 )
-from ai_employee.serialization import canonical_digest, canonical_json
+from ai_employee.serialization import canonical_digest, canonical_json, versioned_digest
 from ai_employee.storage import SQLiteStore
 
 NOW = datetime(2026, 8, 29, tzinfo=UTC)
@@ -74,8 +90,14 @@ def _strategy(backend: str = "ollama_cli") -> ExecutionStrategy:
     )
 
 
-def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewRequest:
-    criterion = CompletionCriterion(id="criterion", description="integrated behavior works")
+def _request(
+    strategy: ExecutionStrategy | None = None,
+    criterion_ids: tuple[str, ...] = ("criterion",),
+) -> ParentSemanticReviewRequest:
+    criteria = tuple(
+        CompletionCriterion(id=item, description=f"{item} integrated behavior works")
+        for item in criterion_ids
+    )
     nodes = tuple(
         Node(
             id=node_id,
@@ -83,7 +105,7 @@ def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewR
             name=node_id,
             objective=f"implement {node_id}",
             output_contract=OutputContract(id=f"contract-{node_id}"),
-            completion_criteria=(criterion,),
+            completion_criteria=criteria,
         )
         for node_id in ("a", "b")
     )
@@ -98,7 +120,7 @@ def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewR
     goal = Goal(
         id="goal",
         statement="integrate both tasks",
-        completion_criteria=(criterion,),
+        completion_criteria=criteria,
     )
     candidate_body = b"diff --git a/a.py b/a.py\n+INTEGRATED = False\n"
     candidate = ArtifactDescriptor(
@@ -114,10 +136,13 @@ def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewR
         store_locator="sha256/candidate",
     )
     candidate_digest = canonical_digest({"candidate": candidate.artifact_digest})
-    result = CriterionResult(
-        criterion_id="criterion",
-        outcome=CriterionOutcome.SATISFIED,
-        explanation="deterministic tests pass",
+    results = tuple(
+        CriterionResult(
+            criterion_id=item,
+            outcome=CriterionOutcome.SATISFIED,
+            explanation="deterministic tests pass",
+        )
+        for item in criterion_ids
     )
     ledger = EvaluationEvidenceLedger(
         id="ledger",
@@ -128,17 +153,20 @@ def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewR
         evaluator_specification_digest="3" * 64,
         effective_policy_digest=POLICY,
         evaluation_result_digests=("4" * 64,),
-        expected_criterion_ids=("criterion",),
-        criterion_results=(result,),
+        expected_criterion_ids=criterion_ids,
+        criterion_results=results,
         freshness=EvaluationFreshness(fresh=True),
         remaining_budget=EvaluationBudget(),
         behavior=EvaluatorBehavior.DETERMINISTIC,
         decision=EvaluationDecision.PASS,
     )
-    evidence = CriterionEvidence(
-        criterion_id="criterion",
-        disposition="satisfied",
-        evidence_refs=(ledger.content_digest or "0" * 64,),
+    evidence = tuple(
+        CriterionEvidence(
+            criterion_id=item,
+            disposition="satisfied",
+            evidence_refs=(ledger.content_digest or "0" * 64,),
+        )
+        for item in criterion_ids
     )
     return ParentSemanticReviewRequest(
         id="request",
@@ -175,7 +203,7 @@ def _request(strategy: ExecutionStrategy | None = None) -> ParentSemanticReviewR
         ),
         deterministic_ledgers=(ledger,),
         deterministic_ledger_digests=(ledger.content_digest or "0" * 64,),
-        criterion_evidence=(evidence,),
+        criterion_evidence=evidence,
     )
 
 
@@ -184,6 +212,7 @@ def _finding(
     *,
     repair_objective: str | None = "make task b consume task a's output",
     confidence: ParentSemanticConfidence = ParentSemanticConfidence.CERTAIN,
+    criterion_ids: tuple[str, ...] = ("criterion",),
 ) -> ParentSemanticFinding:
     return ParentSemanticFinding(
         id="cross-task-gap",
@@ -191,7 +220,7 @@ def _finding(
         severity=ParentSemanticSeverity.HIGH,
         confidence=confidence,
         basis=ParentSemanticBasis.OBSERVED,
-        criterion_ids=("criterion",),
+        criterion_ids=criterion_ids,
         node_ids=("a", "b"),
         observation="all tests pass but task b ignores task a's produced value",
         rationale="the exact candidate hard-codes the pre-integration behavior",
@@ -208,7 +237,7 @@ def _result(
     return bind_parent_semantic_review_payload(
         ParentSemanticReviewPayload(
             findings=(finding,),
-            reviewed_criterion_ids=("criterion",),
+            reviewed_criterion_ids=request.criterion_ids,
             reviewed_node_ids=("a", "b"),
         ),
         request=request,
@@ -288,6 +317,43 @@ def test_cross_task_gap_maps_to_repair_only_with_bounded_objective() -> None:
     )
 
 
+def test_finding_digest_is_merged_only_into_its_affected_criterion() -> None:
+    request = _request(criterion_ids=("criterion-a", "criterion-b"))
+    finding = _finding(request, criterion_ids=("criterion-a",))
+    result = _result(request, finding)
+    decision = decide_parent_semantic_review(
+        request,
+        result,
+        block_severities=(ParentSemanticSeverity.HIGH,),
+        decision_id="decision",
+        run_id=RUN,
+        created_at=NOW,
+    )
+    chain = tuple(
+        item
+        for item in (request.content_digest, result.content_digest, decision.content_digest)
+        if item is not None
+    )
+    criterion_evidence = {item.criterion_id: item for item in request.criterion_evidence}
+    evaluator = object.__new__(GraphCandidateEvaluator)
+
+    evaluator._merge_semantic_evidence(
+        criterion_evidence,
+        request,
+        result,
+        decision,
+        chain,
+    )
+
+    finding_digest = canonical_digest(finding)
+    assert finding_digest in criterion_evidence["criterion-a"].evidence_refs
+    assert finding_digest not in criterion_evidence["criterion-b"].evidence_refs
+    assert set(chain) <= set(criterion_evidence["criterion-a"].evidence_refs)
+    assert set(chain) <= set(criterion_evidence["criterion-b"].evidence_refs)
+    assert criterion_evidence["criterion-a"].disposition == "blocked"
+    assert criterion_evidence["criterion-b"].disposition == "satisfied"
+
+
 def test_parent_semantic_result_rejects_foreign_candidate() -> None:
     request = _request()
     result = _result(request, _finding(request)).model_copy(update={"candidate_digest": "f" * 64})
@@ -344,6 +410,166 @@ def test_resume_deduplicates_exact_content_but_rejects_changed_evidence(
             request.content_digest
         )
         assert evaluator._resumable_semantic_request(changed) is None
+
+
+@pytest.mark.parametrize("provider_id", ["process.harness", "browser.playwright"])
+@pytest.mark.parametrize("runtime_state", ["missing", "foreign"])
+def test_resumed_semantic_evidence_requires_exact_runtime_result(
+    tmp_path: Path,
+    provider_id: str,
+    runtime_state: str,
+) -> None:
+    request = _request()
+    process_request = (
+        ProcessRequest(
+            id="runtime-process",
+            run_id=RUN,
+            created_at=NOW,
+            argv=("verify",),
+            purpose="test exact runtime binding",
+        )
+        if provider_id == "process.harness"
+        else None
+    )
+    scenario = (
+        BrowserScenario(
+            origin="http://127.0.0.1:3000",
+            actions=(BrowserAction(kind="navigate", url="http://127.0.0.1:3000/"),),
+            captures=(
+                BrowserCapture(
+                    id="runtime-screen",
+                    kind="screenshot",
+                    logical_kind="browser_screenshot",
+                ),
+            ),
+        )
+        if provider_id == "browser.playwright"
+        else None
+    )
+    specification = EvaluatorSpecification(
+        id="runtime-specification",
+        run_id=RUN,
+        created_at=NOW,
+        provider_id=provider_id,
+        provider_schema_version="v2",
+        provider_descriptor_digest="3" * 64,
+        behavior=EvaluatorBehavior.DETERMINISTIC,
+        required_capabilities=("process" if process_request is not None else "browser",),
+        command_ref=None if process_request is None else process_request.id,
+        browser_scenario=scenario,
+        criterion_ids=("criterion",),
+    )
+    binding = ParentVerificationBinding(
+        harness_evaluator_id="runtime-evaluator",
+        harness_command_ref=None if process_request is None else "verify",
+        specification=specification,
+        process_request=process_request,
+    )
+    evaluation_request = EvaluationRequest(
+        id="runtime-evaluation-request",
+        run_id=RUN,
+        created_at=NOW,
+        candidate_digest=request.candidate_digest,
+        generation=request.generation,
+        evaluator_specification_digest=specification.content_digest or "0" * 64,
+        effective_policy_digest=POLICY,
+    )
+    evaluation_request_digest = evaluation_request.content_digest or "0" * 64
+    if runtime_state == "foreign" and process_request is not None:
+        runtime: ExecutionResult | BrowserObservation | None = ExecutionResult(
+            id="foreign-runtime-process",
+            run_id=RUN,
+            created_at=NOW,
+            request_digest="f" * 64,
+            status="succeeded",
+            exit_code=0,
+            duration_seconds=0.01,
+        )
+    elif runtime_state == "foreign":
+        assert scenario is not None
+        runtime = BrowserObservation(
+            id="foreign-runtime-browser",
+            run_id=RUN,
+            created_at=NOW,
+            request_digest="f" * 64,
+            scenario_digest=versioned_digest(scenario),
+            session_id="foreign-session",
+            status="succeeded",
+            final_url=scenario.origin,
+            actions_completed=len(scenario.actions),
+            duration_seconds=0.01,
+        )
+    else:
+        runtime = None
+    manifest = ObservationManifest(
+        id="runtime-manifest",
+        run_id=RUN,
+        created_at=NOW,
+        request_digest=evaluation_request_digest,
+        candidate_digest=request.candidate_digest,
+        generation=request.generation,
+        evaluator_specification_digest=specification.content_digest or "0" * 64,
+        effective_policy_digest=POLICY,
+    )
+    evaluation_result = EvaluationResult(
+        id="runtime-evaluation-result",
+        run_id=RUN,
+        created_at=NOW,
+        request_digest=evaluation_request_digest,
+        candidate_digest=request.candidate_digest,
+        generation=request.generation,
+        evaluator_specification_digest=specification.content_digest or "0" * 64,
+        effective_policy_digest=POLICY,
+        provider_descriptor_digest=specification.provider_descriptor_digest,
+        behavior=EvaluatorBehavior.DETERMINISTIC,
+        expected_criterion_ids=("criterion",),
+        observation_manifest=manifest,
+        execution_result_digest=(
+            "5" * 64 if runtime is None else runtime.content_digest or "0" * 64
+        ),
+        criterion_results=(
+            CriterionResult(
+                criterion_id="criterion",
+                outcome=CriterionOutcome.SATISFIED,
+                explanation="runtime passed",
+            ),
+        ),
+    )
+    ledger = EvaluationEvidenceLedger(
+        id="runtime-ledger",
+        run_id=RUN,
+        created_at=NOW,
+        candidate_digest=request.candidate_digest,
+        generation=request.generation,
+        evaluator_specification_digest=specification.content_digest or "0" * 64,
+        effective_policy_digest=POLICY,
+        evaluation_result_digests=(evaluation_result.content_digest or "0" * 64,),
+        observation_manifest_digests=(manifest.content_digest or "0" * 64,),
+        expected_criterion_ids=("criterion",),
+        criterion_results=evaluation_result.criterion_results,
+        freshness=EvaluationFreshness(fresh=True),
+        remaining_budget=EvaluationBudget(),
+        behavior=EvaluatorBehavior.DETERMINISTIC,
+        decision=EvaluationDecision.PASS,
+    )
+    semantic_request = request.model_copy(update={"deterministic_ledgers": (ledger,)})
+    parent_request = cast(
+        ParentCandidateEvaluationRequest,
+        SimpleNamespace(verification_bindings=(binding,)),
+    )
+    with SQLiteStore(tmp_path / f"missing-{provider_id}.db") as store:
+        store.put("evaluation_request_v2", evaluation_request, run_id=RUN)
+        store.put("evaluation_result_v2", evaluation_result, run_id=RUN)
+        store.put("observation_manifest_v2", manifest, run_id=RUN)
+        if isinstance(runtime, ExecutionResult):
+            store.put("verification_result_v2", runtime, run_id=RUN)
+        elif isinstance(runtime, BrowserObservation):
+            store.put("browser_observation_v2", runtime, run_id=RUN)
+        evaluator = object.__new__(GraphCandidateEvaluator)
+        evaluator.store = store
+
+        with pytest.raises(ValueError, match="runtime evidence is missing"):
+            evaluator._semantic_verification_results(semantic_request, parent_request)
 
 
 class _Executor:
@@ -415,10 +641,16 @@ def test_parent_observer_receives_only_exact_patch_and_body_free_other_descripto
         )
     ).encode()
     prompts: list[bytes] = []
+    candidate_reads: list[ArtifactDescriptor] = []
+
+    def read_candidate(descriptor: ArtifactDescriptor) -> bytes:
+        candidate_reads.append(descriptor)
+        return candidate if descriptor == request.candidate_descriptor else b"foreign"
+
     reviewer = CliParentSemanticReviewer(
         _Executor(),
         lambda digest: output if digest == "9" * 64 else b"",
-        lambda descriptor: candidate if descriptor == request.candidate_descriptor else b"foreign",
+        read_candidate,
         _allow,
         run_id=RUN,
         strategy=request.reviewer_strategy,
@@ -429,6 +661,7 @@ def test_parent_observer_receives_only_exact_patch_and_body_free_other_descripto
 
     reviewer.review(request)
 
+    assert candidate_reads == [request.candidate_descriptor]
     prompt = json.loads(prompts[0])
     assert prompt["protocol"] == "fleet-parent-semantic-review/2"
     assert prompt["request"]["candidate_patch"] == candidate.decode()
@@ -468,3 +701,43 @@ def test_parent_observer_disables_tools_and_sessions() -> None:
         "shell_tool",
         "unified_exec",
     )
+
+
+def test_parent_observer_rejects_foreign_run_before_reading_stdout() -> None:
+    request = _request()
+    candidate = b"diff --git a/a.py b/a.py\n+INTEGRATED = False\n"
+    stdout_reads: list[str] = []
+
+    class ForeignRunExecutor:
+        def execute(
+            self,
+            process_request: ProcessRequest,
+            _decision: PolicyDecision,
+            _cancellation: object,
+        ) -> ExecutionResult:
+            return ExecutionResult(
+                id="foreign-execution",
+                run_id="foreign-run",
+                created_at=NOW,
+                request_digest=process_request.content_digest or "0" * 64,
+                status="succeeded",
+                duration_seconds=0.01,
+                stdout_artifact_digest="f" * 64,
+            )
+
+    reviewer = CliParentSemanticReviewer(
+        ForeignRunExecutor(),
+        lambda digest: (stdout_reads.append(digest), b"foreign body")[1],
+        lambda _descriptor: candidate,
+        _allow,
+        run_id=RUN,
+        strategy=request.reviewer_strategy,
+        executable="ollama",
+        cwd=".",
+        prompt_writer=lambda _value: "8" * 64,
+    )
+
+    with pytest.raises(ValueError, match="invocation failed"):
+        reviewer.review(request)
+
+    assert stdout_reads == []

@@ -697,7 +697,8 @@ class CliParentSemanticReviewer:
             raise ValueError("parent semantic-review policy did not allow the exact request")
         process_result = self.executor.execute(process_request, decision, _NeverCancelled())
         if (
-            process_result.request_digest != process_request.content_digest
+            process_result.run_id != self.run_id
+            or process_result.request_digest != process_request.content_digest
             or process_result.status != "succeeded"
             or process_result.stdout_artifact_digest is None
         ):

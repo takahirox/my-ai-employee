@@ -64,7 +64,6 @@ from .graph_execution import GraphExecutionService
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
 from .parent_review import (
     CliParentSemanticReviewer,
-    ParentSemanticSeverity,
     parent_semantic_review_schema_json,
 )
 from .plan_review import (
@@ -1103,10 +1102,6 @@ def _work(args: argparse.Namespace) -> int:
                     )
                 ),
                 semantic_reviewer=parent_reviewer,
-                semantic_block_severities=tuple(
-                    ParentSemanticSeverity(item)
-                    for item in harness.verification.review.block_severities
-                ),
             )
             fixed_strategy_id = None
             if routing_mode is RoutingMode.FIXED:

@@ -132,6 +132,8 @@ class HarnessReview(HarnessModel):
             raise ValueError("review blocking severities must be unique")
         if (self.independent_task_review or self.parent_semantic_review) and not self.required:
             raise ValueError("AI review requires the review gate")
+        if self.parent_semantic_review and not self.block_severities:
+            raise ValueError("parent semantic review requires blocking severities")
         return self
 
 

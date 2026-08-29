@@ -58,6 +58,7 @@ from ai_employee.parent_review import (
     ParentSemanticConfidence,
     ParentSemanticFinding,
     ParentSemanticFindingType,
+    ParentSemanticReviewDecision,
     ParentSemanticReviewPayload,
     ParentSemanticReviewRequest,
     ParentSemanticReviewResult,
@@ -516,6 +517,18 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
 
         semantic_reviewer = SemanticReviewer(strategy)
 
+        if semantic_enabled:
+            with pytest.raises(ValueError, match="must match the bound Harness"):
+                GraphCandidateEvaluator(
+                    store,
+                    workspace,
+                    harness,
+                    ParentExecutor,
+                    allow_parent_process,
+                    semantic_reviewer=semantic_reviewer,
+                    semantic_block_severities=(ParentSemanticSeverity.LOW,),
+                )
+
         parent_evaluator = GraphCandidateEvaluator(
             store,
             workspace,
@@ -698,7 +711,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         assert service.replay(run.id) == replay
         assert composition_calls == 1
         assert parent_process_calls == (
-            0 if parent_verification_succeeds in {None, "browser"} else 1
+            0 if parent_verification_succeeds in {None, "browser", "semantic-stale-node"} else 1
         )
         if run.parent_evaluation_id is not None:
             parent_record = store.get(
@@ -711,8 +724,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             assert parent_replay.record == parent_record
             assert len(parent_replay.acceptance_ledger.criteria) == 1
             assert parent_replay.acceptance_ledger.criteria[0].disposition == (
-                "satisfied" if parent_ready or semantic_stale_node else "blocked"
+                "uncovered" if semantic_stale_node else "satisfied" if parent_ready else "blocked"
             )
+            if semantic_stale_node:
+                assert parent_record.verification_result_digests == ()
             assert len(parent_replay.semantic_decisions) == (1 if semantic_invoked else 0)
             assert len(parent_replay.semantic_repair_requests) == (1 if semantic_repair else 0)
             assert parent_replay.process_invocations == 0
@@ -746,6 +761,32 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 run.composition_id,
                 GraphPatchCompositionRecord,
             )
+            if semantic_retry:
+                original_runtime = store.list_records(
+                    "verification_result_v2", ExecutionResult, run_id=run.id
+                )[0]
+                changed_runtime = ExecutionResult(
+                    id="second-parent-verification-result",
+                    run_id=run.id,
+                    created_at=NOW,
+                    request_digest=original_runtime.request_digest,
+                    status="succeeded",
+                    exit_code=0,
+                    duration_seconds=0.02,
+                )
+                assert changed_runtime.content_digest != original_runtime.content_digest
+                store.put("verification_result_v2", changed_runtime, run_id=run.id)
+                pending_request = store.list_records(
+                    "parent_semantic_review_request_v2",
+                    ParentSemanticReviewRequest,
+                    run_id=run.id,
+                )[0]
+                interrupted_result = semantic_reviewer.review(pending_request)
+                store.put(
+                    "parent_semantic_review_result_v2",
+                    interrupted_result,
+                    run_id=run.id,
+                )
             resumed_evaluation = parent_evaluator.evaluate(
                 goal,
                 replay.acceptance.accepted_revision,
@@ -756,4 +797,15 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             )
             assert resumed_evaluation.decision is EvaluationDecision.REPAIR
             assert len(parent_evaluator.replay(resumed_evaluation.id).semantic_results) == 1
+            completed_decisions = tuple(
+                item
+                for item in store.list_records(
+                    "parent_semantic_review_decision_v2",
+                    ParentSemanticReviewDecision,
+                    run_id=run.id,
+                )
+                if item.result_digest is not None
+            )
+            assert len(completed_decisions) == 1
+            assert len({item.content_digest for item in completed_decisions}) == 1
         assert semantic_reviewer.calls == (2 if semantic_retry else 1 if semantic_repair else 0)

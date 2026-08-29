@@ -108,6 +108,15 @@ def test_parent_semantic_review_requires_explicit_harness_review_gate() -> None:
         ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
 
 
+def test_parent_semantic_review_rejects_empty_blocking_policy() -> None:
+    enabled = valid_harness()
+    enabled["verification"]["review"]["parent_semantic_review"] = True
+    enabled["verification"]["review"]["block_severities"] = []
+
+    with pytest.raises(ValidationError, match="requires blocking severities"):
+        ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
+
+
 def test_disabled_task_review_preserves_pre_issue7_harness_digest() -> None:
     harness = ProjectHarnessV2.model_validate_json(json.dumps(valid_harness()), strict=True)
     old_payload = harness.model_dump(mode="python")
