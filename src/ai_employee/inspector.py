@@ -59,6 +59,12 @@ from .task_orchestration import (
     TaskGraphAcceptance,
     _load_plan_review_history,
 )
+from .task_review import (
+    StaleTaskReviewResult,
+    TaskReviewDecision,
+    TaskReviewRequest,
+    TaskReviewResult,
+)
 
 
 class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
@@ -408,6 +414,32 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
                 key=lambda item: (item.generation, item.created_at, item.id),
             )
         ],
+        "task_reviews": {
+            "requests": [
+                _json_model(item)
+                for item in store.list_records(
+                    "task_review_request_v2", TaskReviewRequest, run_id=run_id
+                )
+            ],
+            "results": [
+                _json_model(item)
+                for item in store.list_records(
+                    "task_review_result_v2", TaskReviewResult, run_id=run_id
+                )
+            ],
+            "decisions": [
+                _json_model(item)
+                for item in store.list_records(
+                    "task_review_decision_v2", TaskReviewDecision, run_id=run_id
+                )
+            ],
+            "stale_results": [
+                _json_model(item)
+                for item in store.list_records(
+                    "stale_task_review_result_v2", StaleTaskReviewResult, run_id=run_id
+                )
+            ],
+        },
         "composition": None if composition is None else _json_model(composition),
         "candidate_patch": None if candidate is None else _json_model(candidate),
         "parent_evaluation": None if evaluation is None else _json_model(evaluation),

@@ -151,6 +151,31 @@ def test_planner_candidates_require_explicit_operator_eligibility() -> None:
     )
 
 
+def test_task_reviewer_requires_explicit_operator_eligibility_and_default() -> None:
+    reviewer = OperatorStrategyConfig(
+        id="reviewer",
+        backend="codex_cli",
+        model="reviewer-model",
+        effort="high",
+        task_reviewer_eligible=True,
+    )
+    config = OperatorConfig(
+        routing=OperatorRoutingConfig(
+            strategies=(reviewer,),
+            default_strategy_set="review",
+            default_task_reviewer_strategy="reviewer",
+            strategy_sets={"review": ("reviewer",)},
+        )
+    )
+
+    assert config.task_reviewer_strategy(RoutingMode.ADAPTIVE).id == "reviewer"
+    with pytest.raises(ValidationError, match="reviewer-eligible"):
+        OperatorRoutingConfig(
+            strategies=(reviewer.model_copy(update={"task_reviewer_eligible": False}),),
+            default_task_reviewer_strategy="reviewer",
+        )
+
+
 def test_named_strategy_set_limits_available_strategies() -> None:
     codex = OperatorStrategyConfig(id="codex", backend="codex_cli", model="gpt-5", effort="medium")
     claude = OperatorStrategyConfig(

@@ -64,6 +64,16 @@ from .serialization import canonical_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
 from .task_planning import PlannerRoutingDecision, ProposedGraph
+from .task_review import (
+    StaleTaskReviewResult,
+    TaskReviewAction,
+    TaskReviewDecision,
+    TaskReviewRequest,
+    TaskReviewResult,
+    TaskReviewSeverity,
+    decide_task_review,
+    validate_task_review_result,
+)
 
 NodeExecutionStatus = Literal[
     "pending", "routed", "running", "passed", "failed", "blocked", "cancelled"
@@ -284,6 +294,12 @@ class NodeEvaluatorRecord(DigestedRecordV2):
     decision: EvaluationDecision
 
 
+class TaskResultReviewer(Protocol):
+    strategy: ExecutionStrategy
+
+    def review(self, request: TaskReviewRequest) -> TaskReviewResult: ...
+
+
 class GoalEvaluatorRecord(DigestedRecordV2):
     schema_name: ClassVar[str] = "goal_evaluator_record"
     goal_id: Identifier
@@ -345,6 +361,12 @@ class GraphRunRecord(BaseModel):
     allowed_backends: tuple[str, ...]
     local_backend_allowed: bool
     independent_node_assessment: bool = False
+    independent_task_review: bool = False
+    task_reviewer_strategy: ExecutionStrategy | None = None
+    task_review_block_severities: tuple[TaskReviewSeverity, ...] = (
+        TaskReviewSeverity.CRITICAL,
+        TaskReviewSeverity.HIGH,
+    )
     planner_routing: PlannerRoutingDecision | None = None
     status: GraphExecutionStatus
     max_concurrency: int = Field(ge=1)
@@ -497,6 +519,10 @@ class GraphReplay(BaseModel):
     controls: tuple[GraphControlFact, ...]
     stale_results: tuple[StaleNodeResultRecord, ...]
     loop_transitions: tuple[LoopTransitionRecord, ...] = ()
+    task_review_requests: tuple[TaskReviewRequest, ...] = ()
+    task_review_results: tuple[TaskReviewResult, ...] = ()
+    task_review_decisions: tuple[TaskReviewDecision, ...] = ()
+    stale_task_review_results: tuple[StaleTaskReviewResult, ...] = ()
     route_count: int
     worker_result_count: int
     evidence_count: int
@@ -575,6 +601,12 @@ class TaskOrchestrator:
         node_assessor: NodeAssessor | None = None,
         routing_risk_floor: int = 0,
         independent_node_assessment: bool = False,
+        task_reviewer: TaskResultReviewer | None = None,
+        independent_task_review: bool = False,
+        task_review_block_severities: Iterable[TaskReviewSeverity] = (
+            TaskReviewSeverity.CRITICAL,
+            TaskReviewSeverity.HIGH,
+        ),
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
@@ -625,6 +657,21 @@ class TaskOrchestrator:
                 raise ValueError("node assessor must use an authorized configured strategy")
         self.node_assessor = node_assessor
         self.independent_node_assessment = independent_node_assessment
+        if independent_task_review != (task_reviewer is not None):
+            raise ValueError("independent task review requires exactly one configured reviewer")
+        if task_reviewer is not None:
+            configured = {item.id: item for item in self.strategies}
+            if configured.get(task_reviewer.strategy.id) != task_reviewer.strategy or (
+                task_reviewer.strategy.backend in {"ollama", "ollama_cli"}
+                and not self.local_backend_allowed
+            ):
+                raise ValueError("task reviewer must use an authorized configured strategy")
+        block_severities = tuple(task_review_block_severities)
+        if not block_severities or len(block_severities) != len(set(block_severities)):
+            raise ValueError("task-review blocking severities must be non-empty and unique")
+        self.task_reviewer = task_reviewer
+        self.independent_task_review = independent_task_review
+        self.task_review_block_severities = block_severities
 
     def run(
         self,
@@ -726,6 +773,10 @@ class TaskOrchestrator:
                 or prior_run.allowed_backends != self.allowed_backends
                 or prior_run.local_backend_allowed != self.local_backend_allowed
                 or prior_run.independent_node_assessment != self.independent_node_assessment
+                or prior_run.independent_task_review != self.independent_task_review
+                or prior_run.task_reviewer_strategy
+                != (None if self.task_reviewer is None else self.task_reviewer.strategy)
+                or prior_run.task_review_block_severities != self.task_review_block_severities
                 or prior_run.max_concurrency != self.max_concurrency
                 or prior_run.repository != self.repository
                 or prior_run.base_commit != self.base_commit
@@ -794,6 +845,10 @@ class TaskOrchestrator:
                 or graph_run.allowed_backends != self.allowed_backends
                 or graph_run.local_backend_allowed != self.local_backend_allowed
                 or graph_run.independent_node_assessment != self.independent_node_assessment
+                or graph_run.independent_task_review != self.independent_task_review
+                or graph_run.task_reviewer_strategy
+                != (None if self.task_reviewer is None else self.task_reviewer.strategy)
+                or graph_run.task_review_block_severities != self.task_review_block_severities
                 or graph_run.repository != self.repository
                 or graph_run.base_commit != self.base_commit
                 or graph_run.operator_config_digest != self.operator_config_digest
@@ -938,6 +993,11 @@ class TaskOrchestrator:
                 allowed_backends=self.allowed_backends,
                 local_backend_allowed=self.local_backend_allowed,
                 independent_node_assessment=self.independent_node_assessment,
+                independent_task_review=self.independent_task_review,
+                task_reviewer_strategy=(
+                    None if self.task_reviewer is None else self.task_reviewer.strategy
+                ),
+                task_review_block_severities=self.task_review_block_severities,
                 planner_routing=None if proposal is None else proposal.planner_routing,
                 status="planned" if plan_only else "running",
                 max_concurrency=self.max_concurrency,
@@ -989,6 +1049,7 @@ class TaskOrchestrator:
                 previous_node = previous_nodes.get(node_id)
                 if (
                     replan
+                    and not self.independent_task_review
                     and previous_revision is not None
                     and previous_node is not None
                     and prior is not None
@@ -1122,6 +1183,7 @@ class TaskOrchestrator:
             if transition.node_id is not None:
                 loop_counts[(transition.node_id, transition.action)] += 1
         repair_feedback_by_node: dict[str, tuple[Digest, ...]] = {}
+        repair_goal_by_node: dict[str, str] = {}
         for node_id, record in records.items():
             if record.status != "pending":
                 continue
@@ -1134,6 +1196,10 @@ class TaskOrchestrator:
             )
             if repair is not None:
                 repair_feedback_by_node[node_id] = repair.evidence_digests
+                if repair.reason_code == "ACCEPTED_TASK_REVIEW_FEEDBACK":
+                    repair_goal_by_node[node_id] = self._task_review_repair_goal(
+                        nodes[node_id], repair.evidence_digests
+                    )
         active: dict[
             Future[NodeExecutionResult],
             tuple[str, Node, WorkerRequest, NodeReservationRecord],
@@ -1329,7 +1395,7 @@ class TaskOrchestrator:
                         id=identifier("worker-request"),
                         run_id=_node_worker_run_id(run_id, node),
                         created_at=now(),
-                        goal=node.objective or node.name,
+                        goal=repair_goal_by_node.get(node_id, node.objective or node.name),
                         completion_criteria=tuple(
                             item.description for item in node.completion_criteria
                         ),
@@ -1436,24 +1502,146 @@ class TaskOrchestrator:
                             if item is not None
                         )
                         if current.status == "passed":
-                            self._save_loop_transition(
-                                LoopTransitionRecord(
-                                    id=identifier("loop-transition"),
-                                    run_id=run_id,
-                                    created_at=now(),
-                                    action=LoopAction.PASS,
-                                    reason_code="NODE_EVALUATION_PASS",
-                                    accepted_graph_revision_digest=graph_digest,
-                                    generation=node.generation,
-                                    attempt=node.attempt,
-                                    node_id=node_id,
-                                    worker_request_digest=request.content_digest,
-                                    worker_result_digest=current.worker_result_digest,
-                                    evidence_digests=feedback,
-                                    consumed=0,
-                                    limit=0,
+                            review_decision: TaskReviewDecision | None = None
+                            if self.independent_task_review:
+                                review_decision, feedback = self._review_verified_result(
+                                    graph_run,
+                                    node,
+                                    request,
+                                    result,
+                                    current,
+                                    graph_digest,
                                 )
-                            )
+                            if review_decision is None or (
+                                review_decision.action is TaskReviewAction.PASS
+                            ):
+                                self._save_loop_transition(
+                                    LoopTransitionRecord(
+                                        id=identifier("loop-transition"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        action=LoopAction.PASS,
+                                        reason_code=(
+                                            "NODE_EVALUATION_PASS"
+                                            if review_decision is None
+                                            else "TASK_REVIEW_PASS"
+                                        ),
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        node_id=node_id,
+                                        worker_request_digest=request.content_digest,
+                                        worker_result_digest=current.worker_result_digest,
+                                        evidence_digests=feedback,
+                                        consumed=0,
+                                        limit=0,
+                                    )
+                                )
+                            elif review_decision.action is TaskReviewAction.REPAIR:
+                                repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
+                                repair_limit = graph_run.max_repairs
+                                remaining = cast(
+                                    Mapping[str, int | float], reservation.remaining_budgets
+                                )
+                                resources_available = _node_resources_remain(node, remaining)
+                                if repair_count < repair_limit and resources_available:
+                                    transition = LoopTransitionRecord(
+                                        id=identifier("loop-transition"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        action=LoopAction.REPAIR,
+                                        reason_code="ACCEPTED_TASK_REVIEW_FEEDBACK",
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        node_id=node_id,
+                                        worker_request_digest=request.content_digest,
+                                        worker_result_digest=current.worker_result_digest,
+                                        evidence_digests=feedback,
+                                        consumed=repair_count + 1,
+                                        limit=repair_limit,
+                                    )
+                                    self._save_loop_transition(transition)
+                                    loop_counts[(node_id, LoopAction.REPAIR)] += 1
+                                    repair_feedback_by_node[node_id] = feedback
+                                    repair_goal_by_node[node_id] = self._task_review_repair_goal(
+                                        node, feedback
+                                    )
+                                    records[node_id] = NodeExecutionRecord(
+                                        id=identifier("node-execution"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        node_id=node_id,
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=graph_run.generation,
+                                        attempt=current.attempt + 1,
+                                        sequence=0,
+                                        status="pending",
+                                        failure_code="REPAIR_AFTER:TASK_REVIEW_BLOCKED",
+                                    )
+                                    self._save_node(records[node_id])
+                                else:
+                                    reason = (
+                                        "REPAIR_RESOURCE_BUDGET_EXHAUSTED"
+                                        if repair_count < repair_limit
+                                        else "REPAIR_BUDGET_EXHAUSTED"
+                                    )
+                                    self._save_loop_transition(
+                                        LoopTransitionRecord(
+                                            id=identifier("loop-transition"),
+                                            run_id=run_id,
+                                            created_at=now(),
+                                            action=LoopAction.ESCALATE,
+                                            reason_code=reason,
+                                            accepted_graph_revision_digest=graph_digest,
+                                            generation=node.generation,
+                                            attempt=node.attempt,
+                                            node_id=node_id,
+                                            worker_request_digest=request.content_digest,
+                                            worker_result_digest=current.worker_result_digest,
+                                            evidence_digests=feedback,
+                                            consumed=repair_count,
+                                            limit=repair_limit,
+                                        )
+                                    )
+                                    records[node_id] = self._advance(
+                                        current,
+                                        status="failed",
+                                        failure_code=f"LOOP_ESCALATED:{reason}",
+                                    )
+                            else:
+                                action = (
+                                    LoopAction.ESCALATE
+                                    if review_decision.action is TaskReviewAction.ESCALATE
+                                    else LoopAction.FAIL
+                                )
+                                self._save_loop_transition(
+                                    LoopTransitionRecord(
+                                        id=identifier("loop-transition"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        action=action,
+                                        reason_code=review_decision.reason_code,
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        node_id=node_id,
+                                        worker_request_digest=request.content_digest,
+                                        worker_result_digest=current.worker_result_digest,
+                                        evidence_digests=feedback,
+                                        consumed=0,
+                                        limit=0,
+                                    )
+                                )
+                                records[node_id] = self._advance(
+                                    current,
+                                    status="failed",
+                                    failure_code=(
+                                        f"LOOP_ESCALATED:{review_decision.reason_code}"
+                                        if action is LoopAction.ESCALATE
+                                        else review_decision.reason_code
+                                    ),
+                                )
                         elif current.evaluator_decision is EvaluationDecision.FAIL:
                             repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
                             repair_limit = graph_run.max_repairs
@@ -1632,6 +1820,16 @@ class TaskOrchestrator:
         authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
         if authoritative.generation != graph_run.generation:
             return authoritative
+        if self.independent_task_review:
+            for node_id, record in tuple(records.items()):
+                if record.status == "passed" and not self._task_review_pass_is_authoritative(
+                    record
+                ):
+                    records[node_id] = self._advance(
+                        record,
+                        status="failed",
+                        failure_code="TASK_REVIEW_INCOMPLETE",
+                    )
         node_pass = all(item.status == "passed" for item in records.values())
         writing_graph = any("edit_intent" in node.required_capabilities for node in nodes.values())
         if self.defer_parent_evaluation and writing_graph:
@@ -1979,6 +2177,42 @@ class TaskOrchestrator:
                     ),
                 )
             ),
+            task_review_requests=tuple(
+                sorted(
+                    self.store.list_records(
+                        "task_review_request_v2", TaskReviewRequest, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.attempt, item.node_id),
+                )
+            ),
+            task_review_results=tuple(
+                sorted(
+                    self.store.list_records(
+                        "task_review_result_v2", TaskReviewResult, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.attempt, item.node_id),
+                )
+            ),
+            task_review_decisions=tuple(
+                sorted(
+                    self.store.list_records(
+                        "task_review_decision_v2", TaskReviewDecision, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.attempt, item.node_id),
+                )
+            ),
+            stale_task_review_results=tuple(
+                sorted(
+                    self.store.list_records(
+                        "stale_task_review_result_v2", StaleTaskReviewResult, run_id=run_id
+                    ),
+                    key=lambda item: (
+                        item.expected_generation,
+                        item.expected_attempt,
+                        item.node_id,
+                    ),
+                )
+            ),
             route_count=len(routes),
             worker_result_count=sum(
                 item.worker_result_digest is not None for item in latest.values()
@@ -2266,6 +2500,204 @@ class TaskOrchestrator:
             effective_policy_digest=effective_policy_digest,
             harness_digest=harness_digest,
         )
+
+    def _task_review_repair_goal(self, node: Node, feedback: tuple[Digest, ...]) -> str:
+        if len(feedback) != 3:
+            raise ValueError("task-review repair feedback must bind request, result, and decision")
+        results = self.store.list_records("task_review_result_v2", TaskReviewResult)
+        decisions = self.store.list_records("task_review_decision_v2", TaskReviewDecision)
+        result = next((item for item in results if item.content_digest == feedback[1]), None)
+        decision = next((item for item in decisions if item.content_digest == feedback[2]), None)
+        if (
+            result is None
+            or decision is None
+            or decision.action is not TaskReviewAction.REPAIR
+            or decision.result_digest != result.content_digest
+            or decision.node_id != node.id
+        ):
+            raise ValueError("task-review repair feedback is stale or non-authoritative")
+        accepted = tuple(
+            item
+            for item in result.findings
+            if canonical_digest(item) in decision.accepted_finding_digests
+        )
+        if len(accepted) != len(decision.accepted_finding_digests):
+            raise ValueError("task-review repair findings do not match the accepted digests")
+        lines = [node.objective or node.name, "", "Accepted semantic review repair objectives:"]
+        for finding in accepted:
+            refs = ",".join((*finding.evidence_digests, *finding.artifact_digests))
+            lines.append(
+                f"- {finding.id} [{canonical_digest(finding)}] {finding.repair_objective} "
+                f"(evidence: {refs})"
+            )
+        value = "\n".join(lines)
+        if len(value) > 20_000:
+            raise ValueError("accepted task-review repair context exceeds the worker bound")
+        return value
+
+    def _task_review_pass_is_authoritative(self, record: NodeExecutionRecord) -> bool:
+        result_generation = (
+            record.generation if record.output_generation is None else record.output_generation
+        )
+        requests = self.store.list_records(
+            "task_review_request_v2", TaskReviewRequest, run_id=record.run_id
+        )
+        results = self.store.list_records(
+            "task_review_result_v2", TaskReviewResult, run_id=record.run_id
+        )
+        decisions = self.store.list_records(
+            "task_review_decision_v2", TaskReviewDecision, run_id=record.run_id
+        )
+        candidates = tuple(
+            item
+            for item in decisions
+            if item.node_id == record.node_id
+            and item.accepted_graph_revision_digest == record.accepted_graph_revision_digest
+            and item.generation == result_generation
+            and item.attempt == record.attempt
+            and item.action is TaskReviewAction.PASS
+        )
+        if not candidates:
+            return False
+        decision = max(candidates, key=lambda item: (item.created_at, item.id))
+        request = next(
+            (item for item in requests if item.content_digest == decision.request_digest), None
+        )
+        result = next(
+            (item for item in results if item.content_digest == decision.result_digest), None
+        )
+        if request is None or result is None:
+            return False
+        try:
+            validate_task_review_result(request, result)
+        except ValueError:
+            return False
+        return bool(
+            request.node_id == record.node_id
+            and request.worker_request_digest == record.worker_request_digest
+            and request.worker_result_digest == record.worker_result_digest
+            and record.evidence_digest in request.deterministic_evidence_digests
+            and record.evaluator_digest in request.deterministic_evidence_digests
+            and decision.result_digest == result.content_digest
+        )
+
+    def _review_verified_result(
+        self,
+        graph_run: GraphRunRecord,
+        node: Node,
+        worker_request: WorkerRequest,
+        execution_result: NodeExecutionResult,
+        node_record: NodeExecutionRecord,
+        graph_digest: Digest,
+    ) -> tuple[TaskReviewDecision, tuple[Digest, ...]]:
+        """Persist one exact review chain and return its authoritative feedback digests."""
+
+        assert self.task_reviewer is not None
+        if (
+            node_record.evaluator_decision is not EvaluationDecision.PASS
+            or node_record.evidence_digest is None
+            or node_record.evaluator_digest is None
+            or node_record.worker_result_digest is None
+            or worker_request.content_digest is None
+            or execution_result.worker_result.content_digest is None
+        ):
+            raise ValueError("task review requires an exact successful verification chain")
+        criterion_by_id = {item.criterion_id: item for item in execution_result.criterion_evidence}
+        criterion_ids = tuple(item.id for item in node.completion_criteria)
+        if (
+            not criterion_ids
+            or len(criterion_ids) > 16
+            or set(criterion_by_id) != set(criterion_ids)
+        ):
+            raise ValueError("independent task review supports one to sixteen exact criteria")
+        deterministic_digests = tuple(
+            dict.fromkeys(
+                (
+                    node_record.evidence_digest,
+                    node_record.evaluator_digest,
+                    *node_record.verification_result_digests,
+                )
+            )
+        )
+        review_request = TaskReviewRequest(
+            id=identifier("task-review-request"),
+            run_id=graph_run.id,
+            created_at=now(),
+            node_id=node.id,
+            objective=node.objective or node.name,
+            completion_criteria=tuple(item.description for item in node.completion_criteria),
+            criterion_ids=criterion_ids,
+            accepted_graph_revision_digest=graph_digest,
+            generation=node.generation,
+            attempt=node.attempt,
+            reviewer_strategy=self.task_reviewer.strategy,
+            harness_digest=graph_run.harness_digest,
+            effective_policy_digest=graph_run.effective_policy_digest,
+            worker_request_digest=worker_request.content_digest,
+            worker_request=worker_request,
+            worker_result_digest=execution_result.worker_result.content_digest,
+            worker_result=execution_result.worker_result,
+            criterion_evidence=tuple(criterion_by_id[item] for item in criterion_ids),
+            deterministic_evidence_digests=deterministic_digests,
+            artifact_descriptors=execution_result.artifact_descriptors,
+        )
+        self.store.put("task_review_request_v2", review_request, run_id=graph_run.id)
+        review_result: TaskReviewResult | None = None
+        try:
+            review_result = self.task_reviewer.review(review_request)
+            validate_task_review_result(review_request, review_result)
+            self.store.put("task_review_result_v2", review_result, run_id=graph_run.id)
+            decision = decide_task_review(
+                review_request,
+                review_result,
+                block_severities=self.task_review_block_severities,
+                decision_id=identifier("task-review-decision"),
+                run_id=graph_run.id,
+                created_at=now(),
+            )
+        except Exception:
+            if review_result is not None:
+                self.store.put(
+                    "stale_task_review_result_v2",
+                    StaleTaskReviewResult(
+                        id=identifier("stale-task-review-result"),
+                        run_id=graph_run.id,
+                        created_at=now(),
+                        node_id=node.id,
+                        request_digest=_required_digest(review_request.content_digest),
+                        result_digest=_required_digest(review_result.content_digest),
+                        expected_graph_revision_digest=graph_digest,
+                        result_graph_revision_digest=review_result.accepted_graph_revision_digest,
+                        expected_generation=node.generation,
+                        result_generation=review_result.generation,
+                        expected_attempt=node.attempt,
+                        result_attempt=review_result.attempt,
+                    ),
+                    run_id=graph_run.id,
+                )
+            decision = TaskReviewDecision(
+                id=identifier("task-review-decision"),
+                run_id=graph_run.id,
+                created_at=now(),
+                request_digest=_required_digest(review_request.content_digest),
+                node_id=node.id,
+                accepted_graph_revision_digest=graph_digest,
+                generation=node.generation,
+                attempt=node.attempt,
+                action=TaskReviewAction.FAIL,
+                reason_code="TASK_REVIEW_FAILED",
+            )
+        self.store.put("task_review_decision_v2", decision, run_id=graph_run.id)
+        feedback = tuple(
+            item
+            for item in (
+                review_request.content_digest,
+                None if review_result is None else review_result.content_digest,
+                decision.content_digest,
+            )
+            if item is not None
+        )
+        return decision, feedback
 
     def _persist_result(
         self,
@@ -2676,7 +3108,57 @@ class TaskOrchestrator:
         )
         if repair is None:
             return not feedback
-        if len(feedback) != 2 or feedback != repair.evidence_digests:
+        if feedback != repair.evidence_digests:
+            return False
+        if repair.reason_code == "ACCEPTED_TASK_REVIEW_FEEDBACK":
+            if len(feedback) != 3:
+                return False
+            review_requests = self.store.list_records(
+                "task_review_request_v2", TaskReviewRequest, run_id=request.graph_run_id
+            )
+            review_results = self.store.list_records(
+                "task_review_result_v2", TaskReviewResult, run_id=request.graph_run_id
+            )
+            review_decisions = self.store.list_records(
+                "task_review_decision_v2", TaskReviewDecision, run_id=request.graph_run_id
+            )
+            trusted_request = next(
+                (item for item in review_requests if item.content_digest == feedback[0]), None
+            )
+            trusted_result = next(
+                (item for item in review_results if item.content_digest == feedback[1]), None
+            )
+            trusted_decision = next(
+                (item for item in review_decisions if item.content_digest == feedback[2]), None
+            )
+            if (
+                trusted_request is None
+                or trusted_result is None
+                or trusted_decision is None
+                or trusted_result.request_digest != trusted_request.content_digest
+                or trusted_decision.request_digest != trusted_request.content_digest
+                or trusted_decision.result_digest != trusted_result.content_digest
+                or trusted_decision.action is not TaskReviewAction.REPAIR
+                or trusted_request.node_id != node.id
+                or trusted_request.accepted_graph_revision_digest
+                != repair.accepted_graph_revision_digest
+                or trusted_request.generation != repair.generation
+                or trusted_request.attempt != repair.attempt
+                or trusted_request.worker_request_digest != repair.worker_request_digest
+                or trusted_request.worker_result_digest != repair.worker_result_digest
+                or trusted_result.node_id != node.id
+                or trusted_result.accepted_graph_revision_digest
+                != repair.accepted_graph_revision_digest
+                or trusted_result.generation != repair.generation
+                or trusted_result.attempt != repair.attempt
+            ):
+                return False
+            try:
+                validate_task_review_result(trusted_request, trusted_result)
+            except ValueError:
+                return False
+            return True
+        if len(feedback) != 2 or repair.reason_code != "ACCEPTED_NODE_EVALUATION_FEEDBACK":
             return False
         history = self.store.list_records(
             "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id

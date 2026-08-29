@@ -55,12 +55,24 @@ def test_explicit_harness_is_typed_strict_and_deeply_immutable(tmp_path: Path) -
     harness = discover_project(tmp_path)
     assert isinstance(harness, ProjectHarnessV2)
     assert harness.verification.required == ("test",)
+    assert not harness.verification.review.independent_task_review
     with pytest.raises(TypeError):
         harness.commands["lint"] = harness.commands["test"]  # type: ignore[index]
     broken = valid_harness()
     broken["unknown"] = True
     with pytest.raises(ValidationError):
         ProjectHarnessV2.model_validate_json(json.dumps(broken), strict=True)
+
+
+def test_independent_task_review_requires_explicit_harness_review_gate() -> None:
+    enabled = valid_harness()
+    enabled["verification"]["review"]["independent_task_review"] = True
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
+    assert harness.verification.review.independent_task_review
+
+    enabled["verification"]["review"]["required"] = False
+    with pytest.raises(ValidationError, match="requires the review gate"):
+        ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
 
 
 def test_harness_allows_repeated_argv_but_rejects_overlapping_protected_paths() -> None:

@@ -30,6 +30,7 @@ from ai_employee.task_orchestration import (
     TaskGraphAcceptance,
 )
 from ai_employee.task_planning import ProposedGraph
+from ai_employee.task_review import TaskReviewDecision
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -68,6 +69,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 }
             elif protocol == "fleet-plan-review/2":
                 structured = {"schema_version": "2", "findings": []}
+            elif protocol == "fleet-task-result-review/2":
+                structured = {
+                    "schema_version": "2",
+                    "findings": [],
+                    "reviewed_criterion_ids": prompt["request"]["criterion_ids"],
+                    "limitations": [],
+                }
             elif protocol == "fleet-proposed-graph/2":
                 def node(name, complexity):
                     return {
@@ -151,6 +159,14 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             raise SystemExit(0)
         if protocol == "fleet-plan-review/2":
             print(json.dumps({"schema_version": "2", "findings": []}))
+            raise SystemExit(0)
+        if protocol == "fleet-task-result-review/2":
+            print(json.dumps({
+                "schema_version": "2",
+                "findings": [],
+                "reviewed_criterion_ids": prompt["request"]["criterion_ids"],
+                "limitations": [],
+            }))
             raise SystemExit(0)
         if protocol == "fleet-proposed-graph/2":
             def node(node_name, complexity):
@@ -280,7 +296,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                     "writable": ["a.txt", "b.txt", "c.txt"],
                     "protected": [".git/**"],
                 },
-                "verification": {"required": ["parent-test"]},
+                "verification": {
+                    "required": ["parent-test"],
+                    "review": {"independent_task_review": True},
+                },
                 "worker": {
                     "allowed": ["codex_cli"],
                     "allowed_strategy_ids": ["low", "high", "planner"],
@@ -321,6 +340,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "routing": {
                     "default_strategy_set": "all",
                     "default_assessment_strategy": "planner",
+                    "default_task_reviewer_strategy": "planner",
                     "strategy_sets": {"all": ["low", "high", "planner"]},
                     "strategies": [
                         {
@@ -350,6 +370,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             "effort": "high",
                             "capabilities": ["edit_intent", "process"],
                             "planner_eligible": True,
+                            "task_reviewer_eligible": True,
                         },
                     ],
                 },
@@ -404,6 +425,9 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
             "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
         )
         requests = store.list_records("worker_request_v2", WorkerRequest)
+        task_reviews = store.list_records(
+            "task_review_decision_v2", TaskReviewDecision, run_id=run_id
+        )
         work_runs = store.list_records("work_run_v2", WorkRun)
         composition = store.get(
             "graph_patch_composition_v2",
@@ -473,6 +497,9 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     assert set(request_by_node) == {"a", "b", "c"}
     assert len({item.id for item in request_by_node.values()}) == 3
     assert len({item.run_id for item in request_by_node.values()}) == 3
+    assert len(task_reviews) == 3
+    assert all(item.action.value == "PASS" for item in task_reviews)
+    assert len(inspected["task_reviews"]["decisions"]) == 3
     assert all(
         item.accepted_graph_revision_digest == graph_run.accepted_graph_revision_digest
         for item in request_by_node.values()
