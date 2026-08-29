@@ -28,6 +28,7 @@ from ai_employee.domain.v2 import (
     WorkerResult,
 )
 from ai_employee.inspector import inspect_graph_run
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.serialization import canonical_digest
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
@@ -344,6 +345,7 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         run = _execute_revision_two(scenario)
         replay = scenario.orchestrator.replay(RUN_ID)
         inspected = inspect_graph_run(store, RUN_ID)
+        explanation = explain_any_run(store, RUN_ID)
 
         assert run.status == "completed"
         assert run.generation == 1
@@ -366,6 +368,10 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         assert revision_two.previous_revision_digest == revision_one_digest
         assert revision_two.replan_trigger == "repair failed node"
         assert revision_two.replan_evidence == (scenario.evidence,)
+        assert [item["revision"] for item in explanation["graph"]["evolution"]] == [1, 2]
+        assert explanation["graph"]["evolution"][1]["trigger"] == "repair failed node"
+        assert explanation["graph"]["evolution"][1]["evidence_digests"] == [scenario.evidence]
+        assert explanation["current_state"]["graph_revision"] == 2
 
         by_node = {item.node_id: item for item in replay.nodes}
         retained = replay.retained_node_bindings

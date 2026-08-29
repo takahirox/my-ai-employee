@@ -10,7 +10,15 @@ from urllib.parse import urlparse
 
 from pydantic import RootModel
 
-from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
+from .domain import (
+    Artifact,
+    ContextPackage,
+    ExecutionMetrics,
+    Goal,
+    Node,
+    Run,
+    VerificationEvidence,
+)
 from .domain.base import FrozenDict
 from .domain.browser import BrowserObservation
 from .domain.evaluation import EvaluationEvidenceLedger, EvaluationResult, ObservationManifest
@@ -68,6 +76,7 @@ from .task_orchestration import (
     TaskGraphAcceptance,
     _load_plan_review_history,
 )
+from .task_planning import ProposedGraph
 from .task_review import (
     StaleTaskReviewResult,
     TaskReviewDecision,
@@ -105,6 +114,7 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     routing = [item.custom for item in metrics if item.custom is not None]
     return {
         "run_id": run.id,
+        "goal": _json_model(run.goal),
         "state": run.state.value,
         "generation": run.generation,
         "graph": {
@@ -567,11 +577,40 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
     failures = store.list_records(
         "plan_review_failure_evidence_v2", PlanReviewFailureEvidence, run_id=run_id
     )
+    try:
+        goal_projection = _json_model(store.get("goal_v2", attempts[0].goal_id, Goal))
+    except KeyError:
+        # Databases created before the Issue 14 projection did not preserve the
+        # pre-acceptance Goal body. Keep them inspectable and mark the gap instead
+        # of inventing a statement or invoking an AI to reconstruct it.
+        goal_projection = {
+            "id": attempts[0].goal_id,
+            "statement": None,
+            "unavailable_reason": "goal_not_persisted_by_older_runtime",
+        }
+    proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+    if not proposals:
+        raise KeyError(("proposed_graph_v2", run_id))
+    proposal = next(
+        (
+            item
+            for item in reversed(proposals)
+            if item.content_digest == attempts[-1].proposed_graph_digest
+        ),
+        None,
+    )
+    if proposal is None:
+        raise KeyError(("proposed_graph_v2", attempts[-1].proposed_graph_digest))
     return {
         "schema_version": "2",
         "run_id": run_id,
         "kind": "graph_run",
         "state": "failed",
+        "generation": 0,
+        "goal": goal_projection,
+        "proposed_graph": _json_model(proposal),
+        "graph_acceptance": None,
+        "graph_revisions": [],
         "plan_review": {
             "status": "failed",
             "attempts": [_json_model(item) for item in attempts],
@@ -618,7 +657,17 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path.startswith("/api/runs/"):
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
+                run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
+                try:
+                    from .run_explanation import explain_any_run
+
+                    body = canonical_json(explain_any_run(store, run_id)).encode()
+                except KeyError:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                content_type = "application/json"
+            elif parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.removeprefix("/api/runs/")
                 try:
                     body = canonical_json(inspect_any_run(store, run_id)).encode()

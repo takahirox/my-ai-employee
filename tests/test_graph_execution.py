@@ -65,6 +65,7 @@ from ai_employee.parent_review import (
     ParentSemanticSeverity,
     bind_parent_semantic_review_payload,
 )
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.services_v2 import (
@@ -659,6 +660,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             by_node[name].evidence_digest for name in ("a", "b")
         )
         inspected = inspect_graph_run(store, run.id)
+        explanation = explain_any_run(store, run.id)
         assert len(inspected["parent_acceptance"]) == (
             0 if parent_verification_succeeds is None else 1
         )
@@ -674,6 +676,13 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         inspected_manifests = inspected["worker_context_manifests"]
         assert len(inspected_manifests) == 3
         assert all(item["artifact_bodies_included"] is False for item in inspected_manifests)
+        assert all(
+            item["information_flow"]["artifact_bodies_included"] is False
+            for item in explanation["task_stories"]
+        )
+        if semantic_repair:
+            assert explanation["final_outcome"]["parent_semantic_review"]["action"] == ("REPAIR")
+            assert explanation["final_outcome"]["disposition"] == "rejected_or_incomplete"
         assert requests["c"].prior_artifact_digests == (
             by_node["a"].patch_digest,
             by_node["b"].patch_digest,

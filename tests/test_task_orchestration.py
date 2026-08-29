@@ -43,6 +43,7 @@ from ai_employee.plan_review import (
     PlanRevisionAttempt,
     bind_plan_review,
 )
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.serialization import canonical_digest
 from ai_employee.services_v2._common import identifier
 from ai_employee.storage import SQLiteStore
@@ -221,6 +222,57 @@ def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> N
         assert replay.worker_result_count == 3
         assert replay.evidence_count == 3
         assert replay.evaluator_count == 3
+        explanation = explain_any_run(store, run.id)
+        assert explanation == explain_any_run(store, run.id)
+        assert explanation["goal"]["statement"] == goal.statement
+        assert explanation["current_state"]["task_counts"] == {"completed": 3}
+        assert explanation["graph"]["accepted"] is True
+        assert [item["task_id"] for item in explanation["task_stories"]] == ["a", "b", "c"]
+        assert explanation["task_stories"][2]["information_flow"]["predecessor_task_ids"] == [
+            "a",
+            "b",
+        ]
+        assert explanation["task_stories"][0]["routing"]["selected_strategy"]["id"] == (
+            "strategy-process"
+        )
+        assert explanation["final_outcome"]["disposition"] == "accepted"
+        assert explanation["observation"] == {
+            "source": "persisted_facts",
+            "read_only": True,
+            "ai_invocations": 0,
+            "artifact_bodies_read": False,
+        }
+        assert len(requests) == 3
+
+
+def test_explanation_marks_ready_and_dependency_waiting_tasks(tmp_path: Path) -> None:
+    goal = Goal(id="goal-planned", statement="plan a fork and join")
+    with SQLiteStore(tmp_path / "planned.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("plan-only explanation must not invoke a Worker"),
+            (_strategy(),),
+            max_concurrency=2,
+        )
+        run = orchestrator.run(
+            goal,
+            _fork_join_graph(),
+            ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="planned-explanation",
+            available_capabilities=("process",),
+            plan_only=True,
+        )
+
+        assert run.status == "planned"
+        explanation = explain_any_run(store, run.id)
+        assert explanation["current_state"]["ready_task_ids"] == ["a", "b"]
+        assert explanation["current_state"]["waiting_task_ids"] == ["c"]
+        assert explanation["current_state"]["task_counts"] == {"ready": 2, "waiting": 1}
+        assert explanation["task_stories"][2]["why_this_state"] == [
+            "one or more predecessor tasks have not passed"
+        ]
 
 
 def test_explicit_breadth_objective_propagates_to_worker_request(tmp_path: Path) -> None:
@@ -774,6 +826,23 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(
         assert (
             inspected["plan_review"]["failure_evidence"][0]["stdout_artifact_digest"]
             == stdout_artifact_digest
+        )
+        explanation = explain_any_run(store, run_id)
+        assert explanation["goal"]["statement"] == goal.statement
+        assert explanation["graph"]["accepted"] is False
+        assert explanation["graph"]["tasks"][0]["id"] == "a"
+        assert explanation["failure_path"][0]["stage"] == "plan_review"
+        assert explanation["failure_path"][0]["reason_code"] == "PLAN_REVIEW_FAILED"
+        assert explanation["final_outcome"]["failure_code"] == "PLAN_REVIEW_FAILED"
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("goal_v2", goal.id),
+            )
+        older_explanation = explain_any_run(store, run_id)
+        assert older_explanation["goal"]["statement"] is None
+        assert older_explanation["goal"]["unavailable_reason"] == (
+            "goal_not_persisted_by_older_runtime"
         )
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 

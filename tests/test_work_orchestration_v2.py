@@ -38,6 +38,7 @@ from ai_employee.domain.v2 import (
 )
 from ai_employee.inspector import inspect_work_run
 from ai_employee.orchestration import WorkCoordinator, WorkRun
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
@@ -1257,6 +1258,12 @@ def test_v2_inspector_projects_evidence_without_artifact_bodies(tmp_path: Path) 
         assert view["patch"]["artifact_digest"] == sha256(patch).hexdigest()
         assert "body" not in view["patch"]
         assert view["events"]
+        explanation = explain_any_run(store, "work-1")
+        assert explanation["goal"]["statement"] == run.goal
+        assert explanation["current_state"]["status"] == "ready_to_promote"
+        assert explanation["final_outcome"]["disposition"] == ("accepted_awaiting_promotion")
+        assert explanation["observation"]["artifact_bodies_read"] is False
+        assert explanation["timeline"]
     finally:
         store.close()
 

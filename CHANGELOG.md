@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added deterministic single-run explanations through `fleet explain` and the local
+  Inspector, including graph position, persisted decision reasons, information flow,
+  failure paths, graph evolution, and final disposition without AI re-execution.
 - Added machine-local Operator Config support for explicit Codex and Claude Code
   executable paths, deterministic runtime path entries, and executable provenance.
 

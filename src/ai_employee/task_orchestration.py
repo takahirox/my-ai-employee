@@ -1910,6 +1910,10 @@ class TaskOrchestrator:
             raise ValueError("review and revision must reuse the resolved Planner strategy")
         max_nodes = min(proposal.graph.budget.max_nodes, policy.max_nodes)
         max_wall_seconds = min(proposal.graph.budget.max_wall_seconds, policy.max_wall_seconds)
+        # Preserve the human-authored subject before the probabilistic review gate.
+        # A failed gate never creates GraphRunRecord, so without this small record a
+        # historical diagnosis could identify the rejected proposal but not its Goal.
+        self.store.put("goal_v2", goal, run_id=proposal.run_id)
         self.store.put("proposed_graph_v2", proposal, run_id=proposal.run_id)
         first = self._invoke_plan_review(
             goal,
