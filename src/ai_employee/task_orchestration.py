@@ -45,8 +45,11 @@ from .plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAction,
     PlanReviewAttempt,
+    PlanReviewFailureEvidence,
+    PlanReviewFailureKind,
     PlanReviewFinding,
     PlanReviewGateError,
+    PlanReviewInvocationError,
     PlanReviewPayload,
     PlanRevisionAttempt,
     TrustedPlanReview,
@@ -2018,13 +2021,18 @@ class TaskOrchestrator:
                 or trusted.effective_policy_digest != proposal.effective_policy_digest
                 or trusted.harness_digest != proposal.harness_digest
             ):
-                raise ValueError("plan review returned stale or mismatched bindings")
+                raise PlanReviewInvocationError(
+                    PlanReviewFailureKind.STALE_BINDING,
+                    "plan review returned stale or mismatched bindings",
+                )
             attempt = _completed_plan_review_attempt(trusted)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             attempt = _failed_plan_review_attempt(
                 goal, proposal, review_round, self.plan_reviewer.strategy
             )
             self.store.put("plan_review_attempt_v2", attempt, run_id=proposal.run_id)
+            failure = _plan_review_failure_evidence(attempt, error)
+            self.store.put("plan_review_failure_evidence_v2", failure, run_id=proposal.run_id)
             raise PlanReviewGateError("PLAN_REVIEW_FAILED", str(error)) from error
         self.store.put("plan_review_attempt_v2", attempt, run_id=proposal.run_id)
         return attempt
@@ -3352,6 +3360,26 @@ def _failed_plan_review_attempt(
         outcome="failed",
         action=PlanReviewAction.REJECT,
         failure_code="PLAN_REVIEW_FAILED",
+    )
+
+
+def _plan_review_failure_evidence(
+    attempt: PlanReviewAttempt,
+    error: BaseException,
+) -> PlanReviewFailureEvidence:
+    kind = PlanReviewFailureKind.REVIEWER_ERROR
+    stdout_artifact_digest = None
+    if isinstance(error, PlanReviewInvocationError):
+        kind = error.kind
+        stdout_artifact_digest = error.stdout_artifact_digest
+    return PlanReviewFailureEvidence(
+        id=identifier("plan-review-failure"),
+        run_id=attempt.run_id,
+        created_at=now(),
+        plan_review_attempt_id=attempt.id,
+        plan_review_attempt_digest=_required_digest(attempt.content_digest),
+        failure_kind=kind,
+        stdout_artifact_digest=stdout_artifact_digest,
     )
 
 

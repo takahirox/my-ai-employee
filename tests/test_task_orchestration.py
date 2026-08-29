@@ -28,14 +28,17 @@ from ai_employee.domain import (
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
 from ai_employee.graph import GraphValidationError, accept_task_graph
-from ai_employee.inspector import inspect_graph_run
+from ai_employee.inspector import inspect_any_run, inspect_graph_run
 from ai_employee.plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAttempt,
+    PlanReviewFailureEvidence,
+    PlanReviewFailureKind,
     PlanReviewFinding,
     PlanReviewFindingType,
     PlanReviewGateError,
     PlanReviewImpact,
+    PlanReviewInvocationError,
     PlanReviewPayload,
     PlanRevisionAttempt,
     bind_plan_review,
@@ -712,7 +715,11 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
     reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, [])
 
     def fail_review(*_args: object, **_kwargs: object) -> object:
-        raise ValueError("malformed reviewer output")
+        raise PlanReviewInvocationError(
+            PlanReviewFailureKind.MALFORMED_OUTPUT,
+            "malformed reviewer output",
+            stdout_artifact_digest="9" * 64,
+        )
 
     reviewer.review = fail_review  # type: ignore[method-assign]
     with SQLiteStore(tmp_path / "failed-review.db") as store:
@@ -740,6 +747,21 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"
         assert attempts[0].failure_code == "PLAN_REVIEW_FAILED"
+        evidence = store.list_records(
+            "plan_review_failure_evidence_v2",
+            PlanReviewFailureEvidence,
+            run_id="failed-review-run",
+        )
+        assert len(evidence) == 1
+        assert evidence[0].plan_review_attempt_id == attempts[0].id
+        assert evidence[0].plan_review_attempt_digest == attempts[0].content_digest
+        assert evidence[0].failure_kind is PlanReviewFailureKind.MALFORMED_OUTPUT
+        assert evidence[0].stdout_artifact_digest == "9" * 64
+        inspected = inspect_any_run(store, "failed-review-run")
+        assert inspected["plan_review"]["failure_evidence"][0]["failure_kind"] == (
+            "malformed_output"
+        )
+        assert inspected["plan_review"]["failure_evidence"][0]["stdout_artifact_digest"] == "9" * 64
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 
 

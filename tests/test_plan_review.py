@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 
@@ -16,6 +17,7 @@ from ai_employee.plan_review import (
     PlanReviewValidationError,
     bind_plan_review,
     decide_plan_review_action,
+    parse_plan_review_payload,
     validate_plan_review,
 )
 from ai_employee.task_planning import ProposedGraph
@@ -117,6 +119,45 @@ class PlanReviewContractTests(unittest.TestCase):
         self.assertTrue(
             {"verdict", "graph", "capability", "score"}.isdisjoint(PlanReviewPayload.model_fields)
         )
+
+    def test_parser_canonicalizes_schema_valid_wire_order(self) -> None:
+        finding_b = self._finding(finding_id="finding-b").model_dump(mode="json")
+        finding_b["affected_node_ids"] = ["node-z", "node-a"]
+        finding_a = self._finding(finding_id="finding-a").model_dump(mode="json")
+        payload = parse_plan_review_payload(
+            json.dumps(
+                {
+                    "schema_version": "2",
+                    "findings": [finding_b, finding_a],
+                }
+            )
+        )
+
+        self.assertEqual(tuple(item.id for item in payload.findings), ("finding-a", "finding-b"))
+        self.assertEqual(payload.findings[1].affected_node_ids, ("node-a", "node-z"))
+
+    def test_parser_still_rejects_duplicate_ids_references_and_invalid_values(self) -> None:
+        finding = self._finding().model_dump(mode="json")
+        duplicate_id = {
+            "schema_version": "2",
+            "findings": [finding, finding],
+        }
+        duplicate_reference = {
+            "schema_version": "2",
+            "findings": [{**finding, "affected_node_ids": ["node-a", "node-a"]}],
+        }
+        invalid_enum = {
+            "schema_version": "2",
+            "findings": [{**finding, "impact": "maybe"}],
+        }
+        unknown_field = {
+            "schema_version": "2",
+            "findings": [{**finding, "unexpected": True}],
+        }
+
+        for raw in (duplicate_id, duplicate_reference, invalid_enum, unknown_field):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_plan_review_payload(json.dumps(raw))
 
     def test_missing_coverage_may_target_the_goal_without_inventing_a_node(self) -> None:
         finding = PlanReviewFinding(
