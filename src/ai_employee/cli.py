@@ -88,6 +88,7 @@ from .task_orchestration import (
 )
 from .task_planning import (
     CliProposedGraphPlanner,
+    PlannerRoutingDecision,
     ProposedGraph,
     proposed_graph_schema_json,
 )
@@ -174,6 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
     work.add_argument(
         "--assessment-strategy",
         help="exact operator-defined strategy used for adaptive task assessment",
+    )
+    work.add_argument(
+        "--planner-strategy",
+        help="exact planner-eligible strategy used instead of adaptive Planner selection",
     )
     work.add_argument(
         "--operator-config",
@@ -350,6 +355,8 @@ def _work(args: argparse.Namespace) -> int:
         raise ValueError("--strategy-set requires fixed or adaptive routing")
     if args.routing_mode != "adaptive" and args.assessment_strategy is not None:
         raise ValueError("--assessment-strategy requires adaptive routing")
+    if args.routing_mode != "adaptive" and args.planner_strategy is not None:
+        raise ValueError("--planner-strategy requires adaptive routing")
     if routing_enabled and args.model is not None:
         raise ValueError("--routing-mode cannot be combined with --model")
     if routing_enabled and args.worker is not None:
@@ -395,6 +402,9 @@ def _work(args: argparse.Namespace) -> int:
     effective_strategy_set = None
     routing_mode = None
     strategies: tuple[ExecutionStrategy, ...] = ()
+    planner_candidates: tuple[ExecutionStrategy, ...] = ()
+    planner_strategy: ExecutionStrategy | None = None
+    planner_routing: PlannerRoutingDecision | None = None
     proposed_graph: ProposedGraph | None = None
     graph_planner: CliProposedGraphPlanner | None = None
     semantic_assessor: CliTaskAssessmentAdapter | None = None
@@ -405,6 +415,10 @@ def _work(args: argparse.Namespace) -> int:
         if resume_run is None:
             effective_strategy_set = operator_config.strategy_set_name(args.strategy_set)
             strategies = operator_config.execution_strategies(routing_mode, effective_strategy_set)
+            if routing_mode is RoutingMode.ADAPTIVE:
+                planner_candidates = operator_config.planner_strategies(
+                    routing_mode, effective_strategy_set
+                )
         else:
             effective_strategy_set = resume_run.strategy_set
             strategies = resume_run.execution_strategies
@@ -633,6 +647,54 @@ def _work(args: argparse.Namespace) -> int:
                 task_assessment,
                 semantic,
             )
+            candidates = tuple(sorted(planner_candidates, key=lambda item: item.id))
+            allowed_ids = set(harness.worker.allowed_strategy_ids)
+            allowed_backends = set(harness.worker.allowed)
+            required = set(task_assessment.required_capabilities)
+            eligible_planners = tuple(
+                item
+                for item in candidates
+                if item.id in allowed_ids
+                and item.backend in allowed_backends
+                and (item.backend not in {"ollama", "ollama_cli"} or harness.worker.local_backend)
+                and required <= set(item.capabilities)
+                and task_assessment.risk <= item.max_risk
+                and item.min_complexity <= task_assessment.complexity <= item.max_complexity
+                and item.min_scale <= task_assessment.scale <= item.max_scale
+            )
+            if not eligible_planners:
+                raise ValueError("no explicitly configured Planner satisfies routing constraints")
+            planner_selection_mode = (
+                RoutingMode.FIXED if args.planner_strategy is not None else RoutingMode.ADAPTIVE
+            )
+            selected_planner = select_strategy(
+                eligible_planners,
+                mode=planner_selection_mode,
+                fixed_strategy_id=args.planner_strategy,
+                assessment=task_assessment,
+                allowed_strategy_ids=tuple(item.id for item in eligible_planners),
+                allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible_planners)),
+                local_backend_allowed=harness.worker.local_backend,
+            )
+            harness_digest = canonical_digest(harness)
+            effective_policy_digest = canonical_digest((policy.content_digest,))
+            planner_routing = PlannerRoutingDecision(
+                selection_mode=planner_selection_mode,
+                strategy_set=effective_strategy_set,
+                assessment_strategy=assessment_strategy,
+                assessment=task_assessment,
+                assessment_digest=canonical_digest(task_assessment),
+                candidate_strategy_ids=tuple(item.id for item in candidates),
+                eligible_strategy_ids=tuple(item.id for item in eligible_planners),
+                selected_strategy=selected_planner,
+                effective_policy_digest=effective_policy_digest,
+                harness_digest=harness_digest,
+                operator_config_digest=canonical_digest(operator_config),
+            )
+            planner_strategy = selected_planner.model_copy(update={"routing_reasons": ()})
+            planner_command = operator_config.worker_command(
+                cast(WorkerName, planner_strategy.backend)
+            )
             selected_strategy = select_strategy(
                 strategies,
                 mode=routing_mode,
@@ -646,7 +708,7 @@ def _work(args: argparse.Namespace) -> int:
             worker_effort = selected_strategy.effort
             worker_command = operator_config.worker_command(worker_name)
             planner_schema_path: str | None = None
-            if assessment_strategy.backend == "codex_cli":
+            if planner_strategy.backend == "codex_cli":
                 planner_schema = assessment_directory / "proposed-graph.json"
                 planner_schema.write_bytes(proposed_graph_schema_json())
                 planner_schema_path = str(planner_schema)
@@ -655,28 +717,27 @@ def _work(args: argparse.Namespace) -> int:
                 reviewer_schema_path: str | None = str(reviewer_schema)
             else:
                 reviewer_schema_path = None
-            harness_digest = canonical_digest(harness)
-            effective_policy_digest = canonical_digest((policy.content_digest,))
             try:
                 graph_planner = CliProposedGraphPlanner(
                     executor_for(assessment_directory),
                     read_output,
                     decide_worker_process,
                     run_id=run_id,
-                    strategy=assessment_strategy,
-                    executable=assessment_command.executable,
+                    strategy=planner_strategy,
+                    executable=planner_command.executable,
                     cwd=".",
                     prompt_writer=prompt_writer,
                     output_schema_path=planner_schema_path,
                     timeout_seconds=harness.budgets.wall_seconds,
+                    planner_routing=planner_routing,
                 )
                 plan_reviewer = CliPlanReviewer(
                     executor_for(assessment_directory),
                     read_output,
                     decide_worker_process,
                     run_id=run_id,
-                    strategy=assessment_strategy,
-                    executable=assessment_command.executable,
+                    strategy=planner_strategy,
+                    executable=planner_command.executable,
                     cwd=".",
                     prompt_writer=prompt_writer,
                     output_schema_path=reviewer_schema_path,
@@ -1522,6 +1583,7 @@ def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
             strategy=run.fixed_strategy_id,
             strategy_set=run.strategy_set,
             assessment_strategy=None,
+            planner_strategy=None,
             plan_only=False,
             max_concurrency=run.max_concurrency,
             non_interactive=True,

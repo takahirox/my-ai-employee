@@ -313,6 +313,9 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "generation": run.generation,
         "replan_count": run.replan_count,
         "run": _json_model(run),
+        "planner_routing": (
+            None if run.planner_routing is None else _json_model(run.planner_routing)
+        ),
         "graph_acceptance": None if acceptance is None else _json_model(acceptance),
         "graph_revisions": [_json_model(item) for item in acceptances],
         "plan_review": {

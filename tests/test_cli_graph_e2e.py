@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from ai_employee import cli
-from ai_employee.domain import SemanticTaskType
+from ai_employee.domain import RoutingMode, SemanticTaskType
 from ai_employee.domain.v2 import ApprovalRecord, PromotionRecord, WorkerRequest
 from ai_employee.graph_composition import GraphPatchCompositionRecord
 from ai_employee.graph_evaluation import (
@@ -328,6 +328,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             "backend": "codex_cli",
                             "model": "low-model",
                             "effort": "medium",
+                            "planner_eligible": True,
                             "capabilities": ["edit_intent", "process"],
                             "max_complexity": 2,
                             "max_scale": 2,
@@ -337,6 +338,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             "backend": "codex_cli",
                             "model": "high-model",
                             "effort": "high",
+                            "planner_eligible": True,
                             "capabilities": ["edit_intent", "process"],
                             "min_complexity": 3,
                             "min_scale": 3,
@@ -346,7 +348,8 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             "backend": "codex_cli",
                             "model": "planner-model",
                             "effort": "high",
-                            "capabilities": ["process"],
+                            "capabilities": ["edit_intent", "process"],
+                            "planner_eligible": True,
                         },
                     ],
                 },
@@ -431,9 +434,19 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     assert acceptance.harness_digest == canonical_digest(harness)
     assert acceptance.proposed_graph_digest == proposal.content_digest
     assert inspected["plan_review"]["status"] == "accepted"
-    assert proposal.planner_strategy.id == "planner"
-    assert proposal.planner_strategy.model == "planner-model"
+    assert proposal.planner_strategy.id == "high"
+    assert proposal.planner_strategy.model == "high-model"
     assert proposal.planner_strategy.effort == "high"
+    assert proposal.planner_routing is not None
+    assert graph_run.planner_routing == proposal.planner_routing
+    assert proposal.planner_routing.assessment_strategy.id == "planner"
+    assert proposal.planner_routing.assessment_digest == canonical_digest(
+        proposal.planner_routing.assessment
+    )
+    assert proposal.planner_routing.candidate_strategy_ids == ("high", "low", "planner")
+    assert proposal.planner_routing.eligible_strategy_ids == ("high", "planner")
+    assert proposal.planner_routing.selected_strategy.id == "high"
+    assert inspected["planner_routing"]["selected_strategy"]["id"] == "high"
     assert {item.node_id for item in assessments} == {"a", "b", "c"}
     assert len({item.content_digest for item in assessments}) == 3
     route_by_node = {item.node_id: item for item in routes}
@@ -662,12 +675,14 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
         )
 
     assert resumed.generation == 1
+    assert resumed.planner_routing == paused.planner_routing
     assert len(proposals) == 1
     assert [item.content_digest for item in assessments] == [
         item.content_digest for item in assessments_before
     ]
     assert len(compositions) == 1
     assert len(evaluations) == 1
+    assert resumed.planner_routing == paused.planner_routing
     assert [item.node_id for item in requests].count("a") == 1
     assert [item.node_id for item in requests].count("b") == 1
     assert [item.node_id for item in requests].count("c") == 1
@@ -679,6 +694,75 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
     assert {item.generation for item in join_request.predecessor_outputs} == {1}
     assert {item.result_generation for item in join_request.predecessor_outputs} == {0}
     assert (state / "c.done").exists()
+
+
+def test_cli_simple_goal_selects_cheaper_planner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository, operator, database, _state = _fixture(tmp_path)
+
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a.txt",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--db",
+                str(database),
+                "--plan-only",
+            ]
+        )
+        == 0
+    )
+    emitted = json.loads(capsys.readouterr().out)
+    with SQLiteStore(database) as store:
+        proposal = store.list_records("proposed_graph_v2", ProposedGraph, run_id=emitted["run_id"])[
+            0
+        ]
+
+    assert proposal.planner_strategy.id == "low"
+    assert proposal.planner_routing is not None
+    assert proposal.planner_routing.selected_strategy.id == "low"
+
+
+def test_cli_explicit_fixed_planner_uses_exact_eligible_strategy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository, operator, database, _state = _fixture(tmp_path)
+
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a and b concurrently, then change c",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--db",
+                str(database),
+                "--plan-only",
+                "--planner-strategy",
+                "planner",
+            ]
+        )
+        == 0
+    )
+    emitted = json.loads(capsys.readouterr().out)
+    with SQLiteStore(database) as store:
+        run = store.get("graph_run_v2", emitted["run_id"], GraphRunRecord)
+        proposal = store.list_records("proposed_graph_v2", ProposedGraph, run_id=emitted["run_id"])[
+            0
+        ]
+
+    assert proposal.planner_strategy.id == "planner"
+    assert proposal.planner_routing is not None
+    assert proposal.planner_routing.selection_mode is RoutingMode.FIXED
+    assert proposal.planner_routing.selected_strategy.id == "planner"
+    assert run.planner_routing == proposal.planner_routing
 
 
 def test_cli_graph_promotion_repository_conflict_fails_closed(

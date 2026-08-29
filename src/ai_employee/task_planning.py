@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, Self
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field, model_validator
 from pydantic.main import BaseModel
 
-from .domain import ExecutionStrategy, Goal, Graph
+from .domain import ExecutionStrategy, Goal, Graph, RoutingMode, TaskAssessment
 from .domain.base import Digest, Identifier
 from .domain.services_v2 import ProcessExecutor
 from .domain.v2 import DecisionOutcome, DigestedRecordV2, PolicyDecision, ProcessRequest
@@ -23,6 +23,45 @@ if TYPE_CHECKING:
     from .plan_review import PlanReviewFinding
 
 
+class PlannerRoutingDecision(BaseModel):
+    """Deterministic Planner selection and its exact semantic-profile binding."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["2"] = "2"
+    selection_mode: RoutingMode
+    strategy_set: Identifier | None = None
+    assessment_strategy: ExecutionStrategy
+    assessment: TaskAssessment
+    assessment_digest: Digest
+    candidate_strategy_ids: tuple[Identifier, ...] = Field(min_length=1)
+    eligible_strategy_ids: tuple[Identifier, ...] = Field(min_length=1)
+    selected_strategy: ExecutionStrategy
+    effective_policy_digest: Digest
+    harness_digest: Digest
+    operator_config_digest: Digest
+
+    @model_validator(mode="after")
+    def _complete_deterministic_decision(self) -> Self:
+        if self.selection_mode not in {RoutingMode.ADAPTIVE, RoutingMode.FIXED}:
+            raise ValueError("Planner selection must be adaptive or explicitly fixed")
+        if self.assessment.semantic_profile is None:
+            raise ValueError("Planner selection requires a semantic profile")
+        if self.assessment_digest != canonical_digest(self.assessment):
+            raise ValueError("Planner selection assessment digest is stale")
+        if len(set(self.candidate_strategy_ids)) != len(self.candidate_strategy_ids):
+            raise ValueError("Planner candidate strategy IDs must be unique")
+        if len(set(self.eligible_strategy_ids)) != len(self.eligible_strategy_ids):
+            raise ValueError("eligible Planner strategy IDs must be unique")
+        if not set(self.eligible_strategy_ids) <= set(self.candidate_strategy_ids):
+            raise ValueError("eligible Planner strategies must be configured candidates")
+        if self.selected_strategy.id not in self.eligible_strategy_ids:
+            raise ValueError("selected Planner strategy must be eligible")
+        if not self.selected_strategy.routing_reasons:
+            raise ValueError("selected Planner strategy must record routing reasons")
+        return self
+
+
 class ProposedGraph(DigestedRecordV2):
     """Planner output that has no execution authority until graph acceptance."""
 
@@ -33,9 +72,23 @@ class ProposedGraph(DigestedRecordV2):
     planner_strategy: ExecutionStrategy
     effective_policy_digest: Digest
     harness_digest: Digest
+    planner_routing: PlannerRoutingDecision | None = None
     previous_accepted_revision_digest: Digest | None = None
     replan_trigger: str | None = None
     replan_evidence: tuple[Digest, ...] = ()
+
+    @model_validator(mode="after")
+    def _planner_matches_bound_routing(self) -> Self:
+        routing = self.planner_routing
+        if routing is not None and (
+            routing.selected_strategy.model_copy(update={"routing_reasons": ()})
+            != self.planner_strategy.model_copy(update={"routing_reasons": ()})
+            or routing.effective_policy_digest != self.effective_policy_digest
+            or routing.harness_digest != self.harness_digest
+            or routing.assessment.run_id != self.run_id
+        ):
+            raise ValueError("ProposedGraph Planner does not match its routing decision")
+        return self
 
 
 class ProposedGraphPayload(BaseModel):
@@ -119,6 +172,7 @@ class CliProposedGraphPlanner:
         prompt_writer: Callable[[bytes], str],
         output_schema_path: str | None = None,
         timeout_seconds: float = 300.0,
+        planner_routing: PlannerRoutingDecision | None = None,
     ) -> None:
         if strategy.backend not in {"codex_cli", "claude_code_cli", "ollama_cli"}:
             raise ValueError("unsupported graph-planning strategy backend")
@@ -134,6 +188,7 @@ class CliProposedGraphPlanner:
         self.prompt_writer = prompt_writer
         self.output_schema_path = output_schema_path
         self.timeout_seconds = timeout_seconds
+        self.planner_routing = planner_routing
 
     def plan(
         self,
@@ -241,6 +296,7 @@ class CliProposedGraphPlanner:
             planner_strategy=self.strategy,
             effective_policy_digest=effective_policy_digest,
             harness_digest=harness_digest,
+            planner_routing=self.planner_routing,
         )
 
     def revise(
@@ -378,6 +434,7 @@ class CliProposedGraphPlanner:
             planner_strategy=original.planner_strategy,
             effective_policy_digest=original.effective_policy_digest,
             harness_digest=original.harness_digest,
+            planner_routing=original.planner_routing,
             previous_accepted_revision_digest=original.previous_accepted_revision_digest,
             replan_trigger=original.replan_trigger,
             replan_evidence=original.replan_evidence,
