@@ -51,6 +51,7 @@ from .task_orchestration import (
     NodeExecutionRecord,
     NodeReservationRecord,
     NodeRouteRecord,
+    NodeSemanticAssessmentRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
@@ -341,6 +342,14 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             _json_model(item)
             for item in store.list_records(
                 "node_reservation_v2", NodeReservationRecord, run_id=run_id
+            )
+        ],
+        "node_semantic_assessments": [
+            _json_model(item)
+            for item in store.list_records(
+                "node_semantic_assessment_v2",
+                NodeSemanticAssessmentRecord,
+                run_id=run_id,
             )
         ],
         "routes": [_json_model(item) for item in routes],

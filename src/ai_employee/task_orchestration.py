@@ -23,9 +23,10 @@ from .domain import (
     NodeKind,
     OutputContract,
     RoutingMode,
+    SemanticTaskProfile,
     TaskAssessment,
 )
-from .domain.base import CanonicalData, Digest, Identifier, freeze_json
+from .domain.base import CanonicalData, Digest, Identifier, SchemaModel, freeze_json
 from .domain.v2 import (
     ArtifactDescriptor,
     ArtifactDescriptorReference,
@@ -50,7 +51,13 @@ from .plan_review import (
     decide_plan_review_action,
     validate_plan_review,
 )
-from .routing import RoutingError, assess_task, select_strategy
+from .routing import (
+    RoutingError,
+    assess_task,
+    merge_semantic_profile,
+    profile_compatibility_bands,
+    select_strategy,
+)
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
@@ -130,6 +137,57 @@ class StaleNodeResultRecord(DigestedRecordV2):
     worker_result_digest: Digest
 
 
+class PlannerNodeRoutingHints(SchemaModel):
+    """Planner-authored routing-shaped values retained only as provenance."""
+
+    complexity: int = Field(ge=1, le=10)
+    scale: int = Field(ge=1, le=10)
+    risk: int = Field(ge=0, le=10)
+    required_capabilities: tuple[Identifier, ...] = ()
+    semantic_profile: SemanticTaskProfile | None = None
+
+
+class NodeRoutingFacts(SchemaModel):
+    """Deterministic facts which semantic classification cannot weaken."""
+
+    risk: int = Field(ge=0, le=10)
+    required_capabilities: tuple[Identifier, ...] = ()
+    dependency_ids: tuple[Identifier, ...] = ()
+    completion_criterion_ids: tuple[Identifier, ...] = ()
+    context_character_count: int = Field(ge=0, le=10_000)
+    effective_policy_digest: Digest
+    harness_digest: Digest
+
+
+class NodeSemanticAssessmentRecord(DigestedRecordV2):
+    """Strict independently produced profile bound to one accepted node."""
+
+    schema_name: ClassVar[str] = "node_semantic_assessment_record"
+    node_id: Identifier
+    accepted_graph_revision_digest: Digest
+    node_subject_digest: Digest
+    planner_hints: PlannerNodeRoutingHints
+    routing_facts: NodeRoutingFacts
+    assessment_strategy: ExecutionStrategy
+    semantic_profile: SemanticTaskProfile
+    assessment: TaskAssessment
+
+    @model_validator(mode="after")
+    def _assessment_matches_deterministic_floors(self) -> Self:
+        complexity, scale = profile_compatibility_bands(self.semantic_profile)
+        if (
+            self.assessment.run_id != self.run_id
+            or self.assessment.semantic_profile != self.semantic_profile
+            or self.assessment.complexity != complexity
+            or self.assessment.scale != scale
+            or self.assessment.risk != self.routing_facts.risk
+            or self.assessment.required_capabilities != self.routing_facts.required_capabilities
+            or self.assessment.context_character_count != self.routing_facts.context_character_count
+        ):
+            raise ValueError("semantic node assessment weakens or mismatches routing floors")
+        return self
+
+
 class NodeRouteRecord(DigestedRecordV2):
     schema_name: ClassVar[str] = "node_route_record"
     node_id: Identifier
@@ -137,6 +195,9 @@ class NodeRouteRecord(DigestedRecordV2):
     generation: int = Field(ge=0)
     attempt: int = Field(ge=0)
     assessment: TaskAssessment
+    planner_hints: PlannerNodeRoutingHints | None = None
+    routing_facts: NodeRoutingFacts | None = None
+    semantic_assessment_digest: Digest | None = None
     eligible_strategy_ids: tuple[Identifier, ...] = Field(min_length=1)
     selected_strategy: ExecutionStrategy
     effective_policy_digest: Digest
@@ -223,6 +284,7 @@ class GraphRunRecord(BaseModel):
     allowed_strategy_ids: tuple[Identifier, ...]
     allowed_backends: tuple[str, ...]
     local_backend_allowed: bool
+    independent_node_assessment: bool = False
     status: GraphExecutionStatus
     max_concurrency: int = Field(ge=1)
     max_claims: int = Field(ge=1)
@@ -311,6 +373,16 @@ class NodeRunner(Protocol):
     ) -> NodeExecutionResult: ...
 
 
+class NodeAssessor(Protocol):
+    strategy: ExecutionStrategy
+
+    def assess(
+        self,
+        goal: str,
+        deterministic: TaskAssessment,
+    ) -> SemanticTaskProfile: ...
+
+
 class PlanReviewer(Protocol):
     strategy: ExecutionStrategy
 
@@ -353,6 +425,7 @@ class GraphReplay(BaseModel):
     claims: tuple[Identifier, ...]
     reservations: tuple[NodeReservationRecord, ...]
     routes: tuple[NodeRouteRecord, ...]
+    semantic_assessments: tuple[NodeSemanticAssessmentRecord, ...] = ()
     results: tuple[WorkerResult, ...]
     result_acceptances: tuple[NonMutatingResultAcceptance, ...]
     evidence: tuple[NodeEvidenceRecord, ...]
@@ -434,6 +507,9 @@ class TaskOrchestrator:
         strategy_set: Identifier | None = None,
         plan_reviewer: PlanReviewer | None = None,
         plan_reviser: PlanReviser | None = None,
+        node_assessor: NodeAssessor | None = None,
+        routing_risk_floor: int = 0,
+        independent_node_assessment: bool = False,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
@@ -461,6 +537,9 @@ class TaskOrchestrator:
         self.operator_config_digest = operator_config_digest
         self.operator_config_path = operator_config_path
         self.strategy_set = strategy_set
+        if not 0 <= routing_risk_floor <= 10:
+            raise ValueError("routing risk floor must be between 0 and 10")
+        self.routing_risk_floor = routing_risk_floor
         if (plan_reviewer is None) != (plan_reviser is None):
             raise ValueError("plan reviewer and revision Planner must be configured together")
         if plan_reviewer is not None and plan_reviser is not None:
@@ -472,6 +551,17 @@ class TaskOrchestrator:
                 raise ValueError("plan-review callbacks must use one configured strategy")
         self.plan_reviewer = plan_reviewer
         self.plan_reviser = plan_reviser
+        if node_assessor is not None:
+            configured = {item.id: item for item in self.strategies}
+            if configured.get(
+                node_assessor.strategy.id
+            ) != node_assessor.strategy or node_assessor.strategy.backend in {
+                "ollama",
+                "ollama_cli",
+            }:
+                raise ValueError("node assessor must use an authorized configured strategy")
+        self.node_assessor = node_assessor
+        self.independent_node_assessment = independent_node_assessment
 
     def run(
         self,
@@ -537,6 +627,7 @@ class TaskOrchestrator:
                 or prior_run.allowed_strategy_ids != self.allowed_strategy_ids
                 or prior_run.allowed_backends != self.allowed_backends
                 or prior_run.local_backend_allowed != self.local_backend_allowed
+                or prior_run.independent_node_assessment != self.independent_node_assessment
                 or prior_run.max_concurrency != self.max_concurrency
                 or prior_run.repository != self.repository
                 or prior_run.base_commit != self.base_commit
@@ -602,6 +693,7 @@ class TaskOrchestrator:
                 or graph_run.allowed_strategy_ids != self.allowed_strategy_ids
                 or graph_run.allowed_backends != self.allowed_backends
                 or graph_run.local_backend_allowed != self.local_backend_allowed
+                or graph_run.independent_node_assessment != self.independent_node_assessment
                 or graph_run.repository != self.repository
                 or graph_run.base_commit != self.base_commit
                 or graph_run.operator_config_digest != self.operator_config_digest
@@ -727,6 +819,7 @@ class TaskOrchestrator:
                 allowed_strategy_ids=self.allowed_strategy_ids,
                 allowed_backends=self.allowed_backends,
                 local_backend_allowed=self.local_backend_allowed,
+                independent_node_assessment=self.independent_node_assessment,
                 status="planned" if plan_only else "running",
                 max_concurrency=self.max_concurrency,
                 max_claims=max_claims,
@@ -874,6 +967,26 @@ class TaskOrchestrator:
             self._save_run(graph_run)
             return graph_run
 
+        independent_node_assessment = (
+            self.independent_node_assessment
+            and self.routing_mode is RoutingMode.ADAPTIVE
+            and acceptance.proposed_graph_digest is not None
+        )
+        if independent_node_assessment:
+            self._prepare_node_assessments(
+                run_id,
+                {
+                    node_id: node
+                    for node_id, node in nodes.items()
+                    if records[node_id].status == "pending"
+                },
+                predecessors,
+                graph_digest,
+                effective_policy_digest,
+                harness_digest,
+                invoke=not resume,
+            )
+
         evidence_by_node: dict[str, NodeEvidenceRecord] = {}
         if resume or replan:
             for node_id, record in records.items():
@@ -979,11 +1092,13 @@ class TaskOrchestrator:
                         route = self._route(
                             run_id,
                             node,
+                            predecessors[node_id],
                             graph_digest,
                             effective_policy_digest,
                             harness_digest,
+                            independent_node_assessment=independent_node_assessment,
                         )
-                    except RoutingError:
+                    except (RoutingError, ValueError):
                         records[node_id] = self._advance(
                             records[node_id],
                             status="failed",
@@ -1456,6 +1571,16 @@ class TaskOrchestrator:
             claims=self.store.graph_claims(run_id),
             reservations=reservations,
             routes=routes,
+            semantic_assessments=tuple(
+                sorted(
+                    self.store.list_records(
+                        "node_semantic_assessment_v2",
+                        NodeSemanticAssessmentRecord,
+                        run_id=run_id,
+                    ),
+                    key=lambda item: (item.accepted_graph_revision_digest, item.node_id),
+                )
+            ),
             results=tuple(results.values()),
             result_acceptances=tuple(result_acceptances.values()),
             evidence=tuple(evidence.values()),
@@ -1491,29 +1616,147 @@ class TaskOrchestrator:
             review_acceptance_binding=review_binding,
         )
 
+    def _deterministic_node_assessment(self, run_id: str, node: Node) -> TaskAssessment:
+        return assess_task(
+            node.objective or node.name,
+            run_id=run_id,
+            risk=max(self.routing_risk_floor, node.risk),
+            required_capabilities=node.required_capabilities,
+        )
+
+    def _routing_facts(
+        self,
+        node: Node,
+        dependency_ids: tuple[str, ...],
+        deterministic: TaskAssessment,
+        effective_policy_digest: str,
+        harness_digest: str,
+    ) -> NodeRoutingFacts:
+        return NodeRoutingFacts(
+            risk=deterministic.risk,
+            required_capabilities=deterministic.required_capabilities,
+            dependency_ids=dependency_ids,
+            completion_criterion_ids=tuple(item.id for item in node.completion_criteria),
+            context_character_count=deterministic.context_character_count or 0,
+            effective_policy_digest=effective_policy_digest,
+            harness_digest=harness_digest,
+        )
+
+    def _prepare_node_assessments(
+        self,
+        run_id: str,
+        nodes: Mapping[str, Node],
+        predecessors: Mapping[str, tuple[str, ...]],
+        graph_digest: str,
+        effective_policy_digest: str,
+        harness_digest: str,
+        *,
+        invoke: bool,
+    ) -> None:
+        if invoke and self.node_assessor is None:
+            raise ValueError("independent semantic node assessor is unavailable")
+        for node_id in sorted(nodes):
+            node = nodes[node_id]
+            deterministic = self._deterministic_node_assessment(run_id, node)
+            facts = self._routing_facts(
+                node,
+                predecessors[node_id],
+                deterministic,
+                effective_policy_digest,
+                harness_digest,
+            )
+            existing = self._matching_node_assessments(run_id, node_id, graph_digest)
+            if not invoke:
+                self._validate_node_assessment(existing, node, facts)
+                continue
+            if existing:
+                raise ValueError("semantic node assessment is duplicated or stale")
+            assert self.node_assessor is not None
+            profile = self.node_assessor.assess(node.objective or node.name, deterministic)
+            assessment = merge_semantic_profile(deterministic, profile)
+            record = NodeSemanticAssessmentRecord(
+                id=identifier("node-semantic-assessment"),
+                run_id=run_id,
+                created_at=now(),
+                node_id=node.id,
+                accepted_graph_revision_digest=graph_digest,
+                node_subject_digest=_node_assessment_subject(node),
+                planner_hints=_planner_node_hints(node),
+                routing_facts=facts,
+                assessment_strategy=self.node_assessor.strategy,
+                semantic_profile=profile,
+                assessment=assessment,
+            )
+            self.store.put("node_semantic_assessment_v2", record, run_id=run_id)
+
+    def _matching_node_assessments(
+        self, run_id: str, node_id: str, graph_digest: str
+    ) -> tuple[NodeSemanticAssessmentRecord, ...]:
+        return tuple(
+            item
+            for item in self.store.list_records(
+                "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+            )
+            if item.node_id == node_id and item.accepted_graph_revision_digest == graph_digest
+        )
+
+    def _validate_node_assessment(
+        self,
+        records: tuple[NodeSemanticAssessmentRecord, ...],
+        node: Node,
+        facts: NodeRoutingFacts,
+    ) -> NodeSemanticAssessmentRecord:
+        if len(records) != 1:
+            raise ValueError("authoritative semantic node assessment is missing or ambiguous")
+        record = records[0]
+        configured = {item.id: item for item in self.strategies}
+        if (
+            record.node_subject_digest != _node_assessment_subject(node)
+            or record.planner_hints != _planner_node_hints(node)
+            or record.routing_facts != facts
+            or configured.get(record.assessment_strategy.id) != record.assessment_strategy
+        ):
+            raise ValueError("authoritative semantic node assessment is stale or mismatched")
+        return record
+
     def _route(
         self,
         run_id: str,
         node: Node,
+        dependency_ids: tuple[str, ...],
         graph_digest: str,
         effective_policy_digest: str,
         harness_digest: str,
+        *,
+        independent_node_assessment: bool,
     ) -> NodeRouteRecord:
-        assessment = assess_task(
-            node.objective or node.name,
-            run_id=run_id,
-            risk=node.risk,
-            required_capabilities=node.required_capabilities,
-        ).model_copy(
-            update={
-                "complexity": node.complexity,
-                "scale": node.scale,
-                "semantic_profile": node.semantic_profile,
-            }
+        deterministic = self._deterministic_node_assessment(run_id, node)
+        facts = self._routing_facts(
+            node,
+            dependency_ids,
+            deterministic,
+            effective_policy_digest,
+            harness_digest,
         )
+        semantic_record: NodeSemanticAssessmentRecord | None = None
+        if independent_node_assessment:
+            semantic_record = self._validate_node_assessment(
+                self._matching_node_assessments(run_id, node.id, graph_digest),
+                node,
+                facts,
+            )
+            assessment = semantic_record.assessment
+        else:
+            assessment = deterministic.model_copy(
+                update={
+                    "complexity": node.complexity,
+                    "scale": node.scale,
+                    "semantic_profile": node.semantic_profile,
+                }
+            )
         allowed_ids = set(self.allowed_strategy_ids)
         allowed_backends = set(self.allowed_backends)
-        required = set(node.required_capabilities)
+        required = set(facts.required_capabilities)
         eligible = tuple(
             strategy
             for strategy in self.strategies
@@ -1530,13 +1773,30 @@ class TaskOrchestrator:
         selected = select_strategy(
             eligible,
             mode=self.routing_mode,
-            required_capabilities=node.required_capabilities,
+            required_capabilities=facts.required_capabilities,
             strategy_capabilities={item.id: item.capabilities for item in eligible},
             fixed_strategy_id=self.fixed_strategy_id,
             assessment=assessment,
             allowed_strategy_ids=tuple(item.id for item in eligible),
             allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible)),
             local_backend_allowed=self.local_backend_allowed,
+        )
+        selected = selected.model_copy(
+            update={
+                "routing_reasons": (
+                    *selected.routing_reasons,
+                    "policy, Harness, risk, capability, dependency, completion, "
+                    "and context facts preserved",
+                    (
+                        "independent semantic node assessment selected compatibility bands"
+                        if semantic_record is not None
+                        else (
+                            "compatible deterministic node routing used without semantic "
+                            "reassessment"
+                        )
+                    ),
+                )
+            }
         )
         return NodeRouteRecord(
             id=identifier("node-route"),
@@ -1547,6 +1807,11 @@ class TaskOrchestrator:
             generation=node.generation,
             attempt=node.attempt,
             assessment=assessment,
+            planner_hints=None if semantic_record is None else semantic_record.planner_hints,
+            routing_facts=facts,
+            semantic_assessment_digest=(
+                None if semantic_record is None else semantic_record.content_digest
+            ),
             eligible_strategy_ids=tuple(item.id for item in eligible),
             selected_strategy=selected,
             effective_policy_digest=effective_policy_digest,
@@ -2190,6 +2455,34 @@ def _node_worker_run_id(graph_run_id: str, node: Node) -> str:
         }
     )
     return f"node-{digest[:32]}"
+
+
+def _planner_node_hints(node: Node) -> PlannerNodeRoutingHints:
+    return PlannerNodeRoutingHints(
+        complexity=node.complexity,
+        scale=node.scale,
+        risk=node.risk,
+        required_capabilities=node.required_capabilities,
+        semantic_profile=node.semantic_profile,
+    )
+
+
+def _node_assessment_subject(node: Node) -> str:
+    return canonical_digest(
+        {
+            "node_id": node.id,
+            "kind": node.kind,
+            "name": node.name,
+            "objective": node.objective,
+            "output_contract": node.output_contract,
+            "completion_criteria": node.completion_criteria,
+            "resource_budget": node.resource_budget,
+            "retry_limit": node.retry_limit,
+            "max_iterations": node.max_iterations,
+            "configuration": node.configuration,
+            "planner_hints": _planner_node_hints(node),
+        }
+    )
 
 
 def _node_contract(node: Node) -> str:

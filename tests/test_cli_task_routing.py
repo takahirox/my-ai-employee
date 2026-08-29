@@ -321,7 +321,8 @@ def test_planner_requires_profiles_and_overwrites_numeric_compatibility() -> Non
         scale=1,
     )
     node = proposal.graph.nodes[0]
-    assert (node.complexity, node.scale) == (7, 8)
+    assert (node.complexity, node.scale) == (1, 1)
+    assert node.semantic_profile == profile
     with pytest.raises(ValueError, match="missing semantic_profile"):
         _capture_planner_prompt(
             Goal(id="goal-unprofiled", statement="Choose compatible contracts"),

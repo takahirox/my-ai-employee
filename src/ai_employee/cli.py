@@ -397,6 +397,8 @@ def _work(args: argparse.Namespace) -> int:
     strategies: tuple[ExecutionStrategy, ...] = ()
     proposed_graph: ProposedGraph | None = None
     graph_planner: CliProposedGraphPlanner | None = None
+    semantic_assessor: CliTaskAssessmentAdapter | None = None
+    risk = 0
     plan_reviewer: CliPlanReviewer | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
@@ -613,7 +615,7 @@ def _work(args: argparse.Namespace) -> int:
                 schema = assessment_directory / "semantic-assessment.json"
                 schema.write_bytes(semantic_assessment_schema_json())
                 assessment_schema_path = str(schema)
-            semantic = CliTaskAssessmentAdapter(
+            semantic_assessor = CliTaskAssessmentAdapter(
                 executor_for(assessment_directory),
                 read_output,
                 decide_worker_process,
@@ -624,10 +626,9 @@ def _work(args: argparse.Namespace) -> int:
                 prompt_writer=prompt_writer,
                 output_schema_path=assessment_schema_path,
                 timeout_seconds=harness.budgets.wall_seconds,
-            ).assess(
-                args.goal,
-                task_assessment,
+                expected_effective_policy_digest=canonical_digest((policy.content_digest,)),
             )
+            semantic = semantic_assessor.assess(args.goal, task_assessment)
             task_assessment = merge_semantic_profile(
                 task_assessment,
                 semantic,
@@ -944,6 +945,9 @@ def _work(args: argparse.Namespace) -> int:
                 strategy_set=effective_strategy_set,
                 plan_reviewer=plan_reviewer,
                 plan_reviser=graph_planner,
+                node_assessor=semantic_assessor,
+                routing_risk_floor=risk,
+                independent_node_assessment=routing_mode is RoutingMode.ADAPTIVE,
             )
             graph_input: Graph | ProposedGraph
             if resume_run is not None:
