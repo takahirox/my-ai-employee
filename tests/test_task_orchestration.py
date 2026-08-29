@@ -28,14 +28,17 @@ from ai_employee.domain import (
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
 from ai_employee.graph import GraphValidationError, accept_task_graph
-from ai_employee.inspector import inspect_graph_run
+from ai_employee.inspector import inspect_any_run, inspect_graph_run
 from ai_employee.plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAttempt,
+    PlanReviewFailureEvidence,
+    PlanReviewFailureKind,
     PlanReviewFinding,
     PlanReviewFindingType,
     PlanReviewGateError,
     PlanReviewImpact,
+    PlanReviewInvocationError,
     PlanReviewPayload,
     PlanRevisionAttempt,
     bind_plan_review,
@@ -700,7 +703,19 @@ def test_round_one_blockers_and_review_failures_stop_before_acceptance(tmp_path:
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 
 
-def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("failure_kind", "stdout_artifact_digest"),
+    (
+        (PlanReviewFailureKind.MALFORMED_OUTPUT, "9" * 64),
+        (PlanReviewFailureKind.STALE_BINDING, None),
+    ),
+)
+def test_review_invocation_failure_is_persisted_and_fails_closed(
+    tmp_path: Path,
+    failure_kind: PlanReviewFailureKind,
+    stdout_artifact_digest: str | None,
+) -> None:
+    run_id = f"failed-review-{failure_kind.value}"
     goal = Goal(id="failed-review-goal", statement="complete one bounded task")
     graph = one_node_graph(
         goal,
@@ -712,7 +727,11 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
     reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, [])
 
     def fail_review(*_args: object, **_kwargs: object) -> object:
-        raise ValueError("malformed reviewer output")
+        raise PlanReviewInvocationError(
+            failure_kind,
+            "reviewer boundary failure",
+            stdout_artifact_digest=stdout_artifact_digest,
+        )
 
     reviewer.review = fail_review  # type: ignore[method-assign]
     with SQLiteStore(tmp_path / "failed-review.db") as store:
@@ -726,20 +745,36 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
         with pytest.raises(PlanReviewGateError) as caught:
             orchestrator.run(
                 goal,
-                _review_proposal("failed-review-run", goal, graph),
+                _review_proposal(run_id, goal, graph),
                 ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
                 harness_digest=ZERO,
                 effective_policy_digest="1" * 64,
-                run_id="failed-review-run",
+                run_id=run_id,
                 available_capabilities=("process",),
             )
-        attempts = store.list_records(
-            "plan_review_attempt_v2", PlanReviewAttempt, run_id="failed-review-run"
-        )
+        attempts = store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id)
         assert caught.value.stable_code == "PLAN_REVIEW_FAILED"
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"
         assert attempts[0].failure_code == "PLAN_REVIEW_FAILED"
+        evidence = store.list_records(
+            "plan_review_failure_evidence_v2",
+            PlanReviewFailureEvidence,
+            run_id=run_id,
+        )
+        assert len(evidence) == 1
+        assert evidence[0].plan_review_attempt_id == attempts[0].id
+        assert evidence[0].plan_review_attempt_digest == attempts[0].content_digest
+        assert evidence[0].failure_kind is failure_kind
+        assert evidence[0].stdout_artifact_digest == stdout_artifact_digest
+        inspected = inspect_any_run(store, run_id)
+        assert inspected["plan_review"]["failure_evidence"][0]["failure_kind"] == (
+            failure_kind.value
+        )
+        assert (
+            inspected["plan_review"]["failure_evidence"][0]["stdout_artifact_digest"]
+            == stdout_artifact_digest
+        )
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 
 

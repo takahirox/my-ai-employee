@@ -39,6 +39,7 @@ from .plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAction,
     PlanReviewAttempt,
+    PlanReviewFailureEvidence,
     PlanRevisionAttempt,
 )
 from .serialization import canonical_json
@@ -248,6 +249,9 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             key=lambda item: item.review_round,
         )
     )
+    review_failures = store.list_records(
+        "plan_review_failure_evidence_v2", PlanReviewFailureEvidence, run_id=run_id
+    )
     revision_attempts = store.list_records(
         "plan_revision_attempt_v2", PlanRevisionAttempt, run_id=run_id
     )
@@ -329,6 +333,7 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "plan_review": {
             "status": review_status,
             "attempts": [_json_model(item) for item in review_attempts],
+            "failure_evidence": [_json_model(item) for item in review_failures],
             "revision_attempts": [_json_model(item) for item in revision_attempts],
             "acceptance_binding": (
                 None if len(review_bindings) != 1 else _json_model(review_bindings[0])
@@ -478,6 +483,33 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     }
 
 
+def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Project a pre-acceptance plan-review failure without reading artifact bodies."""
+
+    attempts = tuple(
+        sorted(
+            store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id),
+            key=lambda item: item.review_round,
+        )
+    )
+    if not attempts or attempts[-1].outcome != "failed":
+        raise KeyError(("plan_review_attempt_v2", run_id))
+    failures = store.list_records(
+        "plan_review_failure_evidence_v2", PlanReviewFailureEvidence, run_id=run_id
+    )
+    return {
+        "schema_version": "2",
+        "run_id": run_id,
+        "kind": "graph_run",
+        "state": "failed",
+        "plan_review": {
+            "status": "failed",
+            "attempts": [_json_model(item) for item in attempts],
+            "failure_evidence": [_json_model(item) for item in failures],
+        },
+    }
+
+
 def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     """Read any runtime generation without mutating or migrating state."""
 
@@ -485,9 +517,12 @@ def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         return inspect_graph_run(store, run_id)
     except KeyError:
         try:
-            return inspect_work_run(store, run_id)
+            return inspect_failed_plan_review(store, run_id)
         except KeyError:
-            return inspect_run(store, run_id)
+            try:
+                return inspect_work_run(store, run_id)
+            except KeyError:
+                return inspect_run(store, run_id)
 
 
 def _json_model(value: object) -> dict[str, Any]:
