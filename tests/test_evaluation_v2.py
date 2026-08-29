@@ -262,10 +262,14 @@ def test_freshness_rejects_stale_fences(
 
 
 def test_registry_and_undeclared_process_fail_closed() -> None:
-    assert DEFAULT_EVALUATOR_REGISTRY.available_ids == ("process.harness",)
-    assert "browser.playwright" in DEFAULT_EVALUATOR_REGISTRY.reserved_ids
-    with pytest.raises(KeyError, match="unavailable"):
-        DEFAULT_EVALUATOR_REGISTRY.resolve("browser.playwright")
+    assert DEFAULT_EVALUATOR_REGISTRY.available_ids == (
+        "browser.playwright",
+        "process.harness",
+    )
+    assert "browser.playwright" not in DEFAULT_EVALUATOR_REGISTRY.reserved_ids
+    assert DEFAULT_EVALUATOR_REGISTRY.resolve("browser.playwright").descriptor.provider_id == (
+        "browser.playwright"
+    )
     current = candidate()
     payload = specification().model_dump(exclude={"content_digest", "digest_metadata"})
     payload["command_ref"] = "undeclared"

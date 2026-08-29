@@ -15,6 +15,14 @@ from .base import (
     freeze_json,
     thaw_json,
 )
+from .browser import (
+    BROWSER_EVALUATOR_ID,
+    BrowserAction,
+    BrowserCapture,
+    BrowserEvaluationServices,
+    BrowserObservation,
+    BrowserScenario,
+)
 from .enums import (
     ContextRole,
     ContractKind,
@@ -190,6 +198,7 @@ from .v2 import (
 
 __all__ = [
     "AVAILABLE_FIRST_PARTY_EVALUATOR_IDS",
+    "BROWSER_EVALUATOR_ID",
     "DEFAULT_SAFETY_FLOOR",
     "NODE_TRANSITIONS",
     "PROCESS_EVALUATOR_ID",
@@ -206,6 +215,11 @@ __all__ = [
     "ArtifactDescriptor",
     "ArtifactPutRequest",
     "ArtifactStore",
+    "BrowserAction",
+    "BrowserCapture",
+    "BrowserEvaluationServices",
+    "BrowserObservation",
+    "BrowserScenario",
     "Budget",
     "CandidateRevision",
     "CanonicalData",

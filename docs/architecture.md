@@ -54,15 +54,32 @@ or give a provider state-transition authority. A provider receives a narrow medi
 surface and returns typed observations, findings, and criterion outcomes. Deterministic core
 logic alone maps those facts to `PASS`, `REPAIR`, `ESCALATE`, or `FAIL`.
 
-`process.harness` is the only available provider in this milestone. It adapts an exact
-predeclared Harness command to the existing `ProcessExecutor`, policy decision, cancellation,
-and artifact paths. Process stdout and stderr remain ordinary `ArtifactDescriptor` records;
-evaluators do not write observation files into the candidate worktree. Projects without
-evaluator declarations keep the established command-verification status and exit semantics.
+`process.harness` adapts an exact predeclared
+Harness command to the existing `ProcessExecutor`, policy decision, cancellation, and artifact
+paths. Process stdout and stderr remain ordinary `ArtifactDescriptor` records; evaluators do
+not write observation files into the candidate worktree. Legacy required commands are derived
+into required process evaluators in memory, preserving existing Project Harness intent.
 
-The IDs `browser.playwright`, `judge.visual`, and `threejs.instrumentation` are reserved for
-future first-party implementations and are rejected as unavailable today. Later milestones
-will connect required evaluator declarations to `WorkCoordinator`, Inspector projections,
-and an optional bounded repair loop. A `REPAIR` decision is currently replayable typed data;
-it does not start another worker. Until that integration exists, `fleet work` fails closed
-when `verification.required_evaluators` is non-empty.
+`browser.playwright` is the second available provider. The Playwright dependency is optional
+and loaded only for a declared browser evaluation. Its service maps an exact loopback origin to
+contained candidate-workspace files, denies all other requests, uses a fresh credential-free
+context, executes only typed bounded actions, and persists typed browser observations and
+content-addressed capture artifacts. Provider code still cannot accept a candidate.
+
+The graph-first work path composes node patches, captures one immutable parent candidate, then
+runs all required evaluators in that composition workspace. It persists the candidate revision,
+evaluator specifications and requests, process results or browser observations, observation
+manifests, evaluation results, evidence ledgers, a criterion-level `AcceptanceLedger`, and one
+parent decision before promotion can be requested. A second
+live diff capture rejects a candidate that changed during evaluation. Inspector exposes the
+stored records as metadata-only projections, and replay does not invoke workers, evaluators,
+workspace capture, composition, or promotion.
+
+The IDs `judge.visual` and `threejs.instrumentation` are reserved for future first-party
+implementations and are rejected as unavailable today. A `REPAIR` decision is replayable typed
+data, but parent evaluation currently converts any non-`PASS` result into a failed graph run.
+The next transition reuses the bounded repair machinery: an immutable transition cites the
+parent evidence, advances generation/attempt, passes accepted feedback references to a worker,
+recomposes, and reevaluates. Repair count and remaining resource budgets gate admission;
+generation fences reject stale output, and exhaustion escalates or fails. Probabilistic and
+indeterminate results must continue to escalate rather than pass or repair automatically.

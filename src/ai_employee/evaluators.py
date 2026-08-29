@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from types import MappingProxyType
 
+from .browser_evaluator import BrowserPlaywrightEvaluator
 from .domain.base import Digest, Identifier
 from .domain.evaluation import (
     AVAILABLE_FIRST_PARTY_EVALUATOR_IDS,
@@ -319,4 +320,6 @@ class StaticEvaluatorRegistry:
             raise KeyError(f"evaluator provider is unavailable: {provider_id}") from error
 
 
-DEFAULT_EVALUATOR_REGISTRY = StaticEvaluatorRegistry((ProcessEvaluator(),))
+DEFAULT_EVALUATOR_REGISTRY = StaticEvaluatorRegistry(
+    (ProcessEvaluator(), BrowserPlaywrightEvaluator())
+)

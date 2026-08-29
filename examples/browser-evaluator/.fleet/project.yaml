@@ -1,0 +1,57 @@
+schema_version: 2
+commands:
+  fixture-exists:
+    argv:
+      - python
+      - -c
+      - "from pathlib import Path; assert all(Path(name).is_file() for name in ('index.html', 'app.js'))"
+    cwd: .
+evaluators:
+  - id: fixture-check
+    provider_id: process.harness
+    command_ref: fixture-exists
+    criterion_ids:
+      - example-file-present
+  - id: interaction-check
+    provider_id: browser.playwright
+    criterion_ids:
+      - button-interacts
+    browser_scenario:
+      origin: http://127.0.0.1:3000
+      actions:
+        - kind: navigate
+          url: http://127.0.0.1:3000/index.html
+        - kind: click
+          selector: "#toggle"
+      captures:
+        - id: final-screen
+          kind: screenshot
+          logical_kind: browser_screenshot
+        - id: console-log
+          kind: console
+          logical_kind: browser_console
+        - id: final-dom
+          kind: dom
+          logical_kind: browser_dom
+        - id: accessibility-tree
+          kind: accessibility
+          logical_kind: browser_accessibility
+      timeout_seconds: 10.0
+verification:
+  required:
+    - fixture-exists
+  required_evaluators:
+    - fixture-check
+    - interaction-check
+paths:
+  writable:
+    - index.html
+    - app.js
+  protected:
+    - .git/**
+network:
+  mode: disabled
+budgets:
+  wall_seconds: 300.0
+  processes: 4
+  artifact_bytes: 10000000
