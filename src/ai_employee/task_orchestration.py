@@ -34,6 +34,8 @@ from .domain.v2 import (
     DigestedRecordV2,
     NonMutatingResultAcceptance,
     PredecessorOutputReference,
+    StableFailureCode,
+    WorkerContextManifest,
     WorkerRequest,
     WorkerResult,
 )
@@ -426,6 +428,7 @@ class GraphReplay(BaseModel):
     claims: tuple[Identifier, ...]
     reservations: tuple[NodeReservationRecord, ...]
     routes: tuple[NodeRouteRecord, ...]
+    context_manifests: tuple[WorkerContextManifest, ...]
     semantic_assessments: tuple[NodeSemanticAssessmentRecord, ...] = ()
     results: tuple[WorkerResult, ...]
     result_acceptances: tuple[NonMutatingResultAcceptance, ...]
@@ -1163,11 +1166,19 @@ class TaskOrchestrator:
                         )
                         continue
                     reservation = cast(NodeReservationRecord, reservation)
-                    predecessor_outputs = self._predecessor_outputs(
+                    predecessor_context = self._predecessor_context(
                         tuple(records[parent] for parent in predecessors[node_id]),
                         graph_digest,
                         graph_run.generation,
                     )
+                    if predecessor_context is None:
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
+                        )
+                        continue
+                    predecessor_outputs, predecessor_evidence_digests = predecessor_context
                     prior_results = tuple(item.worker_result_digest for item in predecessor_outputs)
                     prior_artifacts = tuple(
                         artifact.artifact_digest
@@ -1180,7 +1191,7 @@ class TaskOrchestrator:
                         records[node_id] = self._advance(
                             records[node_id],
                             status="failed",
-                            failure_code="PREDECESSOR_ARTIFACT_UNAVAILABLE",
+                            failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
                         )
                         continue
                     request = WorkerRequest(
@@ -1188,6 +1199,10 @@ class TaskOrchestrator:
                         run_id=_node_worker_run_id(run_id, node),
                         created_at=now(),
                         goal=node.objective or node.name,
+                        completion_criteria=tuple(
+                            item.description for item in node.completion_criteria
+                        ),
+                        required_capabilities=node.required_capabilities,
                         accepted_plan_digest=graph_digest,
                         node_id=node.id,
                         accepted_graph_revision_digest=graph_digest,
@@ -1201,7 +1216,48 @@ class TaskOrchestrator:
                         prior_artifact_digests=prior_artifacts,
                         predecessor_outputs=predecessor_outputs,
                     )
+                    manifest = WorkerContextManifest(
+                        id=f"{request.id}-context",
+                        run_id=run_id,
+                        created_at=request.created_at,
+                        worker_request_id=request.id,
+                        worker_request_digest=_required_digest(request.content_digest),
+                        worker_run_id=request.run_id,
+                        node_id=node.id,
+                        objective_digest=canonical_digest(request.goal),
+                        completion_criteria_digest=canonical_digest(request.completion_criteria),
+                        required_capabilities=request.required_capabilities,
+                        accepted_graph_revision_digest=graph_digest,
+                        generation=node.generation,
+                        attempt=node.attempt,
+                        workspace_context=request.workspace_context,
+                        harness_digest=request.harness_digest,
+                        effective_policy_digest=request.effective_policy_digest,
+                        remaining_budgets=request.remaining_budgets,
+                        predecessor_node_ids=tuple(item.node_id for item in predecessor_outputs),
+                        predecessor_result_digests=prior_results,
+                        predecessor_evidence_digests=predecessor_evidence_digests,
+                        artifact_descriptors=tuple(
+                            artifact
+                            for item in predecessor_outputs
+                            for artifact in item.artifact_descriptors
+                        ),
+                    )
                     self.store.put("worker_request_v2", request, run_id=run_id)
+                    self.store.put("worker_context_manifest_v2", manifest, run_id=run_id)
+                    if not self._worker_context_is_valid(
+                        node,
+                        request,
+                        manifest,
+                        graph_digest,
+                        run_id,
+                    ):
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
+                        )
+                        continue
                     records[node_id] = self._advance(
                         records[node_id],
                         status="running",
@@ -1578,6 +1634,14 @@ class TaskOrchestrator:
             claims=self.store.graph_claims(run_id),
             reservations=reservations,
             routes=routes,
+            context_manifests=tuple(
+                sorted(
+                    self.store.list_records(
+                        "worker_context_manifest_v2", WorkerContextManifest, run_id=run_id
+                    ),
+                    key=lambda item: (item.generation, item.attempt, item.node_id),
+                )
+            ),
             semantic_assessments=tuple(
                 sorted(
                     self.store.list_records(
@@ -2112,6 +2176,8 @@ class TaskOrchestrator:
                 or record.output_generation is None
                 or record.worker_result_id is None
                 or record.worker_result_digest is None
+                or record.evidence_id is None
+                or record.evidence_digest is None
                 or record.evaluator_id is None
                 or record.evaluator_digest is None
                 or record.evaluator_decision is not EvaluationDecision.PASS
@@ -2123,17 +2189,25 @@ class TaskOrchestrator:
             evaluator = self.store.get(
                 "node_evaluator_v2", record.evaluator_id, NodeEvaluatorRecord
             )
+            evidence = self.store.get("node_evidence_v2", record.evidence_id, NodeEvidenceRecord)
+            evidence_revision = record.retained_from_revision_digest or graph_digest
             if (
                 worker_result.content_digest != record.worker_result_digest
+                or evidence.content_digest != record.evidence_digest
+                or evidence.node_id != record.node_id
+                or evidence.generation != record.output_generation
+                or evidence.attempt != record.attempt
+                or evidence.accepted_graph_revision_digest != evidence_revision
                 or evaluator.content_digest != record.evaluator_digest
                 or evaluator.node_id != record.node_id
                 or evaluator.generation != record.output_generation
                 or evaluator.attempt != record.attempt
-                or evaluator.accepted_graph_revision_digest
-                != (record.retained_from_revision_digest or graph_digest)
+                or evaluator.accepted_graph_revision_digest != evidence_revision
+                or evaluator.worker_result_digest != record.worker_result_digest
+                or evaluator.evidence_digest != record.evidence_digest
                 or evaluator.decision is not EvaluationDecision.PASS
             ):
-                raise ValueError("predecessor result or evaluator binding is stale")
+                raise ValueError("predecessor result, evidence, or evaluator binding is stale")
             artifacts = record.artifact_descriptors
             for artifact in artifacts:
                 if (
@@ -2207,6 +2281,78 @@ class TaskOrchestrator:
                 )
             )
         return tuple(bindings)
+
+    def _predecessor_context(
+        self,
+        predecessors: tuple[NodeExecutionRecord, ...],
+        graph_digest: Digest,
+        generation: int,
+    ) -> (
+        tuple[
+            tuple[PredecessorOutputReference, ...],
+            tuple[Digest, ...],
+        ]
+        | None
+    ):
+        try:
+            outputs = self._predecessor_outputs(predecessors, graph_digest, generation)
+        except (KeyError, ValueError):
+            return None
+        return (
+            outputs,
+            tuple(_required_digest(record.evidence_digest) for record in predecessors),
+        )
+
+    def _worker_context_is_valid(
+        self,
+        node: Node,
+        request: WorkerRequest,
+        manifest: WorkerContextManifest,
+        graph_digest: Digest,
+        graph_run_id: Identifier,
+    ) -> bool:
+        try:
+            persisted = self.store.get(
+                "worker_context_manifest_v2", manifest.id, WorkerContextManifest
+            )
+        except KeyError:
+            return False
+        return (
+            persisted == manifest
+            and request.content_digest == manifest.worker_request_digest
+            and request.id == manifest.worker_request_id
+            and request.run_id == manifest.worker_run_id
+            and request.graph_run_id == graph_run_id == manifest.run_id
+            and request.node_id == node.id == manifest.node_id
+            and canonical_digest(request.goal) == manifest.objective_digest
+            and canonical_digest(request.completion_criteria) == manifest.completion_criteria_digest
+            and request.completion_criteria
+            == tuple(item.description for item in node.completion_criteria)
+            and request.required_capabilities
+            == node.required_capabilities
+            == manifest.required_capabilities
+            and request.accepted_plan_digest == graph_digest
+            and request.accepted_graph_revision_digest
+            == graph_digest
+            == manifest.accepted_graph_revision_digest
+            and request.generation == node.generation == manifest.generation
+            and request.attempt == node.attempt == manifest.attempt
+            and request.workspace_context == manifest.workspace_context
+            and request.harness_digest == manifest.harness_digest
+            and request.effective_policy_digest == manifest.effective_policy_digest
+            and request.remaining_budgets == manifest.remaining_budgets
+            and tuple(item.node_id for item in request.predecessor_outputs)
+            == manifest.predecessor_node_ids
+            and request.prior_result_digests == manifest.predecessor_result_digests
+            and tuple(
+                artifact
+                for item in request.predecessor_outputs
+                for artifact in item.artifact_descriptors
+            )
+            == manifest.artifact_descriptors
+            and not manifest.conversation_history_included
+            and not manifest.artifact_bodies_included
+        )
 
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
         payload = record.model_dump(mode="python")

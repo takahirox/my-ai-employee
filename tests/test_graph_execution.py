@@ -38,6 +38,7 @@ from ai_employee.domain.v2 import (
     StableFailure,
     StableFailureCode,
     WorkerAvailability,
+    WorkerContextManifest,
     WorkerRequest,
     WorkerResult,
 )
@@ -47,6 +48,7 @@ from ai_employee.graph_evaluation import (
     ParentCandidateEvaluationRecord,
 )
 from ai_employee.graph_execution import GraphExecutionService
+from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkCoordinator
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest
@@ -405,6 +407,35 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         replay = service.replay(run.id)
         by_node = {item.node_id: item for item in replay.nodes}
         evaluator_by_id = {item.id: item for item in replay.evaluator_decisions}
+        manifests = store.list_records(
+            "worker_context_manifest_v2", WorkerContextManifest, run_id=run.id
+        )
+        assert replay.context_manifests == tuple(
+            sorted(manifests, key=lambda item: (item.generation, item.attempt, item.node_id))
+        )
+        assert {item.node_id for item in manifests} == {"a", "b", "c"}
+        manifest_by_node = {item.node_id: item for item in manifests}
+        for node_id, request in requests.items():
+            manifest = manifest_by_node[node_id]
+            assert manifest.worker_request_digest == request.content_digest
+            assert manifest.objective_digest == canonical_digest(request.goal)
+            assert manifest.completion_criteria_digest == canonical_digest(
+                request.completion_criteria
+            )
+            assert request.completion_criteria
+            assert manifest.required_capabilities == request.required_capabilities
+            assert manifest.accepted_graph_revision_digest == run.accepted_graph_revision_digest
+            assert manifest.generation == request.generation
+            assert manifest.predecessor_result_digests == request.prior_result_digests
+            assert not manifest.conversation_history_included
+            assert not manifest.artifact_bodies_included
+        assert manifest_by_node["c"].predecessor_evidence_digests == tuple(
+            by_node[name].evidence_digest for name in ("a", "b")
+        )
+        inspected = inspect_graph_run(store, run.id)
+        inspected_manifests = inspected["worker_context_manifests"]
+        assert len(inspected_manifests) == 3
+        assert all(item["artifact_bodies_included"] is False for item in inspected_manifests)
         assert requests["c"].prior_artifact_digests == (
             by_node["a"].patch_digest,
             by_node["b"].patch_digest,
