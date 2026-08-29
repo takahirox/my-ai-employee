@@ -47,6 +47,7 @@ from .task_orchestration import (
     GoalEvaluatorRecord,
     GraphControlFact,
     GraphRunRecord,
+    LoopTransitionRecord,
     NodeEvaluatorRecord,
     NodeEvidenceRecord,
     NodeExecutionRecord,
@@ -398,6 +399,13 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             _json_model(item)
             for item in store.list_records(
                 "stale_node_result_v2", StaleNodeResultRecord, run_id=run_id
+            )
+        ],
+        "loop_transitions": [
+            _json_model(item)
+            for item in sorted(
+                store.list_records("loop_transition_v2", LoopTransitionRecord, run_id=run_id),
+                key=lambda item: (item.generation, item.created_at, item.id),
             )
         ],
         "composition": None if composition is None else _json_model(composition),
