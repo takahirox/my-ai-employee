@@ -36,17 +36,18 @@ Add review-specific strict v2 models beside the planner boundary. PlanReviewFind
   premature_generalization, over_fragmentation, under_decomposition, unnecessary_refactor,
   verification_gap, or unclear_goal_traceability;
 - impact: blocking or advisory;
-- affected_node_ids: zero to sixteen unique existing node IDs, lexicographically sorted; an empty
-  tuple is allowed only for a graph-wide finding;
+- affected_node_ids: zero to sixteen unique existing node IDs, canonicalized lexicographically; an
+  empty tuple is allowed only for a graph-wide finding;
 - goal_relation: one non-blank string of at most 1,000 characters explaining the finding against
   the supplied Goal or completion criteria; and
 - smallest_correction: one non-blank string of at most 1,000 characters describing the least
   change that resolves it.
 
 PlanReviewPayload contains only schema_version 2 and zero to sixteen findings. Finding IDs are
-unique and sorted. All properties are required, additional properties are forbidden, and unknown
-enums, unknown node IDs, duplicate or unsorted IDs, blank text, excess findings, and excess text
-reject the whole payload. There is no essay, numeric score, confidence, free-form verdict,
+unique and canonicalized lexicographically at the parser boundary because JSON Schema cannot
+express array ordering. All properties are required, additional properties are forbidden, and
+unknown enums, unknown node IDs, duplicate IDs or references, blank text, excess findings, and
+excess text reject the whole payload. There is no essay, numeric score, confidence, free-form verdict,
 replacement graph, proposed capability, policy change, or execution field.
 
 The prompt protocol is fleet-plan-review/2. A fresh context receives exactly the accepted Goal,

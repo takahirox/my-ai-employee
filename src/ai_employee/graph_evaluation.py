@@ -35,7 +35,7 @@ from .domain.v2 import (
 )
 from .evaluators import DEFAULT_EVALUATOR_REGISTRY, HarnessProcessEvaluationServices
 from .graph_composition import GraphPatchCompositionRecord, GraphPatchCompositionRequest
-from .serialization import canonical_digest, versioned_digest
+from .serialization import canonical_digest, project_harness_digest, versioned_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
 from .task_orchestration import (
@@ -588,7 +588,10 @@ class GraphCandidateEvaluator:
         request: ParentCandidateEvaluationRequest,
         composition: GraphPatchCompositionRecord,
     ) -> None:
-        if self.harness.provisional or canonical_digest(self.harness) != request.harness_digest:
+        if (
+            self.harness.provisional
+            or project_harness_digest(self.harness) != request.harness_digest
+        ):
             raise ValueError("parent Harness is provisional or stale")
         if self.harness.budgets.processes < len(request.verification_bindings):
             raise ValueError("parent verification process budget is exhausted")

@@ -50,6 +50,35 @@ class PlanReviewAction(StableStrEnum):
     REJECT = "reject"
 
 
+class PlanReviewFailureKind(StableStrEnum):
+    """Bounded failure classes persisted without model-authored error text."""
+
+    MALFORMED_OUTPUT = "malformed_output"
+    PROCESS_FAILURE = "process_failure"
+    STALE_BINDING = "stale_binding"
+    REVIEWER_ERROR = "reviewer_error"
+
+
+class PlanReviewInvocationError(ValueError):
+    """A classified reviewer-boundary failure with optional captured output evidence."""
+
+    def __init__(
+        self,
+        kind: PlanReviewFailureKind,
+        message: str,
+        *,
+        stdout_artifact_digest: str | None = None,
+    ) -> None:
+        if (
+            stdout_artifact_digest is not None
+            and re.fullmatch(r"[0-9a-f]{64}", stdout_artifact_digest) is None
+        ):
+            raise ValueError("plan-review stdout artifact digest is invalid")
+        self.kind = kind
+        self.stdout_artifact_digest = stdout_artifact_digest
+        super().__init__(message)
+
+
 class PlanReviewFinding(SchemaModelV2):
     """One bounded reviewer claim; it has no graph or execution authority."""
 
@@ -106,7 +135,7 @@ def plan_review_schema_json() -> bytes:
 
 
 def parse_plan_review_payload(output: str) -> PlanReviewPayload:
-    """Parse the complete reviewer wire payload without accepting omitted fields."""
+    """Parse and canonicalize a complete strict reviewer wire payload."""
 
     try:
         raw = json.loads(output)
@@ -129,10 +158,26 @@ def parse_plan_review_payload(output: str) -> PlanReviewPayload:
     for finding in findings:
         if not isinstance(finding, dict) or set(finding) != finding_fields:
             raise ValueError("PlanReviewFinding has missing or unknown fields")
+    normalized = _normalize_plan_review_payload(raw)
     try:
-        return PlanReviewPayload.model_validate_json(output, strict=True)
+        return PlanReviewPayload.model_validate_json(canonical_json(normalized), strict=True)
     except ValueError as error:
         raise ValueError(f"invalid PlanReviewPayload: {error}") from error
+
+
+def _normalize_plan_review_payload(raw: dict[str, object]) -> dict[str, object]:
+    """Canonicalize schema-inexpressible ordering without coercing wire values."""
+
+    findings = raw["findings"]
+    assert isinstance(findings, list)
+    for finding in findings:
+        assert isinstance(finding, dict)
+        references = finding["affected_node_ids"]
+        if isinstance(references, list) and all(isinstance(item, str) for item in references):
+            references.sort()
+    if all(isinstance(finding["id"], str) for finding in findings):
+        findings.sort(key=lambda finding: finding["id"])
+    return raw
 
 
 PLAN_REVIEW_RUBRIC = {
@@ -221,6 +266,16 @@ class PlanReviewAttempt(DigestedRecordV2):
         ):
             raise ValueError("failed plan review must be an empty fail-closed rejection")
         return self
+
+
+class PlanReviewFailureEvidence(DigestedRecordV2):
+    """Bounded diagnostic evidence linked to one failed plan-review attempt."""
+
+    schema_name: ClassVar[str] = "plan_review_failure_evidence"
+    plan_review_attempt_id: Identifier
+    plan_review_attempt_digest: Digest
+    failure_kind: PlanReviewFailureKind
+    stdout_artifact_digest: Digest | None = None
 
 
 class PlanRevisionAttempt(DigestedRecordV2):
@@ -455,29 +510,55 @@ class CliPlanReviewer:
             purpose="obtain a strict non-authoritative PlanReviewPayload",
         )
         decision = self.policy_decider(request)
-        self._validate_decision(request, decision, proposed_graph.effective_policy_digest)
+        try:
+            self._validate_decision(request, decision, proposed_graph.effective_policy_digest)
+        except ValueError as error:
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.REVIEWER_ERROR, str(error)
+            ) from error
         result = self.executor.execute(request, decision, _NeverCancelled())
         if result.request_digest != request.content_digest:
-            raise ValueError("plan-review result is bound to another request")
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.STALE_BINDING,
+                "plan-review result is bound to another request",
+            )
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message
                 if result.failure is not None
                 else "plan-review invocation failed"
             )
-            raise ValueError(message)
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.PROCESS_FAILURE,
+                message,
+                stdout_artifact_digest=result.stdout_artifact_digest,
+            )
         output = self.output_reader(result.stdout_artifact_digest).decode("utf-8", "replace")
-        payload = parse_plan_review_payload(self._extract_payload(output))
-        return bind_plan_review(
-            payload,
-            record_id=identifier("plan-review"),
-            run_id=self.run_id,
-            created_at=now(),
-            review_round=review_round,
-            goal=goal,
-            proposed_graph=proposed_graph,
-            reviewer_strategy=self.strategy,
-        )
+        try:
+            payload = parse_plan_review_payload(self._extract_payload(output))
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.MALFORMED_OUTPUT,
+                str(error),
+                stdout_artifact_digest=result.stdout_artifact_digest,
+            ) from error
+        try:
+            return bind_plan_review(
+                payload,
+                record_id=identifier("plan-review"),
+                run_id=self.run_id,
+                created_at=now(),
+                review_round=review_round,
+                goal=goal,
+                proposed_graph=proposed_graph,
+                reviewer_strategy=self.strategy,
+            )
+        except (TypeError, ValueError) as error:
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.STALE_BINDING,
+                str(error),
+                stdout_artifact_digest=result.stdout_artifact_digest,
+            ) from error
 
     def _validate_decision(
         self,

@@ -75,7 +75,13 @@ from .project import (
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
-from .serialization import canonical_digest, canonical_json, loads_yaml_model
+from .serialization import (
+    canonical_digest,
+    canonical_json,
+    loads_yaml_model,
+    operator_config_digest,
+    project_harness_digest,
+)
 from .services_v2 import (
     AtomicArtifactStore,
     DigestApprovalService,
@@ -98,6 +104,11 @@ from .task_planning import (
     PlannerRoutingDecision,
     ProposedGraph,
     proposed_graph_schema_json,
+)
+from .task_review import (
+    CliTaskResultReviewer,
+    TaskReviewSeverity,
+    task_review_schema_json,
 )
 from .worker_adapters import (
     ClaudeCodeCliWorkerAdapter,
@@ -375,8 +386,10 @@ def _work(args: argparse.Namespace) -> int:
     if args.max_concurrency > 1 and args.routing_mode != "adaptive":
         raise ValueError("task-graph planning requires adaptive routing")
     harness = discover_project_harness(repository)
+    if harness.verification.review.independent_task_review and not routing_enabled:
+        raise ValueError("independent task review requires configured routing")
     goal = _work_goal(run_id, args.goal, harness) if resume_run is None else resume_run.goal
-    if resume_run is not None and canonical_digest(harness) != resume_run.harness_digest:
+    if resume_run is not None and project_harness_digest(harness) != resume_run.harness_digest:
         raise ValueError("Project Harness changed since the graph was accepted")
     capabilities = ["edit_intent", "process"]
     if harness.network.mode.value != "disabled":
@@ -397,7 +410,7 @@ def _work(args: argparse.Namespace) -> int:
     operator_config = load_operator_config(operator_config_path)
     if (
         resume_run is not None
-        and canonical_digest(operator_config) != resume_run.operator_config_digest
+        and operator_config_digest(operator_config) != resume_run.operator_config_digest
     ):
         raise ValueError("operator configuration changed since the graph was accepted")
     worker_name = cast(WorkerName, args.worker or "codex_cli")
@@ -417,6 +430,8 @@ def _work(args: argparse.Namespace) -> int:
     semantic_assessor: CliTaskAssessmentAdapter | None = None
     risk = 0
     plan_reviewer: CliPlanReviewer | None = None
+    task_reviewer: CliTaskResultReviewer | None = None
+    task_reviewer_strategy: ExecutionStrategy | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
         if resume_run is None:
@@ -429,10 +444,30 @@ def _work(args: argparse.Namespace) -> int:
         else:
             effective_strategy_set = resume_run.strategy_set
             strategies = resume_run.execution_strategies
+        if resume_run is not None:
+            task_reviewer_strategy = resume_run.task_reviewer_strategy
+            if harness.verification.review.independent_task_review != (
+                task_reviewer_strategy is not None
+            ):
+                raise ValueError("independent task-review configuration changed since acceptance")
+        elif harness.verification.review.independent_task_review:
+            task_reviewer_strategy = operator_config.task_reviewer_strategy(
+                routing_mode, effective_strategy_set
+            )
         if not strategies:
             raise ValueError("routing requires operator-configured strategies")
         if not harness.worker.allowed_strategy_ids:
             raise ValueError("routing requires Harness allowed strategy IDs")
+        if task_reviewer_strategy is not None and (
+            task_reviewer_strategy not in strategies
+            or task_reviewer_strategy.id not in harness.worker.allowed_strategy_ids
+            or task_reviewer_strategy.backend not in harness.worker.allowed
+            or (
+                task_reviewer_strategy.backend in {"ollama", "ollama_cli"}
+                and not harness.worker.local_backend
+            )
+        ):
+            raise ValueError("task reviewer is outside Harness/operator routing authority")
         if routing_mode is RoutingMode.ADAPTIVE and not harness.worker.adaptive_routing:
             raise ValueError("adaptive routing requires Harness opt-in")
         risk = (
@@ -625,6 +660,30 @@ def _work(args: argparse.Namespace) -> int:
         def decide_worker_process(request: ProcessRequest) -> PolicyDecision:
             return resolve_service_request(request, ActionKind.PROCESS)
 
+        if task_reviewer_strategy is not None:
+            review_directory = workspace_root / "assessment" / run_id
+            review_directory.mkdir(parents=True, exist_ok=True)
+            task_review_schema_path: str | None = None
+            if task_reviewer_strategy.backend == "codex_cli":
+                task_review_schema = review_directory / "task-review.json"
+                task_review_schema.write_bytes(task_review_schema_json())
+                task_review_schema_path = str(task_review_schema)
+            task_reviewer_command = operator_config.worker_command(
+                cast(WorkerName, task_reviewer_strategy.backend)
+            )
+            task_reviewer = CliTaskResultReviewer(
+                executor_for(review_directory),
+                read_output,
+                decide_worker_process,
+                run_id=run_id,
+                strategy=task_reviewer_strategy,
+                executable=task_reviewer_command.executable,
+                cwd=".",
+                prompt_writer=prompt_writer,
+                output_schema_path=task_review_schema_path,
+                timeout_seconds=harness.budgets.wall_seconds,
+            )
+
         if assessment_strategy is not None:
             assert assessment_command is not None
             assert task_assessment is not None
@@ -683,7 +742,7 @@ def _work(args: argparse.Namespace) -> int:
                 allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible_planners)),
                 local_backend_allowed=harness.worker.local_backend,
             )
-            harness_digest = canonical_digest(harness)
+            harness_digest = project_harness_digest(harness)
             effective_policy_digest = canonical_digest((policy.content_digest,))
             planner_routing = PlannerRoutingDecision(
                 selection_mode=planner_selection_mode,
@@ -696,7 +755,7 @@ def _work(args: argparse.Namespace) -> int:
                 selected_strategy=selected_planner,
                 effective_policy_digest=effective_policy_digest,
                 harness_digest=harness_digest,
-                operator_config_digest=canonical_digest(operator_config),
+                operator_config_digest=operator_config_digest(operator_config),
             )
             planner_strategy = selected_planner.model_copy(update={"routing_reasons": ()})
             planner_command = operator_config.worker_command(
@@ -862,7 +921,7 @@ def _work(args: argparse.Namespace) -> int:
             for name in harness.verification.required
         )
         workspace = GitWorkspaceManager(workspace_root, artifacts)
-        harness_digest = canonical_digest(harness)
+        harness_digest = project_harness_digest(harness)
         effective_policy_digest = canonical_digest((policy.content_digest,))
         coordinator = WorkCoordinator(
             store,
@@ -1016,7 +1075,7 @@ def _work(args: argparse.Namespace) -> int:
                 local_backend_allowed=harness.worker.local_backend,
                 parent_evaluator=parent_evaluator,
                 approval_service=DigestApprovalService(store, operator_label="local-operator"),
-                operator_config_digest=canonical_digest(operator_config),
+                operator_config_digest=operator_config_digest(operator_config),
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
                 plan_reviewer=plan_reviewer,
@@ -1024,6 +1083,12 @@ def _work(args: argparse.Namespace) -> int:
                 node_assessor=semantic_assessor,
                 routing_risk_floor=risk,
                 independent_node_assessment=routing_mode is RoutingMode.ADAPTIVE,
+                task_reviewer=task_reviewer,
+                independent_task_review=task_reviewer is not None,
+                task_review_block_severities=tuple(
+                    TaskReviewSeverity(item)
+                    for item in harness.verification.review.block_severities
+                ),
             )
             graph_input: Graph | ProposedGraph
             if resume_run is not None:

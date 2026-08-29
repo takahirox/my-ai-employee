@@ -46,8 +46,10 @@ from .task_orchestration import (
     PlanReviewer,
     PlanReviser,
     TaskOrchestrator,
+    TaskResultReviewer,
 )
 from .task_planning import ProposedGraph
+from .task_review import TaskReviewSeverity
 
 
 class CoordinatorFactory(Protocol):
@@ -152,6 +154,12 @@ class GraphExecutionService:
         node_assessor: NodeAssessor | None = None,
         routing_risk_floor: int = 0,
         independent_node_assessment: bool = False,
+        task_reviewer: TaskResultReviewer | None = None,
+        independent_task_review: bool = False,
+        task_review_block_severities: Iterable[TaskReviewSeverity] = (
+            TaskReviewSeverity.CRITICAL,
+            TaskReviewSeverity.HIGH,
+        ),
     ) -> None:
         self.store = store
         self.coordinator_factory = coordinator_factory
@@ -174,6 +182,9 @@ class GraphExecutionService:
         self.node_assessor = node_assessor
         self.routing_risk_floor = routing_risk_floor
         self.independent_node_assessment = independent_node_assessment
+        self.task_reviewer = task_reviewer
+        self.independent_task_review = independent_task_review
+        self.task_review_block_severities = tuple(task_review_block_severities)
         self.approval_service = approval_service or DigestApprovalService(
             store, operator_label="local-operator"
         )
@@ -397,6 +408,9 @@ class GraphExecutionService:
             node_assessor=self.node_assessor,
             routing_risk_floor=self.routing_risk_floor,
             independent_node_assessment=self.independent_node_assessment,
+            task_reviewer=self.task_reviewer,
+            independent_task_review=self.independent_task_review,
+            task_review_block_severities=self.task_review_block_severities,
         )
 
     def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:

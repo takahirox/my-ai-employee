@@ -18,6 +18,7 @@ from ai_employee.domain import (
     SemanticTaskType,
 )
 from ai_employee.routing import assess_task, merge_semantic_profile, select_strategy
+from ai_employee.serialization import canonical_digest, operator_config_digest
 
 
 def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
@@ -149,6 +150,43 @@ def test_planner_candidates_require_explicit_operator_eligibility() -> None:
     assert tuple(item.id for item in config.planner_strategies(RoutingMode.ADAPTIVE, "all")) == (
         "planner",
     )
+
+
+def test_task_reviewer_requires_explicit_operator_eligibility_and_default() -> None:
+    reviewer = OperatorStrategyConfig(
+        id="reviewer",
+        backend="codex_cli",
+        model="reviewer-model",
+        effort="high",
+        task_reviewer_eligible=True,
+    )
+    config = OperatorConfig(
+        routing=OperatorRoutingConfig(
+            strategies=(reviewer,),
+            default_strategy_set="review",
+            default_task_reviewer_strategy="reviewer",
+            strategy_sets={"review": ("reviewer",)},
+        )
+    )
+
+    assert config.task_reviewer_strategy(RoutingMode.ADAPTIVE).id == "reviewer"
+    with pytest.raises(ValidationError, match="reviewer-eligible"):
+        OperatorRoutingConfig(
+            strategies=(reviewer.model_copy(update={"task_reviewer_eligible": False}),),
+            default_task_reviewer_strategy="reviewer",
+        )
+
+
+def test_disabled_task_review_preserves_pre_issue7_operator_digest() -> None:
+    config = OperatorConfig()
+    old_payload = config.model_dump(mode="python")
+    routing = old_payload["routing"]
+    assert isinstance(routing, dict)
+    routing.pop("default_task_reviewer_strategy")
+    for strategy in routing["strategies"]:
+        strategy.pop("task_reviewer_eligible")
+
+    assert operator_config_digest(config) == canonical_digest(old_payload)
 
 
 def test_named_strategy_set_limits_available_strategies() -> None:

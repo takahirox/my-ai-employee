@@ -67,6 +67,7 @@ class OperatorStrategyConfig(BaseModel):
     effort: str = Field(min_length=1, max_length=100)
     capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
     planner_eligible: bool = False
+    task_reviewer_eligible: bool = False
     min_complexity: int = Field(default=1, ge=1, le=10)
     max_complexity: int = Field(default=10, ge=1, le=10)
     min_scale: int = Field(default=1, ge=1, le=10)
@@ -92,6 +93,7 @@ class OperatorRoutingConfig(BaseModel):
     strategies: tuple[OperatorStrategyConfig, ...] = Field(min_length=1)
     default_strategy_set: Identifier | None = None
     default_assessment_strategy: Identifier | None = None
+    default_task_reviewer_strategy: Identifier | None = None
     strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(default_factory=dict)
     strategy_set_assessors: Mapping[Identifier, Identifier] = Field(default_factory=dict)
 
@@ -149,6 +151,19 @@ class OperatorRoutingConfig(BaseModel):
             and self.default_assessment_strategy not in ids
         ):
             raise ValueError("default assessment strategy must name a configured strategy")
+        if self.default_task_reviewer_strategy is not None:
+            reviewer = next(
+                (
+                    item
+                    for item in self.strategies
+                    if item.id == self.default_task_reviewer_strategy
+                ),
+                None,
+            )
+            if reviewer is None or not reviewer.task_reviewer_eligible:
+                raise ValueError(
+                    "default task reviewer must name an explicitly reviewer-eligible strategy"
+                )
         unknown_sets = set(self.strategy_set_assessors) - set(self.strategy_sets)
         if unknown_sets:
             raise ValueError(
@@ -338,6 +353,36 @@ class OperatorConfig(BaseModel):
         )
         if configured is None:
             raise ValueError(f"unknown assessment strategy: {selected_id}")
+        return ExecutionStrategy(
+            id=configured.id,
+            routing_mode=mode,
+            backend=configured.backend,
+            model=configured.model,
+            effort=configured.effort,
+            capabilities=configured.capabilities,
+            min_complexity=configured.min_complexity,
+            max_complexity=configured.max_complexity,
+            min_scale=configured.min_scale,
+            max_scale=configured.max_scale,
+            max_risk=configured.max_risk,
+        )
+
+    def task_reviewer_strategy(
+        self,
+        mode: RoutingMode,
+        strategy_set: str | None = None,
+    ) -> ExecutionStrategy:
+        """Resolve only an operator-explicit independent task reviewer."""
+
+        if self.routing is None or self.routing.default_task_reviewer_strategy is None:
+            raise ValueError("independent task review requires an operator reviewer opt-in")
+        selected_id = self.routing.default_task_reviewer_strategy
+        selected_set = self.strategy_set_name(strategy_set)
+        if selected_set is not None and selected_id not in self.routing.strategy_sets[selected_set]:
+            raise ValueError("task reviewer is outside the selected strategy set")
+        configured = next(item for item in self.routing.strategies if item.id == selected_id)
+        if not configured.task_reviewer_eligible:
+            raise ValueError("task reviewer strategy is not reviewer-eligible")
         return ExecutionStrategy(
             id=configured.id,
             routing_mode=mode,

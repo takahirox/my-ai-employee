@@ -581,9 +581,11 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
     assert schema["required"] == [
         "schema_version",
         "proposals",
+        "non_mutating_result",
         "assistant_note",
         "usage_json",
     ]
+    assert schema["properties"]["non_mutating_result"]["anyOf"][1] == {"type": "null"}
     edit_proposal, install_proposal = schema["properties"]["proposals"]["items"]["anyOf"]
     assert schema["properties"]["assistant_note"] == {"type": "string"}
     assert schema["properties"]["usage_json"] == {"type": "string"}
@@ -593,6 +595,10 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
     }
     assert edit_proposal["properties"]["payload"]["properties"]["unified_diff"] == {
         "type": "string"
+    }
+    assert edit_proposal["properties"]["expected_artifact_kinds"]["items"] == {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$",
     }
     assert install_proposal["properties"]["kind"] == {
         "type": "string",
