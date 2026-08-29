@@ -172,6 +172,20 @@ class TaskGraphAcceptance(DigestedRecordV2):
         return self
 
 
+class PreAcceptanceGoalRecord(DigestedRecordV2):
+    """Run-scoped Goal retained when plan review can fail before GraphRun creation."""
+
+    schema_name: ClassVar[str] = "pre_acceptance_goal_record"
+    goal: Goal
+    goal_digest: Digest
+
+    @model_validator(mode="after")
+    def _goal_binding_is_exact(self) -> Self:
+        if self.id != self.run_id or self.goal_digest != canonical_digest(self.goal):
+            raise ValueError("pre-acceptance Goal identity or digest is stale")
+        return self
+
+
 class RetainedNodeBinding(DigestedRecordV2):
     schema_name: ClassVar[str] = "retained_node_binding"
     node_id: Identifier
@@ -1910,6 +1924,21 @@ class TaskOrchestrator:
             raise ValueError("review and revision must reuse the resolved Planner strategy")
         max_nodes = min(proposal.graph.budget.max_nodes, policy.max_nodes)
         max_wall_seconds = min(proposal.graph.budget.max_wall_seconds, policy.max_wall_seconds)
+        # A failed gate never creates GraphRunRecord. Preserve its Goal under the
+        # run identity (not Goal.id, which callers may legitimately reuse).
+        goal_record = PreAcceptanceGoalRecord(
+            id=proposal.run_id,
+            run_id=proposal.run_id,
+            created_at=now(),
+            goal=goal,
+            goal_digest=canonical_digest(goal),
+        )
+        if not self.store.put_once("pre_acceptance_goal_v2", goal_record, run_id=proposal.run_id):
+            stored_goal = self.store.get(
+                "pre_acceptance_goal_v2", proposal.run_id, PreAcceptanceGoalRecord
+            )
+            if stored_goal.goal != goal or stored_goal.goal_digest != goal_record.goal_digest:
+                raise ValueError("pre-acceptance Goal changed for an existing run")
         self.store.put("proposed_graph_v2", proposal, run_id=proposal.run_id)
         first = self._invoke_plan_review(
             goal,

@@ -10,7 +10,15 @@ from urllib.parse import urlparse
 
 from pydantic import RootModel
 
-from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
+from .domain import (
+    Artifact,
+    ContextPackage,
+    ExecutionMetrics,
+    Goal,
+    Node,
+    Run,
+    VerificationEvidence,
+)
 from .domain.base import FrozenDict
 from .domain.browser import BrowserObservation
 from .domain.evaluation import EvaluationEvidenceLedger, EvaluationResult, ObservationManifest
@@ -50,7 +58,7 @@ from .plan_review import (
     PlanReviewFailureEvidence,
     PlanRevisionAttempt,
 )
-from .serialization import canonical_json
+from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
     GoalEvaluatorRecord,
@@ -63,11 +71,13 @@ from .task_orchestration import (
     NodeReservationRecord,
     NodeRouteRecord,
     NodeSemanticAssessmentRecord,
+    PreAcceptanceGoalRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
     _load_plan_review_history,
 )
+from .task_planning import ProposedGraph
 from .task_review import (
     StaleTaskReviewResult,
     TaskReviewDecision,
@@ -105,6 +115,7 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     routing = [item.custom for item in metrics if item.custom is not None]
     return {
         "run_id": run.id,
+        "goal": _json_model(run.goal),
         "state": run.state.value,
         "generation": run.generation,
         "graph": {
@@ -562,20 +573,82 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
             key=lambda item: item.review_round,
         )
     )
-    if not attempts or attempts[-1].outcome != "failed":
+    revisions = tuple(
+        sorted(
+            store.list_records("plan_revision_attempt_v2", PlanRevisionAttempt, run_id=run_id),
+            key=lambda item: (item.created_at, item.id),
+        )
+    )
+    if not attempts:
+        raise KeyError(("plan_review_attempt_v2", run_id))
+    if any(item.goal_digest != attempts[0].goal_digest for item in attempts):
+        raise ValueError("pre-acceptance plan-review Goal digests disagree")
+    if revisions and revisions[-1].status == "failed":
+        stable_code = "GRAPH_PLANNER_FAILED"
+        review_status = "failed"
+    elif attempts[-1].outcome == "failed":
+        stable_code = "PLAN_REVIEW_FAILED"
+        review_status = "failed"
+    elif attempts[-1].outcome == "completed" and attempts[-1].action is PlanReviewAction.REJECT:
+        stable_code = "PLAN_REVIEW_BLOCKED"
+        review_status = "blocked"
+    else:
         raise KeyError(("plan_review_attempt_v2", run_id))
     failures = store.list_records(
         "plan_review_failure_evidence_v2", PlanReviewFailureEvidence, run_id=run_id
     )
+    try:
+        goal_record = store.get("pre_acceptance_goal_v2", run_id, PreAcceptanceGoalRecord)
+        if goal_record.goal_digest != attempts[0].goal_digest:
+            raise ValueError("pre-acceptance Goal does not match its review attempt")
+        goal_projection = _json_model(goal_record.goal)
+    except KeyError:
+        legacy_goals = store.list_records("goal_v2", Goal, run_id=run_id)
+        matching_legacy = [
+            item
+            for item in legacy_goals
+            if item.id == attempts[0].goal_id and canonical_digest(item) == attempts[0].goal_digest
+        ]
+        # Older databases may not contain a safe run-scoped Goal. Keep them
+        # inspectable but never guess or reuse a colliding record from another run.
+        goal_projection = (
+            _json_model(matching_legacy[0])
+            if len(matching_legacy) == 1
+            else {
+                "id": attempts[0].goal_id,
+                "statement": None,
+                "unavailable_reason": "goal_not_persisted_by_older_runtime",
+            }
+        )
+    proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+    if not proposals:
+        raise KeyError(("proposed_graph_v2", run_id))
+    proposal = next(
+        (
+            item
+            for item in reversed(proposals)
+            if item.content_digest == attempts[-1].proposed_graph_digest
+        ),
+        None,
+    )
+    if proposal is None:
+        raise KeyError(("proposed_graph_v2", attempts[-1].proposed_graph_digest))
     return {
         "schema_version": "2",
         "run_id": run_id,
         "kind": "graph_run",
         "state": "failed",
+        "failure_code": stable_code,
+        "generation": 0,
+        "goal": goal_projection,
+        "proposed_graph": _json_model(proposal),
+        "graph_acceptance": None,
+        "graph_revisions": [],
         "plan_review": {
-            "status": "failed",
+            "status": review_status,
             "attempts": [_json_model(item) for item in attempts],
             "failure_evidence": [_json_model(item) for item in failures],
+            "revision_attempts": [_json_model(item) for item in revisions],
         },
     }
 
@@ -618,7 +691,17 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path.startswith("/api/runs/"):
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
+                run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
+                try:
+                    from .run_explanation import explain_any_run
+
+                    body = canonical_json(explain_any_run(store, run_id)).encode()
+                except KeyError:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                content_type = "application/json"
+            elif parsed.path.startswith("/api/runs/"):
                 run_id = parsed.path.removeprefix("/api/runs/")
                 try:
                     body = canonical_json(inspect_any_run(store, run_id)).encode()

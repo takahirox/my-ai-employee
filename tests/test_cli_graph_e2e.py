@@ -21,6 +21,7 @@ from ai_employee.graph_evaluation import (
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.project import discover_project_harness
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
@@ -834,6 +835,13 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
         == 0
     )
     capsys.readouterr()
+    with SQLiteStore(database) as store:
+        approved_explanation = explain_any_run(store, run_id)
+    assert approved_explanation["current_state"]["promotion_approval_state"] == "approved"
+    assert approved_explanation["final_outcome"]["disposition"] == ("accepted_awaiting_promotion")
+    assert approved_explanation["final_outcome"]["next_action"] == (
+        "explicitly promote the approved exact candidate patch"
+    )
     (repository / "a.txt").write_text("operator-conflict\n", encoding="utf-8")
 
     assert (

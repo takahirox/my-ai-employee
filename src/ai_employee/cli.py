@@ -78,6 +78,7 @@ from .project import (
     write_migration_candidate,
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
+from .run_explanation import explain_any_run
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import (
     canonical_digest,
@@ -145,6 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = commands.add_parser("inspect", help="inspect a persisted run")
     inspect.add_argument("run_id")
     inspect.add_argument("--db", default=".fleet/fleet.db")
+
+    explain = commands.add_parser(
+        "explain", help="explain one persisted run as a coherent read-only story"
+    )
+    explain.add_argument("run_id")
+    explain.add_argument("--db", default=".fleet/fleet.db")
 
     replay = commands.add_parser("replay", help="replay stored control flow without workers")
     replay.add_argument("run_id")
@@ -312,6 +319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json({"run_id": run_id, "state": outcome.run.state.value}))
         elif args.command == "inspect":
             print(canonical_json(inspect_any_run(store, args.run_id)))
+        elif args.command == "explain":
+            print(canonical_json(explain_any_run(store, args.run_id)))
         elif args.command == "replay":
             try:
                 graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)

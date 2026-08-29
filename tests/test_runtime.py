@@ -17,6 +17,7 @@ from ai_employee.domain import (
 )
 from ai_employee.graph import accept_graph
 from ai_employee.inspector import inspect_run
+from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime, NodeProposal
 from ai_employee.serialization import canonical_digest
 from ai_employee.storage import SQLiteStore
@@ -37,6 +38,10 @@ class RuntimeTests(unittest.TestCase):
             projection = inspect_run(store, "demo-test")
             self.assertEqual(projection["graph"]["revision"], 1)
             self.assertTrue(projection["graph"]["stable"])
+            explanation = explain_any_run(store, "demo-test")
+            self.assertEqual(explanation["goal"]["statement"], outcome.run.goal.statement)
+            self.assertEqual(explanation["source_kind"], "legacy_run")
+            self.assertEqual(explanation["observation"]["ai_invocations"], 0)
 
     def test_completion_is_refused_without_mandatory_evidence(self) -> None:
         goal, requirement = demo_goal()

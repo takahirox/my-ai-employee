@@ -159,6 +159,7 @@ Inspect and control a run from another terminal:
 
 ```bash
 fleet inspect RUN_ID --db /tmp/fleet-work.db
+fleet explain RUN_ID --db /tmp/fleet-work.db
 fleet logs RUN_ID --db /tmp/fleet-work.db
 fleet approvals list --run RUN_ID --db /tmp/fleet-work.db
 fleet approvals approve APPROVAL_ID --request-digest REQUEST_DIGEST --db /tmp/fleet-work.db
@@ -169,6 +170,14 @@ fleet promote RUN_ID --patch-digest PATCH_DIGEST --db /tmp/fleet-work.db
 
 `fleet promote` is the only v0.2 operation that applies the reviewed patch to the
 original worktree. Fleet never commits, pushes, publishes, or deploys it.
+
+`fleet explain` builds a deterministic, read-only story for one running or historical
+run from its persisted facts. It summarizes the Goal, current task positions, graph
+evolution, routing reasons, body-free information flow, evidence and review decisions,
+failure path, and final disposition. It never invokes an AI worker, reads artifact
+bodies, or mutates/migrates the database. `fleet inspect` remains the detailed raw
+forensic projection. The local Inspector exposes the same summary at
+`/api/runs/RUN_ID/explanation`.
 
 Network retrieval and project-local installation are supported only through
 typed, digest-bound services. The example Harness disables both. Enabling them
