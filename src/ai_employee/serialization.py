@@ -53,6 +53,34 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def project_harness_digest(harness: BaseModel) -> str:
+    """Digest Harness v2 while preserving disabled Issue 7 field compatibility."""
+
+    payload = harness.model_dump(mode="python", by_alias=True, exclude_none=False)
+    verification = payload.get("verification")
+    if isinstance(verification, dict):
+        review = verification.get("review")
+        if isinstance(review, dict) and review.get("independent_task_review") is False:
+            review.pop("independent_task_review")
+    return canonical_digest(payload)
+
+
+def operator_config_digest(config: BaseModel) -> str:
+    """Digest operator config without serializing disabled Issue 7 opt-in defaults."""
+
+    payload = config.model_dump(mode="python", by_alias=True, exclude_none=False)
+    routing = payload.get("routing")
+    if isinstance(routing, dict):
+        if routing.get("default_task_reviewer_strategy") is None:
+            routing.pop("default_task_reviewer_strategy")
+        strategies = routing.get("strategies")
+        if isinstance(strategies, (tuple, list)):
+            for strategy in strategies:
+                if isinstance(strategy, dict) and strategy.get("task_reviewer_eligible") is False:
+                    strategy.pop("task_reviewer_eligible")
+    return canonical_digest(payload)
+
+
 DIGEST_ALGORITHM = "sha256"
 DIGEST_FORMAT_VERSION = "1"
 

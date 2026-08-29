@@ -118,10 +118,19 @@ def _globs_may_overlap(left: str, right: str) -> bool:
 class HarnessReview(HarnessModel):
     schema_name: ClassVar[str] = "harness_review"
     required: bool = True
+    independent_task_review: bool = False
     block_severities: tuple[Literal["critical", "high", "medium", "low"], ...] = (
         "critical",
         "high",
     )
+
+    @model_validator(mode="after")
+    def _review_policy_is_canonical(self) -> Self:
+        if len(self.block_severities) != len(set(self.block_severities)):
+            raise ValueError("review blocking severities must be unique")
+        if self.independent_task_review and not self.required:
+            raise ValueError("independent task review requires the review gate")
+        return self
 
 
 class HarnessEvaluator(HarnessModel):

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 from ai_employee.domain import (
     Budget,
     CompletionCriterion,
+    Edge,
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
@@ -24,6 +27,17 @@ from ai_employee.task_orchestration import (
     NodeExecutionResult,
     NodeRunner,
     TaskOrchestrator,
+)
+from ai_employee.task_review import (
+    TaskReviewBasis,
+    TaskReviewConfidence,
+    TaskReviewFinding,
+    TaskReviewFindingType,
+    TaskReviewPayload,
+    TaskReviewRequest,
+    TaskReviewResult,
+    TaskReviewSeverity,
+    bind_task_review_payload,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -107,6 +121,87 @@ def _run(
     run_id: str,
 ) -> tuple[TaskOrchestrator, GraphRunRecord]:
     orchestrator = TaskOrchestrator(store, runner, (_strategy(),))
+    result = orchestrator.run(
+        goal,
+        graph,
+        ExecutionPolicy(max_nodes=1, max_attempts=4, max_wall_seconds=4.0),
+        harness_digest=HARNESS,
+        effective_policy_digest=POLICY,
+        run_id=run_id,
+        available_capabilities=("process",),
+    )
+    return orchestrator, result
+
+
+class _ScriptedTaskReviewer:
+    strategy = _strategy()
+
+    def __init__(self, findings_by_attempt: dict[int, tuple[TaskReviewFinding, ...]]) -> None:
+        self.findings_by_attempt = findings_by_attempt
+        self.requests: list[TaskReviewRequest] = []
+
+    def review(self, request: TaskReviewRequest) -> TaskReviewResult:
+        self.requests.append(request)
+        return bind_task_review_payload(
+            TaskReviewPayload(
+                findings=self.findings_by_attempt.get(request.attempt, ()),
+                reviewed_criterion_ids=tuple(sorted(request.criterion_ids)),
+                limitations=(),
+            ),
+            request=request,
+            record_id=f"task-review-result-{request.node_id}-{request.attempt}",
+            run_id=request.run_id,
+            created_at=NOW,
+        )
+
+
+def _review_finding(request: TaskReviewRequest, *, inferred: bool = False) -> TaskReviewFinding:
+    return TaskReviewFinding(
+        id="finding-correctness",
+        finding_type=TaskReviewFindingType.CORRECTNESS_RISK,
+        severity=TaskReviewSeverity.HIGH,
+        confidence=(TaskReviewConfidence.UNCERTAIN if inferred else TaskReviewConfidence.CERTAIN),
+        basis=TaskReviewBasis.INFERRED if inferred else TaskReviewBasis.OBSERVED,
+        criterion_ids=tuple(sorted(request.criterion_ids)),
+        description="the exact verified result still misses the semantic requirement",
+        evidence_digests=tuple(sorted(request.deterministic_evidence_digests[:2])),
+        artifact_digests=(),
+        repair_objective="make the smallest correction needed by the criterion",
+    )
+
+
+class _FirstAttemptFindingReviewer(_ScriptedTaskReviewer):
+    def __init__(self, *, inferred: bool = False, always: bool = False) -> None:
+        super().__init__({})
+        self.inferred = inferred
+        self.always = always
+
+    def review(self, request: TaskReviewRequest) -> TaskReviewResult:
+        findings = (
+            (_review_finding(request, inferred=self.inferred),)
+            if self.always or request.attempt == 0
+            else ()
+        )
+        self.findings_by_attempt[request.attempt] = findings
+        return super().review(request)
+
+
+def _run_with_review(
+    store: SQLiteStore,
+    graph: Graph,
+    goal: Goal,
+    runner: NodeRunner,
+    reviewer: _ScriptedTaskReviewer,
+    *,
+    run_id: str,
+) -> tuple[TaskOrchestrator, GraphRunRecord]:
+    orchestrator = TaskOrchestrator(
+        store,
+        runner,
+        (_strategy(),),
+        task_reviewer=reviewer,
+        independent_task_review=True,
+    )
     result = orchestrator.run(
         goal,
         graph,
@@ -341,3 +436,284 @@ def test_repair_feedback_survives_worker_retry(tmp_path: Path) -> None:
         repair.evidence_digests,
         repair.evidence_digests,
     ]
+
+
+def test_independent_task_review_passes_after_verification_and_replays(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs()
+    reviewer = _ScriptedTaskReviewer({0: ()})
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-pass.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-pass"
+        )
+        replay = orchestrator.replay("task-review-pass")
+        inspected = inspect_graph_run(store, "task-review-pass")
+
+    assert run.status == "completed"
+    assert len(reviewer.requests) == 1
+    assert reviewer.requests[0].worker_result.status == "succeeded"
+    assert len(replay.task_review_requests) == 1
+    assert len(replay.task_review_results) == 1
+    assert replay.task_review_decisions[0].action.value == "PASS"
+    assert replay.loop_transitions[-1].reason_code == "TASK_REVIEW_PASS"
+    assert inspected["task_reviews"]["decisions"][0]["action"] == "PASS"
+
+
+def test_blocking_task_review_repairs_then_reverifies_and_reviews(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    reviewer = _FirstAttemptFindingReviewer()
+    worker_requests: list[WorkerRequest] = []
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        worker_requests.append(request)
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-repair.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-repair"
+        )
+        replay = orchestrator.replay("task-review-repair")
+        repair = replay.loop_transitions[0]
+
+    assert run.status == "completed"
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.PASS,
+    ]
+    assert [item.attempt for item in reviewer.requests] == [0, 1]
+    assert worker_requests[1].accepted_feedback_digests == repair.evidence_digests
+    assert "Accepted semantic review repair objectives:" in worker_requests[1].goal
+    assert "make the smallest correction" in worker_requests[1].goal
+    assert len(repair.evidence_digests) == 3
+    assert [item.action.value for item in replay.task_review_decisions] == ["REPAIR", "PASS"]
+
+
+def test_uncertain_task_review_escalates_without_repair(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    reviewer = _FirstAttemptFindingReviewer(inferred=True)
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-escalate.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-escalate"
+        )
+        replay = orchestrator.replay("task-review-escalate")
+
+    assert run.status == "failed"
+    assert [item.action for item in replay.loop_transitions] == [LoopAction.ESCALATE]
+    assert replay.task_review_decisions[0].action.value == "ESCALATE"
+    assert replay.nodes[0].failure_code == "LOOP_ESCALATED:TASK_REVIEW_OPERATOR_REQUIRED"
+
+
+def test_task_review_repair_bound_exhaustion_escalates(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    reviewer = _FirstAttemptFindingReviewer(always=True)
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-exhausted.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-exhausted"
+        )
+        replay = orchestrator.replay("task-review-exhausted")
+
+    assert run.status == "failed"
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.ESCALATE,
+    ]
+    assert replay.loop_transitions[-1].reason_code == "REPAIR_BUDGET_EXHAUSTED"
+
+
+class _StaleTaskReviewer(_ScriptedTaskReviewer):
+    def review(self, request: TaskReviewRequest) -> TaskReviewResult:
+        valid = super().review(request)
+        return valid.model_copy(update={"attempt": request.attempt + 1})
+
+
+def test_stale_task_review_result_is_rejected_and_recorded(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    reviewer = _StaleTaskReviewer({0: ()})
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-stale.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-stale"
+        )
+        replay = orchestrator.replay("task-review-stale")
+
+    assert run.status == "failed"
+    assert replay.task_review_decisions[0].reason_code == "TASK_REVIEW_FAILED"
+    assert len(replay.stale_task_review_results) == 1
+    assert replay.loop_transitions[0].action is LoopAction.FAIL
+
+
+class _LimitedTaskReviewer(_ScriptedTaskReviewer):
+    def review(self, request: TaskReviewRequest) -> TaskReviewResult:
+        self.requests.append(request)
+        return bind_task_review_payload(
+            TaskReviewPayload(
+                findings=(),
+                reviewed_criterion_ids=request.criterion_ids,
+                limitations=("the semantic result could not be fully assessed",),
+            ),
+            request=request,
+            record_id="limited-task-review-result",
+            run_id=request.run_id,
+            created_at=NOW,
+        )
+
+
+def test_task_review_coverage_limitation_escalates_fail_closed(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    reviewer = _LimitedTaskReviewer({})
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "task-review-limited.db") as store:
+        orchestrator, run = _run_with_review(
+            store, graph, goal, runner, reviewer, run_id="task-review-limited"
+        )
+        replay = orchestrator.replay("task-review-limited")
+
+    assert run.status == "failed"
+    assert replay.task_review_decisions[0].action.value == "ESCALATE"
+    assert replay.task_review_decisions[0].reason_code == "TASK_REVIEW_COVERAGE_LIMITED"
+    assert replay.loop_transitions[0].action is LoopAction.ESCALATE
+    assert replay.nodes[0].failure_code == "LOOP_ESCALATED:TASK_REVIEW_COVERAGE_LIMITED"
+
+
+def test_passed_task_review_is_not_reinvoked_after_pause_resume(tmp_path: Path) -> None:
+    first_criterion = CompletionCriterion(id="criterion-first", description="first passed")
+    second_criterion = CompletionCriterion(id="criterion-second", description="second passed")
+    first = Node(
+        id="first",
+        kind=NodeKind.FUNCTION,
+        name="first",
+        objective="complete first",
+        output_contract=OutputContract(id="contract-first"),
+        required_capabilities=("process",),
+        completion_criteria=(first_criterion,),
+    )
+    second = Node(
+        id="second",
+        kind=NodeKind.FUNCTION,
+        name="second",
+        objective="complete second",
+        output_contract=OutputContract(id="contract-second"),
+        required_capabilities=("process",),
+        completion_criteria=(second_criterion,),
+    )
+    graph = Graph(
+        id="task-review-resume-graph",
+        nodes=(first, second),
+        edges=(Edge(id="first-second", source_id="first", target_id="second"),),
+        entry_node_ids=("first",),
+        terminal_node_ids=("second",),
+        budget=Budget(max_attempts=4, max_nodes=2, max_wall_seconds=4.0),
+    )
+    goal = Goal(id="task-review-resume-goal", statement="complete both tasks")
+    database = tmp_path / "task-review-resume.db"
+    reviewer = _ScriptedTaskReviewer({0: ()})
+    started = Event()
+    release = Event()
+
+    def runner(
+        _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        started.set()
+        assert release.wait(timeout=5)
+        criterion_id = f"criterion-{request.node_id}"
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id=f"worker-result-{request.node_id}",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id=criterion_id,
+                    disposition="satisfied",
+                    evidence_refs=(ZERO,),
+                ),
+            ),
+        )
+
+    def initial_run() -> GraphRunRecord:
+        with SQLiteStore(database) as store:
+            orchestrator = TaskOrchestrator(
+                store,
+                runner,
+                (_strategy(),),
+                task_reviewer=reviewer,
+                independent_task_review=True,
+            )
+            return orchestrator.run(
+                goal,
+                graph,
+                ExecutionPolicy(max_nodes=2, max_attempts=4, max_wall_seconds=4.0),
+                harness_digest=HARNESS,
+                effective_policy_digest=POLICY,
+                run_id="task-review-resume",
+                available_capabilities=("process",),
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(initial_run)
+        assert started.wait(timeout=5)
+        with SQLiteStore(database) as controller:
+            controller.request_control("task-review-resume", "pause")
+        release.set()
+        paused = future.result(timeout=5)
+
+    assert paused.status == "paused"
+    assert [item.node_id for item in reviewer.requests] == ["first"]
+    with SQLiteStore(database) as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            runner,
+            (_strategy(),),
+            task_reviewer=reviewer,
+            independent_task_review=True,
+        )
+        resumed = orchestrator.run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=2, max_attempts=4, max_wall_seconds=4.0),
+            harness_digest=HARNESS,
+            effective_policy_digest=POLICY,
+            run_id="task-review-resume",
+            available_capabilities=("process",),
+            resume=True,
+        )
+        replay = orchestrator.replay("task-review-resume")
+
+    assert resumed.status == "completed"
+    assert [item.node_id for item in reviewer.requests] == ["first", "second"]
+    assert len(replay.task_review_requests) == 2
+    assert len(replay.task_review_results) == 2
+    assert len(replay.task_review_decisions) == 2

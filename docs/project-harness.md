@@ -11,6 +11,13 @@ for the repository's sandbox. Rules inferred from files remain provisional until
 reviews and writes an explicit profile. Protected paths express boundaries; they do not grant
 write authority or replace OS-level sandboxing.
 
+Independent task-result AI review is disabled by default. A repository may set
+`verification.review.independent_task_review: true`, but review runs only when operator routing
+also selects a `default_task_reviewer_strategy` whose strategy has
+`task_reviewer_eligible: true`. This double opt-in permits the exact worker request/result and
+deterministic evidence to reach that configured reviewer; it grants no repository or tool access
+and sends no arbitrary artifact bodies, secrets, or conversation history.
+
 Parse a profile through the public API:
 
 ```python
