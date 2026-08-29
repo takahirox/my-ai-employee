@@ -290,12 +290,10 @@ def default_playwright_engine_factory() -> PlaywrightEngine:
     """Load the optional package only when browser evaluation is requested."""
 
     try:
-        from playwright.sync_api import (
-            sync_playwright,  # type: ignore[import-not-found,unused-ignore]
-        )
+        from playwright import sync_api  # type: ignore[import-not-found,unused-ignore]
     except ImportError:
         raise PlaywrightUnavailableError(PLAYWRIGHT_UNAVAILABLE_MESSAGE) from None
-    return _SyncPlaywrightEngine(sync_playwright)
+    return _SyncPlaywrightEngine(sync_api.sync_playwright)
 
 
 @dataclass
