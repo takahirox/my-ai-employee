@@ -11,11 +11,12 @@ from typing import ClassVar, Literal
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
-from .domain.base import freeze_json
+from .domain.base import Digest, freeze_json
 from .domain.models import ExecutionStrategy, SemanticTaskProfile, TaskAssessment
 from .domain.services_v2 import Cancellation, MediatedActionChannel, ProcessExecutor
 from .domain.v2 import (
     ActionProposal,
+    DecisionOutcome,
     ExecutionResult,
     NonMutatingResult,
     PolicyDecision,
@@ -359,6 +360,7 @@ class CliTaskAssessmentAdapter:
         prompt_writer: Callable[[bytes], str],
         output_schema_path: str | None = None,
         timeout_seconds: float = 300.0,
+        expected_effective_policy_digest: Digest | None = None,
     ) -> None:
         if strategy.backend not in {"codex_cli", "claude_code_cli", "ollama_cli"}:
             raise ValueError("unsupported assessment strategy backend")
@@ -374,6 +376,7 @@ class CliTaskAssessmentAdapter:
         self.prompt_writer = prompt_writer
         self.output_schema_path = output_schema_path
         self.timeout_seconds = timeout_seconds
+        self.expected_effective_policy_digest = expected_effective_policy_digest
 
     def assess(
         self,
@@ -410,7 +413,19 @@ class CliTaskAssessmentAdapter:
             budget_class="worker",
             purpose="obtain strict repository-isolated semantic task assessment",
         )
-        result = self.executor.execute(request, self.policy_decider(request), _NeverCancelled())
+        decision = self.policy_decider(request)
+        if decision.run_id != request.run_id or decision.request_digest != request.content_digest:
+            raise ValueError("assessment policy decision is bound to another request")
+        if (
+            self.expected_effective_policy_digest is not None
+            and decision.effective_policy_digest != self.expected_effective_policy_digest
+        ):
+            raise ValueError("assessment policy decision uses another effective policy")
+        if decision.outcome is not DecisionOutcome.ALLOW:
+            raise ValueError(f"assessment policy did not allow execution: {decision.outcome.value}")
+        result = self.executor.execute(request, decision, _NeverCancelled())
+        if result.run_id != request.run_id or result.request_digest != request.content_digest:
+            raise ValueError("assessment result is bound to another request")
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message

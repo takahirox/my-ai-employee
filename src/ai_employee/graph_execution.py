@@ -39,6 +39,7 @@ from .storage import SQLiteStore
 from .task_orchestration import (
     GraphReplay,
     GraphRunRecord,
+    NodeAssessor,
     NodeExecutionResult,
     NodePatchRecord,
     NodeRunner,
@@ -148,6 +149,9 @@ class GraphExecutionService:
         strategy_set: Identifier | None = None,
         plan_reviewer: PlanReviewer | None = None,
         plan_reviser: PlanReviser | None = None,
+        node_assessor: NodeAssessor | None = None,
+        routing_risk_floor: int = 0,
+        independent_node_assessment: bool = False,
     ) -> None:
         self.store = store
         self.coordinator_factory = coordinator_factory
@@ -167,6 +171,9 @@ class GraphExecutionService:
         self.parent_evaluator = parent_evaluator
         self.plan_reviewer = plan_reviewer
         self.plan_reviser = plan_reviser
+        self.node_assessor = node_assessor
+        self.routing_risk_floor = routing_risk_floor
+        self.independent_node_assessment = independent_node_assessment
         self.approval_service = approval_service or DigestApprovalService(
             store, operator_label="local-operator"
         )
@@ -387,6 +394,9 @@ class GraphExecutionService:
             strategy_set=self.strategy_set,
             plan_reviewer=self.plan_reviewer,
             plan_reviser=self.plan_reviser,
+            node_assessor=self.node_assessor,
+            routing_risk_floor=self.routing_risk_floor,
+            independent_node_assessment=self.independent_node_assessment,
         )
 
     def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:

@@ -117,9 +117,13 @@ still requires both an operator-defined set and Project Harness `local_backend: 
 Inspector persists the strategy-set name, assessment strategy, merged task assessment,
 and selected execution strategy for evaluation. Decomposition is top-level assessment
 data only, not a set of independently executed subtasks.
-Adaptive planner nodes must also contain a categorical profile; deterministic code overwrites
-their numeric compatibility fields from that profile before graph acceptance. Existing
-profile-less fixed, policy, hand-authored, and replayed graphs retain their stored bands.
+Adaptive planner routing fields are persisted as non-authoritative hints. After graph
+acceptance, each node that will use adaptive routing receives an independent tool-disabled
+semantic assessment from the configured assessment strategy. Fleet binds that assessment to
+the accepted revision and deterministically merges policy, Harness, risk, capability,
+dependency, completion, and context facts before strategy selection. Replay and resume reuse
+the bound record without invoking AI. Fixed, policy, hand-authored, and compatible deterministic
+graphs retain their stored bands and do not receive an additional assessment.
 
 When both `--routing-mode` and `--strategy-set` are omitted, adaptive routing uses the
 operator-configured `default_strategy_set`. The built-in and example default is

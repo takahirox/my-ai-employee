@@ -14,7 +14,7 @@ from .domain import ExecutionStrategy, Goal, Graph
 from .domain.base import Digest, Identifier
 from .domain.services_v2 import ProcessExecutor
 from .domain.v2 import DecisionOutcome, DigestedRecordV2, PolicyDecision, ProcessRequest
-from .routing import SEMANTIC_PROFILE_RUBRIC, profile_compatibility_bands
+from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .worker_adapters import cli_inherit_environment
@@ -82,13 +82,10 @@ def _canonicalize_graph_payload(
 ) -> Graph:
     if payload.goal_id != goal.id:
         raise ValueError("ProposedGraph is bound to another goal")
-    canonical_nodes = []
     for node in payload.graph.nodes:
         if node.semantic_profile is None:
             raise ValueError(f"ProposedGraph node {node.id!r} is missing semantic_profile")
-        complexity, scale = profile_compatibility_bands(node.semantic_profile)
-        canonical_nodes.append(node.model_copy(update={"complexity": complexity, "scale": scale}))
-    graph = payload.graph.model_copy(update={"nodes": tuple(canonical_nodes)})
+    graph = payload.graph
     allowed = set(available_capabilities)
     unknown = {
         capability
@@ -169,8 +166,10 @@ class CliProposedGraphPlanner:
                     "are the worker-facing scope. Nodes and edges are the only dependency "
                     "authority. Every node needs an objective, completion criteria, an output "
                     "contract, categorical semantic_profile, bounded risk, and only capabilities "
-                    "from available_capabilities. Numeric complexity and scale are compatibility "
-                    "fields and will be overwritten deterministically from semantic_profile. "
+                    "from available_capabilities. Complexity, scale, risk, capabilities, and "
+                    "semantic_profile are planner hints only. The runtime persists them as "
+                    "provenance and independently derives authoritative routing facts after graph "
+                    "acceptance; do not select an execution strategy. "
                     "Set graph max_attempts to at least the node count, and make every aggregate "
                     "graph resource budget cover the sum of its node reservations without "
                     "exceeding the supplied bounds. Edges mean required dependencies only: do "

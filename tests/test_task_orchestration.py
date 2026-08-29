@@ -399,6 +399,23 @@ class _ScriptedPlanReviser:
         )
 
 
+class _ScriptedNodeAssessor:
+    def __init__(
+        self,
+        strategy: ExecutionStrategy,
+        profile: SemanticTaskProfile,
+        events: list[str],
+    ) -> None:
+        self.strategy = strategy
+        self.profile = profile
+        self.events = events
+
+    def assess(self, goal: str, _deterministic: object) -> SemanticTaskProfile:
+        assert goal == "complete the bounded task"
+        self.events.append("assess")
+        return self.profile
+
+
 def _review_proposal(run_id: str, goal: Goal, graph: Graph) -> ProposedGraph:
     return ProposedGraph(
         id="original-proposal",
@@ -502,6 +519,9 @@ def test_blocking_review_revises_once_and_persists_acceptance_chain(tmp_path: Pa
             defer_parent_evaluation=True,
             plan_reviewer=reviewer,
             plan_reviser=reviser,
+            node_assessor=_ScriptedNodeAssessor(_strategy(), routed_profile, events),
+            routing_risk_floor=5,
+            independent_node_assessment=True,
         )
         run = orchestrator.run(
             goal,
@@ -515,7 +535,7 @@ def test_blocking_review_revises_once_and_persists_acceptance_chain(tmp_path: Pa
         replay = orchestrator.replay(run.id)
         inspected = inspect_graph_run(store, run.id)
 
-        assert events == ["review-0", "revision", "review-1", "worker"], (
+        assert events == ["review-0", "revision", "review-1", "assess", "worker"], (
             events,
             tuple((item.status, item.failure_code) for item in replay.nodes),
         )
@@ -528,8 +548,48 @@ def test_blocking_review_revises_once_and_persists_acceptance_chain(tmp_path: Pa
         assert len(replay.review_attempts) == 2
         assert len(replay.revision_attempts) == 1
         assert replay.review_acceptance_binding is not None
+        assert replay.run.independent_node_assessment is True
+        assert replay.routes[0].assessment.risk == 5
+        assert replay.routes[0].assessment.required_capabilities == ("process",)
         assert inspected["plan_review"]["status"] == "revised"
         assert orchestrator.replay(run.id) == replay
+
+
+def test_enabled_independent_node_assessment_fails_closed_without_assessor(
+    tmp_path: Path,
+) -> None:
+    goal = Goal(id="assessment-goal", statement="complete one bounded task")
+    graph = one_node_graph(
+        goal,
+        graph_id="assessment-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    profile = _node("a").semantic_profile
+    assert profile is not None
+    graph = graph.model_copy(
+        update={"nodes": (graph.nodes[0].model_copy(update={"semantic_profile": profile}),)}
+    )
+    with SQLiteStore(tmp_path / "missing-assessor.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("an unavailable assessment must prevent worker routing"),
+            (_strategy(),),
+            bounded_graph_execution=True,
+            defer_parent_evaluation=True,
+            independent_node_assessment=True,
+        )
+        with pytest.raises(ValueError, match="assessor is unavailable"):
+            orchestrator.run(
+                goal,
+                _review_proposal("assessment-run", goal, graph),
+                ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id="assessment-run",
+                available_capabilities=("process",),
+            )
 
 
 def test_advisory_review_accepts_justified_breadth_without_revision(tmp_path: Path) -> None:

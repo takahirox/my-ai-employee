@@ -26,6 +26,7 @@ from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
     NodeRouteRecord,
+    NodeSemanticAssessmentRecord,
     TaskGraphAcceptance,
 )
 from ai_employee.task_planning import ProposedGraph
@@ -56,13 +57,14 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             prompt = json.load(sys.stdin)
             protocol = prompt["protocol"]
             if protocol == "fleet-semantic-task-assessment/2":
+                node_a = prompt["goal"] == "change a.txt"
                 structured = {
                     "schema_version": "1",
-                    "task_type": "architecture",
-                    "reasoning_class": "deep",
-                    "scope": "multi_component",
+                    "task_type": "mechanical" if node_a else "architecture",
+                    "reasoning_class": "mechanical" if node_a else "deep",
+                    "scope": "bounded" if node_a else "multi_component",
                     "ambiguity": "low",
-                    "reasons": ["bounded fork and join"],
+                    "reasons": ["independent accepted-node assessment"],
                 }
             elif protocol == "fleet-plan-review/2":
                 structured = {"schema_version": "2", "findings": []}
@@ -83,11 +85,11 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             }
                         ],
                         "semantic_profile": {
-                            "task_type": "mechanical" if name == "a" else "architecture",
-                            "reasoning_class": "mechanical" if name == "a" else "deep",
-                            "scope": "bounded" if name == "a" else "broad",
+                            "task_type": "mechanical",
+                            "reasoning_class": "mechanical",
+                            "scope": "bounded",
                             "ambiguity": "low",
-                            "reasons": ["bounded fixture route"],
+                            "reasons": ["planner hint only"],
                         },
                         "complexity": complexity,
                         "scale": complexity,
@@ -137,13 +139,14 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         prompt = json.load(sys.stdin)
         protocol = prompt["protocol"]
         if protocol == "fleet-semantic-task-assessment/2":
+            node_a = prompt["goal"] == "change a.txt"
             print(json.dumps({
                 "schema_version": "1",
-                "task_type": "architecture",
-                "reasoning_class": "deep",
-                "scope": "multi_component",
+                "task_type": "mechanical" if node_a else "architecture",
+                "reasoning_class": "mechanical" if node_a else "deep",
+                "scope": "bounded" if node_a else "multi_component",
                 "ambiguity": "low",
-                "reasons": ["bounded fork and join"],
+                "reasons": ["independent accepted-node assessment"],
             }))
             raise SystemExit(0)
         if protocol == "fleet-plan-review/2":
@@ -164,11 +167,11 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                         "required_artifact_ids": ["workspace_patch"],
                     }],
                     "semantic_profile": {
-                        "task_type": "mechanical" if node_name == "a" else "architecture",
-                        "reasoning_class": "mechanical" if node_name == "a" else "deep",
-                        "scope": "bounded" if node_name == "a" else "broad",
+                        "task_type": "mechanical",
+                        "reasoning_class": "mechanical",
+                        "scope": "bounded",
                         "ambiguity": "low",
-                        "reasons": ["bounded fixture route"],
+                        "reasons": ["planner hint only"],
                     },
                     "complexity": complexity,
                     "scale": complexity,
@@ -178,7 +181,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "goal_id": prompt["goal"]["id"],
                 "graph": {
                     "id": "cli-fork-join",
-                    "nodes": [node("a", 2), node("b", 8), node("c", 8)],
+                    "nodes": [node("a", 8), node("b", 1), node("c", 1)],
                     "edges": [
                         {"id": "a-c", "source_id": "a", "target_id": "c"},
                         {"id": "b-c", "source_id": "b", "target_id": "c"},
@@ -394,6 +397,9 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
         )[0]
         proposal = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)[0]
         routes = store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
+        assessments = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+        )
         requests = store.list_records("worker_request_v2", WorkerRequest)
         work_runs = store.list_records("work_run_v2", WorkRun)
         composition = store.get(
@@ -428,16 +434,28 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     assert proposal.planner_strategy.id == "planner"
     assert proposal.planner_strategy.model == "planner-model"
     assert proposal.planner_strategy.effort == "high"
+    assert {item.node_id for item in assessments} == {"a", "b", "c"}
+    assert len({item.content_digest for item in assessments}) == 3
     route_by_node = {item.node_id: item for item in routes}
     assert set(route_by_node) == {"a", "b", "c"}
     assert route_by_node["a"].selected_strategy.model == "low-model"
     assert route_by_node["a"].assessment.semantic_profile is not None
     assert route_by_node["a"].assessment.semantic_profile.task_type is SemanticTaskType.MECHANICAL
+    assert route_by_node["a"].planner_hints is not None
+    assert route_by_node["a"].planner_hints.complexity == 8
+    assert route_by_node["a"].semantic_assessment_digest is not None
     assert route_by_node["a"].selected_strategy.effort == "medium"
     for name in ("b", "c"):
         assert route_by_node[name].selected_strategy.model == "high-model"
         assert route_by_node[name].selected_strategy.effort == "high"
         assert route_by_node[name].assessment.semantic_profile is not None
+        assert route_by_node[name].planner_hints is not None
+        assert route_by_node[name].planner_hints.complexity == 1
+        assert route_by_node[name].routing_facts is not None
+        assert route_by_node[name].routing_facts.required_capabilities == (
+            "edit_intent",
+            "process",
+        )
     request_by_node = {item.node_id: item for item in requests if item.graph_run_id == run_id}
     assert set(request_by_node) == {"a", "b", "c"}
     assert len({item.id for item in request_by_node.values()}) == 3
@@ -555,6 +573,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     replay = json.loads(capsys.readouterr().out)
     assert replay["kind"] == "graph_replay"
     assert replay["promotion_invocations"] == 0
+    assert len(replay["inspection"]["node_semantic_assessments"]) == 3
     assert cli.main(["inspect", run_id, "--db", str(database)]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "completed"
 
@@ -603,6 +622,9 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
         paused = store.get("graph_run_v2", run_id, GraphRunRecord)
         requests_before = store.list_records("worker_request_v2", WorkerRequest)
         proposals_before = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+        assessments_before = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+        )
         compositions_before = store.list_records(
             "graph_patch_composition_v2",
             GraphPatchCompositionRecord,
@@ -624,6 +646,9 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
         resumed = store.get("graph_run_v2", run_id, GraphRunRecord)
         requests = store.list_records("worker_request_v2", WorkerRequest)
         proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+        assessments = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+        )
         work_runs = store.list_records("work_run_v2", WorkRun)
         compositions = store.list_records(
             "graph_patch_composition_v2",
@@ -638,6 +663,9 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
 
     assert resumed.generation == 1
     assert len(proposals) == 1
+    assert [item.content_digest for item in assessments] == [
+        item.content_digest for item in assessments_before
+    ]
     assert len(compositions) == 1
     assert len(evaluations) == 1
     assert [item.node_id for item in requests].count("a") == 1
