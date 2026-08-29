@@ -44,13 +44,22 @@ Harness declarations express repository intent but grant no capabilities: built-
 operator policy still mediate process execution, cancellation, artifact limits, and budgets.
 Provisional Harnesses cannot declare evaluators.
 
-The current foundation parses evaluator definitions, but `WorkCoordinator` execution is a
-later milestone. A Harness that places an evaluator in `verification.required_evaluators`
-therefore makes `fleet work` fail closed with `EVALUATOR_EXECUTION_UNAVAILABLE`; Fleet never
-silently ignores a required evaluation. The repository example declares providers without
-making them required so its existing command-verification flow remains runnable.
+The graph-first `fleet work` path executes every item in
+`verification.required_evaluators` against the exact composed parent candidate before it can
+become `ready_to_promote`. Requests, process results, observation manifests, typed criterion
+results/findings, evidence ledgers, and the parent decision are persisted with candidate,
+generation, Harness, evaluator-specification, and effective-policy digest bindings. Inspector
+projects those records without opening artifact bodies, and replay reads the stored decision
+without re-running a worker, process, composition, or promotion action.
 
-`browser.playwright`, `judge.visual`, and `threejs.instrumentation` are stable reserved IDs
+For backward compatibility, discovery derives one required `process.harness` evaluator for
+each legacy entry in `verification.required` when no explicit `required_evaluators` are
+declared. Projects that use only the established command list therefore keep the same
+verification intent while gaining exact-candidate evidence binding.
+
+`browser.playwright`, `judge.visual`, and `threejs.instrumentation` remain stable reserved IDs
 for later first-party providers. They are not available implementations, so declaring them
 currently fails closed. Harnesses cannot load third-party providers, Python entry points, or
-dynamic imports.
+dynamic imports. An unsatisfied deterministic process evaluation is persisted as typed
+`REPAIR` evidence, but the parent candidate currently fails closed; it does not start an
+automatic repair worker.
