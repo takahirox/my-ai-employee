@@ -62,6 +62,11 @@ from .graph_evaluation import (
 )
 from .graph_execution import GraphExecutionService
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
+from .parent_review import (
+    CliParentSemanticReviewer,
+    ParentSemanticSeverity,
+    parent_semantic_review_schema_json,
+)
 from .plan_review import (
     CliPlanReviewer,
     PlanReviewGateError,
@@ -432,6 +437,8 @@ def _work(args: argparse.Namespace) -> int:
     plan_reviewer: CliPlanReviewer | None = None
     task_reviewer: CliTaskResultReviewer | None = None
     task_reviewer_strategy: ExecutionStrategy | None = None
+    parent_reviewer: CliParentSemanticReviewer | None = None
+    parent_reviewer_strategy: ExecutionStrategy | None = None
     if routing_enabled:
         routing_mode = RoutingMode(args.routing_mode)
         if resume_run is None:
@@ -454,6 +461,10 @@ def _work(args: argparse.Namespace) -> int:
             task_reviewer_strategy = operator_config.task_reviewer_strategy(
                 routing_mode, effective_strategy_set
             )
+        if harness.verification.review.parent_semantic_review:
+            parent_reviewer_strategy = operator_config.parent_reviewer_strategy(
+                routing_mode, effective_strategy_set
+            )
         if not strategies:
             raise ValueError("routing requires operator-configured strategies")
         if not harness.worker.allowed_strategy_ids:
@@ -468,6 +479,16 @@ def _work(args: argparse.Namespace) -> int:
             )
         ):
             raise ValueError("task reviewer is outside Harness/operator routing authority")
+        if parent_reviewer_strategy is not None and (
+            parent_reviewer_strategy not in strategies
+            or parent_reviewer_strategy.id not in harness.worker.allowed_strategy_ids
+            or parent_reviewer_strategy.backend not in harness.worker.allowed
+            or (
+                parent_reviewer_strategy.backend in {"ollama", "ollama_cli"}
+                and not harness.worker.local_backend
+            )
+        ):
+            raise ValueError("parent reviewer is outside Harness/operator routing authority")
         if routing_mode is RoutingMode.ADAPTIVE and not harness.worker.adaptive_routing:
             raise ValueError("adaptive routing requires Harness opt-in")
         risk = (
@@ -682,6 +703,32 @@ def _work(args: argparse.Namespace) -> int:
                 prompt_writer=prompt_writer,
                 output_schema_path=task_review_schema_path,
                 timeout_seconds=harness.budgets.wall_seconds,
+            )
+
+        if parent_reviewer_strategy is not None:
+            review_directory = workspace_root / "assessment" / run_id
+            review_directory.mkdir(parents=True, exist_ok=True)
+            parent_review_schema_path: str | None = None
+            if parent_reviewer_strategy.backend == "codex_cli":
+                parent_review_schema = review_directory / "parent-semantic-review.json"
+                parent_review_schema.write_bytes(parent_semantic_review_schema_json())
+                parent_review_schema_path = str(parent_review_schema)
+            parent_reviewer_command = operator_config.worker_command(
+                cast(WorkerName, parent_reviewer_strategy.backend)
+            )
+            parent_reviewer = CliParentSemanticReviewer(
+                executor_for(review_directory),
+                read_output,
+                lambda descriptor: artifacts.open_verified(descriptor).read(),
+                decide_worker_process,
+                run_id=run_id,
+                strategy=parent_reviewer_strategy,
+                executable=parent_reviewer_command.executable,
+                cwd=".",
+                prompt_writer=prompt_writer,
+                output_schema_path=parent_review_schema_path,
+                timeout_seconds=harness.budgets.wall_seconds,
+                maximum_candidate_bytes=min(1_000_000, harness.budgets.artifact_bytes),
             )
 
         if assessment_strategy is not None:
@@ -1054,6 +1101,11 @@ def _work(args: argparse.Namespace) -> int:
                         cancellation,
                         maximum_artifact_bytes=min(8_000_000, harness.budgets.artifact_bytes),
                     )
+                ),
+                semantic_reviewer=parent_reviewer,
+                semantic_block_severities=tuple(
+                    ParentSemanticSeverity(item)
+                    for item in harness.verification.review.block_severities
                 ),
             )
             fixed_strategy_id = None

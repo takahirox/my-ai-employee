@@ -68,6 +68,7 @@ class OperatorStrategyConfig(BaseModel):
     capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
     planner_eligible: bool = False
     task_reviewer_eligible: bool = False
+    parent_reviewer_eligible: bool = False
     min_complexity: int = Field(default=1, ge=1, le=10)
     max_complexity: int = Field(default=10, ge=1, le=10)
     min_scale: int = Field(default=1, ge=1, le=10)
@@ -94,6 +95,7 @@ class OperatorRoutingConfig(BaseModel):
     default_strategy_set: Identifier | None = None
     default_assessment_strategy: Identifier | None = None
     default_task_reviewer_strategy: Identifier | None = None
+    default_parent_reviewer_strategy: Identifier | None = None
     strategy_sets: Mapping[Identifier, tuple[Identifier, ...]] = Field(default_factory=dict)
     strategy_set_assessors: Mapping[Identifier, Identifier] = Field(default_factory=dict)
 
@@ -163,6 +165,19 @@ class OperatorRoutingConfig(BaseModel):
             if reviewer is None or not reviewer.task_reviewer_eligible:
                 raise ValueError(
                     "default task reviewer must name an explicitly reviewer-eligible strategy"
+                )
+        if self.default_parent_reviewer_strategy is not None:
+            reviewer = next(
+                (
+                    item
+                    for item in self.strategies
+                    if item.id == self.default_parent_reviewer_strategy
+                ),
+                None,
+            )
+            if reviewer is None or not reviewer.parent_reviewer_eligible:
+                raise ValueError(
+                    "default parent reviewer must name an explicitly reviewer-eligible strategy"
                 )
         unknown_sets = set(self.strategy_set_assessors) - set(self.strategy_sets)
         if unknown_sets:
@@ -383,6 +398,36 @@ class OperatorConfig(BaseModel):
         configured = next(item for item in self.routing.strategies if item.id == selected_id)
         if not configured.task_reviewer_eligible:
             raise ValueError("task reviewer strategy is not reviewer-eligible")
+        return ExecutionStrategy(
+            id=configured.id,
+            routing_mode=mode,
+            backend=configured.backend,
+            model=configured.model,
+            effort=configured.effort,
+            capabilities=configured.capabilities,
+            min_complexity=configured.min_complexity,
+            max_complexity=configured.max_complexity,
+            min_scale=configured.min_scale,
+            max_scale=configured.max_scale,
+            max_risk=configured.max_risk,
+        )
+
+    def parent_reviewer_strategy(
+        self,
+        mode: RoutingMode,
+        strategy_set: str | None = None,
+    ) -> ExecutionStrategy:
+        """Resolve only an operator-explicit parent semantic observer."""
+
+        if self.routing is None or self.routing.default_parent_reviewer_strategy is None:
+            raise ValueError("parent semantic review requires an operator reviewer opt-in")
+        selected_id = self.routing.default_parent_reviewer_strategy
+        selected_set = self.strategy_set_name(strategy_set)
+        if selected_set is not None and selected_id not in self.routing.strategy_sets[selected_set]:
+            raise ValueError("parent reviewer is outside the selected strategy set")
+        configured = next(item for item in self.routing.strategies if item.id == selected_id)
+        if not configured.parent_reviewer_eligible:
+            raise ValueError("parent reviewer strategy is not reviewer-eligible")
         return ExecutionStrategy(
             id=configured.id,
             routing_mode=mode,

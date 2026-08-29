@@ -97,10 +97,22 @@ def test_independent_task_review_requires_explicit_harness_review_gate() -> None
         ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
 
 
+def test_parent_semantic_review_requires_explicit_harness_review_gate() -> None:
+    enabled = valid_harness()
+    enabled["verification"]["review"]["parent_semantic_review"] = True
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
+    assert harness.verification.review.parent_semantic_review
+
+    enabled["verification"]["review"]["required"] = False
+    with pytest.raises(ValidationError, match="requires the review gate"):
+        ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
+
+
 def test_disabled_task_review_preserves_pre_issue7_harness_digest() -> None:
     harness = ProjectHarnessV2.model_validate_json(json.dumps(valid_harness()), strict=True)
     old_payload = harness.model_dump(mode="python")
     old_payload["verification"]["review"].pop("independent_task_review")
+    old_payload["verification"]["review"].pop("parent_semantic_review")
 
     assert project_harness_digest(harness) == canonical_digest(old_payload)
 
@@ -116,6 +128,19 @@ def test_disabled_task_review_preserves_pre_issue7_harness_digest() -> None:
         }
     )
     assert project_harness_digest(enabled) != canonical_digest(old_payload)
+
+    parent_enabled = harness.model_copy(
+        update={
+            "verification": harness.verification.model_copy(
+                update={
+                    "review": harness.verification.review.model_copy(
+                        update={"parent_semantic_review": True}
+                    )
+                }
+            )
+        }
+    )
+    assert project_harness_digest(parent_enabled) != canonical_digest(old_payload)
 
 
 def test_harness_allows_repeated_argv_but_rejects_overlapping_protected_paths() -> None:

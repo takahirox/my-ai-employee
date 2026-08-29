@@ -133,6 +133,12 @@ dependency, completion, and context facts before strategy selection. Replay and 
 the bound record without invoking AI. Fixed, policy, hand-authored, and compatible deterministic
 graphs retain their stored bands and do not receive an additional assessment.
 
+An explicit Project Harness and operator double opt-in can also enable tool-disabled semantic
+review of the exact composed parent patch after deterministic verification. The reviewer produces
+typed, digest-bound evidence only; the deterministic Trust Kernel retains final
+`PASS`/`REPAIR`/`ESCALATE`/`FAIL` authority. See the
+[Issue 8 design review](docs/issue-8-review.md).
+
 When both `--routing-mode` and `--strategy-set` are omitted, adaptive routing uses the
 operator-configured `default_strategy_set`. The built-in and example default is
 `codex-balanced`: ordinary, low-risk work uses `gpt-5.6-luna` with `max` effort,

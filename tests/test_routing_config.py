@@ -177,14 +177,41 @@ def test_task_reviewer_requires_explicit_operator_eligibility_and_default() -> N
         )
 
 
+def test_parent_reviewer_requires_explicit_operator_eligibility_and_default() -> None:
+    reviewer = OperatorStrategyConfig(
+        id="parent-reviewer",
+        backend="codex_cli",
+        model="reviewer-model",
+        effort="high",
+        parent_reviewer_eligible=True,
+    )
+    config = OperatorConfig(
+        routing=OperatorRoutingConfig(
+            strategies=(reviewer,),
+            default_strategy_set="review",
+            default_parent_reviewer_strategy="parent-reviewer",
+            strategy_sets={"review": ("parent-reviewer",)},
+        )
+    )
+
+    assert config.parent_reviewer_strategy(RoutingMode.ADAPTIVE).id == "parent-reviewer"
+    with pytest.raises(ValidationError, match="reviewer-eligible"):
+        OperatorRoutingConfig(
+            strategies=(reviewer.model_copy(update={"parent_reviewer_eligible": False}),),
+            default_parent_reviewer_strategy="parent-reviewer",
+        )
+
+
 def test_disabled_task_review_preserves_pre_issue7_operator_digest() -> None:
     config = OperatorConfig()
     old_payload = config.model_dump(mode="python")
     routing = old_payload["routing"]
     assert isinstance(routing, dict)
     routing.pop("default_task_reviewer_strategy")
+    routing.pop("default_parent_reviewer_strategy")
     for strategy in routing["strategies"]:
         strategy.pop("task_reviewer_eligible")
+        strategy.pop("parent_reviewer_eligible")
 
     assert operator_config_digest(config) == canonical_digest(old_payload)
 

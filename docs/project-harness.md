@@ -18,6 +18,16 @@ also selects a `default_task_reviewer_strategy` whose strategy has
 deterministic evidence to reach that configured reviewer; it grants no repository or tool access
 and sends no arbitrary artifact bodies, secrets, or conversation history.
 
+Parent-candidate semantic review is a separate disabled-by-default gate. Set
+`verification.review.parent_semantic_review: true` and separately configure an operator
+`default_parent_reviewer_strategy` whose strategy has `parent_reviewer_eligible: true`. It runs
+after required deterministic parent evaluators pass. The tool-disabled observer receives the exact
+digest-verified composed patch plus body-free deterministic artifact descriptors; enabling it is an
+explicit permission for that candidate patch body to reach the selected backend. Fleet's Trust
+Kernel alone maps typed findings to `PASS`, `REPAIR`, `ESCALATE`, or `FAIL`. See
+[`issue-8-review.md`](issue-8-review.md) for bindings, egress limits, replay, and repair-handoff
+boundaries.
+
 Parse a profile through the public API:
 
 ```python
