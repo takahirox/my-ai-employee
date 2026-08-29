@@ -703,7 +703,19 @@ def test_round_one_blockers_and_review_failures_stop_before_acceptance(tmp_path:
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 
 
-def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("failure_kind", "stdout_artifact_digest"),
+    (
+        (PlanReviewFailureKind.MALFORMED_OUTPUT, "9" * 64),
+        (PlanReviewFailureKind.STALE_BINDING, None),
+    ),
+)
+def test_review_invocation_failure_is_persisted_and_fails_closed(
+    tmp_path: Path,
+    failure_kind: PlanReviewFailureKind,
+    stdout_artifact_digest: str | None,
+) -> None:
+    run_id = f"failed-review-{failure_kind.value}"
     goal = Goal(id="failed-review-goal", statement="complete one bounded task")
     graph = one_node_graph(
         goal,
@@ -716,9 +728,9 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
 
     def fail_review(*_args: object, **_kwargs: object) -> object:
         raise PlanReviewInvocationError(
-            PlanReviewFailureKind.MALFORMED_OUTPUT,
-            "malformed reviewer output",
-            stdout_artifact_digest="9" * 64,
+            failure_kind,
+            "reviewer boundary failure",
+            stdout_artifact_digest=stdout_artifact_digest,
         )
 
     reviewer.review = fail_review  # type: ignore[method-assign]
@@ -733,16 +745,14 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
         with pytest.raises(PlanReviewGateError) as caught:
             orchestrator.run(
                 goal,
-                _review_proposal("failed-review-run", goal, graph),
+                _review_proposal(run_id, goal, graph),
                 ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
                 harness_digest=ZERO,
                 effective_policy_digest="1" * 64,
-                run_id="failed-review-run",
+                run_id=run_id,
                 available_capabilities=("process",),
             )
-        attempts = store.list_records(
-            "plan_review_attempt_v2", PlanReviewAttempt, run_id="failed-review-run"
-        )
+        attempts = store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id)
         assert caught.value.stable_code == "PLAN_REVIEW_FAILED"
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"
@@ -750,18 +760,21 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(tmp_path: Path)
         evidence = store.list_records(
             "plan_review_failure_evidence_v2",
             PlanReviewFailureEvidence,
-            run_id="failed-review-run",
+            run_id=run_id,
         )
         assert len(evidence) == 1
         assert evidence[0].plan_review_attempt_id == attempts[0].id
         assert evidence[0].plan_review_attempt_digest == attempts[0].content_digest
-        assert evidence[0].failure_kind is PlanReviewFailureKind.MALFORMED_OUTPUT
-        assert evidence[0].stdout_artifact_digest == "9" * 64
-        inspected = inspect_any_run(store, "failed-review-run")
+        assert evidence[0].failure_kind is failure_kind
+        assert evidence[0].stdout_artifact_digest == stdout_artifact_digest
+        inspected = inspect_any_run(store, run_id)
         assert inspected["plan_review"]["failure_evidence"][0]["failure_kind"] == (
-            "malformed_output"
+            failure_kind.value
         )
-        assert inspected["plan_review"]["failure_evidence"][0]["stdout_artifact_digest"] == "9" * 64
+        assert (
+            inspected["plan_review"]["failure_evidence"][0]["stdout_artifact_digest"]
+            == stdout_artifact_digest
+        )
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
 
 

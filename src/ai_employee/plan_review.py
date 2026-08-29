@@ -521,7 +521,6 @@ class CliPlanReviewer:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.STALE_BINDING,
                 "plan-review result is bound to another request",
-                stdout_artifact_digest=result.stdout_artifact_digest,
             )
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (

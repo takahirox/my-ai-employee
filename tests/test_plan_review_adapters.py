@@ -180,6 +180,56 @@ def test_claude_wrapper_accepts_unsorted_findings_and_returns_canonical_review()
     assert decide_plan_review_action(review) is PlanReviewAction.ACCEPT
 
 
+def test_foreign_execution_result_does_not_egress_its_stdout_artifact() -> None:
+    goal, proposal = _proposal()
+
+    class _ForeignResultExecutor(_ScriptedExecutor):
+        def execute(
+            self,
+            request: ProcessRequest,
+            decision: PolicyDecision,
+            _cancellation: object,
+        ) -> ExecutionResult:
+            assert decision.request_digest == request.content_digest
+            self.requests.append(request)
+            return ExecutionResult(
+                id="foreign-review-execution",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest="7" * 64,
+                status="succeeded",
+                exit_code=0,
+                duration_seconds=0.01,
+                stdout_artifact_digest=self.output_digest,
+            )
+
+    executor = _ForeignResultExecutor()
+    reviewer = CliPlanReviewer(
+        executor,
+        lambda _digest: pytest.fail("foreign stdout must not be read"),
+        lambda request: _decision(request, DecisionOutcome.ALLOW),
+        run_id="adapter-run",
+        strategy=_strategy(),
+        executable="ollama",
+        cwd=".",
+        prompt_writer=lambda _value: "8" * 64,
+    )
+
+    with pytest.raises(PlanReviewInvocationError) as caught:
+        reviewer.review(
+            goal,  # type: ignore[arg-type]
+            proposal,
+            review_round=0,
+            available_capabilities=("process",),
+            max_nodes=4,
+            max_wall_seconds=30.0,
+        )
+
+    assert caught.value.kind is PlanReviewFailureKind.STALE_BINDING
+    assert caught.value.stdout_artifact_digest is None
+    assert executor.requests
+
+
 def test_reviewer_argv_keeps_codex_and_claude_ephemeral_and_tool_restricted() -> None:
     executor = _ScriptedExecutor()
 
