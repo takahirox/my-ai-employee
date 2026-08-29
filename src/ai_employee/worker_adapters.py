@@ -1040,13 +1040,16 @@ def worker_proposal_schema_json() -> bytes:
                 "type": "array",
                 "items": {"anyOf": [edit_proposal_schema, install_proposal_schema]},
             },
-            "non_mutating_result": result_schema,
+            "non_mutating_result": {
+                "anyOf": [result_schema, {"type": "null"}],
+            },
             "assistant_note": {"type": "string"},
             "usage_json": {"type": "string"},
         },
         "required": [
             "schema_version",
             "proposals",
+            "non_mutating_result",
             "assistant_note",
             "usage_json",
         ],
