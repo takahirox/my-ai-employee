@@ -29,7 +29,13 @@ from .domain import (
     Run,
 )
 from .domain.base import freeze_json
-from .domain.evaluation import EvaluationDecision, EvaluationEvidenceLedger
+from .domain.browser import BrowserObservation
+from .domain.evaluation import (
+    EvaluationDecision,
+    EvaluationEvidenceLedger,
+    EvaluationResult,
+    ObservationManifest,
+)
 from .domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind, PolicyResolver
 from .domain.services_v2 import Cancellation, WorkerAdapter
 from .domain.v2 import (
@@ -75,6 +81,7 @@ from .services_v2 import (
     DigestApprovalService,
     GitWorkspaceManager,
     LocalProcessExecutor,
+    PlaywrightBrowserEvaluationServices,
     ProjectLocalInstaller,
     RestrictedDownloadClient,
 )
@@ -981,6 +988,14 @@ def _work(args: argparse.Namespace) -> int:
                 harness,
                 lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
                 decide_parent_process,
+                browser_services_factory=lambda snapshot, cancellation: (
+                    PlaywrightBrowserEvaluationServices(
+                        snapshot.isolated_worktree,
+                        artifacts,
+                        cancellation,
+                        maximum_artifact_bytes=min(8_000_000, harness.budgets.artifact_bytes),
+                    )
+                ),
             )
             fixed_strategy_id = None
             if routing_mode is RoutingMode.FIXED:
@@ -1324,7 +1339,6 @@ def _graph_promotion_evidence(
         or evaluation.candidate_descriptor_digest != patch.content_digest
         or evaluation.candidate_artifact_digest != patch.artifact_digest
         or evaluation.effective_policy_digest != policy_digest
-        or not evaluation.verification_request_digests
         or not evaluation.verification_result_digests
         or not evaluation.evaluation_ledger_digests
     ):
@@ -1369,9 +1383,15 @@ def _graph_promotion_evidence(
         for item in store.list_records("verification_result_v2", ExecutionResult, run_id=run.id)
         if item.status == "succeeded"
     }
+    browser_observation_digests = {
+        item.content_digest
+        for item in store.list_records("browser_observation_v2", BrowserObservation, run_id=run.id)
+        if item.status == "succeeded"
+    }
     if (
         not set(evaluation.evaluation_ledger_digests) <= ledger_digests
-        or not set(evaluation.verification_result_digests) <= verification_digests
+        or not set(evaluation.verification_result_digests)
+        <= verification_digests | browser_observation_digests
     ):
         raise ValueError("parent PASS evidence is missing")
     goal_evaluations = tuple(
@@ -1379,12 +1399,53 @@ def _graph_promotion_evidence(
         for item in store.list_records("goal_evaluator_v2", GoalEvaluatorRecord, run_id=run.id)
         if item.content_digest == evaluation.goal_evaluator_digest
     )
-    if (
-        len(goal_evaluations) != 1
-        or goal_evaluations[0].decision is not EvaluationDecision.PASS
-        or goal_evaluations[0].evidence_digests != evaluation.evaluation_ledger_digests
-    ):
+    if len(goal_evaluations) != 1 or goal_evaluations[0].decision is not EvaluationDecision.PASS:
         raise ValueError("parent goal PASS evidence is missing or stale")
+    goal_evaluation = goal_evaluations[0]
+    acceptance_ledgers = tuple(
+        item
+        for item in store.list_records("acceptance_ledger_v2", AcceptanceLedger, run_id=run.id)
+        if item.content_digest in goal_evaluation.evidence_digests
+    )
+    if len(acceptance_ledgers) != 1:
+        raise ValueError("parent AcceptanceLedger is missing or stale")
+    acceptance_ledger = acceptance_ledgers[0]
+    if acceptance_ledger.content_digest is None or goal_evaluation.evidence_digests != (
+        acceptance_ledger.content_digest,
+        *evaluation.evaluation_ledger_digests,
+    ):
+        raise ValueError("parent AcceptanceLedger is missing or stale")
+    if tuple(item.criterion_id for item in acceptance_ledger.criteria) != tuple(
+        item.id for item in request.goal.completion_criteria
+    ) or any(item.disposition != "satisfied" for item in acceptance_ledger.criteria):
+        raise ValueError("parent AcceptanceLedger does not satisfy the exact Goal")
+    evaluation_result_digests = {
+        item.content_digest
+        for item in store.list_records("evaluation_result_v2", EvaluationResult, run_id=run.id)
+    }
+    observation_manifest_digests = {
+        item.content_digest
+        for item in store.list_records(
+            "observation_manifest_v2", ObservationManifest, run_id=run.id
+        )
+    }
+    artifact_digests = {
+        digest
+        for item in store.list_records("artifact_descriptor_v2", ArtifactDescriptor, run_id=run.id)
+        for digest in (item.content_digest, item.artifact_digest)
+        if digest is not None
+    }
+    authoritative_evidence = {
+        *evaluation.evaluation_ledger_digests,
+        *evaluation_result_digests,
+        *observation_manifest_digests,
+        *artifact_digests,
+    }
+    if any(
+        not item.evidence_refs or not set(item.evidence_refs) <= authoritative_evidence
+        for item in acceptance_ledger.criteria
+    ):
+        raise ValueError("parent AcceptanceLedger cites non-authoritative evidence")
     return evaluation, policy_digest
 
 

@@ -39,11 +39,16 @@ class BrowserPlaywrightEvaluator:
         provider_schema_version="v1",
         behavior=EvaluatorBehavior.DETERMINISTIC,
         required_capabilities=("browser",),
-        supported_observation_kinds=("browser_screenshot", "browser_accessibility"),
+        supported_observation_kinds=(
+            "browser_screenshot",
+            "browser_console",
+            "browser_dom",
+            "browser_accessibility",
+        ),
         limits=EvaluatorLimits(
             maximum_processes=0,
             maximum_artifact_bytes=8_000_000,
-            maximum_observations=2,
+            maximum_observations=4,
             maximum_actions=50,
             maximum_duration_seconds=60.0,
         ),
@@ -243,6 +248,8 @@ class BrowserPlaywrightEvaluator:
             raise ValueError("browser observation contains undeclared or reordered artifacts")
         expected_media_types = {
             "browser_screenshot": "image/png",
+            "browser_console": "application/json",
+            "browser_dom": "text/html",
             "browser_accessibility": "application/json",
         }
         for artifact in artifacts:

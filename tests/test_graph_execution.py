@@ -24,6 +24,7 @@ from ai_employee.domain import (
     ProjectHarnessV2,
     RoutingMode,
 )
+from ai_employee.domain.browser import BrowserAction, BrowserCapture, BrowserScenario
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
     ActionKind,
@@ -52,16 +53,20 @@ from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkCoordinator
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest
-from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
+from ai_employee.services_v2 import (
+    AtomicArtifactStore,
+    GitWorkspaceManager,
+    PlaywrightBrowserEvaluationServices,
+)
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-@pytest.mark.parametrize("parent_verification_succeeds", [True, False, None])
+@pytest.mark.parametrize("parent_verification_succeeds", [True, False, None, "browser"])
 def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
-    tmp_path: Path, parent_verification_succeeds: bool | None
+    tmp_path: Path, parent_verification_succeeds: bool | str | None
 ) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -133,26 +138,54 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             CompletionCriterion(
                 id="parent-verification",
                 description="the exact composed candidate passes its Harness verification",
-                verification_requirement_ids=("parent-test",),
+                verification_requirement_ids=(
+                    () if parent_verification_succeeds == "browser" else ("parent-test",)
+                ),
                 required_artifact_ids=("workspace_patch",),
             ),
         ),
     )
-    harness = ProjectHarnessV2(
-        commands={"parent-test": HarnessCommand(argv=("verify-parent",))},
-        evaluators=(
-            HarnessEvaluator(
-                id="parent-process-evaluator",
-                provider_id="process.harness",
-                command_ref="parent-test",
-                criterion_ids=("parent-verification",),
+    if parent_verification_succeeds == "browser":
+        browser_scenario = BrowserScenario(
+            origin="http://127.0.0.1:3000",
+            actions=(BrowserAction(kind="navigate", url="http://127.0.0.1:3000/index.html"),),
+            captures=(
+                BrowserCapture(
+                    id="browser-screen",
+                    kind="screenshot",
+                    logical_kind="browser_screenshot",
+                ),
             ),
-        ),
-        verification=HarnessVerification(
-            required=("parent-test",),
-            required_evaluators=("parent-process-evaluator",),
-        ),
-    )
+        )
+        harness = ProjectHarnessV2(
+            evaluators=(
+                HarnessEvaluator(
+                    id="parent-browser-evaluator",
+                    provider_id="browser.playwright",
+                    browser_scenario=browser_scenario,
+                    criterion_ids=("parent-verification",),
+                ),
+            ),
+            verification=HarnessVerification(
+                required_evaluators=("parent-browser-evaluator",),
+            ),
+        )
+    else:
+        harness = ProjectHarnessV2(
+            commands={"parent-test": HarnessCommand(argv=("verify-parent",))},
+            evaluators=(
+                HarnessEvaluator(
+                    id="parent-process-evaluator",
+                    provider_id="process.harness",
+                    command_ref="parent-test",
+                    criterion_ids=("parent-verification",),
+                ),
+            ),
+            verification=HarnessVerification(
+                required=("parent-test",),
+                required_evaluators=("parent-process-evaluator",),
+            ),
+        )
     policy = PolicyLayer(
         id="policy-parent",
         run_id="graph-e2e",
@@ -328,6 +361,59 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 duration_seconds=0.01,
             )
 
+    class ParentBrowserEngine:
+        def __init__(self) -> None:
+            self.url: str | None = None
+
+        def open(self, _route_handler: object) -> None:
+            pass
+
+        def navigate(self, url: str, _timeout_seconds: float) -> None:
+            self.url = url
+
+        def click(self, _selector: str, _timeout_seconds: float) -> None:
+            pass
+
+        def fill(self, _selector: str, _value: str, _timeout_seconds: float) -> None:
+            pass
+
+        def screenshot(self, _timeout_seconds: float) -> bytes:
+            return b"browser-screenshot"
+
+        def console(self) -> tuple[dict[str, object], ...]:
+            return ()
+
+        def dom(self, _timeout_seconds: float) -> str:
+            return "<html></html>"
+
+        def accessibility(self, _timeout_seconds: float) -> object:
+            return {"role": "document"}
+
+        def current_url(self) -> str | None:
+            return self.url
+
+        def close_page(self) -> None:
+            pass
+
+        def close_context(self) -> None:
+            pass
+
+        def close_browser(self) -> None:
+            pass
+
+        def close_engine(self) -> None:
+            pass
+
+    def parent_browser_services(
+        snapshot: object, cancellation: object
+    ) -> PlaywrightBrowserEvaluationServices:
+        return PlaywrightBrowserEvaluationServices(
+            snapshot.isolated_worktree,  # type: ignore[attr-defined]
+            artifacts,
+            cancellation,  # type: ignore[arg-type]
+            engine_factory=ParentBrowserEngine,  # type: ignore[arg-type]
+        )
+
     with SQLiteStore(database) as store:
 
         def allow_composition(edit: EditIntentRequest) -> PolicyDecision:
@@ -355,7 +441,14 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             )
 
         parent_evaluator = GraphCandidateEvaluator(
-            store, workspace, harness, ParentExecutor, allow_parent_process
+            store,
+            workspace,
+            harness,
+            ParentExecutor,
+            allow_parent_process,
+            browser_services_factory=(
+                parent_browser_services if parent_verification_succeeds == "browser" else None
+            ),
         )
 
         class CountingComposer(GraphPatchComposer):
@@ -433,6 +526,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             by_node[name].evidence_digest for name in ("a", "b")
         )
         inspected = inspect_graph_run(store, run.id)
+        assert len(inspected["parent_acceptance"]) == (
+            0 if parent_verification_succeeds is None else 1
+        )
+        assert len(inspected["parent_browser_observations"]) == (
+            1 if parent_verification_succeeds == "browser" else 0
+        )
         inspected_manifests = inspected["worker_context_manifests"]
         assert len(inspected_manifests) == 3
         assert all(item["artifact_bodies_included"] is False for item in inspected_manifests)
@@ -472,7 +571,9 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         assert all(item.status == "passed" for item in replay.nodes)
         assert service.replay(run.id) == replay
         assert composition_calls == 1
-        assert parent_process_calls == (0 if parent_verification_succeeds is None else 1)
+        assert parent_process_calls == (
+            0 if parent_verification_succeeds in {None, "browser"} else 1
+        )
         if run.parent_evaluation_id is not None:
             parent_record = store.get(
                 "parent_candidate_evaluation_v2",
@@ -482,6 +583,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             assert parent_record.status == run.status
             parent_replay = parent_evaluator.replay(parent_record.id)
             assert parent_replay.record == parent_record
+            assert len(parent_replay.acceptance_ledger.criteria) == 1
+            assert parent_replay.acceptance_ledger.criteria[0].disposition == (
+                "satisfied" if parent_verification_succeeds else "blocked"
+            )
             assert parent_replay.process_invocations == 0
             assert parent_replay.composition_invocations == 0
             assert parent_replay.promotion_invocations == 0

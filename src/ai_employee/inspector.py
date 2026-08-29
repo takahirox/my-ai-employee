@@ -12,7 +12,8 @@ from pydantic import RootModel
 
 from .domain import Artifact, ContextPackage, ExecutionMetrics, Node, Run, VerificationEvidence
 from .domain.base import FrozenDict
-from .domain.evaluation import EvaluationEvidenceLedger
+from .domain.browser import BrowserObservation
+from .domain.evaluation import EvaluationEvidenceLedger, EvaluationResult, ObservationManifest
 from .domain.policy_v2 import PolicyLayer
 from .domain.v2 import (
     AcceptanceLedger,
@@ -429,6 +430,26 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
                 "evaluation_evidence_ledger_v2",
                 EvaluationEvidenceLedger,
                 run_id=run_id,
+            )
+        ],
+        "parent_acceptance": [
+            _json_model(item)
+            for item in store.list_records("acceptance_ledger_v2", AcceptanceLedger, run_id=run_id)
+        ],
+        "parent_evaluation_results": [
+            _json_model(item)
+            for item in store.list_records("evaluation_result_v2", EvaluationResult, run_id=run_id)
+        ],
+        "parent_observation_manifests": [
+            _json_model(item)
+            for item in store.list_records(
+                "observation_manifest_v2", ObservationManifest, run_id=run_id
+            )
+        ],
+        "parent_browser_observations": [
+            _json_model(item)
+            for item in store.list_records(
+                "browser_observation_v2", BrowserObservation, run_id=run_id
             )
         ],
         "approval_requests": [

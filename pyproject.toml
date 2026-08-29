@@ -31,6 +31,9 @@ Issues = "https://github.com/takahirox/my-ai-employee/issues"
 Changelog = "https://github.com/takahirox/my-ai-employee/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+browser = [
+  "playwright>=1.62,<2",
+]
 dev = [
   "build>=1.2.2,<2",
   "mypy>=1.14,<2",

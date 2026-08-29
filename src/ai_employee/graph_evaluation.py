@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import ClassVar, Literal, Self
+from typing import ClassVar, Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.main import BaseModel
 
 from .domain import Goal, ProjectHarnessV2
 from .domain.base import Digest, Identifier
+from .domain.browser import BrowserEvaluationServices, BrowserObservation
 from .domain.evaluation import (
     CandidateRevision,
     EvaluationBudget,
     EvaluationDecision,
     EvaluationEvidenceLedger,
     EvaluationRequest,
+    EvaluatorServices,
     EvaluatorSpecification,
     decide_evaluation,
     evaluate_freshness,
@@ -23,7 +25,9 @@ from .domain.evaluation import (
 from .domain.models import AcceptedGraphRevision
 from .domain.services_v2 import Cancellation, ProcessExecutor, WorkspaceManager
 from .domain.v2 import (
+    AcceptanceLedger,
     ArtifactDescriptor,
+    CriterionEvidence,
     DigestedRecordV2,
     PolicyDecision,
     ProcessRequest,
@@ -42,6 +46,15 @@ from .task_orchestration import (
 
 PolicyDecider = Callable[[ProcessRequest], PolicyDecision]
 ExecutorFactory = Callable[[WorkspaceSnapshot], ProcessExecutor]
+
+
+class BrowserExecutionServices(BrowserEvaluationServices, Protocol):
+    """Browser boundary plus the observations needed for durable replay."""
+
+    observations: list[BrowserObservation]
+
+
+BrowserServicesFactory = Callable[[WorkspaceSnapshot, Cancellation], BrowserExecutionServices]
 
 
 class ParentVerificationBinding(BaseModel):
@@ -184,6 +197,8 @@ class ParentCandidateEvaluationReplay(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     schema_version: Literal["2"] = "2"
     record: ParentCandidateEvaluationRecord
+    acceptance_ledger: AcceptanceLedger
+    evaluation_ledgers: tuple[EvaluationEvidenceLedger, ...]
     process_invocations: Literal[0] = 0
     workspace_reads: Literal[0] = 0
     composition_invocations: Literal[0] = 0
@@ -200,12 +215,14 @@ class GraphCandidateEvaluator:
         harness: ProjectHarnessV2,
         executor_factory: ExecutorFactory,
         policy_decider: PolicyDecider,
+        browser_services_factory: BrowserServicesFactory | None = None,
     ) -> None:
         self.store = store
         self.workspace = workspace
         self.harness = harness
         self.executor_factory = executor_factory
         self.policy_decider = policy_decider
+        self.browser_services_factory = browser_services_factory
 
     def evaluate(
         self,
@@ -237,22 +254,14 @@ class GraphCandidateEvaluator:
                 failure_code="PARENT_EVALUATION_BINDING_MISMATCH",
             )
 
-        executor = self.executor_factory(request.composition_workspace)
         ledger_digests: list[Digest] = []
         verification_result_digests: list[Digest] = []
+        criterion_evidence: dict[Identifier, CriterionEvidence] = {}
         for binding in request.verification_bindings:
             specification = binding.specification
             process_request = binding.process_request
-            if process_request is None:
-                return self._finish(
-                    request,
-                    decision=EvaluationDecision.FAIL,
-                    failure_code="PARENT_EVALUATION_UNAVAILABLE",
-                    ledger_digests=tuple(ledger_digests),
-                    verification_result_digests=tuple(verification_result_digests),
-                )
             self.store.put("evaluator_specification_v2", specification, run_id=request.run_id)
-            self.store.put("verification_request_v2", process_request, run_id=request.run_id)
+            scenario = specification.browser_scenario
             evaluation_request = EvaluationRequest(
                 id=identifier("parent-evaluation-request"),
                 run_id=request.run_id,
@@ -262,37 +271,66 @@ class GraphCandidateEvaluator:
                 evaluator_specification_digest=_required(specification.content_digest),
                 effective_policy_digest=request.effective_policy_digest,
                 remaining_budget=EvaluationBudget(
-                    remaining_processes=1,
+                    remaining_processes=1 if process_request is not None else 0,
                     remaining_artifact_bytes=self.harness.budgets.artifact_bytes,
+                    remaining_actions=0 if scenario is None else len(scenario.actions),
+                    remaining_duration_seconds=(
+                        0.0 if scenario is None else scenario.timeout_seconds
+                    ),
                 ),
             )
             self.store.put("evaluation_request_v2", evaluation_request, run_id=request.run_id)
-
-            def decide(value: ProcessRequest) -> PolicyDecision:
-                decision = self.policy_decider(value)
-                self.store.put("policy_decision_v2", decision, run_id=request.run_id)
-                return decision
-
-            services = HarnessProcessEvaluationServices(
-                {process_request.id: process_request},
-                executor,
-                decide,
-                cancellation,
-                artifact_resolver=_unavailable_artifact,
-                id_factory=identifier,
-                clock=now,
-            )
             try:
                 provider = DEFAULT_EVALUATOR_REGISTRY.resolve(specification.provider_id)
-                result = provider.evaluate(evaluation_request, specification, services)
-                if len(services.executions) != 1:
-                    raise ValueError(
-                        "parent evaluator did not execute exactly one declared request"
+                if process_request is not None:
+                    self.store.put(
+                        "verification_request_v2", process_request, run_id=request.run_id
                     )
-                execution = services.executions[0]
-                self.store.put("verification_result_v2", execution, run_id=request.run_id)
-                if result.execution_result_digest != execution.content_digest:
-                    raise ValueError("evaluation result does not cite its exact process result")
+
+                    def decide(value: ProcessRequest) -> PolicyDecision:
+                        decision = self.policy_decider(value)
+                        self.store.put("policy_decision_v2", decision, run_id=request.run_id)
+                        return decision
+
+                    process_services = HarnessProcessEvaluationServices(
+                        {process_request.id: process_request},
+                        self.executor_factory(request.composition_workspace),
+                        decide,
+                        cancellation,
+                        artifact_resolver=_unavailable_artifact,
+                        id_factory=identifier,
+                        clock=now,
+                    )
+                    result = provider.evaluate(evaluation_request, specification, process_services)
+                    if len(process_services.executions) != 1:
+                        raise ValueError(
+                            "parent evaluator did not execute exactly one declared request"
+                        )
+                    execution = process_services.executions[0]
+                    self.store.put("verification_result_v2", execution, run_id=request.run_id)
+                    runtime_result_digest = _required(execution.content_digest)
+                else:
+                    if self.browser_services_factory is None:
+                        raise RuntimeError("parent browser evaluation is not configured")
+                    browser_services = self.browser_services_factory(
+                        request.composition_workspace, cancellation
+                    )
+                    result = provider.evaluate(
+                        evaluation_request,
+                        specification,
+                        cast(EvaluatorServices, browser_services),
+                    )
+                    if len(browser_services.observations) != 1:
+                        raise ValueError(
+                            "parent evaluator did not produce exactly one browser observation"
+                        )
+                    browser_observation = browser_services.observations[0]
+                    self.store.put(
+                        "browser_observation_v2", browser_observation, run_id=request.run_id
+                    )
+                    runtime_result_digest = _required(browser_observation.content_digest)
+                if result.execution_result_digest != runtime_result_digest:
+                    raise ValueError("evaluation result does not cite its exact runtime result")
                 for artifact in result.observation_manifest.artifacts:
                     self.store.put("artifact_descriptor_v2", artifact, run_id=request.run_id)
                 self.store.put(
@@ -344,9 +382,25 @@ class GraphCandidateEvaluator:
                     failure_code="PARENT_EVALUATION_UNAVAILABLE",
                     ledger_digests=tuple(ledger_digests),
                     verification_result_digests=tuple(verification_result_digests),
+                    criterion_evidence=criterion_evidence,
                 )
-            ledger_digests.append(_required(ledger.content_digest))
-            verification_result_digests.append(_required(execution.content_digest))
+            ledger_digest = _required(ledger.content_digest)
+            ledger_digests.append(ledger_digest)
+            verification_result_digests.append(runtime_result_digest)
+            evidence_refs = (
+                ledger_digest,
+                _required(result.content_digest),
+                _required(result.observation_manifest.content_digest),
+                *(item.artifact_digest for item in result.observation_manifest.artifacts),
+            )
+            for criterion_id in specification.criterion_ids:
+                criterion_evidence[criterion_id] = CriterionEvidence(
+                    criterion_id=criterion_id,
+                    disposition=(
+                        "satisfied" if ledger.decision is EvaluationDecision.PASS else "blocked"
+                    ),
+                    evidence_refs=evidence_refs,
+                )
             if ledger.decision is not EvaluationDecision.PASS:
                 return self._finish(
                     request,
@@ -354,6 +408,7 @@ class GraphCandidateEvaluator:
                     failure_code="PARENT_VERIFICATION_FAILED",
                     ledger_digests=tuple(ledger_digests),
                     verification_result_digests=tuple(verification_result_digests),
+                    criterion_evidence=criterion_evidence,
                 )
 
         try:
@@ -365,12 +420,14 @@ class GraphCandidateEvaluator:
                 failure_code="PARENT_CANDIDATE_STALE",
                 ledger_digests=tuple(ledger_digests),
                 verification_result_digests=tuple(verification_result_digests),
+                criterion_evidence=criterion_evidence,
             )
         return self._finish(
             request,
             decision=EvaluationDecision.PASS,
             ledger_digests=tuple(ledger_digests),
             verification_result_digests=tuple(verification_result_digests),
+            criterion_evidence=criterion_evidence,
         )
 
     def replay(self, evaluation_id: Identifier) -> ParentCandidateEvaluationReplay:
@@ -379,7 +436,49 @@ class GraphCandidateEvaluator:
             evaluation_id,
             ParentCandidateEvaluationRecord,
         )
-        return ParentCandidateEvaluationReplay(record=record)
+        goal_evaluators = tuple(
+            item
+            for item in self.store.list_records(
+                "goal_evaluator_v2", GoalEvaluatorRecord, run_id=record.run_id
+            )
+            if item.content_digest == record.goal_evaluator_digest
+        )
+        if len(goal_evaluators) != 1:
+            raise ValueError("parent Goal evaluator evidence is missing or ambiguous")
+        goal_evaluator = goal_evaluators[0]
+        acceptance_ledgers = tuple(
+            item
+            for item in self.store.list_records(
+                "acceptance_ledger_v2", AcceptanceLedger, run_id=record.run_id
+            )
+            if item.content_digest in goal_evaluator.evidence_digests
+        )
+        if len(acceptance_ledgers) != 1:
+            raise ValueError("parent AcceptanceLedger is missing or ambiguous")
+        by_digest = {
+            item.content_digest: item
+            for item in self.store.list_records(
+                "evaluation_evidence_ledger_v2",
+                EvaluationEvidenceLedger,
+                run_id=record.run_id,
+            )
+        }
+        try:
+            evaluation_ledgers = tuple(
+                by_digest[digest] for digest in record.evaluation_ledger_digests
+            )
+        except KeyError as error:
+            raise ValueError("parent evaluation evidence is missing") from error
+        if goal_evaluator.evidence_digests != (
+            _required(acceptance_ledgers[0].content_digest),
+            *record.evaluation_ledger_digests,
+        ):
+            raise ValueError("parent Goal evaluator evidence bindings are stale")
+        return ParentCandidateEvaluationReplay(
+            record=record,
+            acceptance_ledger=acceptance_ledgers[0],
+            evaluation_ledgers=evaluation_ledgers,
+        )
 
     def _request(
         self,
@@ -601,14 +700,35 @@ class GraphCandidateEvaluator:
         failure_code: str | None = None,
         ledger_digests: tuple[Digest, ...] = (),
         verification_result_digests: tuple[Digest, ...] = (),
+        criterion_evidence: Mapping[Identifier, CriterionEvidence] | None = None,
     ) -> ParentCandidateEvaluationRecord:
+        criterion_evidence = criterion_evidence or {}
+        acceptance_ledger = AcceptanceLedger(
+            id=identifier("parent-acceptance-ledger"),
+            run_id=request.run_id,
+            created_at=now(),
+            criteria=tuple(
+                criterion_evidence.get(
+                    criterion.id,
+                    CriterionEvidence(
+                        criterion_id=criterion.id,
+                        disposition="uncovered",
+                    ),
+                )
+                for criterion in request.goal.completion_criteria
+            ),
+        )
+        self.store.put("acceptance_ledger_v2", acceptance_ledger, run_id=request.run_id)
         goal_evaluation = GoalEvaluatorRecord(
             id=identifier("parent-goal-evaluation"),
             run_id=request.run_id,
             created_at=now(),
             goal_id=request.goal.id,
             accepted_graph_revision_digest=_required(request.accepted_revision.content_digest),
-            evidence_digests=ledger_digests,
+            evidence_digests=(
+                _required(acceptance_ledger.content_digest),
+                *ledger_digests,
+            ),
             decision=decision,
         )
         self.store.put("goal_evaluator_v2", goal_evaluation, run_id=request.run_id)

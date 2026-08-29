@@ -120,6 +120,32 @@ def test_harness_accepts_strict_process_evaluator_declarations() -> None:
     assert harness.evaluators[1].provider_id == "browser.playwright"
 
 
+def test_browser_evaluator_example_is_a_loadable_explicit_harness() -> None:
+    example = Path(__file__).parents[1] / "examples" / "browser-evaluator"
+
+    harness = discover_project_harness(example)
+
+    assert not harness.provisional
+    assert harness.verification.required == ("fixture-exists",)
+    assert harness.verification.required_evaluators == (
+        "fixture-check",
+        "interaction-check",
+    )
+    assert tuple(item.provider_id for item in harness.evaluators) == (
+        "process.harness",
+        "browser.playwright",
+    )
+    scenario = harness.evaluators[1].browser_scenario
+    assert scenario is not None
+    assert tuple(item.kind for item in scenario.actions) == ("navigate", "click")
+    assert tuple(item.logical_kind for item in scenario.captures) == (
+        "browser_screenshot",
+        "browser_console",
+        "browser_dom",
+        "browser_accessibility",
+    )
+
+
 @pytest.mark.parametrize(
     ("evaluators", "required", "message"),
     [

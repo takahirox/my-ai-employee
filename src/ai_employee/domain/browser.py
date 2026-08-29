@@ -88,13 +88,17 @@ class BrowserAction(SchemaModelV2):
 class BrowserCapture(SchemaModelV2):
     schema_name: ClassVar[str] = "browser_capture"
     id: Identifier
-    kind: Literal["screenshot", "accessibility"]
-    logical_kind: Literal["browser_screenshot", "browser_accessibility"]
+    kind: Literal["screenshot", "console", "dom", "accessibility"]
+    logical_kind: Literal[
+        "browser_screenshot", "browser_console", "browser_dom", "browser_accessibility"
+    ]
 
     @model_validator(mode="after")
     def _kind_matches_observation(self) -> Self:
         expected = {
             "screenshot": "browser_screenshot",
+            "console": "browser_console",
+            "dom": "browser_dom",
             "accessibility": "browser_accessibility",
         }[self.kind]
         if self.logical_kind != expected:

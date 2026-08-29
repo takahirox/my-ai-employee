@@ -57,9 +57,25 @@ each legacy entry in `verification.required` when no explicit `required_evaluato
 declared. Projects that use only the established command list therefore keep the same
 verification intent while gaining exact-candidate evidence binding.
 
-`browser.playwright`, `judge.visual`, and `threejs.instrumentation` remain stable reserved IDs
-for later first-party providers. They are not available implementations, so declaring them
-currently fails closed. Harnesses cannot load third-party providers, Python entry points, or
-dynamic imports. An unsatisfied deterministic process evaluation is persisted as typed
-`REPAIR` evidence, but the parent candidate currently fails closed; it does not start an
-automatic repair worker.
+`browser.playwright` is an available, developer-managed first-party provider. Its typed
+scenario supports bounded navigation, click, and fill actions plus screenshot, console, DOM,
+and accessibility captures. It serves only files contained by the exact candidate workspace,
+enforces one exact loopback origin, blocks redirects/background requests, uses an ephemeral
+credential-free context, and always tears down the browser layers. Install the optional
+`browser` extra and its Chromium binary only for projects that declare this provider. See
+`examples/browser-evaluator` for a command-plus-browser Harness.
+
+`judge.visual` and `threejs.instrumentation` remain reserved for later first-party providers
+and fail closed today. Harnesses cannot load third-party providers, Python entry points, or
+dynamic imports.
+
+An unsatisfied deterministic parent evaluation is persisted as typed `REPAIR` evidence, but
+the current parent candidate fails closed. The follow-up transition is deliberately defined
+to reuse the existing bounded node repair machinery: create an immutable loop transition that
+names the failed parent evaluation and evidence ledger digests, increment generation and
+attempt, include only those accepted evidence references in the next worker request, recompose
+a new exact candidate, and rerun all required evaluators. `max_repairs`, remaining wall/process/
+action/artifact budgets, and generation fences decide whether the transition is admitted;
+exhaustion escalates or fails. Probabilistic or indeterminate findings escalate and never enter
+automatic repair. This contract avoids granting evaluator providers mutation or transition
+authority.
