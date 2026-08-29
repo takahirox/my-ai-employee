@@ -18,6 +18,7 @@ from ai_employee.domain import (
     SemanticTaskType,
 )
 from ai_employee.routing import assess_task, merge_semantic_profile, select_strategy
+from ai_employee.serialization import canonical_digest, operator_config_digest
 
 
 def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
@@ -174,6 +175,18 @@ def test_task_reviewer_requires_explicit_operator_eligibility_and_default() -> N
             strategies=(reviewer.model_copy(update={"task_reviewer_eligible": False}),),
             default_task_reviewer_strategy="reviewer",
         )
+
+
+def test_disabled_task_review_preserves_pre_issue7_operator_digest() -> None:
+    config = OperatorConfig()
+    old_payload = config.model_dump(mode="python")
+    routing = old_payload["routing"]
+    assert isinstance(routing, dict)
+    routing.pop("default_task_reviewer_strategy")
+    for strategy in routing["strategies"]:
+        strategy.pop("task_reviewer_eligible")
+
+    assert operator_config_digest(config) == canonical_digest(old_payload)
 
 
 def test_named_strategy_set_limits_available_strategies() -> None:

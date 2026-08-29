@@ -21,7 +21,7 @@ from ai_employee.graph_evaluation import (
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.project import discover_project_harness
-from ai_employee.serialization import canonical_digest
+from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
@@ -38,7 +38,7 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, Path, Path]:
     repository = tmp_path / "repo"
     repository.mkdir()
     (repository / ".fleet").mkdir()
@@ -298,7 +298,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 },
                 "verification": {
                     "required": ["parent-test"],
-                    "review": {"independent_task_review": True},
+                    **({"review": {"independent_task_review": True}} if task_review else {}),
                 },
                 "worker": {
                     "allowed": ["codex_cli"],
@@ -340,7 +340,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "routing": {
                     "default_strategy_set": "all",
                     "default_assessment_strategy": "planner",
-                    "default_task_reviewer_strategy": "planner",
+                    **({"default_task_reviewer_strategy": "planner"} if task_review else {}),
                     "strategy_sets": {"all": ["low", "high", "planner"]},
                     "strategies": [
                         {
@@ -370,7 +370,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                             "effort": "high",
                             "capabilities": ["edit_intent", "process"],
                             "planner_eligible": True,
-                            "task_reviewer_eligible": True,
+                            **({"task_reviewer_eligible": True} if task_review else {}),
                         },
                     ],
                 },
@@ -455,7 +455,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
         inspected = inspect_graph_run(store, run_id)
 
     assert graph_run.status == "ready_to_promote"
-    assert acceptance.harness_digest == canonical_digest(harness)
+    assert acceptance.harness_digest == project_harness_digest(harness)
     assert acceptance.proposed_graph_digest == proposal.content_digest
     assert inspected["plan_review"]["status"] == "accepted"
     assert proposal.planner_strategy.id == "high"
@@ -624,7 +624,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
 def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    repository, operator, database, state = _fixture(tmp_path)
+    repository, operator, database, state = _fixture(tmp_path, task_review=False)
     (state / "hold").write_text("hold", encoding="utf-8")
     argv = [
         "work",

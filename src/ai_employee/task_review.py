@@ -293,6 +293,7 @@ def parse_task_review_payload(output: str) -> TaskReviewPayload:
 def validate_task_review_result(request: TaskReviewRequest, result: TaskReviewResult) -> None:
     if (
         result.request_digest != request.content_digest
+        or result.run_id != request.run_id
         or result.node_id != request.node_id
         or result.accepted_graph_revision_digest != request.accepted_graph_revision_digest
         or result.generation != request.generation
@@ -354,7 +355,9 @@ def decide_task_review(
     blocked = set(block_severities)
     accepted = tuple(item for item in result.findings if item.severity in blocked)
     accepted_digests = tuple(sorted(canonical_digest(item) for item in accepted))
-    if not accepted:
+    if result.limitations:
+        action, reason = TaskReviewAction.ESCALATE, "TASK_REVIEW_COVERAGE_LIMITED"
+    elif not accepted:
         action, reason = TaskReviewAction.PASS, "TASK_REVIEW_PASS"
     elif any(item.severity is TaskReviewSeverity.CRITICAL for item in accepted):
         action, reason = TaskReviewAction.FAIL, "TASK_REVIEW_UNRECOVERABLE"
@@ -538,6 +541,11 @@ class CliTaskResultReviewer:
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
+                "--ignore-rules",
+                "--disable",
+                "shell_tool",
+                "--disable",
+                "unified_exec",
                 "--sandbox",
                 "read-only",
                 "--cd",

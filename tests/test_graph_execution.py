@@ -51,7 +51,7 @@ from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkCoordinator
 from ai_employee.runtime import DeterministicRuntime
-from ai_employee.serialization import canonical_digest
+from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_planning import ProposedGraph
@@ -171,7 +171,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         max_artifact_bytes=1_000_000,
     )
     effective_policy_digest = canonical_digest([policy.content_digest])
-    harness_digest = canonical_digest(harness)
+    harness_digest = project_harness_digest(harness)
     proposal = ProposedGraph(
         id="proposal-bounded",
         run_id="graph-e2e",

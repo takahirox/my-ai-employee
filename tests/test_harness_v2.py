@@ -14,6 +14,7 @@ from ai_employee.project import (
     migration_candidate,
     write_migration_candidate,
 )
+from ai_employee.serialization import canonical_digest, project_harness_digest
 
 
 def valid_harness() -> dict[str, object]:
@@ -73,6 +74,27 @@ def test_independent_task_review_requires_explicit_harness_review_gate() -> None
     enabled["verification"]["review"]["required"] = False
     with pytest.raises(ValidationError, match="requires the review gate"):
         ProjectHarnessV2.model_validate_json(json.dumps(enabled), strict=True)
+
+
+def test_disabled_task_review_preserves_pre_issue7_harness_digest() -> None:
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(valid_harness()), strict=True)
+    old_payload = harness.model_dump(mode="python")
+    old_payload["verification"]["review"].pop("independent_task_review")
+
+    assert project_harness_digest(harness) == canonical_digest(old_payload)
+
+    enabled = harness.model_copy(
+        update={
+            "verification": harness.verification.model_copy(
+                update={
+                    "review": harness.verification.review.model_copy(
+                        update={"independent_task_review": True}
+                    )
+                }
+            )
+        }
+    )
+    assert project_harness_digest(enabled) != canonical_digest(old_payload)
 
 
 def test_harness_allows_repeated_argv_but_rejects_overlapping_protected_paths() -> None:

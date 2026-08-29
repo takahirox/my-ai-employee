@@ -69,7 +69,13 @@ from .project import (
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
 from .runtime import DeterministicRuntime, NodeExecutionContext
-from .serialization import canonical_digest, canonical_json, loads_yaml_model
+from .serialization import (
+    canonical_digest,
+    canonical_json,
+    loads_yaml_model,
+    operator_config_digest,
+    project_harness_digest,
+)
 from .services_v2 import (
     AtomicArtifactStore,
     DigestApprovalService,
@@ -376,7 +382,7 @@ def _work(args: argparse.Namespace) -> int:
     if harness.verification.review.independent_task_review and not routing_enabled:
         raise ValueError("independent task review requires configured routing")
     goal = _work_goal(run_id, args.goal, harness) if resume_run is None else resume_run.goal
-    if resume_run is not None and canonical_digest(harness) != resume_run.harness_digest:
+    if resume_run is not None and project_harness_digest(harness) != resume_run.harness_digest:
         raise ValueError("Project Harness changed since the graph was accepted")
     capabilities = ["edit_intent", "process"]
     if harness.network.mode.value != "disabled":
@@ -397,7 +403,7 @@ def _work(args: argparse.Namespace) -> int:
     operator_config = load_operator_config(operator_config_path)
     if (
         resume_run is not None
-        and canonical_digest(operator_config) != resume_run.operator_config_digest
+        and operator_config_digest(operator_config) != resume_run.operator_config_digest
     ):
         raise ValueError("operator configuration changed since the graph was accepted")
     worker_name = cast(WorkerName, args.worker or "codex_cli")
@@ -729,7 +735,7 @@ def _work(args: argparse.Namespace) -> int:
                 allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible_planners)),
                 local_backend_allowed=harness.worker.local_backend,
             )
-            harness_digest = canonical_digest(harness)
+            harness_digest = project_harness_digest(harness)
             effective_policy_digest = canonical_digest((policy.content_digest,))
             planner_routing = PlannerRoutingDecision(
                 selection_mode=planner_selection_mode,
@@ -742,7 +748,7 @@ def _work(args: argparse.Namespace) -> int:
                 selected_strategy=selected_planner,
                 effective_policy_digest=effective_policy_digest,
                 harness_digest=harness_digest,
-                operator_config_digest=canonical_digest(operator_config),
+                operator_config_digest=operator_config_digest(operator_config),
             )
             planner_strategy = selected_planner.model_copy(update={"routing_reasons": ()})
             planner_command = operator_config.worker_command(
@@ -908,7 +914,7 @@ def _work(args: argparse.Namespace) -> int:
             for name in harness.verification.required
         )
         workspace = GitWorkspaceManager(workspace_root, artifacts)
-        harness_digest = canonical_digest(harness)
+        harness_digest = project_harness_digest(harness)
         effective_policy_digest = canonical_digest((policy.content_digest,))
         coordinator = WorkCoordinator(
             store,
@@ -1054,7 +1060,7 @@ def _work(args: argparse.Namespace) -> int:
                 local_backend_allowed=harness.worker.local_backend,
                 parent_evaluator=parent_evaluator,
                 approval_service=DigestApprovalService(store, operator_label="local-operator"),
-                operator_config_digest=canonical_digest(operator_config),
+                operator_config_digest=operator_config_digest(operator_config),
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
                 plan_reviewer=plan_reviewer,

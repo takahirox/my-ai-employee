@@ -6,7 +6,9 @@ from datetime import UTC, datetime
 import pytest
 
 from ai_employee.domain import ExecutionStrategy, RoutingMode
+from ai_employee.domain.base import freeze_json
 from ai_employee.domain.v2 import (
+    ArtifactDescriptor,
     CriterionEvidence,
     DecisionOutcome,
     ExecutionResult,
@@ -20,7 +22,9 @@ from ai_employee.task_review import (
     CliTaskResultReviewer,
     TaskReviewPayload,
     TaskReviewRequest,
+    bind_task_review_payload,
     task_review_schema_json,
+    validate_task_review_result,
 )
 
 NOW = datetime(2026, 8, 29, tzinfo=UTC)
@@ -42,7 +46,10 @@ def _strategy(backend: str = "ollama_cli") -> ExecutionStrategy:
     )
 
 
-def _request(strategy: ExecutionStrategy | None = None) -> TaskReviewRequest:
+def _request(
+    strategy: ExecutionStrategy | None = None,
+    artifact_descriptors: tuple[ArtifactDescriptor, ...] = (),
+) -> TaskReviewRequest:
     worker_request = WorkerRequest(
         id="worker-request",
         run_id="node-run",
@@ -94,6 +101,7 @@ def _request(strategy: ExecutionStrategy | None = None) -> TaskReviewRequest:
         worker_result=worker_result,
         criterion_evidence=(evidence,),
         deterministic_evidence_digests=(EVIDENCE, EVALUATOR),
+        artifact_descriptors=artifact_descriptors,
     )
 
 
@@ -162,6 +170,54 @@ def test_task_reviewer_receives_exact_bounded_payload_after_opt_in() -> None:
     assert {"repository", "conversation_history", "artifact_bodies"}.isdisjoint(prompt)
 
 
+def test_task_reviewer_sanitizes_artifact_descriptor_egress() -> None:
+    canary = "SECRET-CANARY-MUST-NOT-EGRESS"
+    descriptor = ArtifactDescriptor(
+        id="artifact",
+        run_id="review-run",
+        created_at=NOW,
+        artifact_digest="6" * 64,
+        media_type="text/x-diff",
+        size_bytes=123,
+        logical_kind="workspace_patch",
+        producer_action_id="worker-result",
+        source=freeze_json({"secret": canary}),
+        redaction_state="none",
+        store_locator=f"private/{canary}",
+    )
+    request = _request(artifact_descriptors=(descriptor,))
+    output = canonical_json(
+        TaskReviewPayload(findings=(), reviewed_criterion_ids=("criterion-fix",), limitations=())
+    ).encode()
+    prompts: list[bytes] = []
+    reviewer = CliTaskResultReviewer(
+        _Executor(),
+        lambda digest: output if digest == "9" * 64 else b"",
+        _allow,
+        run_id="review-run",
+        strategy=request.reviewer_strategy,
+        executable="ollama",
+        cwd=".",
+        prompt_writer=lambda value: (prompts.append(value), "8" * 64)[1],
+    )
+
+    reviewer.review(request)
+
+    prompt_text = prompts[0].decode()
+    exported = json.loads(prompt_text)["request"]["artifact_descriptors"][0]
+    assert set(exported) == {
+        "artifact_digest",
+        "media_type",
+        "size_bytes",
+        "logical_kind",
+        "producer_action_id",
+        "redaction_state",
+    }
+    assert canary not in prompt_text
+    assert "source" not in exported
+    assert "store_locator" not in exported
+
+
 def test_task_reviewer_argv_disables_tools_and_sessions() -> None:
     executor = _Executor()
     codex = CliTaskResultReviewer(
@@ -189,6 +245,13 @@ def test_task_reviewer_argv_disables_tools_and_sessions() -> None:
     assert "--ephemeral" in codex._argv()
     assert codex._argv()[codex._argv().index("--sandbox") + 1] == "read-only"
     assert codex._argv()[codex._argv().index("--ask-for-approval") + 1] == "never"
+    assert "--ignore-rules" in codex._argv()
+    disabled = tuple(
+        value
+        for index, value in enumerate(codex._argv())
+        if index > 0 and codex._argv()[index - 1] == "--disable"
+    )
+    assert disabled == ("shell_tool", "unified_exec")
     assert "--tools=" in claude._argv()
     assert "--no-session-persistence" in claude._argv()
 
@@ -206,3 +269,19 @@ def test_task_reviewer_rejects_foreign_request() -> None:
     )
     with pytest.raises(ValueError, match="another reviewer or run"):
         reviewer.review(_request())
+
+
+def test_task_review_result_rejects_foreign_run_binding() -> None:
+    request = _request()
+    result = bind_task_review_payload(
+        TaskReviewPayload(
+            findings=(), reviewed_criterion_ids=request.criterion_ids, limitations=()
+        ),
+        request=request,
+        record_id="result",
+        run_id=request.run_id,
+        created_at=NOW,
+    ).model_copy(update={"run_id": "foreign-run"})
+
+    with pytest.raises(ValueError, match="stale or foreign bindings"):
+        validate_task_review_result(request, result)
