@@ -259,3 +259,85 @@ def test_non_repairable_evaluation_selects_terminal_fail(tmp_path: Path) -> None
     assert run.status == "failed"
     assert [item.action for item in replay.loop_transitions] == [LoopAction.FAIL]
     assert replay.loop_transitions[0].reason_code == "NODE_EVALUATION_NOT_PASS"
+
+
+def test_pending_repair_feedback_survives_pause_and_resume(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    database = tmp_path / "repair-resume.db"
+    requests: list[WorkerRequest] = []
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        if request.generation == 0:
+            with SQLiteStore(database) as controller:
+                controller.request_control("closed-loop-repair-resume", "pause")
+            return _result(request, "blocked")
+        return _result(request, "satisfied")
+
+    with SQLiteStore(database) as store:
+        orchestrator, paused = _run(
+            store,
+            graph,
+            goal,
+            runner,
+            run_id="closed-loop-repair-resume",
+        )
+        assert paused.status == "paused"
+        resumed = orchestrator.run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=4, max_wall_seconds=4.0),
+            harness_digest=HARNESS,
+            effective_policy_digest=POLICY,
+            run_id="closed-loop-repair-resume",
+            available_capabilities=("process",),
+            resume=True,
+        )
+        replay = orchestrator.replay("closed-loop-repair-resume")
+
+    repair = next(item for item in replay.loop_transitions if item.action is LoopAction.REPAIR)
+    assert resumed.status == "completed"
+    assert [(item.generation, item.attempt) for item in requests] == [(0, 0), (1, 1)]
+    assert requests[1].accepted_feedback_digests == repair.evidence_digests
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.PASS,
+    ]
+
+
+def test_repair_feedback_survives_worker_retry(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_retries=1, max_repairs=1)
+    requests: list[WorkerRequest] = []
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        if request.attempt == 0:
+            return _result(request, "blocked")
+        if request.attempt == 1:
+            raise RuntimeError("transient repair worker failure")
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "repair-retry.db") as store:
+        orchestrator, run = _run(store, graph, goal, runner, run_id="closed-loop-repair-retry")
+        replay = orchestrator.replay("closed-loop-repair-retry")
+
+    repair = replay.loop_transitions[0]
+    assert run.status == "completed"
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.RETRY,
+        LoopAction.PASS,
+    ]
+    assert [item.accepted_feedback_digests for item in requests] == [
+        (),
+        repair.evidence_digests,
+        repair.evidence_digests,
+    ]

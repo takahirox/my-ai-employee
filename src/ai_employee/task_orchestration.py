@@ -1122,6 +1122,18 @@ class TaskOrchestrator:
             if transition.node_id is not None:
                 loop_counts[(transition.node_id, transition.action)] += 1
         repair_feedback_by_node: dict[str, tuple[Digest, ...]] = {}
+        for node_id, record in records.items():
+            if record.status != "pending":
+                continue
+            repair = self._active_repair_transition(
+                run_id,
+                node_id,
+                graph_digest,
+                record.generation,
+                record.attempt,
+            )
+            if repair is not None:
+                repair_feedback_by_node[node_id] = repair.evidence_digests
         active: dict[
             Future[NodeExecutionResult],
             tuple[str, Node, WorkerRequest, NodeReservationRecord],
@@ -2653,21 +2665,18 @@ class TaskOrchestrator:
         request: WorkerRequest,
     ) -> bool:
         feedback = request.accepted_feedback_digests
-        if not feedback:
-            if request.graph_run_id is None or request.attempt == 0:
-                return True
-            return not any(
-                item.node_id == node.id
-                and item.generation == request.generation
-                and item.attempt == request.attempt - 1
-                and item.action is LoopAction.REPAIR
-                for item in self.store.list_records(
-                    "loop_transition_v2",
-                    LoopTransitionRecord,
-                    run_id=request.graph_run_id,
-                )
-            )
-        if request.attempt < 1 or len(feedback) != 2 or request.graph_run_id is None:
+        if request.graph_run_id is None:
+            return not feedback
+        repair = self._active_repair_transition(
+            request.graph_run_id,
+            node.id,
+            request.accepted_graph_revision_digest,
+            request.generation,
+            request.attempt,
+        )
+        if repair is None:
+            return not feedback
+        if len(feedback) != 2 or feedback != repair.evidence_digests:
             return False
         history = self.store.list_records(
             "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id
@@ -2676,9 +2685,9 @@ class TaskOrchestrator:
             item
             for item in history
             if item.node_id == node.id
-            and item.accepted_graph_revision_digest == request.accepted_graph_revision_digest
-            and item.generation == request.generation
-            and item.attempt == request.attempt - 1
+            and item.accepted_graph_revision_digest == repair.accepted_graph_revision_digest
+            and item.generation == repair.generation
+            and item.attempt == repair.attempt
             and item.status == "failed"
             and item.evaluator_decision is EvaluationDecision.FAIL
             and item.worker_request_digest is not None
@@ -2692,7 +2701,11 @@ class TaskOrchestrator:
         if not candidates:
             return False
         prior = max(candidates, key=lambda item: (item.sequence, item.created_at, item.id))
-        if feedback != (prior.evidence_digest, prior.evaluator_digest):
+        if (
+            repair.worker_request_digest != prior.worker_request_digest
+            or repair.worker_result_digest != prior.worker_result_digest
+            or repair.evidence_digests != (prior.evidence_digest, prior.evaluator_digest)
+        ):
             return False
         assert prior.worker_result_id is not None
         assert prior.evidence_id is not None
@@ -2708,18 +2721,65 @@ class TaskOrchestrator:
             and worker_result.request_digest == prior.worker_request_digest
             and evidence.content_digest == prior.evidence_digest
             and evidence.node_id == node.id
-            and evidence.accepted_graph_revision_digest == request.accepted_graph_revision_digest
-            and evidence.generation == request.generation
-            and evidence.attempt == request.attempt - 1
+            and evidence.accepted_graph_revision_digest == repair.accepted_graph_revision_digest
+            and evidence.generation == repair.generation
+            and evidence.attempt == repair.attempt
             and evaluator.content_digest == prior.evaluator_digest
             and evaluator.node_id == node.id
-            and evaluator.accepted_graph_revision_digest == request.accepted_graph_revision_digest
-            and evaluator.generation == request.generation
-            and evaluator.attempt == request.attempt - 1
+            and evaluator.accepted_graph_revision_digest == repair.accepted_graph_revision_digest
+            and evaluator.generation == repair.generation
+            and evaluator.attempt == repair.attempt
             and evaluator.worker_result_digest == prior.worker_result_digest
             and evaluator.evidence_digest == prior.evidence_digest
             and evaluator.decision is EvaluationDecision.FAIL
         )
+
+    def _active_repair_transition(
+        self,
+        run_id: Identifier,
+        node_id: Identifier,
+        graph_digest: Digest | None,
+        generation: int,
+        attempt: int,
+    ) -> LoopTransitionRecord | None:
+        if graph_digest is None or attempt < 1:
+            return None
+        transitions = self.store.list_records(
+            "loop_transition_v2", LoopTransitionRecord, run_id=run_id
+        )
+        candidates = tuple(
+            item
+            for item in transitions
+            if item.action is LoopAction.REPAIR
+            and item.node_id == node_id
+            and item.accepted_graph_revision_digest == graph_digest
+            and item.generation <= generation
+            and item.attempt < attempt
+        )
+        if not candidates:
+            return None
+        repair = max(
+            candidates,
+            key=lambda item: (item.generation, item.attempt, item.created_at, item.id),
+        )
+        repair_order = (repair.generation, repair.attempt, repair.created_at, repair.id)
+        if any(
+            item.node_id == node_id
+            and item.accepted_graph_revision_digest == graph_digest
+            and item.action in {LoopAction.PASS, LoopAction.FAIL, LoopAction.ESCALATE}
+            and (item.generation, item.attempt, item.created_at, item.id) > repair_order
+            for item in transitions
+        ):
+            return None
+        if generation == repair.generation:
+            return repair
+        resumed = any(
+            item.action == "resume" and item.generation == generation
+            for item in self.store.list_records(
+                "graph_control_fact_v2", GraphControlFact, run_id=run_id
+            )
+        )
+        return repair if resumed else None
 
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
         payload = record.model_dump(mode="python")

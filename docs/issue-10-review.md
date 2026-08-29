@@ -14,6 +14,10 @@ current node evaluator returns `FAIL` and its worker result, evidence, evaluator
 generation, attempt, and request bindings are all authoritative. The next attempt receives only
 the accepted evidence and evaluator digests in a new `WorkerRequest` and
 `WorkerContextManifest`; conversation history and artifact bodies remain excluded.
+The authoritative repair transition is the durable source of those references, so a transient
+retry or an explicit pause/resume reconstructs the same feedback without treating the immediately
+preceding attempt as its producer. A generation change is accepted only with a persisted resume
+fact for the same graph revision; arbitrary cross-generation or cross-revision feedback is stale.
 
 Retry and repair use independent limits (`max_retries` plus the node retry cap, and
 `max_repairs`). Both still consume the existing aggregate attempt, worker-turn, process, wall-time,
