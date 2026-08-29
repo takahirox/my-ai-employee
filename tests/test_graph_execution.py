@@ -11,12 +11,14 @@ from ai_employee.domain import (
     Budget,
     CompletionCriterion,
     Edge,
+    EvaluationDecision,
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
     Graph,
     HarnessCommand,
     HarnessEvaluator,
+    HarnessReview,
     HarnessVerification,
     Node,
     NodeKind,
@@ -43,7 +45,7 @@ from ai_employee.domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
-from ai_employee.graph_composition import GraphPatchComposer
+from ai_employee.graph_composition import GraphPatchComposer, GraphPatchCompositionRecord
 from ai_employee.graph_evaluation import (
     GraphCandidateEvaluator,
     ParentCandidateEvaluationRecord,
@@ -51,6 +53,18 @@ from ai_employee.graph_evaluation import (
 from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkCoordinator
+from ai_employee.parent_review import (
+    ParentSemanticBasis,
+    ParentSemanticConfidence,
+    ParentSemanticFinding,
+    ParentSemanticFindingType,
+    ParentSemanticReviewDecision,
+    ParentSemanticReviewPayload,
+    ParentSemanticReviewRequest,
+    ParentSemanticReviewResult,
+    ParentSemanticSeverity,
+    bind_parent_semantic_review_payload,
+)
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.services_v2 import (
@@ -59,15 +73,40 @@ from ai_employee.services_v2 import (
     PlaywrightBrowserEvaluationServices,
 )
 from ai_employee.storage import SQLiteStore
+from ai_employee.task_orchestration import NodeExecutionRecord
 from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-@pytest.mark.parametrize("parent_verification_succeeds", [True, False, None, "browser"])
+@pytest.mark.parametrize(
+    "parent_verification_succeeds",
+    [
+        True,
+        False,
+        None,
+        "browser",
+        "semantic-repair",
+        "semantic-retry",
+        "semantic-stale-node",
+    ],
+)
 def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     tmp_path: Path, parent_verification_succeeds: bool | str | None
 ) -> None:
+    semantic_repair = parent_verification_succeeds == "semantic-repair"
+    semantic_retry = parent_verification_succeeds == "semantic-retry"
+    semantic_stale_node = parent_verification_succeeds == "semantic-stale-node"
+    semantic_enabled = semantic_repair or semantic_retry or semantic_stale_node
+    semantic_invoked = semantic_repair or semantic_retry
+    deterministic_parent_succeeds = parent_verification_succeeds in {
+        True,
+        "browser",
+        "semantic-repair",
+        "semantic-retry",
+        "semantic-stale-node",
+    }
+    parent_ready = parent_verification_succeeds in {True, "browser"}
     repository = tmp_path / "repo"
     repository.mkdir()
     subprocess.run(("git", "init", "-q", str(repository)), check=True)
@@ -184,6 +223,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             verification=HarnessVerification(
                 required=("parent-test",),
                 required_evaluators=("parent-process-evaluator",),
+                review=HarnessReview(parent_semantic_review=semantic_enabled),
             ),
         )
     policy = PolicyLayer(
@@ -343,7 +383,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             failure = None
             status = "succeeded"
             exit_code = 0
-            if not parent_verification_succeeds:
+            if not deterministic_parent_succeeds:
                 failure = StableFailure(
                     code=StableFailureCode.PROCESS_FAILED,
                     message="declared parent verification failed",
@@ -440,6 +480,55 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 reason_code="parent_verification_allowed",
             )
 
+        class SemanticReviewer:
+            def __init__(self, reviewer_strategy: ExecutionStrategy) -> None:
+                self.strategy = reviewer_strategy
+                self.calls = 0
+
+            def review(self, request: ParentSemanticReviewRequest) -> ParentSemanticReviewResult:
+                self.calls += 1
+                if semantic_retry and self.calls == 1:
+                    raise ValueError("temporary reviewer outage")
+                finding = ParentSemanticFinding(
+                    id="cross-task-integration-gap",
+                    finding_type=ParentSemanticFindingType.INTEGRATION_CONSISTENCY,
+                    severity=ParentSemanticSeverity.HIGH,
+                    confidence=ParentSemanticConfidence.CERTAIN,
+                    basis=ParentSemanticBasis.OBSERVED,
+                    criterion_ids=("parent-verification",),
+                    node_ids=("a", "b"),
+                    observation="the individually passing changes do not integrate semantically",
+                    rationale="the exact composed candidate retains incompatible assumptions",
+                    evidence_digests=(request.candidate_artifact_digest,),
+                    artifact_digests=(request.candidate_artifact_digest,),
+                    repair_objective="make node b consume node a's integrated result",
+                )
+                return bind_parent_semantic_review_payload(
+                    ParentSemanticReviewPayload(
+                        findings=(finding,),
+                        reviewed_criterion_ids=("parent-verification",),
+                        reviewed_node_ids=("a", "b", "c"),
+                    ),
+                    request=request,
+                    record_id="semantic-result",
+                    run_id=request.run_id,
+                    created_at=NOW,
+                )
+
+        semantic_reviewer = SemanticReviewer(strategy)
+
+        if semantic_enabled:
+            with pytest.raises(ValueError, match="must match the bound Harness"):
+                GraphCandidateEvaluator(
+                    store,
+                    workspace,
+                    harness,
+                    ParentExecutor,
+                    allow_parent_process,
+                    semantic_reviewer=semantic_reviewer,
+                    semantic_block_severities=(ParentSemanticSeverity.LOW,),
+                )
+
         parent_evaluator = GraphCandidateEvaluator(
             store,
             workspace,
@@ -449,13 +538,35 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             browser_services_factory=(
                 parent_browser_services if parent_verification_succeeds == "browser" else None
             ),
+            semantic_reviewer=semantic_reviewer if semantic_enabled else None,
         )
 
         class CountingComposer(GraphPatchComposer):
             def compose(self, request: object, cancellation: object) -> object:
                 nonlocal composition_calls
                 composition_calls += 1
-                return real_composer.compose(request, cancellation)  # type: ignore[arg-type,return-value]
+                result = real_composer.compose(request, cancellation)  # type: ignore[arg-type]
+                if semantic_stale_node:
+                    accepted = next(
+                        item
+                        for item in store.list_records(
+                            "node_execution_v2", NodeExecutionRecord, run_id="graph-e2e"
+                        )
+                        if item.node_id == "a" and item.status == "passed"
+                    )
+                    payload = accepted.model_dump(mode="python")
+                    payload.update(
+                        id="late-uncomposed-pass-a",
+                        attempt=accepted.attempt + 1,
+                        sequence=accepted.sequence + 100,
+                        content_digest=None,
+                    )
+                    store.put(
+                        "node_execution_v2",
+                        NodeExecutionRecord.model_validate(payload),
+                        run_id="graph-e2e",
+                    )
+                return result
 
         service = GraphExecutionService(
             store,
@@ -477,14 +588,26 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             available_capabilities=("edit_intent", "process"),
         )
 
-        assert run.status == ("ready_to_promote" if parent_verification_succeeds else "failed")
+        assert run.status == ("ready_to_promote" if parent_ready else "failed")
         assert run.failure_code == (
             None
-            if parent_verification_succeeds
+            if parent_ready
             else (
                 "PARENT_EVALUATION_UNAVAILABLE"
                 if parent_verification_succeeds is None
-                else "PARENT_VERIFICATION_FAILED"
+                else (
+                    "PARENT_SEMANTIC_REPAIR"
+                    if semantic_repair
+                    else (
+                        "PARENT_SEMANTIC_REVIEW_UNAVAILABLE"
+                        if semantic_retry
+                        else (
+                            "PARENT_SEMANTIC_BINDING_MISMATCH"
+                            if semantic_stale_node
+                            else "PARENT_VERIFICATION_FAILED"
+                        )
+                    )
+                )
             )
         )
         assert (run.parent_evaluation_id is not None) == (parent_verification_succeeds is not None)
@@ -499,6 +622,16 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         )
         replay = service.replay(run.id)
         by_node = {item.node_id: item for item in replay.nodes}
+        if semantic_stale_node:
+            by_node["a"] = next(
+                item
+                for item in store.list_records(
+                    "node_execution_v2", NodeExecutionRecord, run_id=run.id
+                )
+                if item.node_id == "a"
+                and item.status == "passed"
+                and item.id != "late-uncomposed-pass-a"
+            )
         evaluator_by_id = {item.id: item for item in replay.evaluator_decisions}
         manifests = store.list_records(
             "worker_context_manifest_v2", WorkerContextManifest, run_id=run.id
@@ -531,6 +664,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         )
         assert len(inspected["parent_browser_observations"]) == (
             1 if parent_verification_succeeds == "browser" else 0
+        )
+        assert len(inspected["parent_semantic_review"]["decisions"]) == (
+            1 if semantic_invoked else 0
+        )
+        assert len(inspected["parent_semantic_review"]["repair_requests"]) == (
+            1 if semantic_repair else 0
         )
         inspected_manifests = inspected["worker_context_manifests"]
         assert len(inspected_manifests) == 3
@@ -572,7 +711,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         assert service.replay(run.id) == replay
         assert composition_calls == 1
         assert parent_process_calls == (
-            0 if parent_verification_succeeds in {None, "browser"} else 1
+            0 if parent_verification_succeeds in {None, "browser", "semantic-stale-node"} else 1
         )
         if run.parent_evaluation_id is not None:
             parent_record = store.get(
@@ -585,8 +724,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             assert parent_replay.record == parent_record
             assert len(parent_replay.acceptance_ledger.criteria) == 1
             assert parent_replay.acceptance_ledger.criteria[0].disposition == (
-                "satisfied" if parent_verification_succeeds else "blocked"
+                "uncovered" if semantic_stale_node else "satisfied" if parent_ready else "blocked"
             )
+            if semantic_stale_node:
+                assert parent_record.verification_result_digests == ()
+            assert len(parent_replay.semantic_decisions) == (1 if semantic_invoked else 0)
+            assert len(parent_replay.semantic_repair_requests) == (1 if semantic_repair else 0)
             assert parent_replay.process_invocations == 0
             assert parent_replay.composition_invocations == 0
             assert parent_replay.promotion_invocations == 0
@@ -611,3 +754,58 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             )
             == ()
         )
+        if semantic_invoked:
+            assert run.composition_id is not None
+            persisted_composition = store.get(
+                "graph_patch_composition_v2",
+                run.composition_id,
+                GraphPatchCompositionRecord,
+            )
+            if semantic_retry:
+                original_runtime = store.list_records(
+                    "verification_result_v2", ExecutionResult, run_id=run.id
+                )[0]
+                changed_runtime = ExecutionResult(
+                    id="second-parent-verification-result",
+                    run_id=run.id,
+                    created_at=NOW,
+                    request_digest=original_runtime.request_digest,
+                    status="succeeded",
+                    exit_code=0,
+                    duration_seconds=0.02,
+                )
+                assert changed_runtime.content_digest != original_runtime.content_digest
+                store.put("verification_result_v2", changed_runtime, run_id=run.id)
+                pending_request = store.list_records(
+                    "parent_semantic_review_request_v2",
+                    ParentSemanticReviewRequest,
+                    run_id=run.id,
+                )[0]
+                interrupted_result = semantic_reviewer.review(pending_request)
+                store.put(
+                    "parent_semantic_review_result_v2",
+                    interrupted_result,
+                    run_id=run.id,
+                )
+            resumed_evaluation = parent_evaluator.evaluate(
+                goal,
+                replay.acceptance.accepted_revision,
+                persisted_composition,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                cancellation=type("NotCancelled", (), {"cancelled": lambda self: False})(),
+            )
+            assert resumed_evaluation.decision is EvaluationDecision.REPAIR
+            assert len(parent_evaluator.replay(resumed_evaluation.id).semantic_results) == 1
+            completed_decisions = tuple(
+                item
+                for item in store.list_records(
+                    "parent_semantic_review_decision_v2",
+                    ParentSemanticReviewDecision,
+                    run_id=run.id,
+                )
+                if item.result_digest is not None
+            )
+            assert len(completed_decisions) == 1
+            assert len({item.content_digest for item in completed_decisions}) == 1
+        assert semantic_reviewer.calls == (2 if semantic_retry else 1 if semantic_repair else 0)

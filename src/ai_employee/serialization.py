@@ -54,7 +54,7 @@ def canonical_digest(value: object) -> str:
 
 
 def project_harness_digest(harness: BaseModel) -> str:
-    """Digest Harness v2 while preserving disabled Issue 7 field compatibility."""
+    """Digest Harness v2 while preserving disabled review-field compatibility."""
 
     payload = harness.model_dump(mode="python", by_alias=True, exclude_none=False)
     verification = payload.get("verification")
@@ -62,22 +62,28 @@ def project_harness_digest(harness: BaseModel) -> str:
         review = verification.get("review")
         if isinstance(review, dict) and review.get("independent_task_review") is False:
             review.pop("independent_task_review")
+        if isinstance(review, dict) and review.get("parent_semantic_review") is False:
+            review.pop("parent_semantic_review")
     return canonical_digest(payload)
 
 
 def operator_config_digest(config: BaseModel) -> str:
-    """Digest operator config without serializing disabled Issue 7 opt-in defaults."""
+    """Digest operator config without serializing disabled review opt-in defaults."""
 
     payload = config.model_dump(mode="python", by_alias=True, exclude_none=False)
     routing = payload.get("routing")
     if isinstance(routing, dict):
         if routing.get("default_task_reviewer_strategy") is None:
             routing.pop("default_task_reviewer_strategy")
+        if routing.get("default_parent_reviewer_strategy") is None:
+            routing.pop("default_parent_reviewer_strategy")
         strategies = routing.get("strategies")
         if isinstance(strategies, (tuple, list)):
             for strategy in strategies:
                 if isinstance(strategy, dict) and strategy.get("task_reviewer_eligible") is False:
                     strategy.pop("task_reviewer_eligible")
+                if isinstance(strategy, dict) and strategy.get("parent_reviewer_eligible") is False:
+                    strategy.pop("parent_reviewer_eligible")
     return canonical_digest(payload)
 
 

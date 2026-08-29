@@ -36,6 +36,13 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
 )
+from .parent_review import (
+    ParentSemanticRepairRequest,
+    ParentSemanticReviewDecision,
+    ParentSemanticReviewRequest,
+    ParentSemanticReviewResult,
+    StaleParentSemanticReviewResult,
+)
 from .plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAction,
@@ -449,6 +456,48 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "composition": None if composition is None else _json_model(composition),
         "candidate_patch": None if candidate is None else _json_model(candidate),
         "parent_evaluation": None if evaluation is None else _json_model(evaluation),
+        "parent_semantic_review": {
+            "requests": [
+                _json_model(item)
+                for item in store.list_records(
+                    "parent_semantic_review_request_v2",
+                    ParentSemanticReviewRequest,
+                    run_id=run_id,
+                )
+            ],
+            "results": [
+                _json_model(item)
+                for item in store.list_records(
+                    "parent_semantic_review_result_v2",
+                    ParentSemanticReviewResult,
+                    run_id=run_id,
+                )
+            ],
+            "decisions": [
+                _json_model(item)
+                for item in store.list_records(
+                    "parent_semantic_review_decision_v2",
+                    ParentSemanticReviewDecision,
+                    run_id=run_id,
+                )
+            ],
+            "repair_requests": [
+                _json_model(item)
+                for item in store.list_records(
+                    "parent_semantic_repair_request_v2",
+                    ParentSemanticRepairRequest,
+                    run_id=run_id,
+                )
+            ],
+            "stale_results": [
+                _json_model(item)
+                for item in store.list_records(
+                    "stale_parent_semantic_review_result_v2",
+                    StaleParentSemanticReviewResult,
+                    run_id=run_id,
+                )
+            ],
+        },
         "parent_evaluation_requests": [
             _json_model(item)
             for item in store.list_records(
