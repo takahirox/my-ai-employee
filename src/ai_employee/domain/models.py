@@ -99,6 +99,7 @@ class NodeResourceBudget(SchemaModel):
 class Budget(SchemaModel):
     max_attempts: int = Field(default=1, ge=1)
     max_retries: int = Field(default=0, ge=0)
+    max_repairs: int = Field(default=0, ge=0)
     max_replans: int = Field(default=0, ge=0)
     max_loop_iterations: int = Field(default=1, ge=1)
     max_nodes: int = Field(default=100, ge=1)

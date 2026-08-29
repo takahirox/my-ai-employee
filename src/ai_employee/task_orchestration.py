@@ -26,7 +26,7 @@ from .domain import (
     SemanticTaskProfile,
     TaskAssessment,
 )
-from .domain.base import CanonicalData, Digest, Identifier, SchemaModel, freeze_json
+from .domain.base import CanonicalData, Digest, Identifier, SchemaModel, StableStrEnum, freeze_json
 from .domain.v2 import (
     ArtifactDescriptor,
     ArtifactDescriptorReference,
@@ -71,6 +71,64 @@ NodeExecutionStatus = Literal[
 GraphExecutionStatus = Literal[
     "planned", "running", "paused", "cancelled", "completed", "ready_to_promote", "failed"
 ]
+
+
+class LoopAction(StableStrEnum):
+    """Deterministic authoritative outcomes for one bounded orchestration step."""
+
+    PASS = "PASS"
+    RETRY = "RETRY"
+    REPAIR = "REPAIR"
+    REPLAN = "REPLAN"
+    ESCALATE = "ESCALATE"
+    FAIL = "FAIL"
+
+
+class LoopTransitionRecord(DigestedRecordV2):
+    """Replayable reason and exact bindings for a closed-loop transition."""
+
+    schema_name: ClassVar[str] = "loop_transition_record"
+    action: LoopAction
+    reason_code: str = Field(min_length=1, max_length=200)
+    accepted_graph_revision_digest: Digest
+    next_graph_revision_digest: Digest | None = None
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    node_id: Identifier | None = None
+    worker_request_digest: Digest | None = None
+    worker_result_digest: Digest | None = None
+    evidence_digests: tuple[Digest, ...] = ()
+    consumed: int = Field(ge=0)
+    limit: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _bindings_match_action(self) -> Self:
+        if self.action is LoopAction.REPLAN:
+            if (
+                self.node_id is not None
+                or not self.evidence_digests
+                or self.next_graph_revision_digest is None
+                or self.next_graph_revision_digest == self.accepted_graph_revision_digest
+            ):
+                raise ValueError("REPLAN requires source, target, graph evidence, and no node")
+        elif self.action is LoopAction.ESCALATE and self.node_id is None:
+            if not self.evidence_digests or self.next_graph_revision_digest is not None:
+                raise ValueError("graph ESCALATE requires evidence and no target revision")
+        elif self.node_id is None:
+            raise ValueError("node loop transition requires a node binding")
+        elif self.next_graph_revision_digest is not None:
+            raise ValueError("node loop transition cannot carry a next graph revision")
+        if self.action in {LoopAction.PASS, LoopAction.REPAIR} and (
+            self.worker_request_digest is None
+            or self.worker_result_digest is None
+            or len(self.evidence_digests) < 2
+        ):
+            raise ValueError("evaluated node transition requires request, result, and evidence")
+        if len(self.evidence_digests) != len(set(self.evidence_digests)):
+            raise ValueError("loop transition evidence must be unique")
+        if self.consumed > self.limit and self.action is not LoopAction.ESCALATE:
+            raise ValueError("only ESCALATE may describe an exhausted bound")
+        return self
 
 
 class TaskGraphAcceptance(DigestedRecordV2):
@@ -291,8 +349,10 @@ class GraphRunRecord(BaseModel):
     status: GraphExecutionStatus
     max_concurrency: int = Field(ge=1)
     max_claims: int = Field(ge=1)
+    max_retries: int = Field(default=0, ge=0)
     max_replans: int = Field(default=0, ge=0)
     replan_count: int = Field(default=0, ge=0)
+    max_repairs: int = Field(default=0, ge=0)
     max_worker_turns: int = Field(default=100, ge=1)
     max_processes: int = Field(default=100, ge=0)
     max_wall_seconds: float = Field(default=3600.0, gt=0)
@@ -436,6 +496,7 @@ class GraphReplay(BaseModel):
     evaluator_decisions: tuple[NodeEvaluatorRecord, ...]
     controls: tuple[GraphControlFact, ...]
     stale_results: tuple[StaleNodeResultRecord, ...]
+    loop_transitions: tuple[LoopTransitionRecord, ...] = ()
     route_count: int
     worker_result_count: int
     evidence_count: int
@@ -621,6 +682,36 @@ class TaskOrchestrator:
             _validate_revision_history(acceptances)
             previous_acceptance = acceptances[-1]
             previous_revision = previous_acceptance.accepted_revision
+            if prior_run.replan_count >= prior_run.max_replans:
+                authoritative_evidence = _authoritative_replan_evidence(
+                    self.store,
+                    run_id,
+                    _required_digest(previous_revision.content_digest),
+                )
+                if (
+                    proposal is not None
+                    and proposal.replan_evidence
+                    and len(proposal.replan_evidence) == len(set(proposal.replan_evidence))
+                    and set(proposal.replan_evidence) <= authoritative_evidence
+                ):
+                    self._save_loop_transition(
+                        LoopTransitionRecord(
+                            id=identifier("loop-transition"),
+                            run_id=run_id,
+                            created_at=now(),
+                            action=LoopAction.ESCALATE,
+                            reason_code="REPLAN_BUDGET_EXHAUSTED",
+                            accepted_graph_revision_digest=_required_digest(
+                                previous_revision.content_digest
+                            ),
+                            generation=prior_run.generation,
+                            attempt=0,
+                            evidence_digests=proposal.replan_evidence,
+                            consumed=prior_run.replan_count,
+                            limit=prior_run.max_replans,
+                        )
+                    )
+                raise ValueError("replan authority, ancestry, or budget is invalid")
             if (
                 prior_run.status not in {"failed", "paused"}
                 or prior_run.goal != goal
@@ -643,12 +734,13 @@ class TaskOrchestrator:
                 or prior_run.strategy_set != self.strategy_set
                 or proposal is None
                 or proposal.planner_routing != prior_run.planner_routing
-                or prior_run.replan_count >= prior_run.max_replans
                 or proposal.previous_accepted_revision_digest != previous_revision.content_digest
                 or not proposal.replan_trigger
                 or not proposal.replan_evidence
                 or len(proposal.replan_evidence) != len(set(proposal.replan_evidence))
                 or candidate.budget.max_replans > prior_run.max_replans
+                or candidate.budget.max_retries > prior_run.max_retries
+                or candidate.budget.max_repairs > prior_run.max_repairs
                 or candidate.budget.max_attempts > prior_run.max_claims
                 or candidate.budget.max_worker_turns > prior_run.max_worker_turns
                 or candidate.budget.max_processes > prior_run.max_processes
@@ -779,6 +871,24 @@ class TaskOrchestrator:
             )
             self.store.clear_control(run_id)
             self._save_run(graph_run)
+            self._save_loop_transition(
+                LoopTransitionRecord(
+                    id=identifier("loop-transition"),
+                    run_id=run_id,
+                    created_at=now(),
+                    action=LoopAction.REPLAN,
+                    reason_code="ACCEPTED_AUTHORITATIVE_REPLAN",
+                    accepted_graph_revision_digest=_required_digest(
+                        previous_acceptance.accepted_revision.content_digest
+                    ),
+                    next_graph_revision_digest=graph_digest,
+                    generation=graph_run.generation,
+                    attempt=0,
+                    evidence_digests=proposal.replan_evidence,
+                    consumed=graph_run.replan_count,
+                    limit=graph_run.max_replans,
+                )
+            )
         else:
             accepted = validated
             if proposal is not None:
@@ -832,7 +942,9 @@ class TaskOrchestrator:
                 status="planned" if plan_only else "running",
                 max_concurrency=self.max_concurrency,
                 max_claims=max_claims,
+                max_retries=candidate.budget.max_retries,
                 max_replans=candidate.budget.max_replans,
+                max_repairs=candidate.budget.max_repairs,
                 max_worker_turns=candidate.budget.max_worker_turns,
                 max_processes=candidate.budget.max_processes,
                 max_wall_seconds=candidate.budget.max_wall_seconds,
@@ -1003,6 +1115,13 @@ class TaskOrchestrator:
                     evidence_by_node[node_id] = self.store.get(
                         "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
                     )
+        loop_counts: dict[tuple[str, LoopAction], int] = defaultdict(int)
+        for transition in self.store.list_records(
+            "loop_transition_v2", LoopTransitionRecord, run_id=run_id
+        ):
+            if transition.node_id is not None:
+                loop_counts[(transition.node_id, transition.action)] += 1
+        repair_feedback_by_node: dict[str, tuple[Digest, ...]] = {}
         active: dict[
             Future[NodeExecutionResult],
             tuple[str, Node, WorkerRequest, NodeReservationRecord],
@@ -1215,6 +1334,7 @@ class TaskOrchestrator:
                         prior_result_digests=prior_results,
                         prior_artifact_digests=prior_artifacts,
                         predecessor_outputs=predecessor_outputs,
+                        accepted_feedback_digests=repair_feedback_by_node.get(node_id, ()),
                     )
                     manifest = WorkerContextManifest(
                         id=f"{request.id}-context",
@@ -1237,6 +1357,7 @@ class TaskOrchestrator:
                         predecessor_node_ids=tuple(item.node_id for item in predecessor_outputs),
                         predecessor_result_digests=prior_results,
                         predecessor_evidence_digests=predecessor_evidence_digests,
+                        accepted_feedback_digests=request.accepted_feedback_digests,
                         artifact_descriptors=tuple(
                             artifact
                             for item in predecessor_outputs
@@ -1295,6 +1416,124 @@ class TaskOrchestrator:
                                 status="cancelled",
                                 failure_code="GRAPH_CANCELLED",
                             )
+                            continue
+                        current = records[node_id]
+                        feedback = tuple(
+                            item
+                            for item in (current.evidence_digest, current.evaluator_digest)
+                            if item is not None
+                        )
+                        if current.status == "passed":
+                            self._save_loop_transition(
+                                LoopTransitionRecord(
+                                    id=identifier("loop-transition"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    action=LoopAction.PASS,
+                                    reason_code="NODE_EVALUATION_PASS",
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    node_id=node_id,
+                                    worker_request_digest=request.content_digest,
+                                    worker_result_digest=current.worker_result_digest,
+                                    evidence_digests=feedback,
+                                    consumed=0,
+                                    limit=0,
+                                )
+                            )
+                        elif current.evaluator_decision is EvaluationDecision.FAIL:
+                            repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
+                            repair_limit = graph_run.max_repairs
+                            remaining = cast(
+                                Mapping[str, int | float], reservation.remaining_budgets
+                            )
+                            resources_available = _node_resources_remain(node, remaining)
+                            if repair_count < repair_limit and resources_available:
+                                transition = LoopTransitionRecord(
+                                    id=identifier("loop-transition"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    action=LoopAction.REPAIR,
+                                    reason_code="ACCEPTED_NODE_EVALUATION_FEEDBACK",
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    node_id=node_id,
+                                    worker_request_digest=request.content_digest,
+                                    worker_result_digest=current.worker_result_digest,
+                                    evidence_digests=feedback,
+                                    consumed=repair_count + 1,
+                                    limit=repair_limit,
+                                )
+                                self._save_loop_transition(transition)
+                                loop_counts[(node_id, LoopAction.REPAIR)] += 1
+                                repair_feedback_by_node[node_id] = feedback
+                                records[node_id] = NodeExecutionRecord(
+                                    id=identifier("node-execution"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    node_id=node_id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=graph_run.generation,
+                                    attempt=current.attempt + 1,
+                                    sequence=0,
+                                    status="pending",
+                                    failure_code="REPAIR_AFTER:NODE_EVALUATION_NOT_PASS",
+                                )
+                                self._save_node(records[node_id])
+                            else:
+                                enabled = repair_limit > 0
+                                action = LoopAction.ESCALATE if enabled else LoopAction.FAIL
+                                reason = (
+                                    "REPAIR_RESOURCE_BUDGET_EXHAUSTED"
+                                    if repair_count < repair_limit
+                                    else "REPAIR_BUDGET_EXHAUSTED"
+                                )
+                                self._save_loop_transition(
+                                    LoopTransitionRecord(
+                                        id=identifier("loop-transition"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        action=action,
+                                        reason_code=(
+                                            reason if enabled else "NODE_EVALUATION_NOT_PASS"
+                                        ),
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        node_id=node_id,
+                                        worker_request_digest=request.content_digest,
+                                        worker_result_digest=current.worker_result_digest,
+                                        evidence_digests=feedback,
+                                        consumed=repair_count,
+                                        limit=repair_limit,
+                                    )
+                                )
+                                if enabled:
+                                    records[node_id] = self._advance(
+                                        current,
+                                        failure_code=f"LOOP_ESCALATED:{reason}",
+                                    )
+                        else:
+                            self._save_loop_transition(
+                                LoopTransitionRecord(
+                                    id=identifier("loop-transition"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    action=LoopAction.FAIL,
+                                    reason_code=current.failure_code or "NODE_RESULT_REJECTED",
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    node_id=node_id,
+                                    worker_request_digest=request.content_digest,
+                                    worker_result_digest=current.worker_result_digest,
+                                    evidence_digests=feedback,
+                                    consumed=0,
+                                    limit=0,
+                                )
+                            )
                     except Exception as error:
                         if stop_action == "cancel":
                             records[node_id] = self._advance(
@@ -1308,16 +1547,26 @@ class TaskOrchestrator:
                             nodes[node_id].retry_limit,
                             accepted.graph.budget.max_retries,
                         )
-                        retry_resources_available = (
-                            int(remaining["node_attempts"]) > 0
-                            and int(remaining["worker_turns"]) >= node.resource_budget.worker_turns
-                            and int(remaining["processes"]) >= node.resource_budget.processes
-                            and float(remaining["wall_seconds"])
-                            >= node.resource_budget.wall_seconds
-                            and int(remaining["artifact_bytes"])
-                            >= node.resource_budget.artifact_bytes
-                        )
-                        if records[node_id].attempt < retry_cap and retry_resources_available:
+                        retry_count = loop_counts[(node_id, LoopAction.RETRY)]
+                        retry_resources_available = _node_resources_remain(node, remaining)
+                        if retry_count < retry_cap and retry_resources_available:
+                            self._save_loop_transition(
+                                LoopTransitionRecord(
+                                    id=identifier("loop-transition"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    action=LoopAction.RETRY,
+                                    reason_code=f"WORKER_BOUNDARY:{type(error).__name__}",
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    node_id=node_id,
+                                    worker_request_digest=request.content_digest,
+                                    consumed=retry_count + 1,
+                                    limit=retry_cap,
+                                )
+                            )
+                            loop_counts[(node_id, LoopAction.RETRY)] += 1
                             records[node_id] = NodeExecutionRecord(
                                 id=identifier("node-execution"),
                                 run_id=run_id,
@@ -1332,10 +1581,40 @@ class TaskOrchestrator:
                             )
                             self._save_node(records[node_id])
                         else:
+                            enabled = retry_cap > 0
+                            reason = (
+                                "RETRY_RESOURCE_BUDGET_EXHAUSTED"
+                                if retry_count < retry_cap
+                                else "RETRY_BUDGET_EXHAUSTED"
+                            )
+                            self._save_loop_transition(
+                                LoopTransitionRecord(
+                                    id=identifier("loop-transition"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    action=(LoopAction.ESCALATE if enabled else LoopAction.FAIL),
+                                    reason_code=(
+                                        reason
+                                        if enabled
+                                        else f"WORKER_BOUNDARY:{type(error).__name__}"
+                                    ),
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    node_id=node_id,
+                                    worker_request_digest=request.content_digest,
+                                    consumed=retry_count,
+                                    limit=retry_cap,
+                                )
+                            )
                             records[node_id] = self._advance(
                                 records[node_id],
                                 status="failed",
-                                failure_code=f"WORKER_BOUNDARY:{type(error).__name__}",
+                                failure_code=(
+                                    f"LOOP_ESCALATED:{reason}"
+                                    if enabled
+                                    else f"WORKER_BOUNDARY:{type(error).__name__}"
+                                ),
                             )
 
         authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
@@ -1673,6 +1952,18 @@ class TaskOrchestrator:
                         item.authoritative_generation,
                         item.node_id,
                         item.attempt,
+                    ),
+                )
+            ),
+            loop_transitions=tuple(
+                sorted(
+                    self.store.list_records(
+                        "loop_transition_v2", LoopTransitionRecord, run_id=run_id
+                    ),
+                    key=lambda item: (
+                        item.generation,
+                        item.created_at,
+                        item.id,
                     ),
                 )
             ),
@@ -2344,6 +2635,8 @@ class TaskOrchestrator:
             and tuple(item.node_id for item in request.predecessor_outputs)
             == manifest.predecessor_node_ids
             and request.prior_result_digests == manifest.predecessor_result_digests
+            and request.accepted_feedback_digests == manifest.accepted_feedback_digests
+            and self._repair_feedback_is_authoritative(node, request)
             and tuple(
                 artifact
                 for item in request.predecessor_outputs
@@ -2352,6 +2645,80 @@ class TaskOrchestrator:
             == manifest.artifact_descriptors
             and not manifest.conversation_history_included
             and not manifest.artifact_bodies_included
+        )
+
+    def _repair_feedback_is_authoritative(
+        self,
+        node: Node,
+        request: WorkerRequest,
+    ) -> bool:
+        feedback = request.accepted_feedback_digests
+        if not feedback:
+            if request.graph_run_id is None or request.attempt == 0:
+                return True
+            return not any(
+                item.node_id == node.id
+                and item.generation == request.generation
+                and item.attempt == request.attempt - 1
+                and item.action is LoopAction.REPAIR
+                for item in self.store.list_records(
+                    "loop_transition_v2",
+                    LoopTransitionRecord,
+                    run_id=request.graph_run_id,
+                )
+            )
+        if request.attempt < 1 or len(feedback) != 2 or request.graph_run_id is None:
+            return False
+        history = self.store.list_records(
+            "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id
+        )
+        candidates = tuple(
+            item
+            for item in history
+            if item.node_id == node.id
+            and item.accepted_graph_revision_digest == request.accepted_graph_revision_digest
+            and item.generation == request.generation
+            and item.attempt == request.attempt - 1
+            and item.status == "failed"
+            and item.evaluator_decision is EvaluationDecision.FAIL
+            and item.worker_request_digest is not None
+            and item.worker_result_id is not None
+            and item.worker_result_digest is not None
+            and item.evidence_id is not None
+            and item.evidence_digest is not None
+            and item.evaluator_id is not None
+            and item.evaluator_digest is not None
+        )
+        if not candidates:
+            return False
+        prior = max(candidates, key=lambda item: (item.sequence, item.created_at, item.id))
+        if feedback != (prior.evidence_digest, prior.evaluator_digest):
+            return False
+        assert prior.worker_result_id is not None
+        assert prior.evidence_id is not None
+        assert prior.evaluator_id is not None
+        try:
+            worker_result = self.store.get("worker_result_v2", prior.worker_result_id, WorkerResult)
+            evidence = self.store.get("node_evidence_v2", prior.evidence_id, NodeEvidenceRecord)
+            evaluator = self.store.get("node_evaluator_v2", prior.evaluator_id, NodeEvaluatorRecord)
+        except KeyError:
+            return False
+        return bool(
+            worker_result.content_digest == prior.worker_result_digest
+            and worker_result.request_digest == prior.worker_request_digest
+            and evidence.content_digest == prior.evidence_digest
+            and evidence.node_id == node.id
+            and evidence.accepted_graph_revision_digest == request.accepted_graph_revision_digest
+            and evidence.generation == request.generation
+            and evidence.attempt == request.attempt - 1
+            and evaluator.content_digest == prior.evaluator_digest
+            and evaluator.node_id == node.id
+            and evaluator.accepted_graph_revision_digest == request.accepted_graph_revision_digest
+            and evaluator.generation == request.generation
+            and evaluator.attempt == request.attempt - 1
+            and evaluator.worker_result_digest == prior.worker_result_digest
+            and evaluator.evidence_digest == prior.evidence_digest
+            and evaluator.decision is EvaluationDecision.FAIL
         )
 
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
@@ -2370,6 +2737,9 @@ class TaskOrchestrator:
             revision=record.sequence + 1,
         )
 
+    def _save_loop_transition(self, transition: LoopTransitionRecord) -> None:
+        self.store.put("loop_transition_v2", transition, run_id=transition.run_id)
+
     def _save_run(self, run: GraphRunRecord) -> None:
         self.store.put("graph_run_v2", run, run_id=run.id, revision=run.generation + 1)
 
@@ -2385,6 +2755,19 @@ def _evaluate_criteria(
     if any(by_id[item.id].disposition != "satisfied" for item in mandatory):
         return EvaluationDecision.FAIL
     return EvaluationDecision.PASS
+
+
+def _node_resources_remain(
+    node: Node,
+    remaining: Mapping[str, int | float],
+) -> bool:
+    return (
+        int(remaining["node_attempts"]) > 0
+        and int(remaining["worker_turns"]) >= node.resource_budget.worker_turns
+        and int(remaining["processes"]) >= node.resource_budget.processes
+        and float(remaining["wall_seconds"]) >= node.resource_budget.wall_seconds
+        and int(remaining["artifact_bytes"]) >= node.resource_budget.artifact_bytes
+    )
 
 
 def _completed_plan_review_attempt(review: TrustedPlanReview) -> PlanReviewAttempt:

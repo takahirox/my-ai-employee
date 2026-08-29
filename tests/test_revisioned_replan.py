@@ -32,6 +32,7 @@ from ai_employee.serialization import canonical_digest
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
+    LoopAction,
     NodeExecutionResult,
     TaskOrchestrator,
 )
@@ -347,6 +348,13 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         assert run.status == "completed"
         assert run.generation == 1
         assert run.replan_count == 1
+        replan_transition = next(
+            item for item in replay.loop_transitions if item.action is LoopAction.REPLAN
+        )
+        assert replan_transition.action is LoopAction.REPLAN
+        assert replan_transition.accepted_graph_revision_digest == revision_one_digest
+        assert replan_transition.next_graph_revision_digest == run.accepted_graph_revision_digest
+        assert replan_transition.evidence_digests == (scenario.evidence,)
         assert run.promotion_approval_id is None
         assert run.promotion_approval_request_digest is None
         assert run.accepted_graph_revision_digest != revision_one_digest
@@ -409,6 +417,7 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         )
 
         assert inspected["replan_count"] == 1
+        assert any(item["action"] == "REPLAN" for item in inspected["loop_transitions"])
         assert [
             item["accepted_revision"]["revision_number"] for item in inspected["graph_revisions"]
         ] == [1, 2]
@@ -642,7 +651,10 @@ def test_replan_limits_and_aggregate_budgets_do_not_reset(tmp_path: Path) -> Non
                 available_capabilities=("process",),
                 replan=True,
             )
-        assert scenario.orchestrator.replay(RUN_ID).run.replan_count == 1
+        exhausted = scenario.orchestrator.replay(RUN_ID)
+        assert exhausted.run.replan_count == 1
+        assert exhausted.loop_transitions[-1].action is LoopAction.ESCALATE
+        assert exhausted.loop_transitions[-1].reason_code == "REPLAN_BUDGET_EXHAUSTED"
 
     with SQLiteStore(tmp_path / "older-evidence.db") as store:
         scenario = _start(store, max_replans=2)
