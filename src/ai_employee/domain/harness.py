@@ -10,6 +10,7 @@ from pydantic import ConfigDict, Field, field_serializer, field_validator, model
 from pydantic.main import BaseModel
 
 from .base import FrozenDict, StableStrEnum
+from .browser import BROWSER_EVALUATOR_ID, BrowserScenario
 from .evaluation import AVAILABLE_FIRST_PARTY_EVALUATOR_IDS, RESERVED_EVALUATOR_IDS
 from .models import ProjectProfile, ProvenancedValue
 
@@ -129,6 +130,7 @@ class HarnessEvaluator(HarnessModel):
     id: str = Field(min_length=1, max_length=200)
     provider_id: str = Field(min_length=1, max_length=200)
     command_ref: str | None = Field(default=None, min_length=1, max_length=200)
+    browser_scenario: BrowserScenario | None = None
     criterion_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -141,8 +143,18 @@ class HarnessEvaluator(HarnessModel):
             raise ValueError(f"evaluator provider is reserved but unavailable: {self.provider_id}")
         if self.provider_id not in AVAILABLE_FIRST_PARTY_EVALUATOR_IDS:
             raise ValueError(f"unknown evaluator provider: {self.provider_id}")
-        if self.provider_id == "process.harness" and self.command_ref is None:
-            raise ValueError("process.harness evaluator requires a command reference")
+        if self.provider_id == "process.harness":
+            if self.command_ref is None:
+                raise ValueError("process.harness evaluator requires a command reference")
+            if self.browser_scenario is not None:
+                raise ValueError("process.harness evaluator cannot declare a browser scenario")
+        elif self.provider_id == BROWSER_EVALUATOR_ID:
+            if self.browser_scenario is None:
+                raise ValueError("browser.playwright evaluator requires a browser scenario")
+            if self.command_ref is not None:
+                raise ValueError("browser.playwright evaluator cannot name a process command")
+        elif self.command_ref is not None or self.browser_scenario is not None:
+            raise ValueError("unsupported evaluator execution configuration")
         return self
 
 

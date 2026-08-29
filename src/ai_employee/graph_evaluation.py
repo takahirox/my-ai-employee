@@ -45,21 +45,35 @@ ExecutorFactory = Callable[[WorkspaceSnapshot], ProcessExecutor]
 
 
 class ParentVerificationBinding(BaseModel):
-    """One required Harness evaluator and its exact mediated process request."""
+    """One required Harness evaluator and its exact provider-specific authority."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     schema_version: Literal["2"] = "2"
     harness_evaluator_id: Identifier
-    harness_command_ref: Identifier
+    harness_command_ref: Identifier | None = None
     specification: EvaluatorSpecification
-    process_request: ProcessRequest
+    process_request: ProcessRequest | None = None
 
     @model_validator(mode="after")
     def _request_is_bound_to_the_specification(self) -> Self:
-        if self.specification.run_id != self.process_request.run_id:
-            raise ValueError("parent evaluator and process request belong to different runs")
-        if self.specification.command_ref != self.process_request.id:
-            raise ValueError("parent evaluator does not name its exact process request")
+        if self.specification.provider_id == "process.harness":
+            if self.harness_command_ref is None or self.process_request is None:
+                raise ValueError("parent process evaluator requires its exact request")
+            if self.specification.run_id != self.process_request.run_id:
+                raise ValueError("parent evaluator and process request belong to different runs")
+            if self.specification.command_ref != self.process_request.id:
+                raise ValueError("parent evaluator does not name its exact process request")
+            if self.specification.browser_scenario is not None:
+                raise ValueError("parent process evaluator cannot retain a browser scenario")
+        elif self.specification.provider_id == "browser.playwright":
+            if self.harness_command_ref is not None or self.process_request is not None:
+                raise ValueError("parent browser evaluator cannot retain process authority")
+            if self.specification.command_ref is not None:
+                raise ValueError("parent browser evaluator cannot name a process request")
+            if self.specification.browser_scenario is None:
+                raise ValueError("parent browser evaluator requires its exact scenario")
+        else:
+            raise ValueError("unsupported parent evaluator provider")
         return self
 
 
@@ -92,7 +106,11 @@ class ParentCandidateEvaluationRequest(DigestedRecordV2):
             self.candidate.run_id,
             self.candidate_artifact.run_id,
             *(item.specification.run_id for item in self.verification_bindings),
-            *(item.process_request.run_id for item in self.verification_bindings),
+            *(
+                item.process_request.run_id
+                for item in self.verification_bindings
+                if item.process_request is not None
+            ),
         }
         if len(run_ids) != 1:
             raise ValueError("parent evaluation inputs belong to different graph runs")
@@ -110,8 +128,16 @@ class ParentCandidateEvaluationRequest(DigestedRecordV2):
         ):
             raise ValueError("parent candidate provenance does not bind the composition workspace")
         evaluator_ids = tuple(item.harness_evaluator_id for item in self.verification_bindings)
-        command_refs = tuple(item.harness_command_ref for item in self.verification_bindings)
-        request_ids = tuple(item.process_request.id for item in self.verification_bindings)
+        command_refs = tuple(
+            item.harness_command_ref
+            for item in self.verification_bindings
+            if item.harness_command_ref is not None
+        )
+        request_ids = tuple(
+            item.process_request.id
+            for item in self.verification_bindings
+            if item.process_request is not None
+        )
         for label, values in (
             ("Harness evaluator", evaluator_ids),
             ("Harness command", command_refs),
@@ -217,6 +243,14 @@ class GraphCandidateEvaluator:
         for binding in request.verification_bindings:
             specification = binding.specification
             process_request = binding.process_request
+            if process_request is None:
+                return self._finish(
+                    request,
+                    decision=EvaluationDecision.FAIL,
+                    failure_code="PARENT_EVALUATION_UNAVAILABLE",
+                    ledger_digests=tuple(ledger_digests),
+                    verification_result_digests=tuple(verification_result_digests),
+                )
             self.store.put("evaluator_specification_v2", specification, run_id=request.run_id)
             self.store.put("verification_request_v2", process_request, run_id=request.run_id)
             evaluation_request = EvaluationRequest(
@@ -363,10 +397,35 @@ class GraphCandidateEvaluator:
         bindings: list[ParentVerificationBinding] = []
         for evaluator_id in self.harness.verification.required_evaluators:
             declaration = by_id[evaluator_id]
+            provider = DEFAULT_EVALUATOR_REGISTRY.resolve(declaration.provider_id)
+            if declaration.provider_id == "browser.playwright":
+                scenario = declaration.browser_scenario
+                if scenario is None:
+                    raise ValueError("required browser evaluator has no scenario")
+                bindings.append(
+                    ParentVerificationBinding(
+                        harness_evaluator_id=declaration.id,
+                        specification=EvaluatorSpecification(
+                            id=identifier("parent-evaluator-specification"),
+                            run_id=composition.run_id,
+                            created_at=now(),
+                            provider_id=provider.descriptor.provider_id,
+                            provider_schema_version=provider.descriptor.provider_schema_version,
+                            provider_descriptor_digest=versioned_digest(provider.descriptor),
+                            behavior=provider.descriptor.behavior,
+                            required_capabilities=provider.descriptor.required_capabilities,
+                            requested_observation_kinds=tuple(
+                                item.logical_kind for item in scenario.captures
+                            ),
+                            browser_scenario=scenario,
+                            criterion_ids=declaration.criterion_ids,
+                        ),
+                    )
+                )
+                continue
             if declaration.command_ref is None:
                 raise ValueError("required parent evaluator has no Harness command")
             command = self.harness.commands[declaration.command_ref]
-            provider = DEFAULT_EVALUATOR_REGISTRY.resolve(declaration.provider_id)
             process_request = ProcessRequest(
                 id=identifier("parent-verification-request"),
                 run_id=composition.run_id,
@@ -500,7 +559,9 @@ class GraphCandidateEvaluator:
             for criterion_id in binding.specification.criterion_ids
         )
         required_commands = tuple(
-            item.harness_command_ref for item in request.verification_bindings
+            item.harness_command_ref
+            for item in request.verification_bindings
+            if item.harness_command_ref is not None
         )
         if (
             not expected
@@ -519,7 +580,9 @@ class GraphCandidateEvaluator:
             request.candidate_artifact.logical_kind,
         }
         for criterion in request.goal.completion_criteria:
-            if set(criterion.verification_requirement_ids) != {by_criterion[criterion.id]}:
+            command_ref = by_criterion[criterion.id]
+            expected_requirements = () if command_ref is None else (command_ref,)
+            if set(criterion.verification_requirement_ids) != set(expected_requirements):
                 raise ValueError("Goal criterion verification binding is missing or stale")
             if not set(criterion.required_artifact_ids) <= artifact_names:
                 raise ValueError("Goal criterion requires unavailable candidate artifacts")
@@ -564,6 +627,7 @@ class GraphCandidateEvaluator:
             verification_request_digests=tuple(
                 _required(item.process_request.content_digest)
                 for item in request.verification_bindings
+                if item.process_request is not None
             ),
             verification_result_digests=verification_result_digests,
             evaluation_ledger_digests=ledger_digests,

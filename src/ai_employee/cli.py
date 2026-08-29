@@ -1347,7 +1347,11 @@ def _graph_promotion_evidence(
         or request.composition_workspace != workspace
         or request.candidate_artifact != patch
         or request.effective_policy_digest != policy_digest
-        or tuple(item.process_request.content_digest for item in request.verification_bindings)
+        or tuple(
+            item.process_request.content_digest
+            for item in request.verification_bindings
+            if item.process_request is not None
+        )
         != evaluation.verification_request_digests
     ):
         raise ValueError("parent evaluation request bindings are stale")
@@ -1610,17 +1614,28 @@ def _work_goal(run_id: str, statement: str, harness: ProjectHarnessV2) -> Goal:
     criteria: list[CompletionCriterion] = []
     for evaluator_id in harness.verification.required_evaluators:
         evaluator = evaluators[evaluator_id]
-        if evaluator.command_ref is None:
-            raise ValueError("required parent evaluator has no Harness command")
+        command_ref = evaluator.command_ref
+        if evaluator.provider_id == "browser.playwright":
+            if evaluator.browser_scenario is None:
+                raise ValueError("required parent browser evaluator has no scenario")
+            description = (
+                "the exact composed candidate passes declared browser scenario "
+                f"{canonical_digest(evaluator.browser_scenario)}"
+            )
+            verification_requirements: tuple[str, ...] = ()
+        else:
+            if command_ref is None:
+                raise ValueError("required parent evaluator has no Harness command")
+            description = (
+                f"the exact composed candidate passes declared Harness command {command_ref}"
+            )
+            verification_requirements = (command_ref,)
         for criterion_id in evaluator.criterion_ids:
             criteria.append(
                 CompletionCriterion(
                     id=criterion_id,
-                    description=(
-                        "the exact composed candidate passes declared Harness command "
-                        f"{evaluator.command_ref}"
-                    ),
-                    verification_requirement_ids=(evaluator.command_ref,),
+                    description=description,
+                    verification_requirement_ids=verification_requirements,
                     required_artifact_ids=("workspace_patch",),
                 )
             )

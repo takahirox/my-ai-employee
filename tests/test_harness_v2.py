@@ -7,7 +7,14 @@ import pytest
 from pydantic import ValidationError
 
 from ai_employee import cli
-from ai_employee.domain import ProjectHarnessV2, ProvenancedValue, ProvenanceKind
+from ai_employee.domain import (
+    BrowserAction,
+    BrowserCapture,
+    BrowserScenario,
+    ProjectHarnessV2,
+    ProvenancedValue,
+    ProvenanceKind,
+)
 from ai_employee.project import (
     discover_project,
     discover_project_harness,
@@ -46,6 +53,20 @@ def valid_harness() -> dict[str, object]:
             "artifact_bytes": 2000,
         },
     }
+
+
+def browser_scenario() -> BrowserScenario:
+    return BrowserScenario(
+        origin="http://127.0.0.1:4173",
+        actions=(BrowserAction(kind="navigate", url="http://127.0.0.1:4173/"),),
+        captures=(
+            BrowserCapture(
+                id="screen",
+                kind="screenshot",
+                logical_kind="browser_screenshot",
+            ),
+        ),
+    )
 
 
 def test_explicit_harness_is_typed_strict_and_deeply_immutable(tmp_path: Path) -> None:
@@ -91,6 +112,7 @@ def test_harness_accepts_strict_process_evaluator_declarations() -> None:
         {
             "id": "browser",
             "provider_id": "browser.playwright",
+            "browser_scenario": browser_scenario().model_dump(mode="json"),
             "criterion_ids": ["browser-safe"],
         }
     )
@@ -165,6 +187,60 @@ def test_required_evaluator_defines_parent_goal_criteria() -> None:
     assert tuple(item.id for item in goal.completion_criteria) == ("tests-pass",)
     assert goal.completion_criteria[0].verification_requirement_ids == ("test",)
     assert goal.completion_criteria[0].required_artifact_ids == ("workspace_patch",)
+
+
+def test_required_browser_evaluator_defines_scenario_bound_goal_criteria() -> None:
+    data = valid_harness()
+    scenario = browser_scenario()
+    data["evaluators"] = [
+        {
+            "id": "browser-smoke",
+            "provider_id": "browser.playwright",
+            "browser_scenario": scenario.model_dump(mode="json"),
+            "criterion_ids": ["rendered-result-observed"],
+        }
+    ]
+    data["verification"]["required_evaluators"] = ["browser-smoke"]
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+
+    goal = cli._work_goal("browser-run", "observe", harness)
+
+    criterion = goal.completion_criteria[0]
+    assert criterion.id == "rendered-result-observed"
+    assert criterion.verification_requirement_ids == ()
+    assert criterion.required_artifact_ids == ("workspace_patch",)
+    assert "browser scenario" in criterion.description
+
+
+@pytest.mark.parametrize(
+    "evaluator",
+    [
+        {
+            "id": "process-with-browser",
+            "provider_id": "process.harness",
+            "command_ref": "test",
+            "browser_scenario": browser_scenario().model_dump(mode="json"),
+            "criterion_ids": ["invalid"],
+        },
+        {
+            "id": "browser-with-command",
+            "provider_id": "browser.playwright",
+            "command_ref": "test",
+            "browser_scenario": browser_scenario().model_dump(mode="json"),
+            "criterion_ids": ["invalid"],
+        },
+        {
+            "id": "browser-without-scenario",
+            "provider_id": "browser.playwright",
+            "criterion_ids": ["invalid"],
+        },
+    ],
+)
+def test_harness_rejects_mixed_evaluator_authority(evaluator: dict[str, object]) -> None:
+    data = valid_harness()
+    data["evaluators"] = [evaluator]
+    with pytest.raises(ValidationError):
+        ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
 
 
 def test_discovery_derives_legacy_required_process_evaluators_once(tmp_path: Path) -> None:
