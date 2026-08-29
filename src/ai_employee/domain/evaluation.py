@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import ClassVar, Protocol, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .base import Digest, Identifier, StableStrEnum
+from .browser import BROWSER_EVALUATOR_ID, BrowserScenario
 from .v2 import ArtifactDescriptor, DigestedRecordV2, SchemaModelV2
 
 PROCESS_EVALUATOR_ID = "process.harness"
-RESERVED_EVALUATOR_IDS = frozenset(
-    {"browser.playwright", "judge.visual", "threejs.instrumentation"}
-)
-AVAILABLE_FIRST_PARTY_EVALUATOR_IDS = frozenset({PROCESS_EVALUATOR_ID})
+RESERVED_EVALUATOR_IDS = frozenset({"judge.visual", "threejs.instrumentation"})
+AVAILABLE_FIRST_PARTY_EVALUATOR_IDS = frozenset({PROCESS_EVALUATOR_ID, BROWSER_EVALUATOR_ID})
 
 
 class EvaluatorBehavior(StableStrEnum):
@@ -58,6 +58,15 @@ class EvaluatorLimits(SchemaModelV2):
     maximum_processes: int = Field(default=0, ge=0)
     maximum_artifact_bytes: int = Field(default=0, ge=0)
     maximum_observations: int = Field(default=0, ge=0)
+    maximum_actions: int = Field(default=0, ge=0)
+    maximum_duration_seconds: float = Field(default=0.0, ge=0)
+
+    @field_validator("maximum_duration_seconds")
+    @classmethod
+    def _duration_is_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("evaluator duration must be finite")
+        return value
 
 
 class EvaluatorDescriptor(SchemaModelV2):
@@ -87,6 +96,7 @@ class EvaluatorSpecification(DigestedRecordV2):
     required_capabilities: tuple[Identifier, ...] = ()
     requested_observation_kinds: tuple[Identifier, ...] = ()
     command_ref: Identifier | None = None
+    browser_scenario: BrowserScenario | None = None
     criterion_ids: tuple[Identifier, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -98,6 +108,13 @@ class EvaluatorSpecification(DigestedRecordV2):
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"evaluator {label} must be unique")
+        if self.provider_id == BROWSER_EVALUATOR_ID:
+            if self.browser_scenario is None:
+                raise ValueError("browser evaluator requires a typed scenario")
+            if self.command_ref is not None:
+                raise ValueError("browser evaluator cannot name a process command")
+        elif self.browser_scenario is not None:
+            raise ValueError("browser scenario requires the browser.playwright provider")
         return self
 
 
@@ -121,6 +138,15 @@ class EvaluationBudget(SchemaModelV2):
     schema_name: ClassVar[str] = "evaluation_budget"
     remaining_processes: int = Field(default=0, ge=0)
     remaining_artifact_bytes: int = Field(default=0, ge=0)
+    remaining_actions: int = Field(default=0, ge=0)
+    remaining_duration_seconds: float = Field(default=0.0, ge=0)
+
+    @field_validator("remaining_duration_seconds")
+    @classmethod
+    def _duration_is_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("remaining evaluation duration must be finite")
+        return value
 
 
 class EvaluationRequest(DigestedRecordV2):

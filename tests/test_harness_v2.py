@@ -87,6 +87,16 @@ def test_harness_accepts_strict_process_evaluator_declarations() -> None:
     assert harness.evaluators[0].command_ref == "test"
     assert harness.verification.required_evaluators == ("unit-tests",)
 
+    data["evaluators"].append(
+        {
+            "id": "browser",
+            "provider_id": "browser.playwright",
+            "criterion_ids": ["browser-safe"],
+        }
+    )
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(data), strict=True)
+    assert harness.evaluators[1].provider_id == "browser.playwright"
+
 
 @pytest.mark.parametrize(
     ("evaluators", "required", "message"),
@@ -117,8 +127,8 @@ def test_harness_accepts_strict_process_evaluator_declarations() -> None:
         (
             [
                 {
-                    "id": "browser",
-                    "provider_id": "browser.playwright",
+                    "id": "visual",
+                    "provider_id": "judge.visual",
                     "criterion_ids": ["visual"],
                 }
             ],
