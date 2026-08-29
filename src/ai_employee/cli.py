@@ -823,6 +823,7 @@ def _work(args: argparse.Namespace) -> int:
             verification_requests=verification_requests,
             protected_paths=harness.paths.protected,
             allowed_processes=tuple(command.argv for command in harness.commands.values()),
+            artifact_store=artifacts,
         )
         head = (
             __import__("subprocess")
@@ -898,6 +899,7 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     protected_paths=harness.paths.protected,
                     allowed_processes=tuple(command.argv for command in harness.commands.values()),
+                    artifact_store=artifacts,
                 )
 
             def decide_composition(edit: EditIntentRequest) -> PolicyDecision:
@@ -1483,6 +1485,7 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
         verification_requests=verification,
         protected_paths=harness.paths.protected,
         allowed_processes=tuple(command.argv for command in harness.commands.values()),
+        artifact_store=artifacts,
     )
     resumed = coordinator.resume(run.id)
     print(

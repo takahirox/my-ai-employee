@@ -17,6 +17,7 @@ from .domain.services_v2 import Cancellation, MediatedActionChannel, ProcessExec
 from .domain.v2 import (
     ActionProposal,
     ExecutionResult,
+    NonMutatingResult,
     PolicyDecision,
     ProcessRequest,
     StableFailure,
@@ -49,6 +50,7 @@ class WorkerProposalEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     schema_version: Literal["2"] = "2"
     proposals: tuple[ActionProposal, ...] = ()
+    non_mutating_result: NonMutatingResult | None = None
     assistant_note: str | None = Field(default=None, max_length=20_000)
     usage: Mapping[str, object] | None = None
 
@@ -113,7 +115,11 @@ class ScriptedWorkerAdapter:
             return _worker_failure(
                 request,
                 started,
-                StableFailureCode.WORKER_PROTOCOL_ERROR,
+                (
+                    StableFailureCode.TYPED_RESULT_MALFORMED
+                    if isinstance(raw, Mapping) and raw.get("non_mutating_result") is not None
+                    else StableFailureCode.WORKER_PROTOCOL_ERROR
+                ),
                 f"invalid worker proposal envelope: {error}",
             )
         for proposal in envelope.proposals:
@@ -126,6 +132,7 @@ class ScriptedWorkerAdapter:
             status="succeeded",
             duration_seconds=time.monotonic() - started,
             proposals=envelope.proposals,
+            non_mutating_result=envelope.non_mutating_result,
             assistant_note=envelope.assistant_note,
             usage=freeze_json(dict(envelope.usage or {})),
         )
@@ -262,14 +269,24 @@ class CliWorkerAdapter:
                 stdout_artifact_digest=process.stdout_artifact_digest,
                 stderr_artifact_digest=process.stderr_artifact_digest,
             )
+        typed_result_supplied = False
         try:
             payload = self._extract_payload(self._output(process.stdout_artifact_digest))
+            decoded_payload = json.loads(payload)
+            typed_result_supplied = (
+                isinstance(decoded_payload, dict)
+                and decoded_payload.get("non_mutating_result") is not None
+            )
             envelope = _validate_worker_envelope(payload)
         except ValueError as error:
             return _worker_failure(
                 request,
                 started,
-                StableFailureCode.WORKER_PROTOCOL_ERROR,
+                (
+                    StableFailureCode.TYPED_RESULT_MALFORMED
+                    if typed_result_supplied
+                    else StableFailureCode.WORKER_PROTOCOL_ERROR
+                ),
                 f"invalid worker proposal envelope: {error}",
                 stdout_artifact_digest=process.stdout_artifact_digest,
                 stderr_artifact_digest=process.stderr_artifact_digest,
@@ -286,6 +303,7 @@ class CliWorkerAdapter:
             stdout_artifact_digest=process.stdout_artifact_digest,
             stderr_artifact_digest=process.stderr_artifact_digest,
             proposals=envelope.proposals,
+            non_mutating_result=envelope.non_mutating_result,
             assistant_note=envelope.assistant_note,
             usage=freeze_json(dict(envelope.usage or {})),
         )
@@ -518,8 +536,11 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
         wrapper = json.loads(output)
         if not isinstance(wrapper, dict):
             raise ValueError("Codex transport must be a JSON object")
-        expected = {"schema_version", "proposals", "assistant_note", "usage_json"}
-        if set(wrapper) != expected or wrapper.get("schema_version") != "2":
+        required = {"schema_version", "proposals", "assistant_note", "usage_json"}
+        allowed = {*required, "non_mutating_result"}
+        if not required <= set(wrapper) or not set(wrapper) <= allowed:
+            raise ValueError("Codex transport has invalid or unknown fields")
+        if wrapper.get("schema_version") != "2":
             raise ValueError("Codex transport has invalid or unknown fields")
         proposals = wrapper["proposals"]
         if not isinstance(proposals, list):
@@ -544,15 +565,15 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
         usage = json.loads(usage_json)
         if usage is not None and not isinstance(usage, dict):
             raise ValueError("Codex usage_json must encode a JSON object")
-        return json.dumps(
-            {
-                "schema_version": "2",
-                "proposals": proposals,
-                "assistant_note": wrapper["assistant_note"],
-                "usage": usage,
-            },
-            separators=(",", ":"),
-        )
+        envelope = {
+            "schema_version": "2",
+            "proposals": proposals,
+            "assistant_note": wrapper["assistant_note"],
+            "usage": usage,
+        }
+        if "non_mutating_result" in wrapper:
+            envelope["non_mutating_result"] = wrapper["non_mutating_result"]
+        return json.dumps(envelope, separators=(",", ":"))
 
 
 class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
@@ -637,6 +658,15 @@ def _bounded_prompt(
         "effective_policy_digest": request.effective_policy_digest,
         "remaining_budgets": request.remaining_budgets,
         "prior_result_digests": request.prior_result_digests,
+        "non_mutating_result_binding": {
+            "run_id": request.run_id,
+            "graph_run_id": request.graph_run_id,
+            "worker_request_digest": request.content_digest,
+            "node_id": request.node_id,
+            "accepted_graph_revision_digest": request.accepted_graph_revision_digest,
+            "generation": request.generation,
+            "attempt": request.attempt,
+        },
         "response_contract": (
             "codex-edit-transport/1"
             if codex_edit_transport
@@ -661,7 +691,10 @@ def _bounded_prompt(
             "repository action only as a typed proposal. If a writable_scratch_directory is "
             "supplied, you may create temporary candidate files only below that exact directory "
             "and use them for deterministic diff generation and read-only validation against the "
-            "repository. Every proposal and nested request must use the supplied run_id."
+            "repository. Every proposal and nested request must use the supplied run_id. For a "
+            "non-mutating diagnosis or research task, return non_mutating_result with the exact "
+            "supplied non_mutating_result_binding values and keep proposals empty; assistant_note "
+            "is commentary and never authoritative task evidence."
         ),
     }
     if include_response_schema:
@@ -683,7 +716,9 @@ def _bounded_prompt(
             "*** Begin Patch, *** Add File, or other apply_patch markers. Use actual newline "
             "characters for line boundaries; do not "
             "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
-            "content digests locally."
+            "content digests locally. For a read-only deliverable, return non_mutating_result "
+            "instead of an edit proposal, copy every supplied binding exactly, and keep proposals "
+            "empty."
         )
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
@@ -720,7 +755,7 @@ def _envelope_schema() -> dict[str, object]:
 
 
 def _claude_envelope_schema() -> dict[str, object]:
-    """Return Claude's minimal edit-only proposal contract.
+    """Return Claude's minimal edit-or-read-only-result contract.
 
     Claude can inspect the isolated repository with its read-only tools. Harness commands run
     deterministically after the proposed patch is applied, so exposing process, download, install,
@@ -735,6 +770,7 @@ def _claude_envelope_schema() -> dict[str, object]:
         "properties": {
             "schema_version": {"type": "string", "enum": ["2"]},
             "proposals": {"type": "array", "items": edit_action},
+            "non_mutating_result": properties["non_mutating_result"],
             "assistant_note": {
                 "anyOf": [
                     {"type": "string", "maxLength": 20_000},
@@ -946,6 +982,56 @@ def worker_proposal_schema_json() -> bytes:
 
     edit_proposal_schema = proposal_schema("edit_intent", edit_payload_schema)
     install_proposal_schema = proposal_schema("install", install_payload_schema)
+    result_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            **identity_properties,
+            "graph_run_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "worker_request_digest": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "node_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "accepted_graph_revision_digest": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "generation": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+            "attempt": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+            "logical_kind": {"type": "string", "enum": ["diagnosis", "research"]},
+            "media_type": {
+                "type": "string",
+                "enum": ["text/plain", "text/markdown"],
+            },
+            "content": {"type": "string", "minLength": 1, "maxLength": 64_000},
+            "summary": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 4_000},
+                    {"type": "null"},
+                ]
+            },
+            "findings": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string", "minLength": 1, "maxLength": 4_000},
+            },
+            "evidence_refs": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            *identity_properties,
+            "graph_run_id",
+            "worker_request_digest",
+            "node_id",
+            "accepted_graph_revision_digest",
+            "generation",
+            "attempt",
+            "logical_kind",
+            "media_type",
+            "content",
+            "summary",
+            "findings",
+            "evidence_refs",
+        ],
+        "additionalProperties": False,
+    }
     schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -954,6 +1040,7 @@ def worker_proposal_schema_json() -> bytes:
                 "type": "array",
                 "items": {"anyOf": [edit_proposal_schema, install_proposal_schema]},
             },
+            "non_mutating_result": result_schema,
             "assistant_note": {"type": "string"},
             "usage_json": {"type": "string"},
         },

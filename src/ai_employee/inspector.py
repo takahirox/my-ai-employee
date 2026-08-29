@@ -22,6 +22,7 @@ from .domain.v2 import (
     DownloadResult,
     ExecutionResult,
     InstallResult,
+    NonMutatingResultAcceptance,
     PolicyDecision,
     PromotionRecord,
     WorkerAvailability,
@@ -181,6 +182,14 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
                 _json_model(item)
                 for item in store.list_records("worker_result_v2", WorkerResult, run_id=run_id)
             ],
+            "typed_result_acceptances": [
+                _json_model(item)
+                for item in store.list_records(
+                    "non_mutating_result_acceptance_v2",
+                    NonMutatingResultAcceptance,
+                    run_id=run_id,
+                )
+            ],
         },
         "workspace": [
             _json_model(item)
@@ -339,6 +348,18 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             _json_model(store.get("worker_result_v2", item.worker_result_id, WorkerResult))
             for item in node_records
             if item.worker_result_id is not None
+        ],
+        "typed_result_acceptances": [
+            _json_model(item)
+            for item in {
+                record.result_acceptance_id: store.get(
+                    "non_mutating_result_acceptance_v2",
+                    record.result_acceptance_id,
+                    NonMutatingResultAcceptance,
+                )
+                for record in node_records
+                if record.result_acceptance_id is not None
+            }.values()
         ],
         "node_evidence": [
             _json_model(store.get("node_evidence_v2", item.evidence_id, NodeEvidenceRecord))

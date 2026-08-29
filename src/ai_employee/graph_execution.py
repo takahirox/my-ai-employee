@@ -19,6 +19,7 @@ from .domain.v2 import (
     ArtifactDescriptor,
     DecisionOutcome,
     ExecutionResult,
+    NonMutatingResultAcceptance,
     PolicyDecision,
     WorkerRequest,
     WorkerResult,
@@ -31,6 +32,7 @@ from .graph_composition import (
 )
 from .graph_evaluation import ParentCandidateEvaluationRecord
 from .orchestration import WorkCoordinator, WorkRun
+from .serialization import canonical_json
 from .services_v2 import DigestApprovalService
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
@@ -408,8 +410,8 @@ def _authoritative_node_result(
     persisted_run = store.get_work_run(run.id)
     writing = "edit_intent" in node.required_capabilities
     expected_status = "ready_to_promote" if writing else "completed"
-    if persisted_run != run or run.status != expected_status:
-        raise ValueError("inner work run did not reach its authoritative terminal state")
+    if persisted_run != run:
+        raise ValueError("inner work run is not the authoritative persisted state")
     if (
         run.id != request.run_id
         or run.accepted_graph_digest != request.accepted_graph_revision_digest
@@ -427,9 +429,62 @@ def _authoritative_node_result(
     if (
         worker_result.run_id != request.run_id
         or worker_result.request_digest != request.content_digest
-        or worker_result.status != "succeeded"
     ):
-        raise ValueError("worker result is not the successful result for the exact request")
+        raise ValueError("worker result is not bound to the exact request")
+    acceptances = store.list_records(
+        "non_mutating_result_acceptance_v2",
+        NonMutatingResultAcceptance,
+        run_id=run.id,
+    )
+    typed_result = worker_result.non_mutating_result
+    if typed_result is None:
+        if acceptances:
+            raise ValueError("worker result has an unexpected typed-result acceptance")
+        result_acceptance = None
+    else:
+        if len(acceptances) != 1:
+            raise ValueError("worker typed result lacks one explicit acceptance")
+        result_acceptance = acceptances[0]
+        if (
+            result_acceptance.run_id != request.run_id
+            or result_acceptance.graph_run_id != request.graph_run_id
+            or result_acceptance.node_id != node.id
+            or result_acceptance.accepted_graph_revision_digest
+            != request.accepted_graph_revision_digest
+            or result_acceptance.generation != request.generation
+            or result_acceptance.attempt != request.attempt
+            or result_acceptance.worker_request_digest != request.content_digest
+            or result_acceptance.worker_result_id != worker_result.id
+            or result_acceptance.worker_result_digest != worker_result.content_digest
+            or result_acceptance.result_id != typed_result.id
+            or result_acceptance.result_digest != typed_result.content_digest
+        ):
+            raise ValueError("worker typed-result acceptance is stale")
+        if result_acceptance.status == "rejected":
+            if (
+                run.status != "failed"
+                or worker_result.status != "succeeded"
+                or result_acceptance.failure_code is None
+                or run.failure_code != result_acceptance.failure_code.value
+            ):
+                raise ValueError("rejected typed result is not the authoritative failure")
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                result_acceptance=result_acceptance,
+            )
+        if (
+            typed_result.run_id != request.run_id
+            or typed_result.graph_run_id != request.graph_run_id
+            or typed_result.worker_request_digest != request.content_digest
+            or typed_result.node_id != node.id
+            or typed_result.accepted_graph_revision_digest != request.accepted_graph_revision_digest
+            or typed_result.generation != request.generation
+            or typed_result.attempt != request.attempt
+        ):
+            raise ValueError("accepted worker typed result is stale")
+    if run.status != expected_status or worker_result.status != "succeeded":
+        raise ValueError("inner work run did not reach its authoritative terminal state")
     descriptors = tuple(
         store.get("artifact_descriptor_v2", artifact_id, ArtifactDescriptor)
         for artifact_id in run.output_artifact_ids
@@ -444,6 +499,34 @@ def _authoritative_node_result(
         for digest in (result.stdout_artifact_digest, result.stderr_artifact_digest)
         if digest is not None
     }
+    if result_acceptance is not None:
+        assert typed_result is not None
+        accepted_artifact = result_acceptance.artifact
+        if accepted_artifact is None or accepted_artifact not in descriptors:
+            raise ValueError("accepted typed-result artifact is absent or stale")
+        body = coordinator.artifact_reader(accepted_artifact)
+        expected_body = canonical_json(typed_result).encode("utf-8")
+        source = accepted_artifact.source
+        if (
+            body != expected_body
+            or accepted_artifact.size_bytes != len(expected_body)
+            or sha256(body).hexdigest() != accepted_artifact.artifact_digest
+            or accepted_artifact.run_id != request.run_id
+            or accepted_artifact.producer_action_id != worker_result.id
+            or accepted_artifact.logical_kind != typed_result.logical_kind
+            or accepted_artifact.media_type != typed_result.media_type
+            or not isinstance(source, Mapping)
+            or source.get("graph_run_id") != request.graph_run_id
+            or source.get("worker_request_digest") != request.content_digest
+            or source.get("node_id") != node.id
+            or source.get("accepted_graph_revision_digest")
+            != request.accepted_graph_revision_digest
+            or source.get("generation") != request.generation
+            or source.get("attempt") != request.attempt
+            or source.get("result_digest") != typed_result.content_digest
+        ):
+            raise ValueError("accepted typed-result artifact is not canonical")
+        produced_digests.add(accepted_artifact.artifact_digest)
     if not writing:
         if run.patch_artifact_id is not None or not descriptors:
             raise ValueError("patchless node lacks authoritative artifacts")
@@ -552,6 +635,8 @@ def _authoritative_node_result(
         workspace_id=workspace.id,
         node_patch=node_patch,
         artifact_descriptors=descriptors,
+        result_acceptance=result_acceptance,
+        acceptance_ledger_digest=_required(ledger.content_digest),
     )
 
 
