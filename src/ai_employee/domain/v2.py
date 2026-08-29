@@ -382,6 +382,7 @@ class WorkerRequest(DigestedRecordV2):
     prior_result_digests: tuple[Digest, ...] = ()
     prior_artifact_digests: tuple[Digest, ...] = ()
     predecessor_outputs: tuple[PredecessorOutputReference, ...] = ()
+    accepted_feedback_digests: tuple[Digest, ...] = ()
 
     _context_paths = field_validator("workspace_context")(
         lambda values: tuple(_relative_path(value) for value in values)
@@ -419,6 +420,8 @@ class WorkerRequest(DigestedRecordV2):
                 for item in self.predecessor_outputs
             ):
                 raise ValueError("predecessor output is stale for this graph generation")
+        if len(self.accepted_feedback_digests) != len(set(self.accepted_feedback_digests)):
+            raise ValueError("accepted feedback digests must be unique")
         return self
 
 
@@ -443,6 +446,7 @@ class WorkerContextManifest(DigestedRecordV2):
     predecessor_node_ids: tuple[Identifier, ...] = ()
     predecessor_result_digests: tuple[Digest, ...] = ()
     predecessor_evidence_digests: tuple[Digest, ...] = ()
+    accepted_feedback_digests: tuple[Digest, ...] = ()
     artifact_descriptors: tuple[ArtifactDescriptorReference, ...] = ()
     conversation_history_included: Literal[False] = False
     artifact_bodies_included: Literal[False] = False
@@ -457,6 +461,8 @@ class WorkerContextManifest(DigestedRecordV2):
             raise ValueError("predecessor context bindings must have equal lengths")
         if len(self.predecessor_node_ids) != len(set(self.predecessor_node_ids)):
             raise ValueError("predecessor context nodes must be unique")
+        if len(self.accepted_feedback_digests) != len(set(self.accepted_feedback_digests)):
+            raise ValueError("accepted feedback digests must be unique")
         descriptor_ids = tuple(item.descriptor_id for item in self.artifact_descriptors)
         if len(descriptor_ids) != len(set(descriptor_ids)):
             raise ValueError("context artifact descriptors must be unique")
