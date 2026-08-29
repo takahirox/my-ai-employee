@@ -406,6 +406,7 @@ exit 0
                             "backend": "codex_cli",
                             "model": "gpt-5.6-luna",
                             "effort": "medium",
+                            "planner_eligible": True,
                             "capabilities": ["edit_intent", "process"],
                             "min_complexity": 1,
                             "max_complexity": 2,
@@ -418,6 +419,7 @@ exit 0
                             "backend": "codex_cli",
                             "model": "gpt-5.6-sol",
                             "effort": "high",
+                            "planner_eligible": True,
                             "capabilities": ["edit_intent", "process"],
                             "min_complexity": 1,
                             "max_complexity": 10,
@@ -573,6 +575,7 @@ def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
             planner_strategy=self.strategy,
             effective_policy_digest=effective_policy_digest,
             harness_digest=harness_digest,
+            planner_routing=self.planner_routing,
         )
 
     monkeypatch.setattr(CliProposedGraphPlanner, "plan", fake_plan)
@@ -633,6 +636,11 @@ def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
     assert acceptance.accepted_revision.graph == graph
     assert proposal.planner_strategy.model == "gpt-5.6-sol"
     assert proposal.planner_strategy.effort == "high"
+    assert proposal.planner_routing is not None
+    assert proposal.planner_routing.candidate_strategy_ids == ("luna", "sol")
+    assert proposal.planner_routing.eligible_strategy_ids == ("sol",)
+    assert proposal.planner_routing.assessment.semantic_profile is not None
+    assert proposal.planner_routing.selected_strategy.id == "sol"
 
 
 def test_adaptive_planner_failure_is_closed_and_stable(

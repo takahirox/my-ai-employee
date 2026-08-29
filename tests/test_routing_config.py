@@ -38,6 +38,7 @@ def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
     assert strategies[0].max_complexity == 3
     assert strategies[0].max_scale == 3
     assert strategies[0].max_risk == 0
+    assert config.planner_strategies(RoutingMode.ADAPTIVE) == strategies
 
     claude = config.execution_strategies(RoutingMode.ADAPTIVE, "claude-only")
     assert tuple((strategy.id, strategy.model, strategy.effort) for strategy in claude) == (
@@ -95,6 +96,7 @@ def test_execution_strategy_conversion_preserves_every_configured_field() -> Non
         model="gpt-5",
         effort="high",
         capabilities=("repository_read", "python_edit"),
+        planner_eligible=True,
         min_complexity=3,
         max_complexity=8,
         min_scale=2,
@@ -117,6 +119,35 @@ def test_execution_strategy_conversion_preserves_every_configured_field() -> Non
             max_scale=7,
             max_risk=4,
         ),
+    )
+    assert config.planner_strategies(RoutingMode.ADAPTIVE) == config.execution_strategies(
+        RoutingMode.ADAPTIVE
+    )
+
+
+def test_planner_candidates_require_explicit_operator_eligibility() -> None:
+    planner = OperatorStrategyConfig(
+        id="planner",
+        backend="codex_cli",
+        model="planner-model",
+        effort="high",
+        planner_eligible=True,
+    )
+    worker = OperatorStrategyConfig(
+        id="worker",
+        backend="codex_cli",
+        model="worker-model",
+        effort="medium",
+    )
+    config = OperatorConfig(
+        routing=OperatorRoutingConfig(
+            strategies=(worker, planner),
+            strategy_sets={"all": ("worker", "planner")},
+        )
+    )
+
+    assert tuple(item.id for item in config.planner_strategies(RoutingMode.ADAPTIVE, "all")) == (
+        "planner",
     )
 
 

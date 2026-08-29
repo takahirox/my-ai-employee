@@ -61,7 +61,7 @@ from .routing import (
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
-from .task_planning import ProposedGraph
+from .task_planning import PlannerRoutingDecision, ProposedGraph
 
 NodeExecutionStatus = Literal[
     "pending", "routed", "running", "passed", "failed", "blocked", "cancelled"
@@ -285,6 +285,7 @@ class GraphRunRecord(BaseModel):
     allowed_backends: tuple[str, ...]
     local_backend_allowed: bool
     independent_node_assessment: bool = False
+    planner_routing: PlannerRoutingDecision | None = None
     status: GraphExecutionStatus
     max_concurrency: int = Field(ge=1)
     max_claims: int = Field(ge=1)
@@ -553,12 +554,10 @@ class TaskOrchestrator:
         self.plan_reviser = plan_reviser
         if node_assessor is not None:
             configured = {item.id: item for item in self.strategies}
-            if configured.get(
-                node_assessor.strategy.id
-            ) != node_assessor.strategy or node_assessor.strategy.backend in {
-                "ollama",
-                "ollama_cli",
-            }:
+            if configured.get(node_assessor.strategy.id) != node_assessor.strategy or (
+                node_assessor.strategy.backend in {"ollama", "ollama_cli"}
+                and not self.local_backend_allowed
+            ):
                 raise ValueError("node assessor must use an authorized configured strategy")
         self.node_assessor = node_assessor
         self.independent_node_assessment = independent_node_assessment
@@ -594,11 +593,16 @@ class TaskOrchestrator:
             or proposal.goal_id != goal.id
             or proposal.goal_digest != canonical_digest(goal)
             or configured_planners.get(proposal.planner_strategy.id) != proposal.planner_strategy
-            or proposal.planner_strategy.backend in {"ollama", "ollama_cli"}
+            or (
+                proposal.planner_strategy.backend in {"ollama", "ollama_cli"}
+                and not self.local_backend_allowed
+            )
             or proposal.effective_policy_digest != effective_policy_digest
             or proposal.harness_digest != harness_digest
         ):
             raise ValueError("ProposedGraph provenance does not match this run")
+        if proposal is not None and proposal.planner_routing is not None:
+            self._validate_planner_routing(goal, proposal, capabilities)
         if replan and proposal is None:
             raise ValueError("replan requires an already-produced strict ProposedGraph")
         previous_acceptance: TaskGraphAcceptance | None = None
@@ -634,8 +638,9 @@ class TaskOrchestrator:
                 or prior_run.operator_config_digest != self.operator_config_digest
                 or prior_run.operator_config_path != self.operator_config_path
                 or prior_run.strategy_set != self.strategy_set
-                or prior_run.replan_count >= prior_run.max_replans
                 or proposal is None
+                or proposal.planner_routing != prior_run.planner_routing
+                or prior_run.replan_count >= prior_run.max_replans
                 or proposal.previous_accepted_revision_digest != previous_revision.content_digest
                 or not proposal.replan_trigger
                 or not proposal.replan_evidence
@@ -820,6 +825,7 @@ class TaskOrchestrator:
                 allowed_backends=self.allowed_backends,
                 local_backend_allowed=self.local_backend_allowed,
                 independent_node_assessment=self.independent_node_assessment,
+                planner_routing=None if proposal is None else proposal.planner_routing,
                 status="planned" if plan_only else "running",
                 max_concurrency=self.max_concurrency,
                 max_claims=max_claims,
@@ -1385,6 +1391,7 @@ class TaskOrchestrator:
                 or revised.planner_strategy != proposal.planner_strategy
                 or revised.effective_policy_digest != proposal.effective_policy_digest
                 or revised.harness_digest != proposal.harness_digest
+                or revised.planner_routing != proposal.planner_routing
                 or revised.previous_accepted_revision_digest
                 != proposal.previous_accepted_revision_digest
                 or revised.replan_trigger != proposal.replan_trigger
@@ -1615,6 +1622,81 @@ class TaskOrchestrator:
             revision_attempts=revision_attempts,
             review_acceptance_binding=review_binding,
         )
+
+    def _validate_planner_routing(
+        self,
+        goal: Goal,
+        proposal: ProposedGraph,
+        capabilities: tuple[str, ...],
+    ) -> None:
+        routing = proposal.planner_routing
+        assert routing is not None
+        profile = routing.assessment.semantic_profile
+        assert profile is not None
+        deterministic = assess_task(
+            goal.statement,
+            run_id=proposal.run_id,
+            risk=self.routing_risk_floor,
+            required_capabilities=capabilities,
+        )
+        expected_assessment = merge_semantic_profile(deterministic, profile)
+        configured = {item.id: item for item in self.strategies}
+        assessor = configured.get(routing.assessment_strategy.id)
+        candidate_ids = set(routing.candidate_strategy_ids)
+        candidates = tuple(
+            sorted(
+                (item for item in self.strategies if item.id in candidate_ids),
+                key=lambda item: item.id,
+            )
+        )
+        allowed_ids = set(self.allowed_strategy_ids)
+        allowed_backends = set(self.allowed_backends)
+        required = set(expected_assessment.required_capabilities)
+        eligible = tuple(
+            item
+            for item in candidates
+            if item.id in allowed_ids
+            and item.backend in allowed_backends
+            and (item.backend not in {"ollama", "ollama_cli"} or self.local_backend_allowed)
+            and required <= set(item.capabilities)
+            and expected_assessment.risk <= item.max_risk
+            and item.min_complexity <= expected_assessment.complexity <= item.max_complexity
+            and item.min_scale <= expected_assessment.scale <= item.max_scale
+        )
+        if (
+            routing.strategy_set != self.strategy_set
+            or routing.effective_policy_digest != proposal.effective_policy_digest
+            or routing.harness_digest != proposal.harness_digest
+            or routing.operator_config_digest != self.operator_config_digest
+            or routing.assessment != expected_assessment
+            or assessor != routing.assessment_strategy
+            or routing.assessment_strategy.id not in allowed_ids
+            or routing.assessment_strategy.backend not in allowed_backends
+            or (
+                routing.assessment_strategy.backend in {"ollama", "ollama_cli"}
+                and not self.local_backend_allowed
+            )
+            or tuple(item.id for item in candidates) != routing.candidate_strategy_ids
+            or tuple(item.id for item in eligible) != routing.eligible_strategy_ids
+        ):
+            raise ValueError("Planner routing decision is stale or mismatched")
+        selected = select_strategy(
+            eligible,
+            mode=routing.selection_mode,
+            fixed_strategy_id=(
+                routing.selected_strategy.id
+                if routing.selection_mode is RoutingMode.FIXED
+                else None
+            ),
+            assessment=expected_assessment,
+            allowed_strategy_ids=routing.eligible_strategy_ids,
+            allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible)),
+            local_backend_allowed=self.local_backend_allowed,
+        )
+        if selected != routing.selected_strategy or selected.model_copy(
+            update={"routing_reasons": ()}
+        ) != proposal.planner_strategy.model_copy(update={"routing_reasons": ()}):
+            raise ValueError("Planner routing selection is not deterministic")
 
     def _deterministic_node_assessment(self, run_id: str, node: Node) -> TaskAssessment:
         return assess_task(

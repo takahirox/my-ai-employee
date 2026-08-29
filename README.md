@@ -83,6 +83,7 @@ fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strat
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set codex-claude
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set local-only
 fleet work "Fix the bug" --repo /path/to/project --assessment-strategy codex-sol-high
+fleet work "Fix the bug" --repo /path/to/project --planner-strategy codex-sol-high
 fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker codex_cli --model MODEL
 ```
 
@@ -117,6 +118,13 @@ still requires both an operator-defined set and Project Harness `local_backend: 
 Inspector persists the strategy-set name, assessment strategy, merged task assessment,
 and selected execution strategy for evaluation. Decomposition is top-level assessment
 data only, not a set of independently executed subtasks.
+In adaptive mode, Fleet uses the same bound semantic profile to select the graph Planner
+deterministically from strategies explicitly marked `planner_eligible` by the operator. Candidate
+strategies pass through the configured strategy set, Project Harness IDs and backends, cloud-only
+Planner boundary, required capabilities, risk, and compatibility bounds before selection. The
+complete candidate and eligible sets, profile, assessor, selected Planner and routing reasons are
+digest-bound to the ProposedGraph and persisted GraphRun. `--planner-strategy` retains exact fixed
+Planner selection while enforcing the same eligibility constraints.
 Adaptive planner routing fields are persisted as non-authoritative hints. After graph
 acceptance, each node that will use adaptive routing receives an independent tool-disabled
 semantic assessment from the configured assessment strategy. Fleet binds that assessment to

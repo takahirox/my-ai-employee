@@ -66,6 +66,7 @@ class OperatorStrategyConfig(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     effort: str = Field(min_length=1, max_length=100)
     capabilities: tuple[Identifier, ...] = Field(default=(), max_length=100)
+    planner_eligible: bool = False
     min_complexity: int = Field(default=1, ge=1, le=10)
     max_complexity: int = Field(default=10, ge=1, le=10)
     min_scale: int = Field(default=1, ge=1, le=10)
@@ -183,6 +184,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 model="gpt-5.6-luna",
                 effort="max",
                 capabilities=("edit_intent", "process"),
+                planner_eligible=True,
                 min_complexity=1,
                 max_complexity=3,
                 min_scale=1,
@@ -195,6 +197,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 model="gpt-5.6-sol",
                 effort="high",
                 capabilities=("edit_intent", "process"),
+                planner_eligible=True,
                 min_complexity=1,
                 max_complexity=10,
                 min_scale=1,
@@ -207,6 +210,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 model="claude-opus-5",
                 effort="high",
                 capabilities=("edit_intent", "process"),
+                planner_eligible=True,
                 min_complexity=1,
                 max_complexity=3,
                 min_scale=1,
@@ -219,6 +223,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 model="claude-fable-5",
                 effort="high",
                 capabilities=("edit_intent", "process"),
+                planner_eligible=True,
                 min_complexity=1,
                 max_complexity=10,
                 min_scale=1,
@@ -286,6 +291,18 @@ class OperatorConfig(BaseModel):
                 max_risk=strategy.max_risk,
             )
             for strategy in configured
+        )
+
+    def planner_strategies(
+        self, mode: RoutingMode, strategy_set: str | None = None
+    ) -> tuple[ExecutionStrategy, ...]:
+        """Return only strategies the operator explicitly admitted to planning."""
+
+        if self.routing is None:
+            return ()
+        planner_ids = {item.id for item in self.routing.strategies if item.planner_eligible}
+        return tuple(
+            item for item in self.execution_strategies(mode, strategy_set) if item.id in planner_ids
         )
 
     def strategy_set_name(self, requested: str | None = None) -> str | None:
