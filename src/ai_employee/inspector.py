@@ -58,7 +58,7 @@ from .plan_review import (
     PlanReviewFailureEvidence,
     PlanRevisionAttempt,
 )
-from .serialization import canonical_json
+from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
     GoalEvaluatorRecord,
@@ -71,6 +71,7 @@ from .task_orchestration import (
     NodeReservationRecord,
     NodeRouteRecord,
     NodeSemanticAssessmentRecord,
+    PreAcceptanceGoalRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
@@ -572,22 +573,53 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
             key=lambda item: item.review_round,
         )
     )
-    if not attempts or attempts[-1].outcome != "failed":
+    revisions = tuple(
+        sorted(
+            store.list_records("plan_revision_attempt_v2", PlanRevisionAttempt, run_id=run_id),
+            key=lambda item: (item.created_at, item.id),
+        )
+    )
+    if not attempts:
+        raise KeyError(("plan_review_attempt_v2", run_id))
+    if any(item.goal_digest != attempts[0].goal_digest for item in attempts):
+        raise ValueError("pre-acceptance plan-review Goal digests disagree")
+    if revisions and revisions[-1].status == "failed":
+        stable_code = "GRAPH_PLANNER_FAILED"
+        review_status = "failed"
+    elif attempts[-1].outcome == "failed":
+        stable_code = "PLAN_REVIEW_FAILED"
+        review_status = "failed"
+    elif attempts[-1].outcome == "completed" and attempts[-1].action is PlanReviewAction.REJECT:
+        stable_code = "PLAN_REVIEW_BLOCKED"
+        review_status = "blocked"
+    else:
         raise KeyError(("plan_review_attempt_v2", run_id))
     failures = store.list_records(
         "plan_review_failure_evidence_v2", PlanReviewFailureEvidence, run_id=run_id
     )
     try:
-        goal_projection = _json_model(store.get("goal_v2", attempts[0].goal_id, Goal))
+        goal_record = store.get("pre_acceptance_goal_v2", run_id, PreAcceptanceGoalRecord)
+        if goal_record.goal_digest != attempts[0].goal_digest:
+            raise ValueError("pre-acceptance Goal does not match its review attempt")
+        goal_projection = _json_model(goal_record.goal)
     except KeyError:
-        # Databases created before the Issue 14 projection did not preserve the
-        # pre-acceptance Goal body. Keep them inspectable and mark the gap instead
-        # of inventing a statement or invoking an AI to reconstruct it.
-        goal_projection = {
-            "id": attempts[0].goal_id,
-            "statement": None,
-            "unavailable_reason": "goal_not_persisted_by_older_runtime",
-        }
+        legacy_goals = store.list_records("goal_v2", Goal, run_id=run_id)
+        matching_legacy = [
+            item
+            for item in legacy_goals
+            if item.id == attempts[0].goal_id and canonical_digest(item) == attempts[0].goal_digest
+        ]
+        # Older databases may not contain a safe run-scoped Goal. Keep them
+        # inspectable but never guess or reuse a colliding record from another run.
+        goal_projection = (
+            _json_model(matching_legacy[0])
+            if len(matching_legacy) == 1
+            else {
+                "id": attempts[0].goal_id,
+                "statement": None,
+                "unavailable_reason": "goal_not_persisted_by_older_runtime",
+            }
+        )
     proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
     if not proposals:
         raise KeyError(("proposed_graph_v2", run_id))
@@ -606,15 +638,17 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
         "run_id": run_id,
         "kind": "graph_run",
         "state": "failed",
+        "failure_code": stable_code,
         "generation": 0,
         "goal": goal_projection,
         "proposed_graph": _json_model(proposal),
         "graph_acceptance": None,
         "graph_revisions": [],
         "plan_review": {
-            "status": "failed",
+            "status": review_status,
             "attempts": [_json_model(item) for item in attempts],
             "failure_evidence": [_json_model(item) for item in failures],
+            "revision_attempts": [_json_model(item) for item in revisions],
         },
     }
 

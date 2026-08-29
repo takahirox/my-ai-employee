@@ -116,7 +116,9 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
         predecessor_statuses = [
             durable_status.get(item, "pending") for item in dependencies[node_id]
         ]
-        if status == "passed":
+        if not accepted_revision:
+            position = "not_accepted"
+        elif status == "passed":
             position = "completed"
         elif status in {"routed", "running"}:
             position = "active"
@@ -140,6 +142,7 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
             "dependents": dependents[str(node["id"])],
             "execution_state": durable_status[str(node["id"])],
             "position": task_positions[str(node["id"])],
+            "authority": "accepted" if accepted_revision else "proposed_only",
         }
         for node in graph_nodes
     ]
@@ -174,6 +177,7 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
         for node in graph_nodes
     ]
 
+    promotion_approval = _promotion_approval_story(view)
     current_state = {
         "status": view.get("state"),
         "generation": view.get("generation"),
@@ -184,7 +188,10 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
         "waiting_task_ids": _ids_at(task_positions, "waiting"),
         "blocked_task_ids": _ids_at(task_positions, "blocked"),
         "failed_task_ids": _ids_at(task_positions, "failed"),
-        "next_action": _next_action(str(view.get("state", "unknown"))),
+        "promotion_approval_state": None
+        if promotion_approval is None
+        else promotion_approval.get("decision"),
+        "next_action": _graph_next_action(str(view.get("state", "unknown")), promotion_approval),
     }
 
     return {
@@ -219,7 +226,7 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
         },
         "task_stories": task_stories,
         "failure_path": _graph_failure_path(view, task_stories),
-        "final_outcome": _graph_final_outcome(view),
+        "final_outcome": _graph_final_outcome(view, promotion_approval),
     }
 
 
@@ -283,7 +290,9 @@ def _graph_task_story(
                 "attempt": item.get("attempt"),
                 "sequence": item.get("sequence"),
                 "status": item.get("status"),
-                "authoritative": item.get("generation") == authoritative_generation,
+                "authoritative_for_current_state": latest is not None
+                and item.get("content_digest") == latest.get("content_digest"),
+                "generation_matches_run": item.get("generation") == authoritative_generation,
                 "route_digest": item.get("route_digest"),
                 "worker_request_digest": item.get("worker_request_digest"),
                 "worker_result_digest": item.get("worker_result_digest"),
@@ -399,6 +408,7 @@ def _why_task_state(
                 "waiting": "one or more predecessor tasks have not passed",
                 "blocked": "the task or one of its predecessors cannot proceed",
                 "ready": "all predecessor tasks passed; execution has not started",
+                "not_accepted": "the proposed task graph was never accepted for execution",
                 "failed": "the latest durable task state is failed",
                 "cancelled": "the task was cancelled",
             }.get(position, f"the latest durable task state is {status}")
@@ -412,12 +422,22 @@ def _graph_evolution(view: dict[str, Any]) -> list[dict[str, Any]]:
         key=lambda item: int(_mapping(item.get("accepted_revision")).get("revision_number", 0)),
     )
     previous_nodes: set[str] = set()
+    previous_summaries: dict[str, dict[str, Any]] = {}
     retention_records = _mappings(view.get("retained_node_bindings"))
+    node_history = _mappings(view.get("node_history"))
+    historical_nodes_by_digest = {
+        item.get("content_digest"): item.get("node_id")
+        for item in _mappings(view.get("node_history"))
+        if item.get("content_digest") and item.get("node_id")
+    }
     evolution: list[dict[str, Any]] = []
     if not revisions:
         proposal = _mapping(view.get("proposed_graph"))
         proposed_graph = _mapping(proposal.get("graph"))
         if proposed_graph:
+            proposed_summaries = _revision_task_summaries(
+                proposed_graph, None, node_history, accepted=False
+            )
             return [
                 {
                     "revision": None,
@@ -425,9 +445,13 @@ def _graph_evolution(view: dict[str, Any]) -> list[dict[str, Any]]:
                     "previous_revision_digest": None,
                     "trigger": "proposal was not accepted",
                     "evidence_digests": [],
+                    "triggered_by_task_ids": [],
                     "added_task_ids": sorted(
                         str(item["id"]) for item in _mappings(proposed_graph.get("nodes"))
                     ),
+                    "tasks": proposed_summaries,
+                    "added_task_summaries": proposed_summaries,
+                    "removed_task_summaries": [],
                     "removed_task_ids": [],
                     "retained_task_ids": [],
                     "redone_task_ids": [],
@@ -437,26 +461,81 @@ def _graph_evolution(view: dict[str, Any]) -> list[dict[str, Any]]:
         accepted = _mapping(item.get("accepted_revision"))
         graph = _mapping(accepted.get("graph"))
         current_nodes = {str(node["id"]) for node in _mappings(graph.get("nodes"))}
+        current_summaries = {
+            str(item["id"]): item
+            for item in _revision_task_summaries(
+                graph, _optional_text(accepted.get("content_digest")), node_history
+            )
+        }
         exact_retained = {
             str(binding["node_id"])
             for binding in retention_records
             if binding.get("accepted_graph_revision_digest") == accepted.get("content_digest")
         }
+        replan_evidence = item.get("replan_evidence", [])
         evolution.append(
             {
                 "revision": accepted.get("revision_number"),
                 "digest": accepted.get("content_digest"),
                 "previous_revision_digest": item.get("previous_revision_digest"),
                 "trigger": item.get("replan_trigger") or "initial plan accepted",
-                "evidence_digests": item.get("replan_evidence", []),
+                "evidence_digests": replan_evidence,
+                "triggered_by_task_ids": sorted(
+                    {
+                        str(historical_nodes_by_digest[digest])
+                        for digest in replan_evidence
+                        if digest in historical_nodes_by_digest
+                    }
+                ),
                 "added_task_ids": sorted(current_nodes - previous_nodes),
                 "removed_task_ids": sorted(previous_nodes - current_nodes),
+                "tasks": [current_summaries[node_id] for node_id in sorted(current_summaries)],
+                "added_task_summaries": [
+                    current_summaries[node_id] for node_id in sorted(current_nodes - previous_nodes)
+                ],
+                "removed_task_summaries": [
+                    previous_summaries[node_id]
+                    for node_id in sorted(previous_nodes - current_nodes)
+                ],
                 "retained_task_ids": sorted(exact_retained),
                 "redone_task_ids": sorted((current_nodes & previous_nodes) - exact_retained),
             }
         )
         previous_nodes = current_nodes
+        previous_summaries = current_summaries
     return evolution
+
+
+def _revision_task_summaries(
+    graph: dict[str, Any],
+    revision_digest: str | None,
+    node_history: list[dict[str, Any]],
+    *,
+    accepted: bool = True,
+) -> list[dict[str, Any]]:
+    nodes = _mappings(graph.get("nodes"))
+    dependencies: dict[str, list[str]] = {str(item["id"]): [] for item in nodes}
+    for edge in _mappings(graph.get("edges")):
+        dependencies.setdefault(str(edge["target_id"]), []).append(str(edge["source_id"]))
+    revision_records = [
+        item
+        for item in node_history
+        if item.get("accepted_graph_revision_digest") == revision_digest
+    ]
+    latest = _latest_by_node(revision_records)
+    return [
+        {
+            "id": str(node["id"]),
+            "name": node.get("name"),
+            "objective": node.get("objective"),
+            "dependencies": dependencies[str(node["id"])],
+            "historical_state": latest.get(str(node["id"]), {}).get(
+                "status", "pending" if accepted else "not_accepted"
+            ),
+            "authority": "historical_accepted" if accepted else "proposed_only",
+        }
+        for node in nodes
+    ]
 
 
 def _graph_failure_path(
@@ -473,6 +552,16 @@ def _graph_failure_path(
                     "action": attempt.get("action"),
                     "reason_code": attempt.get("failure_code"),
                     "finding_ids": [item.get("id") for item in _mappings(attempt.get("findings"))],
+                }
+            )
+    for revision in _mappings(_mapping(view.get("plan_review")).get("revision_attempts")):
+        if revision.get("status") == "failed":
+            path.append(
+                {
+                    "stage": "plan_revision",
+                    "outcome": "failed",
+                    "reason_code": revision.get("failure_code"),
+                    "source_proposed_graph_digest": revision.get("source_proposed_graph_digest"),
                 }
             )
     for story in task_stories:
@@ -495,6 +584,39 @@ def _graph_failure_path(
         for decision in story["loop_decisions"]:
             if decision["action"] != "PASS":
                 path.append({"stage": "closed_loop", "task_id": story["task_id"], **decision})
+    current_revision_digest = _mapping(
+        _mapping(view.get("graph_acceptance")).get("accepted_revision")
+    ).get("content_digest")
+    replan_by_evidence: dict[str, dict[str, Any]] = {}
+    for acceptance in _mappings(view.get("graph_revisions")):
+        accepted = _mapping(acceptance.get("accepted_revision"))
+        for digest in acceptance.get("replan_evidence", []):
+            replan_by_evidence[str(digest)] = {
+                "revision": accepted.get("revision_number"),
+                "revision_digest": accepted.get("content_digest"),
+                "trigger": acceptance.get("replan_trigger"),
+            }
+    for attempt in sorted(_mappings(view.get("node_history")), key=_attempt_key):
+        if attempt.get("accepted_graph_revision_digest") == current_revision_digest or (
+            not attempt.get("failure_code")
+            and attempt.get("status") not in {"failed", "blocked", "cancelled"}
+        ):
+            continue
+        content_digest = attempt.get("content_digest")
+        path.append(
+            {
+                "stage": "historical_task_execution",
+                "historical": True,
+                "task_id": attempt.get("node_id"),
+                "accepted_graph_revision_digest": attempt.get("accepted_graph_revision_digest"),
+                "generation": attempt.get("generation"),
+                "attempt": attempt.get("attempt"),
+                "outcome": attempt.get("status"),
+                "reason_code": attempt.get("failure_code"),
+                "record_digest": content_digest,
+                "triggered_replan": replan_by_evidence.get(str(content_digest)),
+            }
+        )
     for item in _mappings(view.get("loop_transitions")):
         if item.get("node_id") is None and item.get("action") != "PASS":
             path.append({"stage": "graph_control", **_loop_summary(item)})
@@ -506,6 +628,20 @@ def _graph_failure_path(
                 "result_generation": item.get("result_generation"),
                 "authoritative_generation": item.get("authoritative_generation"),
                 "worker_result_digest": item.get("worker_result_digest"),
+            }
+        )
+    promotion_approval = _promotion_approval_story(view)
+    if promotion_approval is not None and promotion_approval.get("decision") in {
+        "denied",
+        "expired",
+    }:
+        path.append(
+            {
+                "stage": "promotion_approval",
+                "outcome": promotion_approval.get("decision"),
+                "approval_id": promotion_approval.get("approval_id"),
+                "request_digest": promotion_approval.get("request_digest"),
+                "reason_code": "PROMOTION_APPROVAL_DENIED_OR_EXPIRED",
             }
         )
     run = _mapping(view.get("run"))
@@ -520,7 +656,9 @@ def _graph_failure_path(
     return path
 
 
-def _graph_final_outcome(view: dict[str, Any]) -> dict[str, Any]:
+def _graph_final_outcome(
+    view: dict[str, Any], promotion_approval: dict[str, Any] | None
+) -> dict[str, Any]:
     status = str(view.get("state", "unknown"))
     revision_digest = _mapping(_mapping(view.get("graph_acceptance")).get("accepted_revision")).get(
         "content_digest"
@@ -538,14 +676,14 @@ def _graph_final_outcome(view: dict[str, Any]) -> dict[str, Any]:
     goal_evaluations.sort(key=_attempt_key)
     semantic_decisions.sort(key=_attempt_key)
     plan_attempts = _mappings(_mapping(view.get("plan_review")).get("attempts"))
-    run_failure_code = _mapping(view.get("run")).get("failure_code")
+    run_failure_code = view.get("failure_code") or _mapping(view.get("run")).get("failure_code")
     if run_failure_code is None and plan_attempts:
         run_failure_code = plan_attempts[-1].get("failure_code") or (
             "PLAN_REVIEW_BLOCKED" if plan_attempts[-1].get("action") == "reject" else None
         )
     return {
         "status": status,
-        "disposition": _disposition(status),
+        "disposition": _graph_disposition(status, promotion_approval),
         "goal_evaluation": None
         if not goal_evaluations
         else {
@@ -560,9 +698,80 @@ def _graph_final_outcome(view: dict[str, Any]) -> dict[str, Any]:
             "accepted_finding_digests": semantic_decisions[-1].get("accepted_finding_digests", []),
         },
         "promotion_recorded": bool(_mappings(view.get("promotions"))),
+        "promotion_approval": promotion_approval,
         "failure_code": run_failure_code,
-        "next_action": _next_action(status),
+        "next_action": _graph_next_action(status, promotion_approval),
     }
+
+
+def _promotion_approval_story(view: dict[str, Any]) -> dict[str, Any] | None:
+    run = _mapping(view.get("run"))
+    approval_id = run.get("promotion_approval_id")
+    request_digest = run.get("promotion_approval_request_digest")
+    if approval_id is None and request_digest is None:
+        return None
+    if not isinstance(approval_id, str) or not isinstance(request_digest, str):
+        return {"binding": "invalid", "decision": "unknown"}
+    policy_digest = run.get("effective_policy_digest")
+    approvals = [item for item in _mappings(view.get("approvals")) if item.get("id") == approval_id]
+    requests = [
+        item
+        for item in _mappings(view.get("approval_requests"))
+        if item.get("request_digest") == request_digest
+        and item.get("policy_digest") == policy_digest
+        and "promotion" in item.get("approval_classes", [])
+    ]
+    approval = approvals[-1] if approvals else None
+    if (
+        approval is None
+        or len(requests) != 1
+        or approval.get("request_digest") != request_digest
+        or approval.get("policy_digest") != policy_digest
+        or request_digest not in approval.get("scope", [])
+    ):
+        return {
+            "binding": "invalid",
+            "decision": "unknown",
+            "approval_id": approval_id,
+            "request_digest": request_digest,
+        }
+    request = requests[0]
+    return {
+        "binding": "bound",
+        "decision": approval.get("decision"),
+        "approval_id": approval_id,
+        "approval_request_id": request.get("id"),
+        "request_digest": request_digest,
+        "policy_digest": policy_digest,
+        "expires_at": approval.get("expires_at"),
+        "decided_at": approval.get("decided_at"),
+    }
+
+
+def _graph_next_action(status: str, approval: dict[str, Any] | None) -> str | None:
+    if status != "ready_to_promote":
+        return _next_action(status)
+    decision = None if approval is None else approval.get("decision")
+    if decision == "pending":
+        return "approve or deny the exact pending promotion request"
+    if decision == "approved":
+        return "explicitly promote the approved exact candidate patch"
+    if decision in {"denied", "expired"}:
+        return "obtain a fresh digest-bound promotion approval before promotion"
+    return "inspect the missing or stale promotion approval binding"
+
+
+def _graph_disposition(status: str, approval: dict[str, Any] | None) -> str:
+    if status != "ready_to_promote":
+        return _disposition(status)
+    decision = None if approval is None else approval.get("decision")
+    if decision == "pending":
+        return "accepted_awaiting_approval"
+    if decision == "approved":
+        return "accepted_awaiting_promotion"
+    if decision in {"denied", "expired"}:
+        return "promotion_blocked_or_incomplete"
+    return "indeterminate"
 
 
 def _planner_routing_story(value: object) -> dict[str, Any] | None:
@@ -709,7 +918,10 @@ def _explain_work_run(view: dict[str, Any]) -> dict[str, Any]:
                     for item in approvals
                 ],
                 "verification": [
-                    {"status": item.get("status"), "failure": item.get("failure")}
+                    {
+                        "status": item.get("status"),
+                        "failure": _stable_failure_summary(item.get("failure")),
+                    }
                     for item in verification
                 ],
             }
@@ -918,3 +1130,13 @@ def _mappings(value: object) -> list[dict[str, Any]]:
 
 def _optional_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _stable_failure_summary(value: object) -> dict[str, Any] | None:
+    failure = _mapping(value)
+    if not failure:
+        return None
+    return {
+        "code": failure.get("code"),
+        "retryable": failure.get("retryable", False),
+    }

@@ -680,6 +680,13 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             item["information_flow"]["artifact_bodies_included"] is False
             for item in explanation["task_stories"]
         )
+        if parent_ready:
+            assert explanation["current_state"]["promotion_approval_state"] == "pending"
+            assert explanation["final_outcome"]["promotion_approval"]["binding"] == ("bound")
+            assert explanation["final_outcome"]["disposition"] == ("accepted_awaiting_approval")
+            assert explanation["final_outcome"]["next_action"] == (
+                "approve or deny the exact pending promotion request"
+            )
         if semantic_repair:
             assert explanation["final_outcome"]["parent_semantic_review"]["action"] == ("REPAIR")
             assert explanation["final_outcome"]["disposition"] == "rejected_or_incomplete"

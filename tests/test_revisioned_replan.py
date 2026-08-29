@@ -371,7 +371,32 @@ def test_revision_two_retains_patchless_pass_and_fences_stale_authority(
         assert [item["revision"] for item in explanation["graph"]["evolution"]] == [1, 2]
         assert explanation["graph"]["evolution"][1]["trigger"] == "repair failed node"
         assert explanation["graph"]["evolution"][1]["evidence_digests"] == [scenario.evidence]
+        assert explanation["graph"]["evolution"][1]["triggered_by_task_ids"] == ["broken"]
+        revision_one_tasks = {
+            item["id"]: item for item in explanation["graph"]["evolution"][0]["tasks"]
+        }
+        assert revision_one_tasks["broken"] == {
+            "id": "broken",
+            "name": "broken",
+            "objective": "complete broken",
+            "dependencies": [],
+            "historical_state": "failed",
+            "authority": "historical_accepted",
+        }
         assert explanation["current_state"]["graph_revision"] == 2
+        historical_failure = next(
+            item
+            for item in explanation["failure_path"]
+            if item["stage"] == "historical_task_execution" and item["task_id"] == "broken"
+        )
+        assert historical_failure["historical"] is True
+        assert historical_failure["record_digest"] == scenario.evidence
+        assert historical_failure["accepted_graph_revision_digest"] == revision_one_digest
+        assert historical_failure["triggered_replan"] == {
+            "revision": 2,
+            "revision_digest": run.accepted_graph_revision_digest,
+            "trigger": "repair failed node",
+        }
 
         by_node = {item.node_id: item for item in replay.nodes}
         retained = replay.retained_node_bindings

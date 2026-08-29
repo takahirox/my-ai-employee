@@ -50,6 +50,7 @@ from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     NodeExecutionResult,
     NodeReservationRecord,
+    PreAcceptanceGoalRecord,
     TaskGraphAcceptance,
     TaskOrchestrator,
     one_node_graph,
@@ -473,7 +474,7 @@ class _ScriptedNodeAssessor:
 
 def _review_proposal(run_id: str, goal: Goal, graph: Graph) -> ProposedGraph:
     return ProposedGraph(
-        id="original-proposal",
+        id=f"original-proposal-{run_id}",
         run_id=run_id,
         created_at=NOW,
         goal_id=goal.id,
@@ -753,6 +754,10 @@ def test_round_one_blockers_and_review_failures_stop_before_acceptance(tmp_path:
             == 1
         )
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
+        explanation = explain_any_run(store, "blocked-review-run")
+        assert explanation["plan_decisions"]["plan_review"]["status"] == "blocked"
+        assert explanation["final_outcome"]["failure_code"] == "PLAN_REVIEW_BLOCKED"
+        assert explanation["failure_path"][-1]["stage"] == "plan_review"
 
 
 @pytest.mark.parametrize(
@@ -831,13 +836,17 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(
         assert explanation["goal"]["statement"] == goal.statement
         assert explanation["graph"]["accepted"] is False
         assert explanation["graph"]["tasks"][0]["id"] == "a"
+        assert explanation["graph"]["tasks"][0]["position"] == "not_accepted"
+        assert explanation["graph"]["tasks"][0]["authority"] == "proposed_only"
+        assert explanation["current_state"]["ready_task_ids"] == []
+        assert explanation["current_state"]["task_counts"] == {"not_accepted": 1}
         assert explanation["failure_path"][0]["stage"] == "plan_review"
         assert explanation["failure_path"][0]["reason_code"] == "PLAN_REVIEW_FAILED"
         assert explanation["final_outcome"]["failure_code"] == "PLAN_REVIEW_FAILED"
         with store.transaction() as connection:
             connection.execute(
                 "DELETE FROM records WHERE kind=? AND record_id=?",
-                ("goal_v2", goal.id),
+                ("pre_acceptance_goal_v2", run_id),
             )
         older_explanation = explain_any_run(store, run_id)
         assert older_explanation["goal"]["statement"] is None
@@ -845,6 +854,102 @@ def test_review_invocation_failure_is_persisted_and_fails_closed(
             "goal_not_persisted_by_older_runtime"
         )
         assert store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance) == ()
+
+
+def test_plan_revision_failure_is_explainable_before_graph_acceptance(tmp_path: Path) -> None:
+    run_id = "failed-plan-revision"
+    goal = Goal(id="revision-failure-goal", statement="revise a rejected bounded plan")
+    graph = one_node_graph(
+        goal,
+        graph_id="revision-failure-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: (_blocking_review_finding(),)}, [])
+    reviser = _ScriptedPlanReviser(_strategy(), graph, [])
+
+    def fail_revision(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("planner unavailable")
+
+    reviser.revise = fail_revision  # type: ignore[method-assign]
+    with SQLiteStore(tmp_path / "failed-revision.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("failed plan revision must not invoke a Worker"),
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=reviser,
+        )
+        with pytest.raises(PlanReviewGateError) as caught:
+            orchestrator.run(
+                goal,
+                _review_proposal(run_id, goal, graph),
+                ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+                harness_digest=ZERO,
+                effective_policy_digest="1" * 64,
+                run_id=run_id,
+                available_capabilities=("process",),
+            )
+
+        assert caught.value.stable_code == "GRAPH_PLANNER_FAILED"
+        explanation = explain_any_run(store, run_id)
+        assert explanation["goal"]["statement"] == goal.statement
+        assert explanation["final_outcome"]["failure_code"] == "GRAPH_PLANNER_FAILED"
+        assert explanation["failure_path"][-1]["stage"] == "plan_revision"
+        assert explanation["failure_path"][-1]["reason_code"] == "GRAPH_PLANNER_FAILED"
+
+
+def test_pre_acceptance_goals_are_isolated_by_run_when_goal_ids_are_reused(
+    tmp_path: Path,
+) -> None:
+    shared_goal_id = "shared-goal-id"
+    with SQLiteStore(tmp_path / "isolated-goals.db") as store:
+        for suffix in ("first", "second"):
+            run_id = f"goal-run-{suffix}"
+            goal = Goal(id=shared_goal_id, statement=f"{suffix} distinct statement")
+            graph = one_node_graph(
+                goal,
+                graph_id=f"graph-{suffix}",
+                node_id="a",
+                required_capabilities=("process",),
+                max_wall_seconds=30.0,
+            )
+            reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, [])
+
+            def fail_review(*_args: object, **_kwargs: object) -> object:
+                raise PlanReviewInvocationError(
+                    PlanReviewFailureKind.REVIEWER_ERROR,
+                    "reviewer unavailable",
+                )
+
+            reviewer.review = fail_review  # type: ignore[method-assign]
+            orchestrator = TaskOrchestrator(
+                store,
+                lambda *_args: pytest.fail("failed plan review must not invoke a Worker"),
+                (_strategy(),),
+                plan_reviewer=reviewer,
+                plan_reviser=_ScriptedPlanReviser(_strategy(), graph, []),
+            )
+            with pytest.raises(PlanReviewGateError):
+                orchestrator.run(
+                    goal,
+                    _review_proposal(run_id, goal, graph),
+                    ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+                    harness_digest=ZERO,
+                    effective_policy_digest="1" * 64,
+                    run_id=run_id,
+                    available_capabilities=("process",),
+                )
+
+        assert explain_any_run(store, "goal-run-first")["goal"]["statement"] == (
+            "first distinct statement"
+        )
+        assert explain_any_run(store, "goal-run-second")["goal"]["statement"] == (
+            "second distinct statement"
+        )
+        records = store.list_records("pre_acceptance_goal_v2", PreAcceptanceGoalRecord)
+        assert {item.id for item in records} == {"goal-run-first", "goal-run-second"}
 
 
 def test_tampered_review_binding_fails_replay_and_resume(tmp_path: Path) -> None:
@@ -1235,6 +1340,7 @@ def test_cancel_fences_late_results_and_replays_only_stale_control_facts(
         )
         controller.join(timeout=3)
         replay = orchestrator.replay(cancelled.id)
+        explanation = explain_any_run(store, cancelled.id)
         assert store.list_records("goal_evaluator_v2", WorkerResult, run_id=cancelled.id) == ()
 
     assert not controller.is_alive()
@@ -1243,6 +1349,15 @@ def test_cancel_fences_late_results_and_replays_only_stale_control_facts(
     assert set(calls) == {"a", "b"}
     statuses = {item.node_id: item.status for item in replay.nodes}
     assert statuses == {"a": "cancelled", "b": "cancelled", "c": "cancelled"}
+    assert explanation["current_state"]["task_counts"] == {"cancelled": 3}
+    assert all(
+        story["execution_attempts"][-1]["authoritative_for_current_state"] is True
+        for story in explanation["task_stories"]
+    )
+    assert any(
+        story["execution_attempts"][-1]["generation_matches_run"] is False
+        for story in explanation["task_stories"]
+    )
     assert replay.results == ()
     assert replay.evidence == ()
     assert replay.evaluator_decisions == ()
