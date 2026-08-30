@@ -11,6 +11,7 @@ from ai_employee import cli
 from ai_employee.config import OperatorConfig, OperatorRoutingConfig, OperatorStrategyConfig
 from ai_employee.domain import (
     AcceptedGraphRevision,
+    Budget,
     CompletionCriterion,
     EvaluationDecision,
     ExecutionPolicy,
@@ -31,6 +32,7 @@ from ai_employee.domain.v2 import (
     AcceptanceLedger,
     ArtifactDescriptor,
     CriterionEvidence,
+    WorkerRequest,
     WorkerResult,
     WorkspaceSnapshot,
 )
@@ -59,7 +61,9 @@ from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
     NodeExecutionRecord,
+    NodeExecutionResult,
     TaskGraphAcceptance,
+    TaskOrchestrator,
 )
 
 NOW = datetime(2026, 8, 30, tzinfo=UTC)
@@ -96,6 +100,7 @@ def _scenario(harness: ProjectHarnessV2, repository: str = "/fixture") -> EvalSc
         tags=("simple",),
         clean_status_digest=canonical_digest(""),
         harness_digest=project_harness_digest(harness),
+        harness=harness,
     )
 
 
@@ -140,6 +145,83 @@ def _environment(scenario: EvalScenario, experiment: EvalExperiment) -> EvalEnvi
     )
 
 
+def _stored_request(
+    store: SQLiteStore,
+    *,
+    graph_run_id: str,
+    request_id: str,
+    node_id: str,
+    accepted_revision_digest: str,
+    generation: int,
+    attempt: int,
+    harness_digest: str,
+    effective_policy_digest: str,
+) -> WorkerRequest:
+    worker_run_digest = canonical_digest(
+        {
+            "graph_run_id": graph_run_id,
+            "node_id": node_id,
+            "generation": generation,
+            "attempt": attempt,
+        }
+    )
+    request = WorkerRequest(
+        id=request_id,
+        run_id=f"node-{worker_run_digest[:32]}",
+        created_at=NOW,
+        goal="execute one bounded evaluation node",
+        accepted_plan_digest=accepted_revision_digest,
+        node_id=node_id,
+        accepted_graph_revision_digest=accepted_revision_digest,
+        graph_run_id=graph_run_id,
+        generation=generation,
+        attempt=attempt,
+        harness_digest=harness_digest,
+        effective_policy_digest=effective_policy_digest,
+        remaining_budgets={},
+    )
+    store.put("worker_request_v2", request, run_id=request.run_id)
+    return request
+
+
+def _stored_worker(
+    store: SQLiteStore,
+    *,
+    graph_run_id: str,
+    worker_id: str,
+    node_id: str,
+    accepted_revision_digest: str,
+    generation: int,
+    attempt: int,
+    harness_digest: str,
+    effective_policy_digest: str,
+    duration_seconds: float,
+    usage: dict[str, int | float],
+) -> WorkerResult:
+    request = _stored_request(
+        store,
+        graph_run_id=graph_run_id,
+        request_id=f"request-{worker_id}",
+        node_id=node_id,
+        accepted_revision_digest=accepted_revision_digest,
+        generation=generation,
+        attempt=attempt,
+        harness_digest=harness_digest,
+        effective_policy_digest=effective_policy_digest,
+    )
+    worker = WorkerResult(
+        id=worker_id,
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or DIGEST,
+        status="succeeded",
+        duration_seconds=duration_seconds,
+        usage=usage,
+    )
+    store.put("worker_result_v2", worker, run_id=request.run_id)
+    return worker
+
+
 def _failed_result(
     scenario: EvalScenario,
     experiment: EvalExperiment,
@@ -147,7 +229,7 @@ def _failed_result(
     binding: EvalStrategyBinding,
 ) -> EvalResult:
     return EvalResult(
-        id=f"result-{trial.id}",
+        id=framework._result_id(trial),
         run_id=experiment.id,
         created_at=NOW + timedelta(seconds=1),
         trial_id=trial.id,
@@ -320,6 +402,21 @@ def test_put_once_rejects_same_scenario_identity_with_different_content(
             persist_exact(store, framework.SCENARIO_KIND, conflicting)
 
 
+def test_inspector_rejects_foreign_trial_id_for_deterministic_plan(tmp_path: Path) -> None:
+    harness = _harness()
+    scenario = _scenario(harness)
+    binding = _binding()
+    experiment = _experiment(scenario, binding)
+    planned = planned_trial(experiment, scenario, binding, 1, created_at=NOW)
+    foreign = planned.model_copy(update={"id": "foreign-trial", "content_digest": None})
+    with SQLiteStore(tmp_path / "eval.db") as store:
+        persist_exact(store, framework.SCENARIO_KIND, scenario)
+        persist_exact(store, framework.EXPERIMENT_KIND, experiment)
+        persist_exact(store, framework.TRIAL_KIND, foreign)
+        with pytest.raises(ValueError, match="deterministic experiment plan"):
+            inspect_experiment(store, experiment.id)
+
+
 def _stored_graph_run(
     store: SQLiteStore,
     scenario: EvalScenario,
@@ -365,16 +462,19 @@ def _stored_graph_run(
         graph_acceptance,
         run_id=trial.fleet_run_id,
     )
-    worker = WorkerResult(
-        id="worker-eval",
-        run_id=trial.fleet_run_id,
-        created_at=NOW,
-        request_digest="4" * 64,
-        status="succeeded",
+    worker = _stored_worker(
+        store,
+        graph_run_id=trial.fleet_run_id,
+        worker_id="worker-eval",
+        node_id=node.id,
+        accepted_revision_digest=accepted.content_digest or DIGEST,
+        generation=0,
+        attempt=1,
+        harness_digest=scenario.harness_digest,
+        effective_policy_digest="3" * 64,
         duration_seconds=2.5,
         usage={"input_tokens": 10, "output_tokens": 5, "cost": 0.25},
     )
-    store.put("worker_result_v2", worker, run_id=trial.fleet_run_id)
     if store_node:
         store.put(
             "node_execution_v2",
@@ -388,6 +488,7 @@ def _stored_graph_run(
                 attempt=1,
                 sequence=1,
                 status="passed" if ready else "failed",
+                worker_request_digest=worker.request_digest,
                 worker_result_id=worker.id,
                 worker_result_digest=worker.content_digest,
                 failure_code=None if ready else "VERIFICATION_FAILED",
@@ -580,14 +681,56 @@ def test_exact_parent_pass_collects_metrics_and_inspector_is_worker_free(
         run, evaluation, ledger, patch = _stored_graph_run(
             store, scenario, experiment, binding, trial, ready=True
         )
-        monkeypatch.setattr(
-            framework,
-            "validate_exact_parent_evidence_store",
-            lambda *_args, **_kwargs: ParentCandidateEvaluationReplay(
+        retry_worker = _stored_worker(
+            store,
+            graph_run_id=trial.fleet_run_id,
+            worker_id="worker-eval-retry",
+            node_id="node-one",
+            accepted_revision_digest=run.accepted_graph_revision_digest,
+            generation=0,
+            attempt=0,
+            harness_digest=run.harness_digest,
+            effective_policy_digest=run.effective_policy_digest,
+            duration_seconds=1.0,
+            usage={"input_tokens": 2, "output_tokens": 1, "cost": 0.05},
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-execution-eval-retry",
+                run_id=trial.fleet_run_id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=0,
+                attempt=0,
+                sequence=1,
+                status="failed",
+                worker_request_digest=retry_worker.request_digest,
+                worker_result_id=retry_worker.id,
+                worker_result_digest=retry_worker.content_digest,
+                failure_code="RETRYABLE",
+            ),
+            run_id=trial.fleet_run_id,
+        )
+        replay_available = True
+        replay_calls = 0
+
+        def replay_authority(*_args: object, **_kwargs: object) -> ParentCandidateEvaluationReplay:
+            nonlocal replay_calls
+            replay_calls += 1
+            if not replay_available:
+                raise ValueError("deep evaluation authority is missing")
+            return ParentCandidateEvaluationReplay(
                 record=evaluation,
                 acceptance_ledger=ledger,
                 evaluation_ledgers=(),
-            ),
+            )
+
+        monkeypatch.setattr(
+            framework,
+            "validate_exact_parent_evidence_store",
+            replay_authority,
         )
         result = collect_authoritative_result(
             store,
@@ -607,6 +750,40 @@ def test_exact_parent_pass_collects_metrics_and_inspector_is_worker_free(
         framework._finish_trial(store, trial, result)
         report = inspect_experiment(store, experiment.id)
         inspected = inspect_any_run(store, experiment.id)
+        replay_available = False
+        with pytest.raises(ValueError, match="deep evaluation authority is missing"):
+            inspect_experiment(store, experiment.id)
+        replay_available = True
+        late_request = _stored_request(
+            store,
+            graph_run_id=run.id,
+            request_id="request-late-worker-error",
+            node_id="node-one",
+            accepted_revision_digest=run.accepted_graph_revision_digest,
+            generation=0,
+            attempt=2,
+            harness_digest=run.harness_digest,
+            effective_policy_digest=run.effective_policy_digest,
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-late-worker-error",
+                run_id=run.id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=0,
+                attempt=2,
+                sequence=2,
+                status="failed",
+                worker_request_digest=late_request.content_digest,
+                failure_code="WORKER_BOUNDARY:RuntimeError",
+            ),
+            run_id=run.id,
+        )
+        with pytest.raises(ValueError, match="worker metrics are stale"):
+            inspect_experiment(store, experiment.id)
         store.put(
             "graph_run_v2",
             run.model_copy(
@@ -624,16 +801,205 @@ def test_exact_parent_pass_collects_metrics_and_inspector_is_worker_free(
 
     assert result.verified
     assert result.succeeded
-    assert result.worker_seconds == 2.5
-    assert result.input_tokens == 10
-    assert result.output_tokens == 5
-    assert result.cost == 0.25
+    assert result.worker_seconds == 3.5
+    assert result.input_tokens == 12
+    assert result.output_tokens == 6
+    assert result.cost == pytest.approx(0.3)
+    assert result.attempts == 2
     assert result.changed_files == 0
     assert result.patch_lines == 2
     assert result.patch_bytes == len(patch)
     assert report.worker_invocations == 0
     assert inspected["worker_invocations"] == 0
     assert "old" not in str(inspected)
+    assert replay_calls >= 4
+
+
+def test_attempt_metrics_include_superseded_replan_revision_and_null_missing_usage(
+    tmp_path: Path,
+) -> None:
+    harness = _harness()
+    scenario = _scenario(harness)
+    binding = _binding()
+    experiment = _experiment(scenario, binding)
+    trial = planned_trial(experiment, scenario, binding, 1, created_at=NOW)
+    with SQLiteStore(tmp_path / "eval.db") as store:
+        run, _, _, _ = _stored_graph_run(store, scenario, experiment, binding, trial, ready=True)
+        first_acceptance = store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id
+        )[0]
+        retry_worker = _stored_worker(
+            store,
+            graph_run_id=run.id,
+            worker_id="worker-before-replan-retry",
+            node_id="node-one",
+            accepted_revision_digest=run.accepted_graph_revision_digest,
+            generation=0,
+            attempt=0,
+            harness_digest=run.harness_digest,
+            effective_policy_digest=run.effective_policy_digest,
+            duration_seconds=1.0,
+            usage={"input_tokens": 2, "output_tokens": 1},
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-before-replan-retry",
+                run_id=run.id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=0,
+                attempt=0,
+                sequence=1,
+                status="failed",
+                worker_request_digest=retry_worker.request_digest,
+                worker_result_id=retry_worker.id,
+                worker_result_digest=retry_worker.content_digest,
+                failure_code="RETRYABLE",
+            ),
+            run_id=run.id,
+        )
+        second_revision = AcceptedGraphRevision(
+            revision_number=2,
+            graph=first_acceptance.accepted_revision.graph,
+        )
+        second_acceptance = TaskGraphAcceptance(
+            id="graph-acceptance-replanned",
+            run_id=run.id,
+            created_at=NOW,
+            accepted_revision=second_revision,
+            effective_policy_digest=run.effective_policy_digest,
+            harness_digest=run.harness_digest,
+            previous_revision_digest=run.accepted_graph_revision_digest,
+            replan_trigger="retry evidence required a bounded replan",
+            replan_evidence=("e" * 64,),
+        )
+        store.put("task_graph_acceptance_v2", second_acceptance, run_id=run.id)
+        replanned_worker = _stored_worker(
+            store,
+            graph_run_id=run.id,
+            worker_id="worker-after-replan",
+            node_id="node-one",
+            accepted_revision_digest=second_revision.content_digest or DIGEST,
+            generation=1,
+            attempt=1,
+            harness_digest=run.harness_digest,
+            effective_policy_digest=run.effective_policy_digest,
+            duration_seconds=3.0,
+            usage={"input_tokens": 20, "output_tokens": 10, "cost": 0.5},
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-after-replan",
+                run_id=run.id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=second_revision.content_digest or DIGEST,
+                generation=1,
+                attempt=1,
+                sequence=1,
+                status="passed",
+                worker_request_digest=replanned_worker.request_digest,
+                worker_result_id=replanned_worker.id,
+                worker_result_digest=replanned_worker.content_digest,
+            ),
+            run_id=run.id,
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-retained-after-replan",
+                run_id=run.id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=second_revision.content_digest or DIGEST,
+                generation=1,
+                attempt=0,
+                sequence=0,
+                status="passed",
+                worker_request_digest=store.get(
+                    "worker_result_v2", "worker-eval", WorkerResult
+                ).request_digest,
+                worker_result_id="worker-eval",
+                worker_result_digest=store.get(
+                    "worker_result_v2", "worker-eval", WorkerResult
+                ).content_digest,
+                retained_from_revision_digest=run.accepted_graph_revision_digest,
+            ),
+            run_id=run.id,
+        )
+        replanned_run = run.model_copy(
+            update={
+                "accepted_graph_revision_digest": second_revision.content_digest,
+                "generation": run.generation + 1,
+            }
+        )
+        missing_result_request = _stored_request(
+            store,
+            graph_run_id=run.id,
+            request_id="request-before-replan-worker-error",
+            node_id="node-one",
+            accepted_revision_digest=run.accepted_graph_revision_digest,
+            generation=0,
+            attempt=2,
+            harness_digest=run.harness_digest,
+            effective_policy_digest=run.effective_policy_digest,
+        )
+        store.put(
+            "node_execution_v2",
+            NodeExecutionRecord(
+                id="node-before-replan-worker-error",
+                run_id=run.id,
+                created_at=NOW,
+                node_id="node-one",
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=0,
+                attempt=2,
+                sequence=2,
+                status="failed",
+                worker_request_digest=missing_result_request.content_digest,
+                failure_code="WORKER_BOUNDARY:RuntimeError",
+            ),
+            run_id=run.id,
+        )
+        attempts, workers, complete = framework._all_authority_bound_worker_results(
+            store, replanned_run
+        )
+        stale_revision = AcceptedGraphRevision(
+            revision_number=3,
+            graph=first_acceptance.accepted_revision.graph,
+        )
+        store.put(
+            "task_graph_acceptance_v2",
+            TaskGraphAcceptance(
+                id="graph-acceptance-stale-ancestry",
+                run_id=run.id,
+                created_at=NOW,
+                accepted_revision=stale_revision,
+                effective_policy_digest=run.effective_policy_digest,
+                harness_digest=run.harness_digest,
+                previous_revision_digest="0" * 64,
+                replan_trigger="foreign ancestry",
+                replan_evidence=("1" * 64,),
+            ),
+            run_id=run.id,
+        )
+        with pytest.raises(ValueError, match="ancestry is stale"):
+            framework._all_authority_bound_worker_results(
+                store,
+                replanned_run.model_copy(
+                    update={"accepted_graph_revision_digest": stale_revision.content_digest}
+                ),
+            )
+
+    assert attempts == 4
+    assert not complete
+    assert sum(item.duration_seconds for item in workers) == 6.5
+    assert framework._complete_usage(workers, "input_tokens", integer=True) == 32
+    assert framework._complete_usage(workers, "output_tokens", integer=True) == 16
+    assert framework._complete_usage(workers, "cost", integer=False) is None
 
 
 def test_foreign_strategy_binding_is_rejected_before_evidence_replay(
@@ -658,6 +1024,84 @@ def test_foreign_strategy_binding_is_rejected_before_evidence_replay(
                 invocation_exit_code=0,
                 finished_at=NOW + timedelta(seconds=1),
             )
+
+
+def test_attempt_metrics_read_actual_scheduler_node_scoped_worker_results(
+    tmp_path: Path,
+) -> None:
+    criterion = CompletionCriterion(id="runtime-check", description="runtime result accepted")
+    node = Node(
+        id="runtime-node",
+        kind=NodeKind.FUNCTION,
+        name="runtime node",
+        objective="complete the runtime node",
+        output_contract=OutputContract(id="runtime-output"),
+        required_capabilities=("process",),
+        completion_criteria=(criterion,),
+    )
+    graph = Graph(
+        id="runtime-graph",
+        nodes=(node,),
+        entry_node_ids=(node.id,),
+        terminal_node_ids=(node.id,),
+        budget=Budget(max_attempts=1, max_nodes=1, max_wall_seconds=30.0),
+    )
+    strategy = _binding().strategy
+
+    def runner(
+        runtime_node: Node,
+        request: WorkerRequest,
+        _strategy: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="runtime-worker-result",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or DIGEST,
+                status="succeeded",
+                duration_seconds=1.25,
+                usage={"input_tokens": 4, "output_tokens": 2, "cost": 0.1},
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id=criterion.id,
+                    disposition="satisfied",
+                    evidence_refs=("a" * 64,),
+                ),
+            ),
+            workspace_id=f"workspace-{runtime_node.id}",
+        )
+
+    with SQLiteStore(tmp_path / "runtime.db") as store:
+        run = TaskOrchestrator(
+            store,
+            runner,
+            (strategy,),
+            max_concurrency=1,
+            routing_mode=RoutingMode.FIXED,
+            fixed_strategy_id=strategy.id,
+        ).run(
+            Goal(
+                id="runtime-goal",
+                statement="complete the actual scheduler run",
+                completion_criteria=(criterion,),
+            ),
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0),
+            harness_digest="b" * 64,
+            effective_policy_digest="c" * 64,
+            run_id="runtime-eval-run",
+            available_capabilities=("process",),
+        )
+        attempts, workers, complete = framework._all_authority_bound_worker_results(store, run)
+
+    assert run.status == "completed"
+    assert attempts == 1
+    assert complete
+    assert len(workers) == 1
+    assert workers[0].run_id != run.id
+    assert workers[0].duration_seconds == 1.25
 
 
 def test_eval_cli_injects_deterministic_trial_run_id(

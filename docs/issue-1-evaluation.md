@@ -57,13 +57,18 @@ accepted graph bindings. Missing, foreign, stale, duplicate, or ambiguous eviden
 unverified stable failure.
 
 Metrics are derived from the bound node WorkerResults, parent verification runtime records, and
-the digest-verified parent candidate artifact:
+the digest-verified parent candidate artifact. Worker duration and usage include every exact
+node-attempt result consumed by the evaluation run, including retry/repair attempts and attempts
+on graph revisions superseded by replan. A retained result referenced again by a later revision is
+deduplicated by its immutable digest, because it did not invoke the worker again. If a bound worker
+request has no result (for example, a worker-boundary exception), all worker duration and usage
+metrics are `null` rather than silently excluding unknown consumption:
 
 - verified success rate, whose denominator is every planned trial;
 - total, worker, and verification duration;
 - input/output tokens and cost only when every bound worker result supplies a finite non-negative
   value (otherwise `null`, never zero-filled);
-- attempts and approvals required;
+- actual worker attempts (retained nodes excluded) and approvals required;
 - changed files, changed patch lines, patch bytes, and stable failure code.
 
 Scenario, experiment, running trial, result, and completed trial facts are inserted with immutable

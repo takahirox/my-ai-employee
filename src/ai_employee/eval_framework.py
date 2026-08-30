@@ -21,6 +21,7 @@ from .domain.v2 import (
     DigestedRecordV2,
     ExecutionResult,
     SchemaModelV2,
+    WorkerRequest,
     WorkerResult,
 )
 from .graph_composition import GraphPatchCompositionRecord
@@ -100,12 +101,17 @@ class EvalScenario(DigestedRecordV2):
     tags: tuple[Identifier, ...] = ()
     clean_status_digest: Digest
     harness_digest: Digest
+    harness: ProjectHarnessV2
 
     @model_validator(mode="after")
     def _scenario_values_are_unique(self) -> EvalScenario:
+        if self.id != self.run_id:
+            raise ValueError("evaluation scenario identity must equal its run identity")
         names = tuple(item.name for item in self.verification_commands)
         if len(names) != len(set(names)) or len(self.tags) != len(set(self.tags)):
             raise ValueError("persisted scenario command names and tags must be unique")
+        if project_harness_digest(self.harness) != self.harness_digest:
+            raise ValueError("persisted scenario Harness digest is stale")
         return self
 
 
@@ -138,6 +144,8 @@ class EvalExperiment(DigestedRecordV2):
 
     @model_validator(mode="after")
     def _plan_is_bounded(self) -> EvalExperiment:
+        if self.id != self.run_id:
+            raise ValueError("evaluation experiment identity must equal its run identity")
         ids = tuple(item.strategy.id for item in self.strategies)
         if len(ids) != len(set(ids)):
             raise ValueError("experiment strategy IDs must be unique")
@@ -175,6 +183,9 @@ class EvalTrial(DigestedRecordV2):
             raise ValueError("completed trial requires exactly one result binding")
         if self.finished_at is not None and self.finished_at < self.started_at:
             raise ValueError("trial cannot finish before it started")
+        expected_generation = 1 if finished else 0
+        if self.generation != expected_generation:
+            raise ValueError("evaluation trial permits only running(0) then completed(1)")
         return self
 
 
@@ -191,6 +202,9 @@ class EvalResult(DigestedRecordV2):
     trial_index: int = Field(ge=1, le=MAX_TRIALS_PER_STRATEGY)
     fleet_run_id: Identifier
     graph_run_digest: Digest | None = None
+    accepted_graph_revision_digest: Digest | None = None
+    harness_digest: Digest | None = None
+    effective_policy_digest: Digest | None = None
     parent_evaluation_digest: Digest | None = None
     acceptance_ledger_digest: Digest | None = None
     worker_result_digests: tuple[Digest, ...] = ()
@@ -229,6 +243,9 @@ class EvalResult(DigestedRecordV2):
             raise ValueError("unverified trial requires a stable failure code")
         verified_bindings = (
             self.graph_run_digest,
+            self.accepted_graph_revision_digest,
+            self.harness_digest,
+            self.effective_policy_digest,
             self.parent_evaluation_digest,
             self.acceptance_ledger_digest,
             self.candidate_artifact_digest,
@@ -323,6 +340,7 @@ def resolve_scenario(
         tags=definition.tags,
         clean_status_digest=environment.clean_status_digest,
         harness_digest=environment.harness_digest,
+        harness=harness,
     )
 
 
@@ -478,7 +496,13 @@ def inspect_experiment(
 ) -> EvalReport:
     experiment = store.get(EXPERIMENT_KIND, experiment_id, EvalExperiment)
     scenario = store.get(SCENARIO_KIND, experiment.scenario_id, EvalScenario)
-    if scenario.content_digest != experiment.scenario_digest:
+    if (
+        experiment.id != experiment_id
+        or experiment.run_id != experiment.id
+        or scenario.id != experiment.scenario_id
+        or scenario.run_id != scenario.id
+        or scenario.content_digest != experiment.scenario_digest
+    ):
         raise ValueError("experiment scenario binding is stale")
     all_trials = store.list_records(TRIAL_KIND, EvalTrial, run_id=experiment.id)
     latest: dict[str, EvalTrial] = {}
@@ -486,7 +510,7 @@ def inspect_experiment(
         prior = latest.get(trial.id)
         if prior is None or trial.generation > prior.generation:
             latest[trial.id] = trial
-        elif trial.generation == prior.generation and trial.content_digest != prior.content_digest:
+        elif trial.generation == prior.generation:
             raise ValueError("evaluation trial generation is ambiguous")
     trials = tuple(sorted(latest.values(), key=lambda item: (item.strategy_id, item.trial_index)))
     seen_pairs: set[tuple[str, int]] = set()
@@ -570,30 +594,33 @@ def collect_authoritative_result(
     if acceptance.run_id != run.id or acceptance.harness_digest != scenario.harness_digest:
         raise ValueError("accepted graph belongs to another trial or Harness")
 
-    attempts = len(
-        {
-            (item.node_id, item.generation, item.attempt)
-            for item in store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run.id)
-            if item.accepted_graph_revision_digest == run.accepted_graph_revision_digest
-        }
+    attempts, all_worker_results, worker_evidence_complete = _all_authority_bound_worker_results(
+        store, run
     )
     approvals = len(store.list_records("approval_request_v2", ApprovalRequest, run_id=run.id))
     total_seconds = max(0.0, (finished_at - trial.started_at).total_seconds())
 
     if run.status != "ready_to_promote" or run.failure_code is not None:
-        try:
-            failed_nodes = _current_nodes(store, run, acceptance)
-            failed_worker_results = _bound_worker_results(store, run, failed_nodes)
-        except (KeyError, ValueError):
-            failed_worker_results = ()
         worker_seconds = (
-            sum(item.duration_seconds for item in failed_worker_results)
-            if failed_worker_results
+            sum(item.duration_seconds for item in all_worker_results)
+            if all_worker_results and worker_evidence_complete
             else None
         )
-        input_tokens = _complete_usage(failed_worker_results, "input_tokens", integer=True)
-        output_tokens = _complete_usage(failed_worker_results, "output_tokens", integer=True)
-        cost = _complete_usage(failed_worker_results, "cost", integer=False)
+        input_tokens = (
+            _complete_usage(all_worker_results, "input_tokens", integer=True)
+            if worker_evidence_complete
+            else None
+        )
+        output_tokens = (
+            _complete_usage(all_worker_results, "output_tokens", integer=True)
+            if worker_evidence_complete
+            else None
+        )
+        cost = (
+            _complete_usage(all_worker_results, "cost", integer=False)
+            if worker_evidence_complete
+            else None
+        )
         return _result(
             experiment,
             scenario,
@@ -608,18 +635,32 @@ def collect_authoritative_result(
             cost,
             attempts,
             approvals,
-            failed_worker_results,
+            all_worker_results,
             failure_code=run.failure_code or f"EVAL_RUN_{run.status.upper()}",
             finished_at=finished_at,
         )
     current_nodes = _current_nodes(store, run, acceptance)
-    worker_results = _bound_worker_results(store, run, current_nodes)
+    _bound_worker_results(store, run, current_nodes)
     worker_seconds = (
-        sum(item.duration_seconds for item in worker_results) if worker_results else None
+        sum(item.duration_seconds for item in all_worker_results)
+        if all_worker_results and worker_evidence_complete
+        else None
     )
-    input_tokens = _complete_usage(worker_results, "input_tokens", integer=True)
-    output_tokens = _complete_usage(worker_results, "output_tokens", integer=True)
-    cost = _complete_usage(worker_results, "cost", integer=False)
+    input_tokens = (
+        _complete_usage(all_worker_results, "input_tokens", integer=True)
+        if worker_evidence_complete
+        else None
+    )
+    output_tokens = (
+        _complete_usage(all_worker_results, "output_tokens", integer=True)
+        if worker_evidence_complete
+        else None
+    )
+    cost = (
+        _complete_usage(all_worker_results, "cost", integer=False)
+        if worker_evidence_complete
+        else None
+    )
     if (
         run.parent_evaluation_id is None
         or run.parent_evaluation_digest is None
@@ -678,9 +719,12 @@ def collect_authoritative_result(
         trial_index=trial.trial_index,
         fleet_run_id=trial.fleet_run_id,
         graph_run_digest=canonical_digest(run),
+        accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+        harness_digest=run.harness_digest,
+        effective_policy_digest=run.effective_policy_digest,
         parent_evaluation_digest=_required(evaluation.content_digest),
         acceptance_ledger_digest=_required(replay.acceptance_ledger.content_digest),
-        worker_result_digests=tuple(_required(item.content_digest) for item in worker_results),
+        worker_result_digests=tuple(_required(item.content_digest) for item in all_worker_results),
         verification_result_digests=evaluation.verification_result_digests,
         candidate_artifact_digest=composition.candidate_patch.artifact_digest,
         succeeded=True,
@@ -719,7 +763,7 @@ def _recover_or_fail_result(
         existing = None
     if existing is not None:
         _validate_result_binding(existing, trial, experiment, scenario, binding)
-        _validate_saved_result_evidence(store, existing)
+        _validate_saved_result_evidence(store, existing, scenario)
         return existing
     if failure_override is None:
         try:
@@ -790,9 +834,16 @@ def _load_exact_result(
 ) -> EvalResult:
     if trial.result_id is None or trial.result_digest is None:
         raise ValueError("completed trial is missing its result pointer")
-    result = store.get(RESULT_KIND, trial.result_id, EvalResult)
+    candidates = tuple(
+        item
+        for item in store.list_records(RESULT_KIND, EvalResult, run_id=experiment.id)
+        if item.id == trial.result_id
+    )
+    if len(candidates) != 1:
+        raise ValueError("completed trial result is missing or ambiguous")
+    result = candidates[0]
     _validate_result_binding(result, trial, experiment, scenario, binding, completed=True)
-    _validate_saved_result_evidence(store, result)
+    _validate_saved_result_evidence(store, result, scenario)
     if result.content_digest != trial.result_digest:
         raise ValueError("completed trial result digest is stale")
     return result
@@ -823,7 +874,8 @@ def _validate_result_binding(
         )
         expected_trial_digest = running.content_digest
     if (
-        result.run_id != experiment.id
+        result.id != _result_id(trial)
+        or result.run_id != experiment.id
         or result.trial_id != trial.id
         or result.trial_digest != expected_trial_digest
         or result.experiment_digest != experiment.content_digest
@@ -836,7 +888,9 @@ def _validate_result_binding(
         raise ValueError("evaluation result belongs to another planned trial")
 
 
-def _validate_saved_result_evidence(store: SQLiteStore, result: EvalResult) -> None:
+def _validate_saved_result_evidence(
+    store: SQLiteStore, result: EvalResult, scenario: EvalScenario
+) -> None:
     """Keep historical metrics fail-closed if their authoritative records disappear."""
 
     if result.graph_run_digest is None:
@@ -846,19 +900,58 @@ def _validate_saved_result_evidence(store: SQLiteStore, result: EvalResult) -> N
             or result.parent_evaluation_digest is not None
             or result.acceptance_ledger_digest is not None
             or result.candidate_artifact_digest is not None
+            or result.accepted_graph_revision_digest is not None
+            or result.harness_digest is not None
+            or result.effective_policy_digest is not None
         ):
             raise ValueError("evaluation result evidence lacks its graph run")
         return
     run = store.get("graph_run_v2", result.fleet_run_id, GraphRunRecord)
-    if run.id != result.fleet_run_id or canonical_digest(run) != result.graph_run_digest:
+    if (
+        run.id != result.fleet_run_id
+        or canonical_digest(run) != result.graph_run_digest
+        or run.accepted_graph_revision_digest != result.accepted_graph_revision_digest
+        or run.harness_digest != result.harness_digest
+        or run.effective_policy_digest != result.effective_policy_digest
+        or run.harness_digest != scenario.harness_digest
+    ):
         raise ValueError("evaluation result graph run is stale")
-    worker_records = store.list_records("worker_result_v2", WorkerResult, run_id=run.id)
-    for digest in result.worker_result_digests:
-        matches = tuple(item for item in worker_records if item.content_digest == digest)
-        if len(matches) != 1 or matches[0].run_id != run.id:
-            raise ValueError("evaluation result worker evidence is missing or ambiguous")
     if result.verification_result_digests:
         _verification_seconds(store, run.id, result.verification_result_digests)
+    attempts, all_workers, worker_evidence_complete = _all_authority_bound_worker_results(
+        store, run
+    )
+    if (
+        tuple(_required(item.content_digest) for item in all_workers)
+        != result.worker_result_digests
+    ):
+        raise ValueError("saved evaluation worker authority is stale")
+    expected_worker_seconds = (
+        sum(item.duration_seconds for item in all_workers)
+        if all_workers and worker_evidence_complete
+        else None
+    )
+    expected_input_tokens = (
+        _complete_usage(all_workers, "input_tokens", integer=True)
+        if worker_evidence_complete
+        else None
+    )
+    expected_output_tokens = (
+        _complete_usage(all_workers, "output_tokens", integer=True)
+        if worker_evidence_complete
+        else None
+    )
+    expected_cost = (
+        _complete_usage(all_workers, "cost", integer=False) if worker_evidence_complete else None
+    )
+    if (
+        result.attempts != attempts
+        or result.worker_seconds != expected_worker_seconds
+        or result.input_tokens != expected_input_tokens
+        or result.output_tokens != expected_output_tokens
+        or result.cost != expected_cost
+    ):
+        raise ValueError("saved evaluation worker metrics are stale")
     if not result.verified:
         return
     if (
@@ -878,6 +971,16 @@ def _validate_saved_result_evidence(store: SQLiteStore, result: EvalResult) -> N
     )
     if len(evaluations) != 1 or evaluations[0].run_id != run.id:
         raise ValueError("verified parent evaluation is missing or ambiguous")
+    evaluation = evaluations[0]
+    acceptances = tuple(
+        item
+        for item in store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id
+        )
+        if item.accepted_revision.content_digest == result.accepted_graph_revision_digest
+    )
+    if len(acceptances) != 1 or acceptances[0].run_id != run.id:
+        raise ValueError("verified accepted graph is missing or ambiguous")
     ledgers = tuple(
         item
         for item in store.list_records("acceptance_ledger_v2", AcceptanceLedger, run_id=run.id)
@@ -893,10 +996,28 @@ def _validate_saved_result_evidence(store: SQLiteStore, result: EvalResult) -> N
     )
     if len(candidates) != 1 or candidates[0].run_id != run.id:
         raise ValueError("verified candidate artifact is missing or ambiguous")
+    replay = validate_exact_parent_evidence_store(
+        store,
+        run,
+        acceptances[0].accepted_revision,
+        evaluation,
+        scenario.harness,
+    )
+    current_nodes = _current_nodes(store, run, acceptances[0])
+    _bound_worker_results(store, run, current_nodes)
+    if (
+        _required(replay.acceptance_ledger.content_digest) != result.acceptance_ledger_digest
+        or tuple(_required(item.content_digest) for item in all_workers)
+        != result.worker_result_digests
+        or evaluation.verification_result_digests != result.verification_result_digests
+        or evaluation.candidate_artifact_digest != result.candidate_artifact_digest
+    ):
+        raise ValueError("saved verified evaluation authority is stale")
 
 
 def _validate_trial_plan(trial: EvalTrial, template: EvalTrial) -> None:
     comparable = (
+        "id",
         "run_id",
         "experiment_digest",
         "scenario_digest",
@@ -964,18 +1085,197 @@ def _bound_worker_results(
         if node.worker_result_id in seen:
             raise ValueError("worker result is ambiguously shared across nodes")
         seen.add(node.worker_result_id)
-        candidates = tuple(
-            item
-            for item in store.list_records("worker_result_v2", WorkerResult, run_id=run.id)
-            if item.id == node.worker_result_id
-        )
-        if len(candidates) != 1:
-            raise ValueError("node worker result is missing or ambiguous")
-        result = candidates[0]
-        if result.run_id != run.id or result.content_digest != node.worker_result_digest:
+        try:
+            result = store.get("worker_result_v2", node.worker_result_id, WorkerResult)
+        except KeyError:
+            raise ValueError("node worker result is missing or ambiguous") from None
+        if result.content_digest != node.worker_result_digest:
             raise ValueError("node worker result is stale or foreign")
         results.append(result)
     return tuple(results)
+
+
+def _all_authority_bound_worker_results(
+    store: SQLiteStore, run: GraphRunRecord
+) -> tuple[int, tuple[WorkerResult, ...], bool]:
+    """Return all consumed node-attempt results, including retries and old revisions."""
+
+    acceptances = tuple(
+        sorted(
+            store.list_records("task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id),
+            key=lambda item: item.accepted_revision.revision_number,
+        )
+    )
+    if tuple(item.accepted_revision.revision_number for item in acceptances) != tuple(
+        range(1, len(acceptances) + 1)
+    ):
+        raise ValueError("accepted graph revision history is missing or ambiguous")
+    for index, acceptance in enumerate(acceptances):
+        if index and (
+            acceptance.previous_revision_digest
+            != acceptances[index - 1].accepted_revision.content_digest
+        ):
+            raise ValueError("accepted graph revision ancestry is stale")
+    if (
+        not acceptances
+        or acceptances[-1].accepted_revision.content_digest != run.accepted_graph_revision_digest
+    ):
+        raise ValueError("current accepted graph revision is missing")
+
+    acceptance_by_digest: dict[Digest, TaskGraphAcceptance] = {}
+    for acceptance in acceptances:
+        digest = _required(acceptance.accepted_revision.content_digest)
+        if digest in acceptance_by_digest:
+            raise ValueError("accepted graph revision is ambiguous")
+        if (
+            acceptance.run_id != run.id
+            or acceptance.harness_digest != run.harness_digest
+            or acceptance.effective_policy_digest != run.effective_policy_digest
+        ):
+            raise ValueError("accepted graph revision is foreign to its Fleet run")
+        acceptance_by_digest[digest] = acceptance
+    attempt_records: dict[tuple[Digest, str, int, int], list[NodeExecutionRecord]] = {}
+    for record in store.list_records("node_execution_v2", NodeExecutionRecord, run_id=run.id):
+        bound_acceptance = acceptance_by_digest.get(record.accepted_graph_revision_digest)
+        if (
+            record.run_id != run.id
+            or bound_acceptance is None
+            or record.node_id
+            not in {item.id for item in bound_acceptance.accepted_revision.graph.nodes}
+        ):
+            raise ValueError("node execution is not bound to an accepted graph revision")
+        key = (
+            record.accepted_graph_revision_digest,
+            record.node_id,
+            record.generation,
+            record.attempt,
+        )
+        attempt_records.setdefault(key, []).append(record)
+
+    # Successful scheduler results are stored in the node-specific WorkerRequest scope,
+    # not the parent GraphRun scope. Resolve exact IDs across scopes, then validate the
+    # deterministic request chain below.
+    stored_workers = store.list_records("worker_result_v2", WorkerResult)
+    by_id: dict[str, list[WorkerResult]] = {}
+    for worker in stored_workers:
+        by_id.setdefault(worker.id, []).append(worker)
+    # Inner WorkCoordinator execution moves the same request identity to the
+    # node-specific run scope, so request lookup must also be scope-independent.
+    stored_requests = store.list_records("worker_request_v2", WorkerRequest)
+    requests_by_digest: dict[Digest, list[WorkerRequest]] = {}
+    for request in stored_requests:
+        requests_by_digest.setdefault(_required(request.content_digest), []).append(request)
+    consumed: dict[Digest, WorkerResult] = {}
+    worker_evidence_complete = True
+    for key in sorted(attempt_records):
+        request_digests = {
+            record.worker_request_digest
+            for record in attempt_records[key]
+            if record.worker_request_digest is not None
+        }
+        if len(request_digests) > 1:
+            raise ValueError("node attempt has ambiguous worker request bindings")
+        bindings: set[tuple[str, Digest]] = set()
+        for record in attempt_records[key]:
+            worker_id = record.worker_result_id
+            worker_digest = record.worker_result_digest
+            if (worker_id is None) != (worker_digest is None):
+                raise ValueError("node attempt has an incomplete worker result binding")
+            if worker_id is not None and worker_digest is not None:
+                bindings.add((worker_id, worker_digest))
+        if len(bindings) > 1:
+            raise ValueError("node attempt has ambiguous worker result bindings")
+        retained = tuple(
+            record
+            for record in attempt_records[key]
+            if record.retained_from_revision_digest is not None
+        )
+        if retained:
+            if len(retained) != len(attempt_records[key]) or len(request_digests) != 1:
+                raise ValueError("retained node attempt binding is ambiguous")
+            request_digest = next(iter(request_digests))
+            if len(bindings) != 1:
+                raise ValueError("retained node lacks its immutable worker result")
+            retained_worker_id, retained_worker_digest = next(iter(bindings))
+            source_digest = retained[0].retained_from_revision_digest
+            if source_digest is None or any(
+                record.retained_from_revision_digest != source_digest for record in retained
+            ):
+                raise ValueError("retained node ancestry is stale")
+            source_exists = any(
+                source_key[0] == source_digest
+                and source_key[1] == key[1]
+                and any(
+                    record.worker_request_digest == request_digest
+                    and record.worker_result_id == retained_worker_id
+                    and record.worker_result_digest == retained_worker_digest
+                    for record in source_records
+                )
+                for source_key, source_records in attempt_records.items()
+            )
+            if not source_exists:
+                raise ValueError("retained node source attempt is missing")
+            continue
+        if not request_digests:
+            if bindings:
+                raise ValueError("node attempt result lacks its worker request binding")
+            continue
+        request_digest = next(iter(request_digests))
+        request_candidates = requests_by_digest.get(request_digest, ())
+        if len(request_candidates) != 1:
+            raise ValueError("node attempt worker request is missing or ambiguous")
+        request = request_candidates[0]
+        _, node_id, generation, attempt = key
+        worker_run_digest = canonical_digest(
+            {
+                "graph_run_id": run.id,
+                "node_id": node_id,
+                "generation": generation,
+                "attempt": attempt,
+            }
+        )
+        expected_worker_run_id = f"node-{worker_run_digest[:32]}"
+        if (
+            request.graph_run_id != run.id
+            or request.run_id != expected_worker_run_id
+            or request.node_id != node_id
+            or request.accepted_graph_revision_digest != key[0]
+            or request.generation != generation
+            or request.attempt != attempt
+            or request.harness_digest != run.harness_digest
+            or request.effective_policy_digest != run.effective_policy_digest
+        ):
+            raise ValueError("node attempt worker request is stale or foreign")
+        if not bindings:
+            worker_evidence_complete = False
+            continue
+        worker_id, digest = next(iter(bindings))
+        candidates = tuple(
+            item for item in by_id.get(worker_id, ()) if item.content_digest == digest
+        )
+        if (
+            len(candidates) != 1
+            or candidates[0].run_id != request.run_id
+            or candidates[0].request_digest != request_digest
+        ):
+            raise ValueError("node attempt worker result is missing, stale, or ambiguous")
+        # Replanned retained nodes point back to an already-consumed immutable result.
+        # Digest de-duplication prevents charging the same worker invocation twice.
+        consumed.setdefault(digest, candidates[0])
+    actual_attempts = sum(
+        1
+        for records in attempt_records.values()
+        if any(
+            record.retained_from_revision_digest is None
+            and (record.worker_request_digest is not None or record.worker_result_id is not None)
+            for record in records
+        )
+    )
+    return (
+        actual_attempts,
+        tuple(consumed[digest] for digest in sorted(consumed)),
+        worker_evidence_complete,
+    )
 
 
 def _complete_usage(
@@ -1045,6 +1345,9 @@ def _result(
         trial_index=trial.trial_index,
         fleet_run_id=trial.fleet_run_id,
         graph_run_digest=canonical_digest(run),
+        accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+        harness_digest=run.harness_digest,
+        effective_policy_digest=run.effective_policy_digest,
         worker_result_digests=tuple(_required(item.content_digest) for item in worker_results),
         succeeded=False,
         verified=False,
