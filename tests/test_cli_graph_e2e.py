@@ -34,12 +34,17 @@ from ai_employee.graph_evaluation import (
     GraphCandidateEvaluator,
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
+    ParentVerificationBinding,
 )
 from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.project import discover_project_harness
-from ai_employee.promotion_approval import PromotionApprovalTrustKernel, PromotionPolicyDecision
+from ai_employee.promotion_approval import (
+    PromotionApprovalTrustKernel,
+    PromotionPolicyDecision,
+    validate_exact_parent_evidence_store,
+)
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.serialization import canonical_digest, project_harness_digest
 from ai_employee.services_v2 import DigestApprovalService
@@ -534,6 +539,91 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
             lambda _snapshot: None,  # type: ignore[arg-type,return-value]
             lambda _request: None,  # type: ignore[arg-type,return-value]
         ).replay(evaluation.id)
+        operator_config = load_operator_config(operator)
+        assert (
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+            == replay
+        )
+        duplicate_ledger = replay.evaluation_ledgers[0].model_copy(
+            update={"id": "duplicate-parent-evaluation-ledger"}
+        )
+        store.put("evaluation_evidence_ledger_v2", duplicate_ledger, run_id=run_id)
+        with pytest.raises(ValueError, match="ambiguous"):
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("evaluation_evidence_ledger_v2", duplicate_ledger.id),
+            )
+        foreign_ledger = replay.evaluation_ledgers[0].model_copy(
+            update={"id": "foreign-parent-evaluation-ledger", "run_id": "foreign-run"}
+        )
+        store.put("evaluation_evidence_ledger_v2", foreign_ledger, run_id=run_id)
+        with pytest.raises(ValueError, match=r"foreign|ambiguous"):
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("evaluation_evidence_ledger_v2", foreign_ledger.id),
+            )
+        parent_request = next(
+            item
+            for item in store.list_records(
+                "parent_candidate_evaluation_request_v2",
+                ParentCandidateEvaluationRequest,
+                run_id=run_id,
+            )
+            if item.content_digest == evaluation.request_digest
+        )
+        forged_binding = ParentVerificationBinding.model_validate(
+            {
+                **parent_request.verification_bindings[0].model_dump(mode="python"),
+                "harness_evaluator_id": "unrequested-self-consistent-evaluator",
+            },
+            strict=True,
+        )
+        forged_request = ParentCandidateEvaluationRequest.model_validate(
+            {
+                **parent_request.model_dump(mode="python"),
+                "id": "forged-parent-evaluation-request",
+                "verification_bindings": (
+                    forged_binding,
+                    *parent_request.verification_bindings[1:],
+                ),
+                "content_digest": None,
+            },
+            strict=True,
+        )
+        forged_evaluation = ParentCandidateEvaluationRecord.model_validate(
+            {
+                **evaluation.model_dump(mode="python"),
+                "id": "forged-parent-evaluation",
+                "request_digest": forged_request.content_digest,
+                "content_digest": None,
+            },
+            strict=True,
+        )
+        store.put("parent_candidate_evaluation_request_v2", forged_request, run_id=run_id)
+        store.put("parent_candidate_evaluation_v2", forged_evaluation, run_id=run_id)
+        with pytest.raises(ValueError, match="required Harness order"):
+            validate_exact_parent_evidence_store(
+                store,
+                run,
+                acceptance.accepted_revision,
+                forged_evaluation,
+                harness,
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("approval_v2", approval.id),
+            )
         crashed_run = run.model_copy(
             update={
                 "status": "failed",
@@ -569,6 +659,13 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
                 lambda _snapshot: None,  # type: ignore[arg-type,return-value]
                 lambda _request: None,  # type: ignore[arg-type,return-value]
             ),
+            approval_service=DigestApprovalService(store, operator_label="local-operator"),
+            promotion_approval_policy=PromotionApprovalTrustKernel(
+                harness,
+                operator_config.promotion_auto_approval,
+                harness_digest=run.harness_digest,
+                operator_config_digest=run.operator_config_digest or "0" * 64,
+            ),
             operator_config_digest=run.operator_config_digest,
             operator_config_path=run.operator_config_path,
             strategy_set=run.strategy_set,
@@ -576,8 +673,11 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
         recovered_run = recovery_service._recover_policy_approval_pointer(crashed_run)
         assert recovered_run is not None
         assert recovered_run.status == "ready_to_promote"
-        assert recovered_run.promotion_approval_id == approval.id
         assert recovered_run.parent_evaluation_digest == evaluation.content_digest
+        approval = store.get(
+            "approval_v2", recovered_run.promotion_approval_id or "missing", ApprovalRecord
+        )
+        run = recovered_run
         approval_request = next(
             item
             for item in store.list_records("approval_request_v2", ApprovalRequest, run_id=run_id)
@@ -631,8 +731,6 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
     )
     assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
 
-    operator_config = load_operator_config(operator)
-
     def resolve_with(
         *,
         selected_harness: object = harness,
@@ -654,6 +752,7 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
             selected_composition,
             selected_evaluation,
             selected_replay,  # type: ignore[arg-type]
+            evidence_storage_valid=True,
         )
 
     assert resolve_with(selected_replay=None).reason_code == "evidence_replay_unavailable"

@@ -86,6 +86,7 @@ from .project import (
 from .promotion_approval import (
     PromotionApprovalTrustKernel,
     PromotionPolicyDecision,
+    validate_exact_parent_evidence_store,
     validate_policy_auto_authority,
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
@@ -1734,6 +1735,25 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
                 raise ValueError("accepted graph authority is missing or ambiguous")
             harness = discover_project_harness(run.repository)
             operator_config = load_operator_config(run.operator_config_path)
+            exact_replay = validate_exact_parent_evidence_store(
+                store,
+                run,
+                acceptances[0].accepted_revision,
+                evaluation,
+                harness,
+            )
+            exact_semantic = tuple(
+                digest
+                for record in (
+                    *exact_replay.semantic_requests,
+                    *exact_replay.semantic_results,
+                    *exact_replay.semantic_decisions,
+                    *exact_replay.semantic_repair_requests,
+                )
+                if (digest := record.content_digest) is not None
+            )
+            if exact_semantic != semantic_evidence:
+                raise ValueError("promotion semantic evidence is not exact")
             validate_policy_auto_authority(
                 approval,
                 authorities[0],

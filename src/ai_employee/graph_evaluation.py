@@ -620,49 +620,54 @@ class GraphCandidateEvaluator:
             evaluation_id,
             ParentCandidateEvaluationRecord,
         )
-        goal_evaluators = _unique_records(
+        if record.run_id is None:
+            raise ValueError("parent evaluation has no owning run")
+        goal_evaluators = tuple(
             item
             for item in self.store.list_records(
                 "goal_evaluator_v2", GoalEvaluatorRecord, run_id=record.run_id
             )
             if item.content_digest == record.goal_evaluator_digest
         )
-        if len(goal_evaluators) != 1:
+        if len(goal_evaluators) != 1 or goal_evaluators[0].run_id != record.run_id:
             raise ValueError("parent Goal evaluator evidence is missing or ambiguous")
         goal_evaluator = goal_evaluators[0]
-        acceptance_ledgers = _unique_records(
+        acceptance_ledgers = tuple(
             item
             for item in self.store.list_records(
                 "acceptance_ledger_v2", AcceptanceLedger, run_id=record.run_id
             )
             if item.content_digest in goal_evaluator.evidence_digests
         )
-        if len(acceptance_ledgers) != 1:
+        if len(acceptance_ledgers) != 1 or acceptance_ledgers[0].run_id != record.run_id:
             raise ValueError("parent AcceptanceLedger is missing or ambiguous")
-        by_digest = {
-            item.content_digest: item
-            for item in self.store.list_records(
-                "evaluation_evidence_ledger_v2",
-                EvaluationEvidenceLedger,
-                run_id=record.run_id,
-            )
-        }
-        try:
-            evaluation_ledgers = tuple(
-                by_digest[digest] for digest in record.evaluation_ledger_digests
-            )
-        except KeyError as error:
-            raise ValueError("parent evaluation evidence is missing") from error
+        raw_ledgers = self.store.list_records(
+            "evaluation_evidence_ledger_v2",
+            EvaluationEvidenceLedger,
+            run_id=record.run_id,
+        )
+        evaluation_ledgers_list: list[EvaluationEvidenceLedger] = []
+        for digest in record.evaluation_ledger_digests:
+            matches = tuple(item for item in raw_ledgers if item.content_digest == digest)
+            if len(matches) != 1 or matches[0].run_id != record.run_id:
+                raise ValueError("parent evaluation evidence is missing, foreign, or ambiguous")
+            evaluation_ledgers_list.append(matches[0])
+        evaluation_ledgers = tuple(evaluation_ledgers_list)
+        if len(record.evaluation_ledger_digests) != len(set(record.evaluation_ledger_digests)):
+            raise ValueError("parent evaluation evidence references are ambiguous")
         deterministic_prefix = (
             _required(acceptance_ledgers[0].content_digest),
             *record.evaluation_ledger_digests,
         )
         if goal_evaluator.evidence_digests[: len(deterministic_prefix)] != deterministic_prefix:
             raise ValueError("parent Goal evaluator evidence bindings are stale")
-        semantic_digest_set = set(
-            goal_evaluator.evidence_digests[1 + len(record.evaluation_ledger_digests) :]
-        )
-        semantic_requests = _unique_records(
+        semantic_digests = goal_evaluator.evidence_digests[
+            1 + len(record.evaluation_ledger_digests) :
+        ]
+        if len(semantic_digests) != len(set(semantic_digests)):
+            raise ValueError("parent semantic evidence references are ambiguous")
+        semantic_digest_set = set(semantic_digests)
+        semantic_requests = tuple(
             item
             for item in self.store.list_records(
                 "parent_semantic_review_request_v2",
@@ -671,7 +676,7 @@ class GraphCandidateEvaluator:
             )
             if item.content_digest in semantic_digest_set
         )
-        semantic_results = _unique_records(
+        semantic_results = tuple(
             item
             for item in self.store.list_records(
                 "parent_semantic_review_result_v2",
@@ -680,7 +685,7 @@ class GraphCandidateEvaluator:
             )
             if item.content_digest in semantic_digest_set
         )
-        semantic_decisions = _unique_records(
+        semantic_decisions = tuple(
             item
             for item in self.store.list_records(
                 "parent_semantic_review_decision_v2",
@@ -689,7 +694,7 @@ class GraphCandidateEvaluator:
             )
             if item.content_digest in semantic_digest_set
         )
-        semantic_repairs = _unique_records(
+        semantic_repairs = tuple(
             item
             for item in self.store.list_records(
                 "parent_semantic_repair_request_v2",
@@ -699,6 +704,16 @@ class GraphCandidateEvaluator:
             if item.content_digest in semantic_digest_set
         )
         if semantic_digest_set:
+            if any(
+                item.run_id != record.run_id
+                for item in (
+                    *semantic_requests,
+                    *semantic_results,
+                    *semantic_decisions,
+                    *semantic_repairs,
+                )
+            ):
+                raise ValueError("parent semantic evidence belongs to another run")
             if len(semantic_requests) != 1 or len(semantic_decisions) != 1:
                 raise ValueError("parent semantic evidence is missing or ambiguous")
             semantic_request = semantic_requests[0]
