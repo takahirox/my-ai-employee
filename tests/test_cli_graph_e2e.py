@@ -11,18 +11,43 @@ from pathlib import Path
 import pytest
 
 from ai_employee import cli
-from ai_employee.domain import RoutingMode, SemanticTaskType
-from ai_employee.domain.v2 import ApprovalRecord, PromotionRecord, WorkerRequest
+from ai_employee.config import load_operator_config
+from ai_employee.domain import (
+    AcceptedGraphRevision,
+    HarnessApprovals,
+    HarnessNetwork,
+    HarnessReview,
+    RoutingMode,
+    SemanticTaskType,
+)
+from ai_employee.domain.harness import NetworkMode as HarnessNetworkMode
+from ai_employee.domain.v2 import (
+    ApprovalRecord,
+    ApprovalRequest,
+    DecisionOutcome,
+    PolicyDecision,
+    PromotionRecord,
+    WorkerRequest,
+)
 from ai_employee.graph_composition import GraphPatchCompositionRecord
 from ai_employee.graph_evaluation import (
+    GraphCandidateEvaluator,
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
+    ParentVerificationBinding,
 )
+from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.project import discover_project_harness
+from ai_employee.promotion_approval import (
+    PromotionApprovalTrustKernel,
+    PromotionPolicyDecision,
+    validate_exact_parent_evidence_store,
+)
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.serialization import canonical_digest, project_harness_digest
+from ai_employee.services_v2 import DigestApprovalService
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
@@ -380,6 +405,514 @@ def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, P
         encoding="utf-8",
     )
     return repository, operator, tmp_path / "fleet.db", state
+
+
+def _enable_policy_auto_approval(
+    repository: Path, operator: Path, *, project_opt_in: bool = True
+) -> None:
+    if project_opt_in:
+        harness_path = repository / ".fleet" / "project.json"
+        harness = json.loads(harness_path.read_text(encoding="utf-8"))
+        harness["approvals"] = {"promotion": "policy"}
+        harness_path.write_text(json.dumps(harness), encoding="utf-8")
+        subprocess.run(("git", "-C", str(repository), "add", ".fleet/project.json"), check=True)
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repository),
+                "-c",
+                "user.email=fleet@example.invalid",
+                "-c",
+                "user.name=Fleet Test",
+                "commit",
+                "-qm",
+                "enable bounded auto approval",
+            ),
+            check=True,
+        )
+    config = json.loads(operator.read_text(encoding="utf-8"))
+    config["promotion_auto_approval"] = {
+        "mode": "policy",
+        "allowed_repositories": [str(repository.resolve())],
+        "max_risk": 0,
+        "max_changed_files": 5,
+        "max_patch_bytes": 100000,
+    }
+    operator.write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_one_sided_policy_opt_in_persists_manual_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository, operator, database, _state = _fixture(tmp_path, task_review=False)
+    _enable_policy_auto_approval(repository, operator, project_opt_in=False)
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a and b concurrently, then change c",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--db",
+                str(database),
+                "--max-concurrency",
+                "2",
+                "--non-interactive",
+            ]
+        )
+        == 0
+    )
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    with SQLiteStore(database) as store:
+        approval = store.list_records("approval_v2", ApprovalRecord, run_id=run_id)[0]
+        policy = store.list_records(
+            "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run_id
+        )[0]
+        explained = explain_any_run(store, run_id)
+    assert approval.decision == "pending"
+    assert approval.authorization_kind == "manual"
+    assert policy.decision == "manual_required"
+    assert policy.reason_code == "project_policy_opt_in_missing"
+    assert explained["final_outcome"]["promotion_approval"]["authorization_kind"] == "manual"
+
+
+def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository, operator, database, _state = _fixture(tmp_path, task_review=False)
+    _enable_policy_auto_approval(repository, operator)
+
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a and b concurrently, then change c",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--db",
+                str(database),
+                "--max-concurrency",
+                "2",
+                "--non-interactive",
+            ]
+        )
+        == 0
+    )
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "ready_to_promote"
+    run_id = emitted["run_id"]
+
+    with SQLiteStore(database) as store:
+        run = store.get("graph_run_v2", run_id, GraphRunRecord)
+        acceptance = store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+        )[0]
+        composition = store.get(
+            "graph_patch_composition_v2",
+            run.composition_id or "missing",
+            GraphPatchCompositionRecord,
+        )
+        evaluation = store.get(
+            "parent_candidate_evaluation_v2",
+            run.parent_evaluation_id or "missing",
+            ParentCandidateEvaluationRecord,
+        )
+        approvals = store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        decisions = store.list_records(
+            "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run_id
+        )
+        assert len(approvals) == len(decisions) == 1
+        approval = approvals[0]
+        authority = decisions[0]
+        inspected = inspect_graph_run(store, run_id)
+        explained = explain_any_run(store, run_id)
+        harness = discover_project_harness(repository)
+        replay = GraphCandidateEvaluator(
+            store,
+            None,  # type: ignore[arg-type]
+            harness,
+            lambda _snapshot: None,  # type: ignore[arg-type,return-value]
+            lambda _request: None,  # type: ignore[arg-type,return-value]
+        ).replay(evaluation.id)
+        operator_config = load_operator_config(operator)
+        assert (
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+            == replay
+        )
+        duplicate_ledger = replay.evaluation_ledgers[0].model_copy(
+            update={"id": "duplicate-parent-evaluation-ledger"}
+        )
+        store.put("evaluation_evidence_ledger_v2", duplicate_ledger, run_id=run_id)
+        with pytest.raises(ValueError, match="ambiguous"):
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("evaluation_evidence_ledger_v2", duplicate_ledger.id),
+            )
+        foreign_ledger = replay.evaluation_ledgers[0].model_copy(
+            update={"id": "foreign-parent-evaluation-ledger", "run_id": "foreign-run"}
+        )
+        store.put("evaluation_evidence_ledger_v2", foreign_ledger, run_id=run_id)
+        with pytest.raises(ValueError, match=r"foreign|ambiguous"):
+            validate_exact_parent_evidence_store(
+                store, run, acceptance.accepted_revision, evaluation, harness
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("evaluation_evidence_ledger_v2", foreign_ledger.id),
+            )
+        parent_request = next(
+            item
+            for item in store.list_records(
+                "parent_candidate_evaluation_request_v2",
+                ParentCandidateEvaluationRequest,
+                run_id=run_id,
+            )
+            if item.content_digest == evaluation.request_digest
+        )
+        forged_binding = ParentVerificationBinding.model_validate(
+            {
+                **parent_request.verification_bindings[0].model_dump(mode="python"),
+                "harness_evaluator_id": "unrequested-self-consistent-evaluator",
+            },
+            strict=True,
+        )
+        forged_request = ParentCandidateEvaluationRequest.model_validate(
+            {
+                **parent_request.model_dump(mode="python"),
+                "id": "forged-parent-evaluation-request",
+                "verification_bindings": (
+                    forged_binding,
+                    *parent_request.verification_bindings[1:],
+                ),
+                "content_digest": None,
+            },
+            strict=True,
+        )
+        forged_evaluation = ParentCandidateEvaluationRecord.model_validate(
+            {
+                **evaluation.model_dump(mode="python"),
+                "id": "forged-parent-evaluation",
+                "request_digest": forged_request.content_digest,
+                "content_digest": None,
+            },
+            strict=True,
+        )
+        store.put("parent_candidate_evaluation_request_v2", forged_request, run_id=run_id)
+        store.put("parent_candidate_evaluation_v2", forged_evaluation, run_id=run_id)
+        with pytest.raises(ValueError, match="required Harness order"):
+            validate_exact_parent_evidence_store(
+                store,
+                run,
+                acceptance.accepted_revision,
+                forged_evaluation,
+                harness,
+            )
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=?",
+                ("approval_v2", approval.id),
+            )
+        crashed_run = run.model_copy(
+            update={
+                "status": "failed",
+                "failure_code": "PARENT_EVALUATION_UNAVAILABLE",
+                "composition_id": None,
+                "composition_digest": None,
+                "parent_candidate_artifact_id": None,
+                "parent_candidate_digest": None,
+                "parent_evaluation_id": None,
+                "parent_evaluation_digest": None,
+                "goal_evaluator_digest": None,
+                "promotion_approval_id": None,
+                "promotion_approval_request_digest": None,
+            }
+        )
+        store.put("graph_run_v2", crashed_run, run_id=run_id, revision=crashed_run.generation + 1)
+        recovery_service = GraphExecutionService(
+            store,
+            lambda *_args: None,  # type: ignore[arg-type,return-value]
+            None,
+            run.execution_strategies,
+            repository=run.repository or "missing",
+            base_commit=run.base_commit or "0" * 40,
+            routing_mode=run.routing_mode,
+            fixed_strategy_id=run.fixed_strategy_id,
+            allowed_strategy_ids=run.allowed_strategy_ids,
+            allowed_backends=run.allowed_backends,
+            local_backend_allowed=run.local_backend_allowed,
+            parent_evaluator=GraphCandidateEvaluator(
+                store,
+                None,  # type: ignore[arg-type]
+                harness,
+                lambda _snapshot: None,  # type: ignore[arg-type,return-value]
+                lambda _request: None,  # type: ignore[arg-type,return-value]
+            ),
+            approval_service=DigestApprovalService(store, operator_label="local-operator"),
+            promotion_approval_policy=PromotionApprovalTrustKernel(
+                harness,
+                operator_config.promotion_auto_approval,
+                harness_digest=run.harness_digest,
+                operator_config_digest=run.operator_config_digest or "0" * 64,
+            ),
+            operator_config_digest=run.operator_config_digest,
+            operator_config_path=run.operator_config_path,
+            strategy_set=run.strategy_set,
+        )
+        recovered_run = recovery_service._recover_policy_approval_pointer(crashed_run)
+        assert recovered_run is not None
+        assert recovered_run.status == "ready_to_promote"
+        assert recovered_run.parent_evaluation_digest == evaluation.content_digest
+        approval = store.get(
+            "approval_v2", recovered_run.promotion_approval_id or "missing", ApprovalRecord
+        )
+        run = recovered_run
+        approval_request = next(
+            item
+            for item in store.list_records("approval_request_v2", ApprovalRequest, run_id=run_id)
+            if item.request_digest == approval.request_digest
+        )
+        approval_decision = next(
+            item
+            for item in store.list_records("policy_decision_v2", PolicyDecision, run_id=run_id)
+            if item.request_digest == approval.request_digest
+            and item.outcome is DecisionOutcome.APPROVAL_REQUIRED
+        )
+        assert (
+            DigestApprovalService(store, operator_label="ignored").request_policy_auto(
+                approval_request, approval_decision, authority
+            )
+            == approval
+        )
+        with pytest.raises(ValueError, match="stale or mismatched"):
+            DigestApprovalService(store, operator_label="ignored").request_policy_auto(
+                approval_request,
+                approval_decision,
+                authority.model_copy(update={"run_id": "foreign-run"}),
+            )
+        duplicate = approval.model_copy(update={"id": "duplicate-policy-approval"})
+        store.put("approval_v2", duplicate, run_id=run_id)
+        with pytest.raises(ValueError, match="ambiguous"):
+            DigestApprovalService(store, operator_label="ignored").request_policy_auto(
+                approval_request, approval_decision, authority
+            )
+    assert authority.decision == "policy_auto_approved"
+    assert authority.reason_code == "eligible_low_risk_exact_evidence"
+    assert approval.decision == "approved"
+    assert approval.authorization_kind == "policy_auto"
+    assert approval.authorization_digest == authority.content_digest
+    assert approval.accepted_graph_revision_digest == run.accepted_graph_revision_digest
+    assert approval.parent_evaluation_digest == run.parent_evaluation_digest
+    assert approval.verification_evidence_digests
+    assert approval.evaluation_evidence_digests
+    assert inspected["promotion_policy_decisions"][0]["content_digest"] == authority.content_digest
+    story = explained["final_outcome"]["promotion_approval"]
+    assert story["binding"] == "bound"
+    assert story["authorization_kind"] == "policy_auto"
+    assert story["reason_code"] == "eligible_low_risk_exact_evidence"
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
+    assert cli.main(["replay", run_id, "--db", str(database)]) == 0
+    replayed_output = json.loads(capsys.readouterr().out)
+    assert replayed_output["promotion_invocations"] == 0
+    assert (
+        replayed_output["inspection"]["promotion_policy_decisions"][0]["content_digest"]
+        == authority.content_digest
+    )
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
+
+    def resolve_with(
+        *,
+        selected_harness: object = harness,
+        policy: object = operator_config.promotion_auto_approval,
+        selected_replay: object = replay,
+        selected_run: GraphRunRecord = run,
+        selected_acceptance: object = acceptance.accepted_revision,
+        selected_composition: GraphPatchCompositionRecord = composition,
+        selected_evaluation: ParentCandidateEvaluationRecord = evaluation,
+    ) -> PromotionPolicyDecision:
+        return PromotionApprovalTrustKernel(
+            selected_harness,  # type: ignore[arg-type]
+            policy,  # type: ignore[arg-type]
+            harness_digest=run.harness_digest,
+            operator_config_digest=run.operator_config_digest or "0" * 64,
+        ).resolve(
+            selected_run,
+            selected_acceptance,  # type: ignore[arg-type]
+            selected_composition,
+            selected_evaluation,
+            selected_replay,  # type: ignore[arg-type]
+            evidence_storage_valid=True,
+        )
+
+    assert resolve_with(selected_replay=None).reason_code == "evidence_replay_unavailable"
+    assert (
+        resolve_with(
+            selected_harness=harness.model_copy(
+                update={"approvals": HarnessApprovals(promotion="required")}
+            )
+        ).reason_code
+        == "project_policy_opt_in_missing"
+    )
+    assert (
+        resolve_with(
+            policy=operator_config.promotion_auto_approval.model_copy(
+                update={"allowed_repositories": ()}
+            )
+        ).reason_code
+        == "repository_not_allowed"
+    )
+    assert (
+        resolve_with(
+            selected_harness=harness.model_copy(
+                update={"network": HarnessNetwork(mode=HarnessNetworkMode.RESTRICTED)}
+            )
+        ).reason_code
+        == "network_or_install_side_effect"
+    )
+    assert (
+        resolve_with(
+            policy=operator_config.promotion_auto_approval.model_copy(
+                update={"max_changed_files": 1}
+            )
+        ).reason_code
+        == "changed_file_limit_exceeded"
+    )
+    assert (
+        resolve_with(
+            policy=operator_config.promotion_auto_approval.model_copy(update={"max_patch_bytes": 1})
+        ).reason_code
+        == "patch_size_limit_exceeded"
+    )
+    assert (
+        resolve_with(
+            selected_harness=harness.model_copy(
+                update={
+                    "verification": harness.verification.model_copy(
+                        update={
+                            "review": HarnessReview(parent_semantic_review=True),
+                        }
+                    )
+                }
+            )
+        ).reason_code
+        == "semantic_review_not_clean"
+    )
+
+    first_binding = composition.ordered_inputs[0].model_copy(
+        update={"paths": (".fleet/policy.yaml",)}
+    )
+    protected_composition = GraphPatchCompositionRecord.model_validate(
+        {
+            **composition.model_dump(mode="python"),
+            "ordered_inputs": (first_binding, *composition.ordered_inputs[1:]),
+            "content_digest": None,
+        },
+        strict=True,
+    )
+    protected_evaluation = ParentCandidateEvaluationRecord.model_validate(
+        {
+            **evaluation.model_dump(mode="python"),
+            "composition_record_digest": protected_composition.content_digest,
+            "content_digest": None,
+        },
+        strict=True,
+    )
+    protected_run = run.model_copy(
+        update={
+            "composition_digest": protected_composition.content_digest,
+            "parent_evaluation_digest": protected_evaluation.content_digest,
+        }
+    )
+    protected_replay = replay.model_copy(update={"record": protected_evaluation})
+    assert (
+        resolve_with(
+            selected_run=protected_run,
+            selected_composition=protected_composition,
+            selected_evaluation=protected_evaluation,
+            selected_replay=protected_replay,
+        ).reason_code
+        == "protected_or_control_path"
+    )
+
+    first_node = acceptance.accepted_revision.graph.nodes[0].model_copy(update={"risk": 3})
+    high_risk_graph = acceptance.accepted_revision.graph.model_copy(
+        update={"nodes": (first_node, *acceptance.accepted_revision.graph.nodes[1:])}
+    )
+    high_risk_acceptance = AcceptedGraphRevision(
+        revision_number=acceptance.accepted_revision.revision_number,
+        graph=high_risk_graph,
+    )
+    high_risk_evaluation = ParentCandidateEvaluationRecord.model_validate(
+        {
+            **evaluation.model_dump(mode="python"),
+            "accepted_graph_revision_digest": high_risk_acceptance.content_digest,
+            "content_digest": None,
+        },
+        strict=True,
+    )
+    high_risk_run = run.model_copy(
+        update={
+            "accepted_graph_revision_digest": high_risk_acceptance.content_digest,
+            "parent_evaluation_digest": high_risk_evaluation.content_digest,
+        }
+    )
+    high_risk_replay = replay.model_copy(update={"record": high_risk_evaluation})
+    assert (
+        resolve_with(
+            selected_run=high_risk_run,
+            selected_acceptance=high_risk_acceptance,
+            selected_evaluation=high_risk_evaluation,
+            selected_replay=high_risk_replay,
+        ).reason_code
+        == "risk_limit_exceeded"
+    )
+
+    original_operator = operator.read_text(encoding="utf-8")
+    stale_operator = json.loads(original_operator)
+    stale_operator["promotion_auto_approval"]["max_changed_files"] = 1
+    operator.write_text(json.dumps(stale_operator), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "promote",
+                run_id,
+                "--patch-digest",
+                run.parent_candidate_digest or "missing",
+                "--db",
+                str(database),
+            ]
+        )
+        == 8
+    )
+    assert json.loads(capsys.readouterr().out)["stable_code"] == "STALE_PROMOTION_APPROVAL"
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
+    operator.write_text(original_operator, encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "promote",
+                run_id,
+                "--patch-digest",
+                run.parent_candidate_digest or "missing",
+                "--db",
+                str(database),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    assert all((repository / f"{name}.txt").read_text() == f"{name}-after\n" for name in "abc")
 
 
 def test_cli_graph_handoff_inspects_approves_promotes_and_replays(

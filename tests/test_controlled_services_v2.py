@@ -107,6 +107,22 @@ def test_approval_is_digest_bound_persistent_and_single_use(tmp_path: Path) -> N
         service = DigestApprovalService(database, operator_label="operator", clock=lambda: NOW)
         record = service.request(request, decision)
         approved = service.decide(record.id, request.request_digest, "approved")
+        legacy_payload = approved.model_dump(mode="python")
+        for field in (
+            "authorization_kind",
+            "authorization_digest",
+            "rule_id",
+            "reason_code",
+            "accepted_graph_revision_digest",
+            "harness_digest",
+            "operator_config_digest",
+            "parent_evaluation_digest",
+            "verification_evidence_digests",
+            "evaluation_evidence_digests",
+            "semantic_evidence_digests",
+        ):
+            legacy_payload.pop(field)
+        assert ApprovalRecord.model_validate(legacy_payload, strict=True) == approved
         assert service.authorize(decision, approved)
         assert service.apply(decision, approved).outcome is DecisionOutcome.ALLOW
         assert not service.authorize(decision, approved)

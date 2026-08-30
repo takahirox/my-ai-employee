@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -16,6 +16,9 @@ from ai_employee.domain.v2 import (
 from ai_employee.storage import SQLiteStore
 
 from ._common import identifier, now
+
+if TYPE_CHECKING:
+    from ai_employee.promotion_approval import PromotionPolicyDecision
 
 
 class _ApprovalConsumption(BaseModel):
@@ -69,6 +72,82 @@ class DigestApprovalService:
         self.store.put(self._KIND, record, run_id=record.run_id)
         return record
 
+    def request_policy_auto(
+        self,
+        request: ApprovalRequest,
+        decision: PolicyDecision,
+        authority: PromotionPolicyDecision,
+    ) -> ApprovalRecord:
+        """Persist or recover one exact policy-issued approval; never bypass the record."""
+
+        self._validate_request(request, decision)
+        current = self.clock()
+        authority_digest = authority.content_digest
+        if (
+            authority_digest is None
+            or authority.run_id != request.run_id
+            or authority.decision != "policy_auto_approved"
+            or authority.candidate_digest != request.request_digest
+            or authority.effective_policy_digest != request.policy_digest
+            or authority.created_at > current
+            or request.expires_at <= current
+        ):
+            raise ValueError("promotion policy authority is stale or mismatched")
+        expected: dict[str, object] = {
+            "request_digest": request.request_digest,
+            "policy_digest": request.policy_digest,
+            "scope": (request.request_digest,),
+            "decision": "approved",
+            "authorization_kind": "policy_auto",
+            "authorization_digest": authority_digest,
+            "rule_id": authority.rule_id,
+            "reason_code": authority.reason_code,
+            "accepted_graph_revision_digest": authority.accepted_graph_revision_digest,
+            "harness_digest": authority.harness_digest,
+            "operator_config_digest": authority.operator_config_digest,
+            "parent_evaluation_digest": authority.parent_evaluation_digest,
+            "verification_evidence_digests": authority.verification_evidence_digests,
+            "evaluation_evidence_digests": authority.evaluation_ledger_digests,
+            "semantic_evidence_digests": authority.semantic_evidence_digests,
+        }
+        existing = tuple(
+            item
+            for item in self.store.list_records(self._KIND, ApprovalRecord, run_id=request.run_id)
+            if item.authorization_digest == authority_digest
+        )
+        if len(existing) > 1:
+            raise ValueError("promotion policy approval is ambiguous")
+        if existing:
+            record = existing[0]
+            if any(getattr(record, name) != value for name, value in expected.items()):
+                raise ValueError("promotion policy approval recovery is mismatched")
+            return record
+        record = ApprovalRecord(
+            id=identifier("approval"),
+            run_id=request.run_id,
+            created_at=current,
+            request_digest=request.request_digest,
+            policy_digest=request.policy_digest,
+            scope=(request.request_digest,),
+            decision="approved",
+            operator_label=f"policy:{authority.rule_id}",
+            expires_at=request.expires_at,
+            decided_at=current,
+            authorization_kind="policy_auto",
+            authorization_digest=authority_digest,
+            rule_id=authority.rule_id,
+            reason_code=authority.reason_code,
+            accepted_graph_revision_digest=authority.accepted_graph_revision_digest,
+            harness_digest=authority.harness_digest,
+            operator_config_digest=authority.operator_config_digest,
+            parent_evaluation_digest=authority.parent_evaluation_digest,
+            verification_evidence_digests=authority.verification_evidence_digests,
+            evaluation_evidence_digests=authority.evaluation_ledger_digests,
+            semantic_evidence_digests=authority.semantic_evidence_digests,
+        )
+        self.store.put(self._KIND, record, run_id=record.run_id)
+        return record
+
     def decide(
         self,
         approval_id: Identifier,
@@ -84,8 +163,14 @@ class DigestApprovalService:
         outcome: Literal["approved", "denied", "expired"] = decision
         if current >= existing.expires_at:
             outcome = "expired"
-        updated = existing.model_copy(
-            update={"decision": outcome, "decided_at": current, "content_digest": None}
+        updated = ApprovalRecord.model_validate(
+            {
+                **existing.model_dump(mode="python"),
+                "decision": outcome,
+                "decided_at": current,
+                "content_digest": None,
+            },
+            strict=True,
         )
         if not self.store.put_once(self._KIND, updated, run_id=updated.run_id, revision=2):
             raise ValueError("approval has already been decided")
@@ -141,3 +226,13 @@ class DigestApprovalService:
         except KeyError:
             return False
         return True
+
+    def _validate_request(self, request: ApprovalRequest, decision: PolicyDecision) -> None:
+        if decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED:
+            raise ValueError("only approval_required decisions may create approvals")
+        if request.request_digest != decision.request_digest:
+            raise ValueError("approval request digest does not match policy decision")
+        if request.policy_digest != decision.effective_policy_digest:
+            raise ValueError("approval policy digest does not match policy decision")
+        if set(request.approval_classes) != set(decision.required_approval_classes):
+            raise ValueError("approval classes must exactly match the policy decision")

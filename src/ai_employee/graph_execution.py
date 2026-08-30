@@ -15,6 +15,7 @@ from .domain.models import AcceptedGraphRevision
 from .domain.services_v2 import ApprovalService, Cancellation
 from .domain.v2 import (
     AcceptanceLedger,
+    ApprovalRecord,
     ApprovalRequest,
     ArtifactDescriptor,
     DecisionOutcome,
@@ -30,8 +31,13 @@ from .graph_composition import (
     GraphPatchCompositionRequest,
     NodePatchArtifact,
 )
-from .graph_evaluation import ParentCandidateEvaluationRecord
+from .graph_evaluation import ParentCandidateEvaluationRecord, ParentCandidateEvaluationReplay
 from .orchestration import WorkCoordinator, WorkRun
+from .promotion_approval import (
+    PromotionApprovalTrustKernel,
+    PromotionPolicyDecision,
+    validate_exact_parent_evidence_store,
+)
 from .serialization import canonical_json
 from .services_v2 import DigestApprovalService
 from .services_v2._common import identifier, now
@@ -45,6 +51,7 @@ from .task_orchestration import (
     NodeRunner,
     PlanReviewer,
     PlanReviser,
+    TaskGraphAcceptance,
     TaskOrchestrator,
     TaskResultReviewer,
 )
@@ -77,6 +84,8 @@ class ParentCandidateEvaluator(Protocol):
         effective_policy_digest: Digest,
         cancellation: Cancellation,
     ) -> ParentCandidateEvaluationRecord: ...
+
+    def replay(self, evaluation_id: Identifier) -> ParentCandidateEvaluationReplay: ...
 
 
 class _NeverCancelled:
@@ -146,6 +155,7 @@ class GraphExecutionService:
         local_backend_allowed: bool = False,
         parent_evaluator: ParentCandidateEvaluator | None = None,
         approval_service: ApprovalService | None = None,
+        promotion_approval_policy: PromotionApprovalTrustKernel | None = None,
         operator_config_digest: Digest | None = None,
         operator_config_path: str | None = None,
         strategy_set: Identifier | None = None,
@@ -188,6 +198,7 @@ class GraphExecutionService:
         self.approval_service = approval_service or DigestApprovalService(
             store, operator_label="local-operator"
         )
+        self.promotion_approval_policy = promotion_approval_policy
 
     def run(
         self,
@@ -217,6 +228,9 @@ class GraphExecutionService:
             resume=resume,
             replan=replan,
         )
+        recovered = self._recover_policy_approval_pointer(graph_run)
+        if recovered is not None:
+            return recovered
         if plan_only or graph_run.failure_code != "PARENT_EVALUATION_UNAVAILABLE":
             return graph_run
 
@@ -336,9 +350,60 @@ class GraphExecutionService:
         )
         self.store.put("policy_decision_v2", approval_decision, run_id=run_id)
         self.store.put("approval_request_v2", approval_request, run_id=run_id)
+        promotion_policy_decision = None
+        if self.promotion_approval_policy is not None:
+            parent_replay: ParentCandidateEvaluationReplay | None = None
+            evidence_storage_valid = False
+            if (
+                self.promotion_approval_policy.operator_policy.mode == "policy"
+                and self.promotion_approval_policy.harness.approvals.promotion == "policy"
+            ):
+                try:
+                    parent_replay = self.parent_evaluator.replay(evaluation.id)
+                except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                    parent_replay = None
+                if parent_replay is not None:
+                    try:
+                        exact_replay = validate_exact_parent_evidence_store(
+                            self.store,
+                            graph_run.model_copy(update=evaluation_fields),
+                            acceptance.accepted_revision,
+                            evaluation,
+                            self.promotion_approval_policy.harness,
+                        )
+                        evidence_storage_valid = parent_replay == exact_replay
+                    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                        evidence_storage_valid = False
+            promotion_policy_decision = self.promotion_approval_policy.resolve(
+                graph_run.model_copy(update=evaluation_fields),
+                acceptance.accepted_revision,
+                composition,
+                evaluation,
+                parent_replay,
+                evidence_storage_valid=evidence_storage_valid,
+            )
+            self.store.put(
+                "promotion_policy_decision_v2",
+                promotion_policy_decision,
+                run_id=run_id,
+            )
         try:
-            approval = self.approval_service.request(approval_request, approval_decision)
-        except ValueError:
+            if (
+                promotion_policy_decision is not None
+                and promotion_policy_decision.decision == "policy_auto_approved"
+                and isinstance(self.approval_service, DigestApprovalService)
+            ):
+                try:
+                    approval = self.approval_service.request_policy_auto(
+                        approval_request,
+                        approval_decision,
+                        promotion_policy_decision,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    approval = self.approval_service.request(approval_request, approval_decision)
+            else:
+                approval = self.approval_service.request(approval_request, approval_decision)
+        except (KeyError, TypeError, ValueError):
             return self._update_run(
                 graph_run,
                 failure_code="PROMOTION_APPROVAL_UNAVAILABLE",
@@ -422,6 +487,168 @@ class GraphExecutionService:
             revision=updated.generation + 1,
         )
         return updated
+
+    def _recover_policy_approval_pointer(self, run: GraphRunRecord) -> GraphRunRecord | None:
+        """Recover an exact policy approval and final pointer from durable authority facts."""
+
+        if (
+            run.failure_code != "PARENT_EVALUATION_UNAVAILABLE"
+            or self.parent_evaluator is None
+            or self.promotion_approval_policy is None
+        ):
+            return None
+        authorities = tuple(
+            item
+            for item in self.store.list_records(
+                "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run.id
+            )
+            if item.decision == "policy_auto_approved"
+            and item.run_id == run.id
+            and item.accepted_graph_revision_digest == run.accepted_graph_revision_digest
+            and item.harness_digest == run.harness_digest
+            and item.effective_policy_digest == run.effective_policy_digest
+            and item.operator_config_digest == run.operator_config_digest
+            and item.repository == run.repository
+        )
+        if len(authorities) != 1:
+            return None
+        authority = authorities[0]
+        approvals = tuple(
+            item
+            for item in self.store.list_records("approval_v2", ApprovalRecord, run_id=run.id)
+            if item.authorization_kind == "policy_auto"
+            and item.authorization_digest == authority.content_digest
+            and item.decision == "approved"
+            and item.request_digest == authority.candidate_digest
+            and item.policy_digest == authority.effective_policy_digest
+            and item.accepted_graph_revision_digest == authority.accepted_graph_revision_digest
+            and item.parent_evaluation_digest == authority.parent_evaluation_digest
+            and item.verification_evidence_digests == authority.verification_evidence_digests
+            and item.evaluation_evidence_digests == authority.evaluation_ledger_digests
+            and item.semantic_evidence_digests == authority.semantic_evidence_digests
+            and item.run_id == run.id
+        )
+        compositions = tuple(
+            item
+            for item in self.store.list_records(
+                "graph_patch_composition_v2", GraphPatchCompositionRecord, run_id=run.id
+            )
+            if item.content_digest == authority.composition_digest
+            and item.status == "succeeded"
+            and item.candidate_patch is not None
+            and item.candidate_patch.artifact_digest == authority.candidate_digest
+            and item.accepted_graph_revision_digest == authority.accepted_graph_revision_digest
+            and item.run_id == run.id
+        )
+        evaluations = tuple(
+            item
+            for item in self.store.list_records(
+                "parent_candidate_evaluation_v2",
+                ParentCandidateEvaluationRecord,
+                run_id=run.id,
+            )
+            if item.content_digest == authority.parent_evaluation_digest
+            and item.status == "ready_to_promote"
+            and item.decision.value == "PASS"
+            and item.composition_record_digest == authority.composition_digest
+            and item.candidate_artifact_digest == authority.candidate_digest
+            and item.goal_evaluator_digest == authority.goal_evaluator_digest
+            and item.verification_result_digests == authority.verification_evidence_digests
+            and item.evaluation_ledger_digests == authority.evaluation_ledger_digests
+            and item.run_id == run.id
+        )
+        acceptances = tuple(
+            item
+            for item in self.store.list_records(
+                "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id
+            )
+            if item.run_id == run.id
+            and item.accepted_revision.content_digest == authority.accepted_graph_revision_digest
+        )
+        if (
+            len(approvals) > 1
+            or len(compositions) != 1
+            or len(evaluations) != 1
+            or len(acceptances) != 1
+        ):
+            return None
+        try:
+            replay = self.parent_evaluator.replay(evaluations[0].id)
+            exact_replay = validate_exact_parent_evidence_store(
+                self.store,
+                run,
+                acceptances[0].accepted_revision,
+                evaluations[0],
+                self.promotion_approval_policy.harness,
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if replay != exact_replay:
+            return None
+        replay_semantic = tuple(
+            digest
+            for record in (
+                *replay.semantic_requests,
+                *replay.semantic_results,
+                *replay.semantic_decisions,
+                *replay.semantic_repair_requests,
+            )
+            if (digest := record.content_digest) is not None
+        )
+        if replay_semantic != authority.semantic_evidence_digests:
+            return None
+        if not approvals:
+            if not isinstance(self.approval_service, DigestApprovalService):
+                return None
+            approval_requests = tuple(
+                item
+                for item in self.store.list_records(
+                    "approval_request_v2", ApprovalRequest, run_id=run.id
+                )
+                if item.run_id == run.id
+                and item.request_digest == authority.candidate_digest
+                and item.policy_digest == authority.effective_policy_digest
+                and item.approval_classes == ("promotion",)
+            )
+            policy_decisions = tuple(
+                item
+                for item in self.store.list_records(
+                    "policy_decision_v2", PolicyDecision, run_id=run.id
+                )
+                if item.run_id == run.id
+                and item.request_digest == authority.candidate_digest
+                and item.effective_policy_digest == authority.effective_policy_digest
+                and item.outcome is DecisionOutcome.APPROVAL_REQUIRED
+                and item.required_approval_classes == ("promotion",)
+            )
+            if len(approval_requests) != 1 or len(policy_decisions) != 1:
+                return None
+            try:
+                recovered_approval = self.approval_service.request_policy_auto(
+                    approval_requests[0], policy_decisions[0], authority
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            approvals = (recovered_approval,)
+        composition = compositions[0]
+        evaluation = evaluations[0]
+        candidate = composition.candidate_patch
+        if candidate is None:
+            return None
+        return self._update_run(
+            run,
+            status="ready_to_promote",
+            failure_code=None,
+            composition_id=composition.id,
+            composition_digest=composition.content_digest,
+            parent_candidate_artifact_id=candidate.id,
+            parent_candidate_digest=candidate.artifact_digest,
+            parent_evaluation_id=evaluation.id,
+            parent_evaluation_digest=evaluation.content_digest,
+            goal_evaluator_digest=evaluation.goal_evaluator_digest,
+            promotion_approval_id=approvals[0].id,
+            promotion_approval_request_digest=approvals[0].request_digest,
+        )
 
 
 def _authoritative_node_result(

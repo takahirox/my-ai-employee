@@ -1,4 +1,11 @@
 schema_version: 1
+# Promotion stays manual unless both this operator file and the Project Harness opt in.
+promotion_auto_approval:
+  mode: manual
+  allowed_repositories: []
+  max_risk: 0
+  max_changed_files: 5
+  max_patch_bytes: 100000
 workers:
   codex_cli:
     executable: /absolute/path/to/codex

@@ -64,7 +64,13 @@ from .graph_execution import GraphExecutionService
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
 from .parent_review import (
     CliParentSemanticReviewer,
+    ParentSemanticReviewDecision,
+    ParentSemanticReviewRequest,
+    ParentSemanticReviewResult,
+    ParentSemanticSeverity,
+    decide_parent_semantic_review,
     parent_semantic_review_schema_json,
+    validate_parent_semantic_review_result,
 )
 from .plan_review import (
     CliPlanReviewer,
@@ -76,6 +82,12 @@ from .project import (
     discover_project_harness,
     migration_candidate,
     write_migration_candidate,
+)
+from .promotion_approval import (
+    PromotionApprovalTrustKernel,
+    PromotionPolicyDecision,
+    validate_exact_parent_evidence_store,
+    validate_policy_auto_authority,
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
 from .run_explanation import explain_any_run
@@ -977,6 +989,7 @@ def _work(args: argparse.Namespace) -> int:
         )
         workspace = GitWorkspaceManager(workspace_root, artifacts)
         harness_digest = project_harness_digest(harness)
+        operator_digest = operator_config_digest(operator_config)
         effective_policy_digest = canonical_digest((policy.content_digest,))
         coordinator = WorkCoordinator(
             store,
@@ -1131,7 +1144,20 @@ def _work(args: argparse.Namespace) -> int:
                 local_backend_allowed=harness.worker.local_backend,
                 parent_evaluator=parent_evaluator,
                 approval_service=DigestApprovalService(store, operator_label="local-operator"),
-                operator_config_digest=operator_config_digest(operator_config),
+                promotion_approval_policy=(
+                    PromotionApprovalTrustKernel(
+                        harness,
+                        operator_config.promotion_auto_approval,
+                        harness_digest=harness_digest,
+                        operator_config_digest=operator_digest,
+                    )
+                    if (
+                        operator_config.promotion_auto_approval.mode == "policy"
+                        or harness.approvals.promotion == "policy"
+                    )
+                    else None
+                ),
+                operator_config_digest=operator_digest,
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
                 plan_reviewer=plan_reviewer,
@@ -1432,7 +1458,7 @@ def _graph_promotion_evidence(
     patch: ArtifactDescriptor,
     composition: GraphPatchCompositionRecord,
     workspace: WorkspaceSnapshot,
-) -> tuple[ParentCandidateEvaluationRecord, str]:
+) -> tuple[ParentCandidateEvaluationRecord, str, tuple[str, ...]]:
     acceptances = tuple(
         item
         for item in store.list_records(
@@ -1531,11 +1557,78 @@ def _graph_promotion_evidence(
     if len(acceptance_ledgers) != 1:
         raise ValueError("parent AcceptanceLedger is missing or stale")
     acceptance_ledger = acceptance_ledgers[0]
-    if acceptance_ledger.content_digest is None or goal_evaluation.evidence_digests != (
+    deterministic_prefix = (
         acceptance_ledger.content_digest,
         *evaluation.evaluation_ledger_digests,
+    )
+    if (
+        acceptance_ledger.content_digest is None
+        or goal_evaluation.evidence_digests[: len(deterministic_prefix)] != deterministic_prefix
     ):
         raise ValueError("parent AcceptanceLedger is missing or stale")
+    semantic_evidence = goal_evaluation.evidence_digests[len(deterministic_prefix) :]
+    if run.repository is None:
+        raise ValueError("graph repository authority is missing")
+    harness = discover_project_harness(run.repository)
+    accepted_semantic_findings: tuple[str, ...] = ()
+    if harness.verification.review.parent_semantic_review:
+        semantic_set = set(semantic_evidence)
+        semantic_requests = tuple(
+            item
+            for item in store.list_records(
+                "parent_semantic_review_request_v2", ParentSemanticReviewRequest, run_id=run.id
+            )
+            if item.content_digest in semantic_set
+        )
+        semantic_results = tuple(
+            item
+            for item in store.list_records(
+                "parent_semantic_review_result_v2", ParentSemanticReviewResult, run_id=run.id
+            )
+            if item.content_digest in semantic_set
+        )
+        semantic_decisions = tuple(
+            item
+            for item in store.list_records(
+                "parent_semantic_review_decision_v2", ParentSemanticReviewDecision, run_id=run.id
+            )
+            if item.content_digest in semantic_set
+        )
+        if (
+            len(semantic_requests) != 1
+            or len(semantic_results) != 1
+            or len(semantic_decisions) != 1
+        ):
+            raise ValueError("parent semantic PASS evidence is missing or ambiguous")
+        semantic_request = semantic_requests[0]
+        semantic_result = semantic_results[0]
+        semantic_decision = semantic_decisions[0]
+        validate_parent_semantic_review_result(semantic_request, semantic_result)
+        expected_semantic_decision = decide_parent_semantic_review(
+            semantic_request,
+            semantic_result,
+            block_severities=tuple(
+                ParentSemanticSeverity(item)
+                for item in harness.verification.review.block_severities
+            ),
+            decision_id=semantic_decision.id,
+            run_id=semantic_decision.run_id,
+            created_at=semantic_decision.created_at,
+        )
+        expected_semantic = (
+            semantic_request.content_digest,
+            semantic_result.content_digest,
+            semantic_decision.content_digest,
+        )
+        if (
+            semantic_decision != expected_semantic_decision
+            or semantic_decision.action is not EvaluationDecision.PASS
+            or semantic_evidence != expected_semantic
+        ):
+            raise ValueError("parent semantic PASS evidence is stale")
+        accepted_semantic_findings = semantic_decision.accepted_finding_digests
+    elif semantic_evidence:
+        raise ValueError("unexpected parent semantic evidence")
     if tuple(item.criterion_id for item in acceptance_ledger.criteria) != tuple(
         item.id for item in request.goal.completion_criteria
     ) or any(item.disposition != "satisfied" for item in acceptance_ledger.criteria):
@@ -1561,13 +1654,15 @@ def _graph_promotion_evidence(
         *evaluation_result_digests,
         *observation_manifest_digests,
         *artifact_digests,
+        *semantic_evidence,
     }
+    authoritative_evidence.update(accepted_semantic_findings)
     if any(
         not item.evidence_refs or not set(item.evidence_refs) <= authoritative_evidence
         for item in acceptance_ledger.criteria
     ):
         raise ValueError("parent AcceptanceLedger cites non-authoritative evidence")
-    return evaluation, policy_digest
+    return evaluation, policy_digest, semantic_evidence
 
 
 def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -> int:
@@ -1588,7 +1683,9 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
         return 8
     try:
         patch, composition, snapshot = _graph_candidate(store, run)
-        _, policy_digest = _graph_promotion_evidence(store, run, patch, composition, snapshot)
+        evaluation, policy_digest, semantic_evidence = _graph_promotion_evidence(
+            store, run, patch, composition, snapshot
+        )
     except (KeyError, ValueError):
         _print_work_failure(run.id, run.status, "EVIDENCE_OR_REVIEW_BLOCKED")
         return 5
@@ -1616,6 +1713,63 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
     if approval.decision != "approved" or approval.expires_at <= now():
         _print_work_failure(run.id, run.status, "STALE_PROMOTION_APPROVAL")
         return 8
+    if approval.authorization_kind == "policy_auto":
+        authorities = tuple(
+            item
+            for item in store.list_records(
+                "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run.id
+            )
+            if item.content_digest == approval.authorization_digest
+        )
+        try:
+            if len(authorities) != 1 or run.repository is None:
+                raise ValueError("policy approval authority is missing or ambiguous")
+            acceptances = tuple(
+                item
+                for item in store.list_records(
+                    "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run.id
+                )
+                if item.accepted_revision.content_digest == run.accepted_graph_revision_digest
+            )
+            if len(acceptances) != 1:
+                raise ValueError("accepted graph authority is missing or ambiguous")
+            harness = discover_project_harness(run.repository)
+            operator_config = load_operator_config(run.operator_config_path)
+            exact_replay = validate_exact_parent_evidence_store(
+                store,
+                run,
+                acceptances[0].accepted_revision,
+                evaluation,
+                harness,
+            )
+            exact_semantic = tuple(
+                digest
+                for record in (
+                    *exact_replay.semantic_requests,
+                    *exact_replay.semantic_results,
+                    *exact_replay.semantic_decisions,
+                    *exact_replay.semantic_repair_requests,
+                )
+                if (digest := record.content_digest) is not None
+            )
+            if exact_semantic != semantic_evidence:
+                raise ValueError("promotion semantic evidence is not exact")
+            validate_policy_auto_authority(
+                approval,
+                authorities[0],
+                run,
+                acceptances[0].accepted_revision,
+                composition,
+                evaluation,
+                harness,
+                operator_config,
+                semantic_evidence,
+                harness_digest=project_harness_digest(harness),
+                operator_config_digest=operator_config_digest(operator_config),
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            _print_work_failure(run.id, run.status, "STALE_PROMOTION_APPROVAL")
+            return 8
     state_root = Path(store.path).resolve().parent
     artifacts = AtomicArtifactStore(state_root / "artifacts")
     workspace = GitWorkspaceManager(Path(snapshot.isolated_worktree).resolve().parent, artifacts)

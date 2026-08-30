@@ -96,6 +96,9 @@ class DigestedRecordV2(SchemaModelV2):
     digest_metadata: DigestMetadata = DigestMetadata()
     content_digest: Digest | None = None
 
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        return frozenset()
+
     @model_validator(mode="after")
     def _bind_content_digest(self) -> Self:
         actual = versioned_digest(
@@ -114,7 +117,13 @@ def _digest_content(value: object) -> object:
 
     if isinstance(value, BaseModel):
         excluded = (
-            {"content_digest", "id", "run_id", "created_at"}
+            {
+                "content_digest",
+                "id",
+                "run_id",
+                "created_at",
+                *value._digest_compatibility_exclusions(),
+            }
             if isinstance(value, DigestedRecordV2)
             else set()
         )
@@ -584,6 +593,36 @@ class ApprovalRecord(DigestedRecordV2):
     operator_label: str = Field(min_length=1, max_length=200)
     expires_at: UtcTimestamp
     decided_at: UtcTimestamp | None = None
+    authorization_kind: Literal["manual", "policy_auto"] = "manual"
+    authorization_digest: Digest | None = None
+    rule_id: Identifier | None = None
+    reason_code: Identifier | None = None
+    accepted_graph_revision_digest: Digest | None = None
+    harness_digest: Digest | None = None
+    operator_config_digest: Digest | None = None
+    parent_evaluation_digest: Digest | None = None
+    verification_evidence_digests: tuple[Digest, ...] = ()
+    evaluation_evidence_digests: tuple[Digest, ...] = ()
+    semantic_evidence_digests: tuple[Digest, ...] = ()
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        if self.authorization_kind != "manual":
+            return frozenset()
+        return frozenset(
+            {
+                "authorization_kind",
+                "authorization_digest",
+                "rule_id",
+                "reason_code",
+                "accepted_graph_revision_digest",
+                "harness_digest",
+                "operator_config_digest",
+                "parent_evaluation_digest",
+                "verification_evidence_digests",
+                "evaluation_evidence_digests",
+                "semantic_evidence_digests",
+            }
+        )
 
     @model_validator(mode="after")
     def _decision_and_time_are_consistent(self) -> Self:
@@ -595,6 +634,34 @@ class ApprovalRecord(DigestedRecordV2):
             raise ValueError("terminal approval requires a decision time")
         if self.decided_at is not None and self.decided_at < self.created_at:
             raise ValueError("approval decision cannot predate creation")
+        auto_bindings = (
+            self.authorization_digest,
+            self.rule_id,
+            self.reason_code,
+            self.accepted_graph_revision_digest,
+            self.harness_digest,
+            self.operator_config_digest,
+            self.parent_evaluation_digest,
+        )
+        if self.authorization_kind == "policy_auto":
+            if self.decision != "approved" or self.decided_at is None:
+                raise ValueError("policy auto-approval must be an approved terminal fact")
+            if any(value is None for value in auto_bindings):
+                raise ValueError("policy auto-approval requires complete authority bindings")
+            if not self.verification_evidence_digests or not self.evaluation_evidence_digests:
+                raise ValueError("policy auto-approval requires verification evidence")
+        elif any(value is not None for value in auto_bindings) or (
+            self.verification_evidence_digests
+            or self.evaluation_evidence_digests
+            or self.semantic_evidence_digests
+        ):
+            raise ValueError("manual approval cannot claim policy auto-approval authority")
+        if (
+            len(self.verification_evidence_digests) != len(set(self.verification_evidence_digests))
+            or len(self.evaluation_evidence_digests) != len(set(self.evaluation_evidence_digests))
+            or len(self.semantic_evidence_digests) != len(set(self.semantic_evidence_digests))
+        ):
+            raise ValueError("approval evidence digests must be unique")
         return self
 
 
