@@ -6,13 +6,15 @@ import argparse
 import getpass
 import io
 import shutil
+import subprocess
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
 from . import __version__
-from .config import WorkerName, load_operator_config
+from .config import OperatorConfig, WorkerName, load_operator_config
 from .demo import run_demo
 from .domain import (
     CompletionCriterion,
@@ -52,6 +54,17 @@ from .domain.v2 import (
     PromotionRecord,
     WorkerRequest,
     WorkspaceSnapshot,
+)
+from .eval_framework import (
+    EvalEnvironmentSnapshot,
+    EvalExperiment,
+    EvalReport,
+    EvalStrategyBinding,
+    EvalTrial,
+    deterministic_experiment_id,
+    load_scenario_definition,
+    resolve_scenario,
+    run_experiment,
 )
 from .graph import GraphValidationError, accept_graph
 from .graph_composition import GraphPatchComposer, GraphPatchCompositionRecord
@@ -154,6 +167,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", default=None)
     run.add_argument("--db", default=".fleet/fleet.db")
     run.add_argument("--pause-after", type=int)
+
+    evaluate = commands.add_parser(
+        "eval", help="compare fixed Fleet strategies over bounded repeated trials"
+    )
+    evaluate.add_argument("scenario")
+    evaluate.add_argument(
+        "--strategy", action="append", required=True, help="exact operator strategy ID"
+    )
+    evaluate.add_argument("--trials", type=int, default=5)
+    evaluate.add_argument("--eval-id", help="explicit experiment ID; otherwise deterministic")
+    evaluate.add_argument("--operator-config")
+    evaluate.add_argument("--db", default=".fleet/evals.db")
+    evaluate.add_argument("--json", action="store_true")
 
     inspect = commands.add_parser("inspect", help="inspect a persisted run")
     inspect.add_argument("run_id")
@@ -285,6 +311,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "work":
         return _work(args)
+    if args.command == "eval":
+        return _eval(args)
     with SQLiteStore(args.db) as store:
         if args.command == "approvals":
             return _approvals(store, args)
@@ -381,12 +409,196 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _eval(args: argparse.Namespace) -> int:
+    definition = load_scenario_definition(args.scenario)
+    scenario_path = Path(args.scenario).resolve()
+    requested_repository = Path(definition.repository_fixture).expanduser()
+    repository = (
+        (scenario_path.parent / requested_repository).resolve()
+        if not requested_repository.is_absolute()
+        else requested_repository.resolve()
+    )
+    operator_config_path = (
+        None
+        if args.operator_config is None
+        else str(Path(args.operator_config).expanduser().resolve())
+    )
+
+    def environment() -> EvalEnvironmentSnapshot:
+        status = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ),
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout
+        if status:
+            raise ValueError("evaluation fixture must have a clean Git status")
+        head = subprocess.run(
+            ("git", "-C", str(repository), "rev-parse", "HEAD"),
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        current_harness = discover_project_harness(repository)
+        current_operator = load_operator_config(operator_config_path)
+        return EvalEnvironmentSnapshot(
+            repository=str(repository),
+            head_commit=head,
+            clean_status_digest=canonical_digest(status),
+            harness_digest=project_harness_digest(current_harness),
+            operator_config_digest=operator_config_digest(current_operator),
+        )
+
+    initial_environment = environment()
+    harness = discover_project_harness(repository)
+    operator_config = load_operator_config(operator_config_path)
+    scenario = resolve_scenario(
+        definition,
+        scenario_path,
+        initial_environment,
+        harness,
+        created_at=now(),
+    )
+    requested_strategy_ids = tuple(args.strategy)
+    if len(requested_strategy_ids) != len(set(requested_strategy_ids)):
+        raise ValueError("evaluation strategy IDs must be unique")
+    bindings = tuple(
+        _eval_strategy_binding(operator_config, harness, strategy_id)
+        for strategy_id in requested_strategy_ids
+    )
+    experiment_id = args.eval_id or deterministic_experiment_id(scenario, bindings, args.trials)
+    experiment = EvalExperiment(
+        id=experiment_id,
+        run_id=experiment_id,
+        created_at=now(),
+        scenario_id=scenario.id,
+        scenario_digest=scenario.content_digest or "",
+        strategies=bindings,
+        trials_per_strategy=args.trials,
+        operator_config_digest=operator_config_digest(operator_config),
+    )
+    db_path = Path(args.db).expanduser().resolve()
+    git_directory = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "--git-dir"),
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    resolved_git_directory = (
+        Path(git_directory).resolve()
+        if Path(git_directory).is_absolute()
+        else (repository / git_directory).resolve()
+    )
+    if db_path == resolved_git_directory or resolved_git_directory in db_path.parents:
+        raise ValueError("evaluation database cannot be stored inside Git metadata")
+    artifact_store = AtomicArtifactStore(db_path.parent / "artifacts")
+
+    def execute(trial: EvalTrial, binding: EvalStrategyBinding) -> int:
+        work_args = argparse.Namespace(
+            goal=scenario.goal,
+            repo=scenario.repository,
+            worker=None,
+            model=None,
+            routing_mode="fixed",
+            strategy=binding.strategy.id,
+            strategy_set=binding.strategy_set,
+            assessment_strategy=None,
+            planner_strategy=None,
+            operator_config=operator_config_path,
+            plan_only=False,
+            max_concurrency=1,
+            non_interactive=True,
+            json=True,
+            db=str(db_path),
+            run_id=trial.fleet_run_id,
+        )
+        with redirect_stdout(io.StringIO()):
+            return _work(work_args)
+
+    with SQLiteStore(db_path) as store:
+        report = run_experiment(
+            store,
+            scenario,
+            experiment,
+            harness,
+            environment,
+            lambda descriptor: artifact_store.open_verified(descriptor).read(),
+            execute,
+            clock=now,
+        )
+    if args.json:
+        print(canonical_json(report))
+    else:
+        _print_eval_summary(report)
+    return 0
+
+
+def _eval_strategy_binding(
+    operator_config: OperatorConfig,
+    harness: ProjectHarnessV2,
+    strategy_id: str,
+) -> EvalStrategyBinding:
+    if operator_config.routing is None:
+        raise ValueError("evaluation requires operator-configured routing strategies")
+    routing = operator_config.routing
+    configured = tuple(item for item in routing.strategies if item.id == strategy_id)
+    if len(configured) != 1:
+        raise ValueError(f"unknown or ambiguous evaluation strategy: {strategy_id}")
+    containing_sets = tuple(
+        sorted(name for name, values in routing.strategy_sets.items() if strategy_id in values)
+    )
+    if routing.default_strategy_set in containing_sets:
+        strategy_set = routing.default_strategy_set
+    elif containing_sets:
+        strategy_set = containing_sets[0]
+    elif routing.default_strategy_set is None:
+        strategy_set = None
+    else:
+        raise ValueError("evaluation strategy is not admitted by any operator strategy set")
+    strategies = operator_config.execution_strategies(RoutingMode.FIXED, strategy_set)
+    matches = tuple(item for item in strategies if item.id == strategy_id)
+    if len(matches) != 1:
+        raise ValueError("evaluation strategy resolution is missing or ambiguous")
+    strategy = matches[0]
+    if (
+        strategy.id not in harness.worker.allowed_strategy_ids
+        or strategy.backend not in harness.worker.allowed
+        or (strategy.backend in {"ollama", "ollama_cli"} and not harness.worker.local_backend)
+    ):
+        raise ValueError("evaluation strategy is denied by Project Harness")
+    return EvalStrategyBinding(
+        strategy=strategy,
+        strategy_digest=canonical_digest(strategy),
+        strategy_set=strategy_set,
+    )
+
+
+def _print_eval_summary(report: EvalReport) -> None:
+    print(f"Experiment {report.experiment.id} ({len(report.results)} completed trials)")
+    print("Strategy                 Verified      p50 total   Cost")
+    for item in report.summaries:
+        total = "-" if item.median_total_seconds is None else f"{item.median_total_seconds:.2f}s"
+        cost = "-" if item.total_cost is None else f"{item.total_cost:.4f}"
+        verified = (
+            f"{item.verified_successes}/{item.planned_trials} ({item.verified_success_rate:.0%})"
+        )
+        print(f"{item.strategy_id:<24} {verified:<13} {total:<11} {cost}")
+
+
 def _work(args: argparse.Namespace) -> int:
     from .orchestration import WorkCoordinator, bind_service_decision
 
     resume_run: GraphRunRecord | None = getattr(args, "resume_graph_run", None)
     repository = Path(args.repo).resolve()
-    run_id = identifier("work") if resume_run is None else resume_run.id
+    requested_run_id = getattr(args, "run_id", None)
+    run_id = (requested_run_id or identifier("work")) if resume_run is None else resume_run.id
     routing_enabled = args.routing_mode != "legacy"
     if args.routing_mode == "fixed" and args.strategy is None:
         raise ValueError("--routing-mode fixed requires --strategy")

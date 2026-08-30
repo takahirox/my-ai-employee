@@ -670,6 +670,12 @@ def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     """Read any runtime generation without mutating or migrating state."""
 
     try:
+        from .eval_framework import inspect_experiment
+
+        return _json_model(inspect_experiment(store, run_id))
+    except KeyError:
+        pass
+    try:
         return inspect_graph_run(store, run_id)
     except KeyError:
         try:

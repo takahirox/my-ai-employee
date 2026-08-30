@@ -168,6 +168,23 @@ fleet diff RUN_ID --db /tmp/fleet-work.db
 fleet promote RUN_ID --patch-digest PATCH_DIGEST --db /tmp/fleet-work.db
 ```
 
+Compare exact fixed-routing strategies over repeated runs of one clean fixture:
+
+```bash
+fleet eval evals/small-refactor.yaml \
+  --strategy codex-luna-max \
+  --strategy codex-sol-high \
+  --trials 5 \
+  --db .fleet/evals.db
+```
+
+The scenario binds the current base commit and required Project Harness commands. Fleet reuses its
+isolated worktrees and authoritative parent verification records, reports verified success and
+bounded latency/usage/patch metrics, and resumes without repeating completed trials. Add `--json`
+for canonical JSON or inspect the deterministic experiment ID with `fleet inspect`. See
+[`docs/issue-1-evaluation.md`](docs/issue-1-evaluation.md) for the strict schema, recovery behavior,
+and non-goals.
+
 Promotion approval is manual by default. A bounded low-risk graph parent candidate can receive a
 durable policy approval only with the Project Harness and operator double opt-in described in
 [the policy-controlled approval guide](docs/issue-9-auto-approval.md). Policy approval never runs
