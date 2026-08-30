@@ -58,6 +58,7 @@ from .plan_review import (
     PlanReviewFailureEvidence,
     PlanRevisionAttempt,
 )
+from .promotion_approval import PromotionPolicyDecision
 from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
@@ -199,6 +200,12 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "approvals": [
             _json_model(item)
             for item in store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        ],
+        "promotion_policy_decisions": [
+            _json_model(item)
+            for item in store.list_records(
+                "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run_id
+            )
         ],
         "worker": {
             "availability": [
@@ -556,6 +563,12 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         "approvals": [
             _json_model(item)
             for item in store.list_records("approval_v2", ApprovalRecord, run_id=run_id)
+        ],
+        "promotion_policy_decisions": [
+            _json_model(item)
+            for item in store.list_records(
+                "promotion_policy_decision_v2", PromotionPolicyDecision, run_id=run_id
+            )
         ],
         "promotions": [
             _json_model(item)

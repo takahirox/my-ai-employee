@@ -168,6 +168,11 @@ fleet diff RUN_ID --db /tmp/fleet-work.db
 fleet promote RUN_ID --patch-digest PATCH_DIGEST --db /tmp/fleet-work.db
 ```
 
+Promotion approval is manual by default. A bounded low-risk graph parent candidate can receive a
+durable policy approval only with the Project Harness and operator double opt-in described in
+[the policy-controlled approval guide](docs/issue-9-auto-approval.md). Policy approval never runs
+`fleet promote`; promotion remains an explicit, exact-digest operation.
+
 `fleet promote` is the only v0.2 operation that applies the reviewed patch to the
 original worktree. Fleet never commits, pushes, publishes, or deploys it.
 

@@ -11,6 +11,10 @@ for the repository's sandbox. Rules inferred from files remain provisional until
 reviews and writes an explicit profile. Protected paths express boundaries; they do not grant
 write authority or replace OS-level sandboxing.
 
+`approvals.promotion` defaults to `required`. Setting it to `policy` is only the repository half of
+the bounded promotion auto-approval opt-in; the operator must independently enable the exact
+repository and limits. See [policy-controlled promotion approval](issue-9-auto-approval.md).
+
 Independent task-result AI review is disabled by default. A repository may set
 `verification.review.independent_task_review: true`, but review runs only when operator routing
 also selects a `default_task_reviewer_strategy` whose strategy has

@@ -383,6 +383,14 @@ def test_duplicate_yaml_keys_and_unknown_versions_fail_closed(tmp_path: Path) ->
         discover_project(tmp_path)
 
 
+def test_provisional_harness_cannot_opt_in_to_policy_auto_approval() -> None:
+    with pytest.raises(ValidationError, match="promotion auto-approval"):
+        ProjectHarnessV2.model_validate_json(
+            '{"schema_version":2,"provisional":true,"approvals":{"promotion":"policy"}}',
+            strict=True,
+        )
+
+
 def test_v1_conversion_is_provisional_restrictive_and_non_destructive(tmp_path: Path) -> None:
     profile = tmp_path / ".fleet" / "project.json"
     profile.parent.mkdir()

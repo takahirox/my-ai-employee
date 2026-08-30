@@ -736,6 +736,34 @@ def _promotion_approval_story(view: dict[str, Any]) -> dict[str, Any] | None:
             "request_digest": request_digest,
         }
     request = requests[0]
+    authorization_kind = approval.get("authorization_kind", "manual")
+    authority = None
+    if authorization_kind == "policy_auto":
+        authority_digest = approval.get("authorization_digest")
+        authorities = [
+            item
+            for item in _mappings(view.get("promotion_policy_decisions"))
+            if item.get("content_digest") == authority_digest
+        ]
+        authority = authorities[0] if len(authorities) == 1 else None
+        if (
+            authority is None
+            or authority.get("decision") != "policy_auto_approved"
+            or authority.get("candidate_digest") != request_digest
+            or authority.get("effective_policy_digest") != policy_digest
+            or authority.get("accepted_graph_revision_digest")
+            != run.get("accepted_graph_revision_digest")
+            or authority.get("harness_digest") != run.get("harness_digest")
+            or authority.get("operator_config_digest") != run.get("operator_config_digest")
+            or authority.get("parent_evaluation_digest") != run.get("parent_evaluation_digest")
+        ):
+            return {
+                "binding": "invalid",
+                "decision": "unknown",
+                "approval_id": approval_id,
+                "request_digest": request_digest,
+                "authorization_kind": authorization_kind,
+            }
     return {
         "binding": "bound",
         "decision": approval.get("decision"),
@@ -743,6 +771,11 @@ def _promotion_approval_story(view: dict[str, Any]) -> dict[str, Any] | None:
         "approval_request_id": request.get("id"),
         "request_digest": request_digest,
         "policy_digest": policy_digest,
+        "authorization_kind": authorization_kind,
+        "rule_id": approval.get("rule_id"),
+        "reason_code": approval.get("reason_code"),
+        "authorization_digest": approval.get("authorization_digest"),
+        "authority": authority,
         "expires_at": approval.get("expires_at"),
         "decided_at": approval.get("decided_at"),
     }

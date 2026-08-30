@@ -193,6 +193,27 @@ class OperatorRoutingConfig(BaseModel):
         return self
 
 
+class PromotionAutoApprovalConfig(BaseModel):
+    """Operator-side authority for the one conservative promotion policy rule."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    mode: Literal["manual", "policy"] = "manual"
+    allowed_repositories: tuple[str, ...] = ()
+    max_risk: int = Field(default=0, ge=0, le=2)
+    max_changed_files: int = Field(default=5, ge=1, le=100)
+    max_patch_bytes: int = Field(default=100_000, ge=1, le=1_000_000)
+
+    @field_validator("allowed_repositories")
+    @classmethod
+    def _absolute_unique_repositories(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("auto-approval repositories must be unique")
+        if any("\x00" in item or not Path(item).is_absolute() for item in value):
+            raise ValueError("auto-approval repositories must be absolute and NUL-free")
+        return value
+
+
 def default_operator_routing_config() -> OperatorRoutingConfig:
     """Built-in cloud-only routing used when the operator does not override it."""
 
@@ -272,6 +293,7 @@ class OperatorConfig(BaseModel):
     schema_version: Literal[1] = 1
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
     routing: OperatorRoutingConfig | None = Field(default_factory=default_operator_routing_config)
+    promotion_auto_approval: PromotionAutoApprovalConfig = PromotionAutoApprovalConfig()
 
     @field_validator("workers")
     @classmethod

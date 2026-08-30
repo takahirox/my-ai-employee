@@ -45,3 +45,16 @@ def test_explicit_missing_config_duplicate_keys_and_relative_paths_fail_closed(
     )
     with pytest.raises(ValidationError, match="absolute"):
         load_operator_config(relative)
+
+
+def test_promotion_auto_approval_rejects_always_and_relative_repositories() -> None:
+    with pytest.raises(ValidationError):
+        OperatorConfig.model_validate_json(
+            '{"promotion_auto_approval":{"mode":"always"}}', strict=True
+        )
+    with pytest.raises(ValidationError, match="absolute"):
+        OperatorConfig.model_validate_json(
+            '{"promotion_auto_approval":'
+            '{"mode":"policy","allowed_repositories":["relative/repo"]}}',
+            strict=True,
+        )

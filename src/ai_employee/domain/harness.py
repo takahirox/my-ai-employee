@@ -233,7 +233,7 @@ class HarnessApprovals(HarnessModel):
     manifest_lock_mutation: Literal["required", "deny"] = "required"
     lifecycle_scripts: Literal["required", "deny"] = "deny"
     new_registry_domain: Literal["required", "deny"] = "required"
-    promotion: Literal["required"] = "required"
+    promotion: Literal["required", "policy"] = "required"
 
 
 class HarnessWorker(HarnessModel):
@@ -337,6 +337,8 @@ class ProjectHarnessV2(HarnessModel):
         if missing_commands:
             raise ValueError(f"evaluators reference unknown commands: {sorted(missing_commands)}")
         if self.provisional:
+            if self.approvals.promotion == "policy":
+                raise ValueError("provisional Harness cannot grant promotion auto-approval")
             if self.network.mode is not NetworkMode.DISABLED:
                 raise ValueError("provisional Harness cannot grant network authority")
             if self.install.ecosystems or self.install.existing_lock is not InstallDisposition.DENY:

@@ -71,6 +71,9 @@ def operator_config_digest(config: BaseModel) -> str:
     """Digest operator config without serializing disabled review opt-in defaults."""
 
     payload = config.model_dump(mode="python", by_alias=True, exclude_none=False)
+    promotion = payload.get("promotion_auto_approval")
+    if isinstance(promotion, dict) and promotion.get("mode") == "manual":
+        payload.pop("promotion_auto_approval")
     routing = payload.get("routing")
     if isinstance(routing, dict):
         if routing.get("default_task_reviewer_strategy") is None:
