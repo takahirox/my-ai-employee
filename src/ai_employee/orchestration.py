@@ -46,6 +46,7 @@ from .domain.v2 import (
     EditIntentRequest,
     ExecutionResult,
     InstallRequest,
+    InstallResult,
     NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
@@ -371,7 +372,12 @@ class WorkCoordinator:
             result_digest=availability.content_digest,
         )
         if availability.availability == "unavailable":
-            return self._update(run, status="failed", failure_code="WORKER_UNAVAILABLE")
+            availability_code = (
+                StableFailureCode.WORKER_UNAVAILABLE
+                if availability.failure is None
+                else availability.failure.code
+            )
+            return self._update(run, status="failed", failure_code=availability_code.value)
         if plan_only:
             return self._update(run, status="planned")
         request = WorkspaceRequest(
@@ -405,7 +411,19 @@ class WorkCoordinator:
             workspace_context=(),
             harness_digest=harness_digest,
             effective_policy_digest=run.effective_policy_digest,
-            remaining_budgets=freeze_json({"worker_turns": self.max_worker_turns}),
+            remaining_budgets=freeze_json(
+                {
+                    "worker_turns": self.max_worker_turns,
+                    "artifact_bytes": min(
+                        (
+                            layer.max_artifact_bytes
+                            for layer in self.policy_layers
+                            if layer.max_artifact_bytes is not None
+                        ),
+                        default=0,
+                    ),
+                }
+            ),
         )
         self.store.put("worker_request_v2", worker_request, run_id=run.id)
         channel = _Channel(self, run)
@@ -413,6 +431,12 @@ class WorkCoordinator:
         if not isinstance(result, WorkerResult):
             raise TypeError("worker adapter returned a non-WorkerResult value")
         self.store.put("worker_result_v2", result, run_id=run.id)
+        if result.boundary_diagnostic is not None:
+            self.store.put(
+                "worker_boundary_diagnostic_v2",
+                result.boundary_diagnostic,
+                run_id=run.id,
+            )
         self._event(
             run.id,
             "worker_finished",
@@ -430,8 +454,12 @@ class WorkCoordinator:
         )
         run = self._update(run, worker_result_id=result.id)
         if result.status != "succeeded":
-            code = result.failure.code.value if result.failure else "WORKER_PROTOCOL_ERROR"
-            return self._update(run, status="failed", failure_code=code)
+            failure_code = result.failure.code.value if result.failure else "WORKER_PROTOCOL_ERROR"
+            return self._update(
+                run,
+                status="cancelled" if result.status == "cancelled" else "failed",
+                failure_code=failure_code,
+            )
         result_acceptance = self._accept_non_mutating_result(
             worker_request, result, len(channel.decisions)
         )
@@ -582,7 +610,7 @@ class WorkCoordinator:
             if layer.max_artifact_bytes is not None
         )
         if failure_code is None and valid_artifact_limit is None:
-            failure_code = StableFailureCode.TYPED_RESULT_UNBOUND
+            failure_code = StableFailureCode.ARTIFACT_BUDGET_INVALID
         if (
             failure_code is None
             and valid_artifact_limit is not None
@@ -717,7 +745,8 @@ class WorkCoordinator:
             else:
                 return self._update(run, status="failed", failure_code="UNSUPPORTED_ACTION")
             self.store.put("action_result_v2", result, run_id=run.id)
-            retain(_mediated_result_artifacts(result, executor))
+            artifact_service = installer if isinstance(result, InstallResult) else executor
+            retain(_mediated_result_artifacts(result, artifact_service))
             self._event(
                 run.id,
                 "action_finished",
@@ -1075,12 +1104,21 @@ def _mediated_result_artifacts(
         descriptors.append(result.artifact)
     resolver = getattr(service, "output_descriptor", None)
     if callable(resolver):
+        producer_action_id = result.id
+        if isinstance(result, InstallResult):
+            usage = result.resource_usage
+            process_result_id = (
+                usage.get("process_result_id") if isinstance(usage, Mapping) else None
+            )
+            if not isinstance(process_result_id, str) or not process_result_id:
+                raise ValueError("install result is missing process output provenance")
+            producer_action_id = process_result_id
         for digest, logical_kind in (
             (result.stdout_artifact_digest, "process_stdout"),
             (result.stderr_artifact_digest, "process_stderr"),
         ):
             if digest is not None:
-                descriptor = resolver(digest, logical_kind, result.id)
+                descriptor = resolver(digest, logical_kind, producer_action_id)
                 if not isinstance(descriptor, ArtifactDescriptor):
                     raise TypeError("service returned a non-descriptor artifact reference")
                 descriptors.append(descriptor)

@@ -8,6 +8,7 @@ from pathlib import Path
 from ai_employee.domain.base import freeze_json
 from ai_employee.domain.services_v2 import ArtifactStore, Cancellation, ProcessExecutor
 from ai_employee.domain.v2 import (
+    ArtifactDescriptor,
     ArtifactPutRequest,
     DecisionOutcome,
     InstallRequest,
@@ -194,6 +195,7 @@ class ProjectLocalInstaller:
                 {
                     "inventory_before": len(before),
                     "inventory_after": len(after),
+                    "process_result_id": executed.id,
                     "process_result_digest": executed.content_digest,
                 }
             ),
@@ -201,6 +203,22 @@ class ProjectLocalInstaller:
             stderr_artifact_digest=executed.stderr_artifact_digest,
             inventory_artifact_digest=inventory.artifact_digest,
         )
+
+    def output_descriptor(
+        self,
+        artifact_digest: str,
+        logical_kind: str,
+        producer_execution_id: str,
+    ) -> ArtifactDescriptor:
+        """Resolve output through the exact executor that ran the install."""
+
+        resolver = getattr(self.executor, "output_descriptor", None)
+        if not callable(resolver):
+            raise ValueError("installer executor cannot resolve output provenance")
+        descriptor = resolver(artifact_digest, logical_kind, producer_execution_id)
+        if not isinstance(descriptor, ArtifactDescriptor):
+            raise TypeError("installer executor returned a non-descriptor artifact reference")
+        return descriptor
 
     def _validate(self, request: InstallRequest, decision: PolicyDecision) -> StableFailure | None:
         forbidden = {"-g", "--global", "--user", "sudo"}

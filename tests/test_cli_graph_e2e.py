@@ -39,6 +39,7 @@ from ai_employee.graph_evaluation import (
 from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.orchestration import WorkRun
+from ai_employee.plan_review import PlanReviewAttempt
 from ai_employee.project import discover_project_harness
 from ai_employee.promotion_approval import (
     PromotionApprovalTrustKernel,
@@ -1287,6 +1288,72 @@ def test_cli_simple_goal_selects_cheaper_planner(
     assert proposal.planner_strategy.id == "low"
     assert proposal.planner_routing is not None
     assert proposal.planner_routing.selected_strategy.id == "low"
+
+
+def test_cli_starts_exact_accepted_plan_only_graph_without_replanning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository, operator, database, state = _fixture(tmp_path, task_review=False)
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a.txt",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--db",
+                str(database),
+                "--max-concurrency",
+                "2",
+                "--plan-only",
+            ]
+        )
+        == 0
+    )
+    planned_output = json.loads(capsys.readouterr().out)
+    run_id = planned_output["run_id"]
+    assert planned_output["status"] == "planned"
+
+    with SQLiteStore(database) as store:
+        planned = store.get("graph_run_v2", run_id, GraphRunRecord)
+        proposals_before = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+        reviews_before = store.list_records(
+            "plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id
+        )
+        assessments_before = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+        )
+
+    assert planned.generation == 0
+    assert cli.main(["resume", run_id, "--db", str(database)]) == 0
+    started_output = json.loads(capsys.readouterr().out)
+    assert started_output["status"] == "ready_to_promote"
+
+    with SQLiteStore(database) as store:
+        started = store.get("graph_run_v2", run_id, GraphRunRecord)
+        proposals = store.list_records("proposed_graph_v2", ProposedGraph, run_id=run_id)
+        reviews = store.list_records("plan_review_attempt_v2", PlanReviewAttempt, run_id=run_id)
+        assessments = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run_id
+        )
+        requests = store.list_records("worker_request_v2", WorkerRequest)
+
+    assert started.generation == 0
+    assert [item.content_digest for item in proposals] == [
+        item.content_digest for item in proposals_before
+    ]
+    assert [item.content_digest for item in reviews] == [
+        item.content_digest for item in reviews_before
+    ]
+    assert [item.content_digest for item in assessments] == [
+        item.content_digest for item in assessments_before
+    ]
+    assert sorted(item.node_id for item in requests) == ["a", "b", "c"]
+    assert (state / "a.done").exists()
+    assert (state / "b.done").exists()
+    assert (state / "c.done").exists()
 
 
 def test_cli_explicit_fixed_planner_uses_exact_eligible_strategy(

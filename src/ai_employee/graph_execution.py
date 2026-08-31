@@ -687,6 +687,17 @@ def _authoritative_node_result(
         NonMutatingResultAcceptance,
         run_id=run.id,
     )
+    if worker_result.status != "succeeded":
+        if acceptances:
+            raise ValueError("failed worker result has an unexpected typed-result acceptance")
+        expected_run_status = "cancelled" if worker_result.status == "cancelled" else "failed"
+        if (
+            run.status != expected_run_status
+            or worker_result.failure is None
+            or run.failure_code != worker_result.failure.code.value
+        ):
+            raise ValueError("worker failure is not the authoritative inner-run failure")
+        return NodeExecutionResult(worker_result=worker_result, criterion_evidence=())
     typed_result = worker_result.non_mutating_result
     if typed_result is None:
         if acceptances:

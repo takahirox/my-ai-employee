@@ -43,6 +43,7 @@ from ai_employee.domain.v2 import (
     ProcessRequest,
     PromotionRecord,
     WorkerAvailability,
+    WorkerBoundaryDiagnostic,
     WorkerRequest,
     WorkerResult,
 )
@@ -632,11 +633,15 @@ def test_patchless_descriptor_provenance_failures_are_closed(tmp_path: Path, cas
             available_capabilities=("edit_intent", "process"),
         )
         replay = orchestrator.replay(run.id)
+        diagnostics = store.list_records("worker_boundary_diagnostic_v2", WorkerBoundaryDiagnostic)
 
     assert run.status == "failed"
     assert replay.nodes[0].status == "failed"
     expected_error = "ValidationError" if case == "tampered" else "ValueError"
-    assert replay.nodes[0].failure_code == f"WORKER_BOUNDARY:{expected_error}"
+    assert replay.nodes[0].failure_code == "WORKER_BOUNDARY_ERROR"
+    assert len(diagnostics) == 1
+    assert diagnostics[0].code == "WORKER_BOUNDARY_ERROR"
+    assert diagnostics[0].exception_type == expected_error
 
 
 @pytest.mark.parametrize("case", ["duplicate_kind", "missing_descriptor_digest"])

@@ -26,7 +26,13 @@ from ai_employee.domain import (
     SemanticTaskType,
 )
 from ai_employee.domain.models import NodeResourceBudget
-from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
+from ai_employee.domain.v2 import (
+    CriterionEvidence,
+    StableFailureCode,
+    WorkerBoundaryDiagnostic,
+    WorkerRequest,
+    WorkerResult,
+)
 from ai_employee.graph import GraphValidationError, accept_task_graph
 from ai_employee.inspector import inspect_any_run, inspect_graph_run
 from ai_employee.plan_review import (
@@ -1016,6 +1022,80 @@ def test_tampered_review_binding_fails_replay_and_resume(tmp_path: Path) -> None
         assert inspect_graph_run(store, run.id)["plan_review"]["status"] == "failed"
 
 
+def test_authoritative_plan_only_graph_starts_without_review(tmp_path: Path) -> None:
+    goal = Goal(id="planned-start-goal", statement="start the accepted plan")
+    graph = one_node_graph(
+        goal,
+        graph_id="planned-start-graph",
+        node_id="a",
+        required_capabilities=("process",),
+        max_wall_seconds=30.0,
+    )
+    events: list[str] = []
+    requests: list[WorkerRequest] = []
+    reviewer = _ScriptedPlanReviewer(_strategy(), {0: ()}, events)
+
+    def runner(
+        node: Node, request: WorkerRequest, _strategy_value: ExecutionStrategy
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="planned-start-result",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id=node.completion_criteria[0].id,
+                    disposition="satisfied",
+                    evidence_refs=(ZERO,),
+                ),
+            ),
+        )
+
+    policy = ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=30.0)
+    with SQLiteStore(tmp_path / "planned-start.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            runner,
+            (_strategy(),),
+            plan_reviewer=reviewer,
+            plan_reviser=_ScriptedPlanReviser(_strategy(), graph, events),
+        )
+        planned = orchestrator.run(
+            goal,
+            _review_proposal("planned-start", goal, graph),
+            policy,
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="planned-start",
+            available_capabilities=("process",),
+            plan_only=True,
+        )
+        started = orchestrator.run(
+            goal,
+            graph,
+            policy,
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id=planned.id,
+            available_capabilities=("process",),
+            resume=True,
+        )
+        replay = orchestrator.replay(started.id)
+
+    assert started.status == "completed"
+    assert started.generation == 0
+    assert len(requests) == 1
+    assert events == ["review-0"]
+    assert len(replay.review_attempts) == 1
+    assert replay.controls == ()
+
+
 def test_invalid_initial_graph_never_invokes_optional_reviewer(tmp_path: Path) -> None:
     events: list[str] = []
     goal = Goal(id="invalid-review-goal", statement="reject the invalid graph")
@@ -1383,7 +1463,7 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
     ) -> NodeExecutionResult:
         requests.append(request)
         if request.attempt == 0:
-            raise RuntimeError("transient worker boundary")
+            raise RuntimeError("token=supersecret transient worker boundary")
         return NodeExecutionResult(
             worker_result=WorkerResult(
                 id=f"worker-result-{request.attempt}",
@@ -1440,6 +1520,10 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
             available_capabilities=("process",),
         )
         replay = orchestrator.replay(run.id)
+        diagnostics = store.list_records(
+            "worker_boundary_diagnostic_v2", WorkerBoundaryDiagnostic, run_id=run.id
+        )
+        inspected = inspect_graph_run(store, run.id)
 
     assert run.status == "completed"
     assert [item.attempt for item in requests] == [0, 1]
@@ -1456,6 +1540,17 @@ def test_worker_boundary_retries_once_with_new_attempt_authority(
     assert all(not item.conversation_history_included for item in replay.context_manifests)
     assert all(item.assessment.semantic_profile is not None for item in replay.routes)
     assert len({item.id for item in replay.routes}) == 2
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.code == StableFailureCode.WORKER_BOUNDARY_ERROR.value
+    assert diagnostic.stage == "runner"
+    assert diagnostic.retryable is True
+    assert diagnostic.exception_type == "RuntimeError"
+    assert diagnostic.exception_message is not None
+    assert "supersecret" not in diagnostic.exception_message
+    assert "<redacted>" in diagnostic.exception_message
+    assert diagnostic.worker_result_id is None
+    assert inspected["worker_boundary_diagnostics"] == [diagnostic.model_dump(mode="json")]
 
 
 @pytest.mark.parametrize("failure_kind", ["evaluator", "budget"])
@@ -1517,8 +1612,17 @@ def test_evaluator_failure_and_exhausted_resources_do_not_retry(
             available_capabilities=("process",),
         )
         replay = orchestrator.replay(run.id)
+        diagnostics = store.list_records(
+            "worker_boundary_diagnostic_v2", WorkerBoundaryDiagnostic, run_id=run.id
+        )
 
     assert run.status == "failed"
     assert len(requests) == 1
     assert len(replay.routes) == 1
     assert len(replay.reservations) == 1
+    if failure_kind == "budget":
+        assert run.failure_code == StableFailureCode.WORKER_BOUNDARY_ERROR.value
+        assert len(diagnostics) == 1
+        assert diagnostics[0].retryable is False
+    else:
+        assert diagnostics == ()
