@@ -281,13 +281,19 @@ forensic projection. The local Inspector exposes the same summary at
 `/api/runs/RUN_ID/explanation`.
 
 Start the browser Inspector with `fleet serve` (or `fleet serve --db PATH`). Its repository
-selector filters runs from the shared database by their persisted repository identity.
-The dependency-free DAG view shows entry and terminal tasks, parallel branches, persisted
-task states and remaining work. Selecting a task opens its persisted criteria, routing and
-predecessor context,
-attempts, results, evidence, reviews, and loop decisions. Accepted revisions can be
-selected for historical replan comparison; raw Inspector and explanation JSON remain
-available in adjacent tabs. Loading, revision selection, and refresh perform GETs only.
+selector filters runs from the shared database by their persisted repository identity. The
+default Fleet overview separates currently active runs from terminal History and shows each
+run's persisted goal, repository, authoritative status, completed/total graph progress, active
+task or phase, and attention conditions. The same read-only projection is available at
+`/api/overview`, with an optional `repository_id` query parameter.
+
+Selecting a run drills into its dependency-free DAG view, which shows entry and terminal tasks,
+parallel branches, persisted task states, and remaining work. Selecting a task opens its
+persisted criteria, routing and predecessor context, attempts, results, evidence, reviews, and
+loop decisions. The Fleet overview button returns to the run list. Accepted revisions can be
+selected for historical replan comparison; raw Inspector and explanation JSON remain available
+in adjacent tabs. Overview loading, drill-down, return navigation, revision selection, and
+refresh perform GETs only.
 
 While the page is open, a dependency-free `EventSource` GET listens for bounded,
 freshness-only notifications. One Inspector process and its SSE monitor observe exactly one

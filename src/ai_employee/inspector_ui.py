@@ -79,6 +79,60 @@ margin-bottom:.8rem}
 color:var(--muted)}
 .tabs button[aria-selected=true]{
 background:#29496f}
+.overview-head{
+display:flex;
+justify-content:space-between;
+align-items:center;
+gap:1rem;
+margin-bottom:1rem}
+.run-grid{
+display:grid;
+grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+gap:.8rem;
+margin-bottom:1.4rem}
+.run-card{
+display:block;
+width:100%;
+text-align:left;
+background:var(--panel);
+border:1px solid #293752;
+border-radius:10px;
+padding:1rem}
+.run-card:hover,
+.run-card:focus-visible{
+border-color:#60a5fa}
+.run-card.attention-card{
+border-color:#f59e0b;
+background:#211d19}
+.run-card h3{
+margin:0 0 .45rem;
+font-size:1rem}
+.run-card dl{
+display:grid;
+grid-template-columns:7rem 1fr;
+gap:.3rem .6rem;
+margin:.8rem 0 0}
+.run-card dt{
+color:var(--muted)}
+.run-card dd{
+margin:0;
+overflow-wrap:anywhere}
+.attention{
+color:#ffcf86}
+.empty{
+padding:1rem;
+border:1px dashed #42516d;
+border-radius:8px;
+color:var(--muted)}
+details.history{
+margin-top:1rem}
+details.history>summary{
+cursor:pointer;
+font-size:1.25rem;
+font-weight:700;
+margin-bottom:.8rem}
+#back-to-fleet{
+margin-bottom:.8rem}
 .workspace{
 display:grid;
 grid-template-columns:minmax(520px,
@@ -218,19 +272,27 @@ width:45vw}
 <option value="">All repositories</option>
 </select>
 </label>
-<select id="run-list" aria-label="Persisted runs">
-<option value="">Select a persisted run</option>
-</select>
-<input id="run" placeholder="Run ID" aria-label="Run ID">
-<button id="inspect">Inspect</button>
 <button id="refresh">Refresh latest persisted state</button>
 </header>
 <main>
-<div id="message" class="muted">Enter a persisted run ID. Inspection never invokes workers,
+<div id="message" class="muted">Loading persisted Fleet runs. Inspection never invokes workers,
 planners,
 reviewers,
 or evaluators.</div>
+<section id="fleet-overview">
+<div class="overview-head">
+<h2>Fleet runs</h2>
+<span class="muted">Select a run to inspect its graph and tasks.</span>
+</div>
+<h2>Active <span id="active-count" class="muted"></span></h2>
+<div id="active-runs" class="run-grid"></div>
+<details id="history-section" class="history">
+<summary>History <span id="history-count" class="muted"></span></summary>
+<div id="history-runs" class="run-grid"></div>
+</details>
+</section>
 <section id="app" class="hidden">
+<button id="back-to-fleet">← Fleet overview</button>
 <div class="toolbar">
 <label>Graph revision <select id="revision">
 </select>
@@ -285,6 +347,8 @@ story=null,
 selectedRevision=null,
 selectedTask=null,
 selectedTab='dag',
+selectedRun=null,
+overview=null,
 eventSource=null,
 reconnectFailures=0,
 refreshQueued=false,
@@ -314,28 +378,68 @@ $('#message').textContent=value;
 $('#message').className=error?
 'error':'muted'}
 
-async function filterRunList(){
-const repository=$('#repository-filter').value,
-selectedRun=$('#run-list').value||
-$('#run').value.trim(),
-suffix=repository?
-'?repository_id='+encodeURIComponent(repository):'',
-payload=await getJSON('/api/runs'+suffix),
-runs=maps(payload.runs),
-placeholder=document.createElement('option');
-placeholder.value='';
-placeholder.textContent='Select a persisted run';
-$('#run-list').replaceChildren(placeholder,
-...runs.map(item=>{
-const option=document.createElement('option');
-option.value=item.run_id;
-option.textContent=item.run_id+
-(item.repository?
-' · '+item.repository:' · legacy/unassigned');
-return option}
-));
-if(runs.some(item=>item.run_id===selectedRun))$('#run-list').value=selectedRun;
-message('Repository filter matched '+runs.length+' persisted run(s).')}
+function showOverview(){
+selectedRun=null;
+$('#app').classList.add('hidden');
+$('#fleet-overview').classList.remove('hidden');
+history.replaceState(null,'',location.pathname);
+}
+
+function openRun(id){
+selectedRun=id;
+load();
+}
+
+function renderRunGroup(rootId,runs,emptyLabel){
+const root=$('#'+rootId);
+root.replaceChildren();
+if(!runs.length){
+const empty=document.createElement('p');
+empty.className='empty';
+empty.textContent=emptyLabel;
+root.append(empty);
+return}
+for(const run of runs){
+const card=document.createElement('button');
+card.className='run-card';
+card.classList.toggle('attention-card',Boolean(run.requires_attention));
+const title=document.createElement('h3');
+title.textContent=run.goal||run.run_id;
+const repository=document.createElement('div');
+repository.className='muted';
+repository.textContent=run.repository||'Legacy / unassigned repository';
+const details=document.createElement('dl');
+for(const [label,value] of [
+['Status',run.status],
+['Progress',run.progress.completed+' / '+run.progress.total],
+['Active task',run.active_task],
+['Phase',run.phase],
+['Attention',run.attention.length?
+run.attention.map(x=>x.task_id?
+x.task_id+': '+x.condition:x.condition).join(', '):
+'None persisted']]){
+const dt=document.createElement('dt'),dd=document.createElement('dd');
+dt.textContent=label;
+dd.textContent=text(value);
+if(label==='Attention'&&run.attention.length)dd.className='attention';
+details.append(dt,dd)}
+card.append(title,repository,details);
+card.addEventListener('click',()=>openRun(run.run_id));
+root.append(card)}
+}
+
+async function loadOverview(){
+const repository=$('#repository-filter').value;
+const suffix=repository?'?repository_id='+encodeURIComponent(repository):'';
+overview=await getJSON('/api/overview'+suffix);
+renderRunGroup('active-runs',maps(overview.active),'No active Fleet runs.');
+renderRunGroup('history-runs',maps(overview.history),'No historical Fleet runs.');
+$('#active-count').textContent='('+maps(overview.active).length+')';
+$('#history-count').textContent='('+maps(overview.history).length+')';
+message('Showing '+maps(overview.active).length+
+' active and '+maps(overview.history).length+
+' historical run(s).');
+}
 
 async function refreshRunCatalog(){
 const selected=$('#repository-filter').value,
@@ -356,11 +460,11 @@ option.textContent=repository;
 return option}
 ));
 if(repositories.has(selected))$('#repository-filter').value=selected;
-await filterRunList()}
+await loadOverview()}
 
 async function load(preserve=false){
-const id=$('#run').value.trim();
-if(!id)return message('Enter a run ID.',
+const id=selectedRun;
+if(!id)return message('Select a persisted run.',
 true);
 message('Loading latest persisted records…');
 try{
@@ -379,10 +483,9 @@ revisions.find(x=>x.digest===selectedRevision.digest):
 revisions.at(-1)||
 null);
 $('#app').classList.remove('hidden');
+$('#fleet-overview').classList.add('hidden');
 message('Loaded persisted state. Refresh is read only.');
 render();
-if(Array.from($('#run-list').options).some(option=>option.value===id))
-$('#run-list').value=id;
 history.replaceState(null,
 '',
 '?run='+
@@ -869,7 +972,7 @@ try{
 while(refreshQueued){
 refreshQueued=false;
 await refreshRunCatalog();
-if($('#run').value.trim())await load(true)}
+if(!$('#app').classList.contains('hidden')&&selectedRun)await load(true)}
 }
 catch(error){
 message(error.message,
@@ -902,19 +1005,14 @@ disconnected?
 'Disconnected':'Reconnecting')};
 }
 
-$('#inspect').addEventListener('click',
-()=>load());
 $('#refresh').addEventListener('click',
-()=>load(true));
+()=>refreshFreshState());
+$('#back-to-fleet').addEventListener('click',showOverview);
 $('#repository-filter').addEventListener('change',
-()=>filterRunList().catch(error=>message(error.message,
-true)));
-$('#run-list').addEventListener('change',
-event=>{
-if(!event.target.value)return;
-$('#run').value=event.target.value;
-load()}
-);
+()=>{
+showOverview();
+loadOverview().catch(error=>message(error.message,
+true))});
 $('#revision').addEventListener('change',
 event=>{
 selectedRevision=maps(story.graph?.evolution).find(x=>x.digest===event.target.value)||
@@ -922,17 +1020,12 @@ null;
 selectedTask=null;
 render()}
 );
-$('#run').addEventListener('keydown',
-event=>{
-if(event.key==='Enter')load()}
-);
 for(const button of document.querySelectorAll('[data-tab]'))button.addEventListener('click',
 ()=>selectTab(button.dataset.tab));
 const initial=new URLSearchParams(location.search).get('run');
-if(initial){
-$('#run').value=initial;
-load()}
-refreshRunCatalog().catch(error=>message(error.message,
+if(initial)selectedRun=initial;
+else showOverview();
+refreshRunCatalog().then(()=>initial?load():undefined).catch(error=>message(error.message,
 true)).finally(()=>connectEvents());
 window.addEventListener('beforeunload',
 ()=>{
