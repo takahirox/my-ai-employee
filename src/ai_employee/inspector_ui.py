@@ -161,13 +161,16 @@ color:var(--muted)}
 .details h2{
 font-size:1rem;
 margin-top:0}
-.details details{
+.details details,
+#revision-story details{
 border-top:1px solid #293752;
 padding:.6rem 0}
-.details summary{
+.details summary,
+#revision-story summary{
 cursor:pointer;
 font-weight:600}
 .details pre,
+#revision-story pre,
 .raw{
 white-space:pre-wrap;
 overflow-wrap:anywhere;
@@ -217,7 +220,7 @@ reviewers,
 or evaluators.</div>
 <section id="app" class="hidden">
 <div class="toolbar">
-<label>Accepted revision <select id="revision">
+<label>Graph revision <select id="revision">
 </select>
 </label>
 <span id="history" class="badge">
@@ -327,11 +330,17 @@ message(error.message,
 true)}
 }
 
-function currentRevision(){
+function latestRevisionSelected(){
 return !selectedRevision||
 selectedRevision.digest===story.graph?.digest}
+function graphAccepted(){
+return story.source_kind==='legacy_run'||
+story.graph?.accepted===true}
+function currentRevision(){
+return graphAccepted()&&
+latestRevisionSelected()}
 function revisionTasks(){
-return currentRevision()?
+return latestRevisionSelected()?
 maps(story.graph?.tasks):maps(selectedRevision?.tasks)}
 function graphRecord(){
 const accepted=maps(raw.graph_revisions).map(x=>x.accepted_revision).find(
@@ -358,13 +367,15 @@ option.textContent='Revision '+
 (item.revision??
 'unaccepted')+
 (item.digest===story.graph?.digest?
-' · current':' · historical');
+(graphAccepted()?
+' · current accepted':' · current unaccepted'):' · historical accepted');
 option.selected=item.digest===(selectedRevision?.digest||
 story.graph?.digest);
 return option}
 ));
-$('#history').textContent=currentRevision()?
-'Current accepted revision':'Historical accepted revision';
+$('#history').textContent=latestRevisionSelected()?
+(graphAccepted()?
+'Current accepted revision':'Current unaccepted proposal'):'Historical accepted revision';
 const remaining=revisionTasks().filter(x=>position(x)!=='completed').map(x=>x.id);
 $('#summary').textContent='Run '+
 story.run_id+
@@ -394,7 +405,7 @@ changes=[['Added',
 'removed_task_ids'],
 ['Retained',
 'retained_task_ids'],
-['Replaced or rerun',
+['Redone (replacement or rerun not distinguished)',
 'redone_task_ids']];
 root.replaceChildren();
 const p=document.createElement('p');
@@ -416,7 +427,19 @@ document.createTextNode((item[key]||
 []).join(', ')||
 'None recorded'));
 boxes.append(box)}
-root.append(boxes)}
+root.append(boxes);
+add(root,
+'Revision provenance',
+{
+triggered_by_task_ids:item.triggered_by_task_ids||
+[],
+evidence_digests:item.evidence_digests||
+[],
+added_task_summaries:item.added_task_summaries||
+[],
+removed_task_summaries:item.removed_task_summaries||
+[]}
+)}
 
 function position(task){
 const status=task.execution_state||
@@ -469,7 +492,7 @@ dependencies=task.dependencies?.length?
 task.dependencies:maps(record.edges).filter(x=>x.target_id===id).map(x=>x.source_id),
 digest=selectedRevision?.digest||
 story.graph?.digest,
-nodeStory=currentRevision()?
+nodeStory=latestRevisionSelected()?
 maps(story.task_stories).find(x=>x.task_id===id)||
 {
 }
@@ -479,6 +502,15 @@ maps(story.task_stories).find(x=>x.task_id===id)||
 records=name=>maps(raw[name]).filter(x=>x.node_id===id&&
 x.accepted_graph_revision_digest===digest),
 attempts=records('node_history'),
+stateReasons=Array.isArray(nodeStory.why_this_state)&&
+nodeStory.why_this_state.length?
+nodeStory.why_this_state:attempts.map(x=>({
+status:x.status,
+failure_code:x.failure_code,
+generation:x.generation,
+attempt:x.attempt,
+sequence:x.sequence}
+)),
 resultDigests=new Set(attempts.map(x=>x.worker_result_digest).filter(Boolean)),
 reviews=raw.task_reviews||
 {
@@ -504,8 +536,7 @@ definition.state||
 position:position(task),
 style_state:style(task),
 details:{
-state_reason:nodeStory.why_this_state||
-[],
+state_reason:stateReasons,
 routing:records('routes').length?
 records('routes'):nodeStory.routing,
 predecessor_context:records('worker_context_manifests').length?
