@@ -209,6 +209,13 @@ width:45vw}
 <header>
 <h1>Fleet Inspector</h1>
 <span class="badge readonly">Read only</span>
+<label>Repository <select id="repository-filter" aria-label="Repository filter">
+<option value="">All repositories</option>
+</select>
+</label>
+<select id="run-list" aria-label="Persisted runs">
+<option value="">Select a persisted run</option>
+</select>
 <input id="run" placeholder="Run ID" aria-label="Run ID">
 <button id="inspect">Inspect</button>
 <button id="refresh">Refresh latest persisted state</button>
@@ -296,6 +303,47 @@ error=false){
 $('#message').textContent=value;
 $('#message').className=error?
 'error':'muted'}
+
+async function filterRunList(){
+const repository=$('#repository-filter').value,
+suffix=repository?
+'?repository_id='+encodeURIComponent(repository):'',
+payload=await getJSON('/api/runs'+suffix),
+runs=maps(payload.runs),
+placeholder=document.createElement('option');
+placeholder.value='';
+placeholder.textContent='Select a persisted run';
+$('#run-list').replaceChildren(placeholder,
+...runs.map(item=>{
+const option=document.createElement('option');
+option.value=item.run_id;
+option.textContent=item.run_id+
+(item.repository?
+' · '+item.repository:' · legacy/unassigned');
+return option}
+));
+message('Repository filter matched '+runs.length+' persisted run(s).')}
+
+async function refreshRunCatalog(){
+const selected=$('#repository-filter').value,
+payload=await getJSON('/api/runs'),
+repositories=new Map();
+for(const item of maps(payload.runs))if(item.repository_id&&
+item.repository)repositories.set(item.repository_id,
+item.repository);
+const all=document.createElement('option');
+all.value='';
+all.textContent='All repositories';
+$('#repository-filter').replaceChildren(all,
+...Array.from(repositories.entries()).map(([id,
+repository])=>{
+const option=document.createElement('option');
+option.value=id;
+option.textContent=repository;
+return option}
+));
+if(repositories.has(selected))$('#repository-filter').value=selected;
+await filterRunList()}
 
 async function load(preserve=false){
 const id=$('#run').value.trim();
@@ -793,6 +841,15 @@ $('#inspect').addEventListener('click',
 ()=>load());
 $('#refresh').addEventListener('click',
 ()=>load(true));
+$('#repository-filter').addEventListener('change',
+()=>filterRunList().catch(error=>message(error.message,
+true)));
+$('#run-list').addEventListener('change',
+event=>{
+if(!event.target.value)return;
+$('#run').value=event.target.value;
+load()}
+);
 $('#revision').addEventListener('change',
 event=>{
 selectedRevision=maps(story.graph?.evolution).find(x=>x.digest===event.target.value)||
@@ -810,6 +867,8 @@ const initial=new URLSearchParams(location.search).get('run');
 if(initial){
 $('#run').value=initial;
 load()}
+refreshRunCatalog().catch(error=>message(error.message,
+true));
 
 </script>
 </body>

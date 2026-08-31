@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -28,19 +30,98 @@ from .serialization import canonical_json
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
+_RUN_ID_TABLES = (
+    "records",
+    "events",
+    "checkpoints",
+    "controls",
+    "work_events_v2",
+    "work_checkpoints_v2",
+    "graph_claims_v2",
+    "graph_reservations_v2",
+)
+
+
+def _existing_run_id_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+            + ",".join("?" for _item in _RUN_ID_TABLES)
+            + ")",
+            _RUN_ID_TABLES,
+        )
+    }
+    return tuple(table for table in _RUN_ID_TABLES if table in existing)
+
+
+def _repository_details(repository: str | Path) -> tuple[str, str]:
+    """Return a stable local identity and display path for a repository."""
+
+    root = Path(repository).expanduser().resolve()
+    anchor = root
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        anchor = dot_git.resolve()
+    elif dot_git.is_file():
+        lines = dot_git.read_text(encoding="utf-8").splitlines()
+        if lines and lines[0].startswith("gitdir: "):
+            git_directory = Path(lines[0].removeprefix("gitdir: "))
+            if not git_directory.is_absolute():
+                git_directory = (root / git_directory).resolve()
+            common_directory = git_directory / "commondir"
+            anchor = (
+                (git_directory / common_directory.read_text(encoding="utf-8").strip()).resolve()
+                if common_directory.is_file()
+                else git_directory.resolve()
+            )
+    digest = hashlib.sha256(f"fleet-repository-v1\0{anchor}".encode()).hexdigest()
+    return digest, str(root)
+
+
+def _prepare_database_file(path: Path) -> None:
+    """Create a private, non-symlink SQLite target and any missing parents."""
+
+    missing: list[Path] = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
 
 class SQLiteStore:
     """Small vendor-neutral storage API backed by SQLite by default."""
 
-    def __init__(self, path: str | Path = ".fleet/fleet.db") -> None:
-        self.path = str(path)
+    def __init__(self, path: str | Path = "~/.fleet/fleet.db") -> None:
+        self.path = str(Path(path).expanduser()) if str(path) != ":memory:" else ":memory:"
         if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA busy_timeout = 10000")
-        self._create_schema()
+            _prepare_database_file(Path(self.path))
+        self._connection = sqlite3.connect(self.path, timeout=10.0)
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA busy_timeout = 10000")
+            if self.path != ":memory:":
+                journal = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                if journal is None or str(journal[0]).lower() != "wal":
+                    raise RuntimeError("Fleet database does not support required WAL journaling")
+            self._create_schema()
+            if self.path != ":memory:":
+                os.chmod(self.path, 0o600)
+        except BaseException:
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         self._connection.close()
@@ -104,6 +185,17 @@ class SQLiteStore:
                 run_id TEXT PRIMARY KEY,
                 action TEXT NOT NULL CHECK(action IN ('pause', 'cancel'))
             );
+            CREATE TABLE IF NOT EXISTS repositories (
+                repository_id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS run_repositories (
+                run_id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                FOREIGN KEY(repository_id) REFERENCES repositories(repository_id)
+            );
+            CREATE INDEX IF NOT EXISTS run_repositories_repository
+                ON run_repositories(repository_id, run_id);
             """
         )
         with self._connection:
@@ -230,6 +322,79 @@ class SQLiteStore:
 
     def save_run(self, run: Run) -> None:
         self.put("run", run, run_id=run.id, revision=run.generation + 1)
+
+    def claim_run_id(self, run_id: str, repository: str | Path) -> None:
+        """Atomically bind a new run ID to one repository without overwriting history."""
+
+        repository_id, normalized = _repository_details(repository)
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            claimed = connection.execute(
+                "SELECT 1 FROM run_repositories WHERE run_id=?", (run_id,)
+            ).fetchone()
+            persisted = any(
+                connection.execute(
+                    f"SELECT 1 FROM {table} WHERE run_id=? LIMIT 1", (run_id,)
+                ).fetchone()
+                is not None
+                for table in _existing_run_id_tables(connection)
+            )
+            if claimed is not None or persisted:
+                raise ValueError(f"run ID {run_id!r} already exists; choose a different --run-id")
+            connection.execute(
+                "INSERT OR IGNORE INTO repositories(repository_id,repository) VALUES(?,?)",
+                (repository_id, normalized),
+            )
+            connection.execute(
+                "INSERT INTO run_repositories(run_id,repository_id) VALUES(?,?)",
+                (run_id, repository_id),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def repository_for_run(self, run_id: str) -> dict[str, str] | None:
+        row = self._connection.execute(
+            "SELECT repositories.repository_id,repositories.repository "
+            "FROM run_repositories JOIN repositories USING(repository_id) "
+            "WHERE run_repositories.run_id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"repository_id": str(row[0]), "repository": str(row[1])}
+
+    def list_run_repositories(
+        self, repository_id: str | None = None
+    ) -> tuple[dict[str, str | None], ...]:
+        """List registered and legacy run IDs, optionally filtered by repository."""
+
+        run_sources = ["SELECT run_id FROM run_repositories"]
+        run_sources.extend(
+            f"SELECT DISTINCT run_id FROM {table} WHERE run_id IS NOT NULL"
+            for table in _existing_run_id_tables(self._connection)
+        )
+        rows = self._connection.execute(
+            "WITH run_ids(run_id) AS ("
+            + " UNION ".join(run_sources)
+            + ") SELECT run_ids.run_id,run_repositories.repository_id,repositories.repository "
+            "FROM run_ids "
+            "LEFT JOIN run_repositories USING(run_id) "
+            "LEFT JOIN repositories USING(repository_id) "
+            "WHERE (? IS NULL OR run_repositories.repository_id=?) "
+            "ORDER BY COALESCE(repositories.repository,''),run_ids.run_id",
+            (repository_id, repository_id),
+        )
+        return tuple(
+            {
+                "run_id": str(row[0]),
+                "repository_id": None if row[1] is None else str(row[1]),
+                "repository": None if row[2] is None else str(row[2]),
+            }
+            for row in rows
+        )
 
     def save_graph(self, run_id: str, revision: AcceptedGraphRevision) -> None:
         self.put("graph", revision, run_id=run_id, revision=revision.revision_number)

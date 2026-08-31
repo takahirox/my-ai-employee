@@ -15,6 +15,7 @@ from typing import Literal, cast
 
 from . import __version__
 from .config import OperatorConfig, WorkerName, load_operator_config
+from .database import resolve_database_path
 from .demo import run_demo
 from .domain import (
     CompletionCriterion,
@@ -158,14 +159,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     demo = commands.add_parser("demo", help="run the deterministic offline demonstration")
-    demo.add_argument("--db", default=".fleet/fleet.db")
+    demo.add_argument("--db")
     demo.add_argument("--run-id", default=None)
 
     run = commands.add_parser("run", help="run a declarative YAML/JSON graph")
     run.add_argument("graph")
     run.add_argument("--goal", default="Execute the accepted declarative graph")
     run.add_argument("--run-id", default=None)
-    run.add_argument("--db", default=".fleet/fleet.db")
+    run.add_argument("--db")
     run.add_argument("--pause-after", type=int)
 
     evaluate = commands.add_parser(
@@ -183,34 +184,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = commands.add_parser("inspect", help="inspect a persisted run")
     inspect.add_argument("run_id")
-    inspect.add_argument("--db", default=".fleet/fleet.db")
+    inspect.add_argument("--db")
 
     explain = commands.add_parser(
         "explain", help="explain one persisted run as a coherent read-only story"
     )
     explain.add_argument("run_id")
-    explain.add_argument("--db", default=".fleet/fleet.db")
+    explain.add_argument("--db")
 
     replay = commands.add_parser("replay", help="replay stored control flow without workers")
     replay.add_argument("run_id")
-    replay.add_argument("--db", default=".fleet/fleet.db")
+    replay.add_argument("--db")
 
     resume = commands.add_parser("resume", help="resume a paused run")
     resume.add_argument("run_id")
-    resume.add_argument("--db", default=".fleet/fleet.db")
+    resume.add_argument("--db")
 
     for name in ("pause", "cancel"):
         control = commands.add_parser(name, help=f"request {name} at the next node boundary")
         control.add_argument("run_id")
-        control.add_argument("--db", default=".fleet/fleet.db")
+        control.add_argument("--db")
 
     compare = commands.add_parser("compare", help="compare two stored runs and strategies")
     compare.add_argument("left_run_id")
     compare.add_argument("right_run_id")
-    compare.add_argument("--db", default=".fleet/fleet.db")
+    compare.add_argument("--db")
 
     server = commands.add_parser("serve", help="serve the read-only local Inspector")
-    server.add_argument("--db", default=".fleet/fleet.db")
+    server.add_argument("--db")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
 
@@ -262,36 +263,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work.add_argument("--non-interactive", action="store_true")
     work.add_argument("--json", action="store_true")
-    work.add_argument("--db", default=".fleet/fleet.db")
+    work.add_argument("--db")
 
     approvals = commands.add_parser("approvals", help="manage digest-bound approvals")
     approval_commands = approvals.add_subparsers(dest="approval_command", required=True)
     approval_list = approval_commands.add_parser("list")
     approval_list.add_argument("--run")
-    approval_list.add_argument("--db", default=".fleet/fleet.db")
+    approval_list.add_argument("--db")
     approval_show = approval_commands.add_parser("show")
     approval_show.add_argument("approval_id")
-    approval_show.add_argument("--db", default=".fleet/fleet.db")
+    approval_show.add_argument("--db")
     for decision in ("approve", "deny"):
         approval_decide = approval_commands.add_parser(decision)
         approval_decide.add_argument("approval_id")
         approval_decide.add_argument("--request-digest", required=True)
-        approval_decide.add_argument("--db", default=".fleet/fleet.db")
+        approval_decide.add_argument("--db")
 
     logs = commands.add_parser("logs", help="show durable v0.2 events")
     logs.add_argument("run_id")
     logs.add_argument("--follow", action="store_true")
-    logs.add_argument("--db", default=".fleet/fleet.db")
+    logs.add_argument("--db")
 
     diff = commands.add_parser("diff", help="show the exact captured work-run patch")
     diff.add_argument("run_id")
     diff.add_argument("--stat", action="store_true")
-    diff.add_argument("--db", default=".fleet/fleet.db")
+    diff.add_argument("--db")
 
     promote = commands.add_parser("promote", help="apply an explicitly approved exact patch")
     promote.add_argument("run_id")
     promote.add_argument("--patch-digest", required=True)
-    promote.add_argument("--db", default=".fleet/fleet.db")
+    promote.add_argument("--db")
     return parser
 
 
@@ -309,10 +310,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(canonical_json(discover_project(args.root)))
         return 0
-    if args.command == "work":
-        return _work(args)
     if args.command == "eval":
         return _eval(args)
+    args.db = str(resolve_database_path(args.db))
+    if args.command == "work":
+        return _work(args)
     with SQLiteStore(args.db) as store:
         if args.command == "approvals":
             return _approvals(store, args)
@@ -326,6 +328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _promote(store, args)
         if args.command == "demo":
             run_id = args.run_id or f"demo-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+            store.claim_run_id(run_id, Path.cwd())
             outcome = run_demo(store, run_id=run_id)
             print(
                 canonical_json(
@@ -339,6 +342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "run":
             graph = loads_yaml_model(Path(args.graph).read_text(encoding="utf-8"), Graph)
             run_id = args.run_id or f"run-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+            store.claim_run_id(run_id, Path.cwd())
             policy = ExecutionPolicy(
                 max_nodes=graph.budget.max_nodes,
                 max_attempts=graph.budget.max_attempts,
@@ -778,7 +782,7 @@ def _work(args: argparse.Namespace) -> int:
         if assessment_strategy is None
         else operator_config.worker_command(cast(WorkerName, assessment_strategy.backend))
     )
-    db_path = Path(args.db)
+    db_path = Path(args.db).expanduser()
     storage_root = db_path.resolve().parent
     workspace_root = repository.parent / f".fleet-{repository.name}" / "workspaces"
     artifacts = AtomicArtifactStore(storage_root / "artifacts")
@@ -810,6 +814,8 @@ def _work(args: argparse.Namespace) -> int:
         add_executable_path(command.argv[0])
 
     with SQLiteStore(db_path) as store:
+        if resume_run is None:
+            store.claim_run_id(run_id, repository)
 
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(

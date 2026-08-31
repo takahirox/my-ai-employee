@@ -29,9 +29,11 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "explanation",
         "graph",
         "raw",
+        "repository-filter",
         "revision",
         "revision-story",
         "run",
+        "run-list",
         "summary",
     }
     assert document.tabs == {"dag", "raw", "explanation"}
@@ -43,6 +45,7 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "Run explanation record",
         "taskView",
         "renderGraph",
+        "Repository filter",
         "Typed result acceptances",
     ):
         assert marker in _INDEX
