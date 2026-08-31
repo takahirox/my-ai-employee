@@ -41,6 +41,7 @@ class StableFailureCode(StableStrEnum):
     APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     INVALID_REQUEST = "INVALID_REQUEST"
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+    ARTIFACT_BUDGET_INVALID = "ARTIFACT_BUDGET_INVALID"
     TIMEOUT = "TIMEOUT"
     CANCELLED = "CANCELLED"
     SPAWN_FAILED = "SPAWN_FAILED"
@@ -53,6 +54,9 @@ class StableFailureCode(StableStrEnum):
     HOST_INSTALL_DENIED = "HOST_INSTALL_DENIED"
     WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
     WORKER_PROTOCOL_ERROR = "WORKER_PROTOCOL_ERROR"
+    WORKER_EMPTY_OUTPUT = "WORKER_EMPTY_OUTPUT"
+    WORKER_STRUCTURED_OUTPUT_MISSING = "WORKER_STRUCTURED_OUTPUT_MISSING"
+    WORKER_BOUNDARY_ERROR = "WORKER_BOUNDARY_ERROR"
     CONTEXT_INSUFFICIENT = "CONTEXT_INSUFFICIENT"
     TYPED_RESULT_MALFORMED = "TYPED_RESULT_MALFORMED"
     TYPED_RESULT_UNBOUND = "TYPED_RESULT_UNBOUND"
@@ -323,8 +327,8 @@ class PredecessorOutputReference(SchemaModelV2):
     generation: int = Field(ge=0)
     result_generation: int = Field(ge=0)
     attempt: int = Field(ge=0)
-    worker_result_id: Identifier
-    worker_result_digest: Digest
+    worker_result_id: Identifier | None = None
+    worker_result_digest: Digest | None = None
     artifact_descriptor_id: Identifier | None = None
     artifact_descriptor_digest: Digest | None = None
     artifact_digest: Digest | None = None
@@ -754,12 +758,51 @@ class WorkerAvailability(DigestedRecordV2):
     failure: StableFailure | None = None
 
 
+class WorkerBoundaryDiagnostic(DigestedRecordV2):
+    """Sanitized, bounded provenance for one worker-boundary failure."""
+
+    schema_name: ClassVar[str] = "worker_boundary_diagnostic"
+    adapter: Identifier
+    stage: Literal["probe", "process", "transport", "envelope", "typed_result", "runner"]
+    code: Identifier
+    retryable: bool = False
+    graph_run_id: Identifier | None = None
+    node_id: Identifier | None = None
+    accepted_graph_revision_digest: Digest | None = None
+    generation: int | None = Field(default=None, ge=0)
+    attempt: int | None = Field(default=None, ge=0)
+    worker_request_id: Identifier
+    worker_request_digest: Digest
+    worker_result_id: Identifier | None = None
+    worker_result_digest: Digest | None = None
+    process_request_id: Identifier | None = None
+    process_request_digest: Digest | None = None
+    process_result_id: Identifier | None = None
+    process_result_digest: Digest | None = None
+    exception_type: str | None = Field(default=None, max_length=200)
+    exception_message: str | None = Field(default=None, max_length=1_000)
+    process_status: Literal["succeeded", "failed", "cancelled", "indeterminate"] | None = None
+    exit_code: int | None = None
+    duration_seconds: float = Field(ge=0)
+    configured_timeout_seconds: float | None = Field(default=None, gt=0)
+    effective_timeout_seconds: float | None = Field(default=None, gt=0)
+    stdout_bytes: int = Field(default=0, ge=0)
+    stderr_bytes: int = Field(default=0, ge=0)
+    stdout_artifact_digest: Digest | None = None
+    stderr_artifact_digest: Digest | None = None
+
+
 class WorkerResult(ExecutionResult):
     schema_name: ClassVar[str] = "worker_result"
     proposals: tuple[ActionProposal, ...] = ()
     non_mutating_result: NonMutatingResult | None = None
     assistant_note: str | None = Field(default=None, max_length=20_000)
     usage: CanonicalData = None
+    boundary_diagnostic: WorkerBoundaryDiagnostic | None = None
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        # The nested diagnostic binds the already-computed historical result digest.
+        return frozenset({"boundary_diagnostic"})
 
 
 class WorkspaceSnapshot(DigestedRecordV2):

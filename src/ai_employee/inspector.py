@@ -39,6 +39,7 @@ from .domain.v2 import (
     PolicyDecision,
     PromotionRecord,
     WorkerAvailability,
+    WorkerBoundaryDiagnostic,
     WorkerContextManifest,
     WorkerResult,
     WorkspaceSnapshot,
@@ -225,6 +226,14 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             "results": [
                 _json_model(item)
                 for item in store.list_records("worker_result_v2", WorkerResult, run_id=run_id)
+            ],
+            "boundary_diagnostics": [
+                _json_model(item)
+                for item in store.list_records(
+                    "worker_boundary_diagnostic_v2",
+                    WorkerBoundaryDiagnostic,
+                    run_id=run_id,
+                )
             ],
             "typed_result_acceptances": [
                 _json_model(item)
@@ -413,6 +422,14 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             _json_model(store.get("worker_result_v2", item.worker_result_id, WorkerResult))
             for item in node_records
             if item.worker_result_id is not None
+        ],
+        "worker_boundary_diagnostics": [
+            _json_model(item)
+            for item in store.list_records(
+                "worker_boundary_diagnostic_v2",
+                WorkerBoundaryDiagnostic,
+                run_id=run_id,
+            )
         ],
         "typed_result_acceptances": [
             _json_model(item)

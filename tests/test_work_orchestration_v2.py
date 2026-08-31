@@ -28,11 +28,14 @@ from ai_employee.domain.v2 import (
     EditIntentRequest,
     ExecutionResult,
     InstallResult,
+    NonMutatingResult,
     PolicyDecision,
     ProcessRequest,
     StableFailure,
     StableFailureCode,
+    WorkerBoundaryDiagnostic,
     WorkerRequest,
+    WorkerResult,
     WorkspaceRequest,
     WorkspaceSnapshot,
 )
@@ -166,6 +169,42 @@ class SuccessfulExecutor:
             exit_code=0,
             duration_seconds=0.01,
         )
+
+
+class BoundProcessExecutor:
+    def __init__(self, code: StableFailureCode, status: str) -> None:
+        self.code = code
+        self.status = status
+
+    def execute(
+        self, request: ProcessRequest, _decision: PolicyDecision, _cancellation: object
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            id=f"process-result-{request.id}",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            status=self.status,  # type: ignore[arg-type]
+            failure=StableFailure(code=self.code, message="bounded worker failure"),
+            exit_code=7,
+            duration_seconds=0.25,
+            resource_usage={"stdout_bytes": 17, "stderr_bytes": 23},
+            stdout_artifact_digest="1" * 64,
+            stderr_artifact_digest="2" * 64,
+        )
+
+
+def allow_worker(request: ProcessRequest) -> PolicyDecision:
+    return PolicyDecision(
+        id="worker-policy-1",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        effective_policy_digest=ZERO,
+        outcome=DecisionOutcome.ALLOW,
+        reason_code="policy_allowed",
+        limits={"max_wall_seconds": 12.0},
+    )
 
 
 class FakeWorkspace:
@@ -1112,6 +1151,236 @@ def test_cli_worker_expands_flattened_markdown_new_file_diff() -> None:
     assert isinstance(payload, EditIntentRequest)
     assert "<br>" not in payload.unified_diff
     assert payload.unified_diff.count("\n+") >= 11
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    (
+        (StableFailureCode.TIMEOUT, "failed"),
+        (StableFailureCode.CANCELLED, "cancelled"),
+        (StableFailureCode.SPAWN_FAILED, "failed"),
+        (StableFailureCode.PROCESS_FAILED, "failed"),
+        (StableFailureCode.POLICY_DENIED, "failed"),
+        (StableFailureCode.APPROVAL_REQUIRED, "failed"),
+    ),
+)
+def test_cli_worker_preserves_process_failure_and_diagnostics(
+    code: StableFailureCode, status: str
+) -> None:
+    result = CodexCliWorkerAdapter(
+        BoundProcessExecutor(code, status),
+        lambda _digest: b"",
+        allow_worker,
+        run_id="run-1",
+        timeout_seconds=30.0,
+    ).propose(worker_request(), Channel())  # type: ignore[arg-type]
+
+    assert result.status == status
+    assert result.failure is not None and result.failure.code is code
+    assert result.failure.code is not StableFailureCode.WORKER_UNAVAILABLE
+    diagnostic = result.boundary_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.code == code.value
+    assert diagnostic.worker_result_digest == result.content_digest
+    assert diagnostic.process_request_digest is not None
+    assert diagnostic.process_result_digest is not None
+    assert diagnostic.configured_timeout_seconds == 30.0
+    assert diagnostic.effective_timeout_seconds == 12.0
+    assert (diagnostic.stdout_bytes, diagnostic.stderr_bytes) == (17, 23)
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "output", "expected", "expected_failure"),
+    (
+        (
+            CodexCliWorkerAdapter,
+            b"",
+            "WORKER_EMPTY_OUTPUT",
+            StableFailureCode.WORKER_EMPTY_OUTPUT,
+        ),
+        (
+            CodexCliWorkerAdapter,
+            b"not json",
+            "WORKER_ENVELOPE_MALFORMED",
+            StableFailureCode.WORKER_PROTOCOL_ERROR,
+        ),
+        (
+            ClaudeCodeCliWorkerAdapter,
+            b"{}",
+            "WORKER_STRUCTURED_OUTPUT_MISSING",
+            StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING,
+        ),
+        (
+            CodexCliWorkerAdapter,
+            json.dumps(
+                {
+                    "schema_version": "2",
+                    "proposals": [],
+                    "non_mutating_result": {"logical_kind": "diagnosis"},
+                    "assistant_note": "",
+                    "usage_json": "{}",
+                }
+            ).encode(),
+            "TYPED_RESULT_MALFORMED",
+            StableFailureCode.TYPED_RESULT_MALFORMED,
+        ),
+    ),
+)
+def test_cli_worker_distinguishes_protocol_failures(
+    adapter_type: type[CodexCliWorkerAdapter],
+    output: bytes,
+    expected: str,
+    expected_failure: StableFailureCode,
+) -> None:
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
+        id="process-success",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+    result = adapter_type(
+        executor,
+        lambda _digest: output,
+        allow_worker,
+        run_id="run-1",
+    ).propose(worker_request(), Channel())  # type: ignore[arg-type]
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == expected
+    assert result.failure is not None
+    assert result.failure.code is expected_failure
+
+
+def test_coordinator_persists_and_projects_worker_boundary_diagnostic(
+    tmp_path: Path,
+) -> None:
+    malformed = {
+        "schema_version": "2",
+        "proposals": [{"kind": "unsupported"}],
+    }
+    with SQLiteStore(tmp_path / "boundary.db") as store:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            FakeWorkspace(b""),  # type: ignore[arg-type]
+            lambda _snapshot, _cancellation: ScriptedWorkerAdapter([malformed]),
+            lambda _snapshot: (_ for _ in ()).throw(
+                AssertionError("failed worker result must not create an executor")
+            ),
+            lambda _artifact: b"",
+            (builtin_policy("work-boundary"),),
+        )
+        run = coordinator.start(
+            "record a bounded worker failure",
+            str(tmp_path),
+            "a" * 40,
+            worker_name="scripted",
+            run_id="work-boundary",
+        )
+        diagnostics = store.list_records(
+            "worker_boundary_diagnostic_v2",
+            WorkerBoundaryDiagnostic,
+            run_id=run.id,
+        )
+        view = inspect_work_run(store, run.id)
+
+    assert run.status == "failed"
+    assert run.failure_code == StableFailureCode.WORKER_PROTOCOL_ERROR.value
+    assert len(diagnostics) == 1
+    assert diagnostics[0].worker_result_id == run.worker_result_id
+    assert diagnostics[0].worker_result_digest is not None
+    assert view["worker"]["boundary_diagnostics"] == [diagnostics[0].model_dump(mode="json")]
+
+
+def test_legacy_coordinator_accepts_bound_typed_result_with_authoritative_budget(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "typed.db")
+    artifacts = AtomicArtifactStore(tmp_path / "artifacts")
+    try:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            FakeWorkspace(b""),  # type: ignore[arg-type]
+            lambda _snapshot, _cancellation: ScriptedWorkerAdapter([]),
+            lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+            lambda _artifact: b"",
+            (builtin_policy("worker-run"),),
+            artifact_store=artifacts,
+        )
+        request = WorkerRequest(
+            id="typed-request",
+            run_id="worker-run",
+            created_at=NOW,
+            goal="return a diagnosis",
+            accepted_plan_digest=ZERO,
+            node_id="diagnose",
+            accepted_graph_revision_digest=ZERO,
+            graph_run_id="graph-run",
+            harness_digest=ZERO,
+            effective_policy_digest=ZERO,
+            remaining_budgets={"worker_turns": 1, "artifact_bytes": 1_024},
+        )
+        typed = NonMutatingResult(
+            id="typed-result",
+            run_id=request.run_id,
+            created_at=NOW,
+            graph_run_id=request.graph_run_id,
+            worker_request_digest=request.content_digest or ZERO,
+            node_id=request.node_id,
+            accepted_graph_revision_digest=request.accepted_graph_revision_digest,
+            generation=request.generation,
+            attempt=request.attempt,
+            logical_kind="diagnosis",
+            media_type="text/plain",
+            content="bounded diagnosis",
+        )
+        result = WorkerResult(
+            id="typed-worker-result",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or ZERO,
+            status="succeeded",
+            duration_seconds=0.01,
+            non_mutating_result=typed,
+        )
+        accepted = coordinator._accept_non_mutating_result(request, result, 0)
+
+        missing_budget_request = WorkerRequest(
+            **{
+                **request.model_dump(exclude={"content_digest"}),
+                "id": "missing-budget-request",
+                "remaining_budgets": {"worker_turns": 1},
+            }
+        )
+        missing_budget_typed = typed.model_copy(
+            update={
+                "worker_request_digest": missing_budget_request.content_digest,
+            }
+        )
+        missing_budget_result = result.model_copy(
+            update={
+                "request_digest": missing_budget_request.content_digest,
+                "non_mutating_result": missing_budget_typed,
+            }
+        )
+        rejected = coordinator._accept_non_mutating_result(
+            missing_budget_request, missing_budget_result, 0
+        )
+    finally:
+        store.close()
+
+    assert accepted is not None
+    assert accepted.status == "accepted"
+    assert accepted.failure_code is None
+    assert accepted.artifact is not None
+    assert rejected is not None
+    assert rejected.status == "rejected"
+    assert rejected.failure_code is StableFailureCode.ARTIFACT_BUDGET_INVALID
+    assert rejected.failure_code is not StableFailureCode.TYPED_RESULT_UNBOUND
 
 
 def test_cli_worker_uses_injected_runtime_policy_decision() -> None:

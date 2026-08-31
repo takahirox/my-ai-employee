@@ -6,6 +6,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import ClassVar, Literal
 
 from pydantic import ConfigDict, Field
@@ -24,6 +25,7 @@ from .domain.v2 import (
     StableFailure,
     StableFailureCode,
     WorkerAvailability,
+    WorkerBoundaryDiagnostic,
     WorkerRequest,
     WorkerResult,
 )
@@ -35,6 +37,20 @@ from .services_v2._common import identifier, now
 class _NeverCancelled:
     def cancelled(self) -> bool:
         return False
+
+
+@dataclass(frozen=True)
+class _ProcessInvocation:
+    request: ProcessRequest
+    decision: PolicyDecision
+    result: ExecutionResult
+
+
+class _WorkerProtocolDiagnostic(ValueError):
+    def __init__(self, code: str, stage: Literal["transport", "envelope"]) -> None:
+        self.code = code
+        self.stage = stage
+        super().__init__(code)
 
 
 def cli_inherit_environment(backend: str) -> tuple[str, ...]:
@@ -103,6 +119,7 @@ class ScriptedWorkerAdapter:
                 started,
                 StableFailureCode.BUDGET_EXCEEDED,
                 "scripted worker turn budget exhausted",
+                adapter=self.adapter,
             )
         raw = self._results[self._turn]
         self._turn += 1
@@ -122,6 +139,18 @@ class ScriptedWorkerAdapter:
                     else StableFailureCode.WORKER_PROTOCOL_ERROR
                 ),
                 f"invalid worker proposal envelope: {error}",
+                adapter=self.adapter,
+                stage=(
+                    "typed_result"
+                    if isinstance(raw, Mapping) and raw.get("non_mutating_result") is not None
+                    else "envelope"
+                ),
+                diagnostic_code=(
+                    "TYPED_RESULT_MALFORMED"
+                    if isinstance(raw, Mapping) and raw.get("non_mutating_result") is not None
+                    else "WORKER_ENVELOPE_MALFORMED"
+                ),
+                error=error,
             )
         for proposal in envelope.proposals:
             mediated_channel.submit(proposal)
@@ -199,7 +228,10 @@ class CliWorkerAdapter:
         self.timeout_seconds = timeout_seconds
 
     def probe(self) -> WorkerAvailability:
-        version = self._execute((self.executable, "--version"), "probe worker version", 10.0)
+        version_invocation = self._execute(
+            (self.executable, "--version"), "probe worker version", 10.0
+        )
+        version = version_invocation.result
         if version.status != "succeeded" or version.stdout_artifact_digest is None:
             return WorkerAvailability(
                 id=identifier("worker-probe"),
@@ -215,7 +247,8 @@ class CliWorkerAdapter:
                     message="worker executable is unavailable",
                 ),
             )
-        help_result = self._execute((self.executable, "--help"), "probe worker help", 10.0)
+        help_invocation = self._execute((self.executable, "--help"), "probe worker help", 10.0)
+        help_result = help_invocation.result
         help_text = self._output(help_result.stdout_artifact_digest)
         if help_result.status != "succeeded" or self.noninteractive_flag not in help_text:
             return WorkerAvailability(
@@ -227,9 +260,13 @@ class CliWorkerAdapter:
                 availability="unavailable",
                 auth="unknown",
                 version=self._output(version.stdout_artifact_digest).strip()[:200],
-                failure=StableFailure(
-                    code=StableFailureCode.WORKER_UNAVAILABLE,
-                    message="safe non-interactive mode was not found in CLI help",
+                failure=(
+                    help_result.failure
+                    if help_result.status != "succeeded"
+                    else StableFailure(
+                        code=StableFailureCode.WORKER_UNAVAILABLE,
+                        message="safe non-interactive mode was not found in CLI help",
+                    )
                 ),
             )
         return WorkerAvailability(
@@ -255,31 +292,76 @@ class CliWorkerAdapter:
         )
         stdin_digest = self.prompt_writer(prompt) if self.prompt_writer else None
         argv = self._proposal_argv(None if stdin_digest else prompt.decode("utf-8"))
-        process = self._execute(
+        invocation = self._execute(
             argv,
             "obtain strict worker proposal envelope",
             self.timeout_seconds,
             stdin_digest=stdin_digest,
         )
-        if process.status != "succeeded" or process.stdout_artifact_digest is None:
+        process = invocation.result
+        if process.status != "succeeded":
+            failure = process.failure or StableFailure(
+                code=StableFailureCode.WORKER_PROTOCOL_ERROR,
+                message="worker invocation failed without a stable process failure",
+            )
             return _worker_failure(
                 request,
                 started,
-                StableFailureCode.WORKER_UNAVAILABLE,
-                process.failure.message if process.failure else "worker invocation failed",
-                stdout_artifact_digest=process.stdout_artifact_digest,
-                stderr_artifact_digest=process.stderr_artifact_digest,
+                failure.code,
+                failure.message,
+                adapter=self.adapter,
+                diagnostic_code=failure.code.value,
+                invocation=invocation,
+                retryable=failure.retryable,
+                status=process.status,
+            )
+        if process.stdout_artifact_digest is None:
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_EMPTY_OUTPUT,
+                "worker invocation produced no stdout artifact",
+                adapter=self.adapter,
+                stage="transport",
+                diagnostic_code=StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                invocation=invocation,
+                error=ValueError("stdout artifact is missing"),
+            )
+        output = self._output(process.stdout_artifact_digest)
+        if not output.strip():
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_EMPTY_OUTPUT,
+                "worker invocation produced empty output",
+                adapter=self.adapter,
+                stage="transport",
+                diagnostic_code=StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                invocation=invocation,
+                error=ValueError("worker output is empty"),
             )
         typed_result_supplied = False
         try:
-            payload = self._extract_payload(self._output(process.stdout_artifact_digest))
+            payload = self._extract_payload(output)
             decoded_payload = json.loads(payload)
             typed_result_supplied = (
                 isinstance(decoded_payload, dict)
                 and decoded_payload.get("non_mutating_result") is not None
             )
             envelope = _validate_worker_envelope(payload)
-        except ValueError as error:
+        except _WorkerProtocolDiagnostic as error:
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING,
+                "worker response is missing required structured output",
+                adapter=self.adapter,
+                stage=error.stage,
+                diagnostic_code=StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+                invocation=invocation,
+                error=error,
+            )
+        except (KeyError, TypeError, ValueError) as error:
             return _worker_failure(
                 request,
                 started,
@@ -288,9 +370,20 @@ class CliWorkerAdapter:
                     if typed_result_supplied
                     else StableFailureCode.WORKER_PROTOCOL_ERROR
                 ),
-                f"invalid worker proposal envelope: {error}",
-                stdout_artifact_digest=process.stdout_artifact_digest,
-                stderr_artifact_digest=process.stderr_artifact_digest,
+                (
+                    "malformed non-mutating result"
+                    if typed_result_supplied
+                    else "malformed worker proposal envelope"
+                ),
+                adapter=self.adapter,
+                stage="typed_result" if typed_result_supplied else "envelope",
+                diagnostic_code=(
+                    "TYPED_RESULT_MALFORMED"
+                    if typed_result_supplied
+                    else "WORKER_ENVELOPE_MALFORMED"
+                ),
+                invocation=invocation,
+                error=error,
             )
         for proposal in envelope.proposals:
             mediated_channel.submit(proposal)
@@ -316,7 +409,7 @@ class CliWorkerAdapter:
         timeout: float,
         *,
         stdin_digest: str | None = None,
-    ) -> ExecutionResult:
+    ) -> _ProcessInvocation:
         request = ProcessRequest(
             id=identifier("worker-process"),
             run_id=self.run_id,
@@ -332,7 +425,8 @@ class CliWorkerAdapter:
             purpose=purpose,
         )
         decision = self.policy_decider(request)
-        return self.executor.execute(request, decision, self.cancellation)
+        result = self.executor.execute(request, decision, self.cancellation)
+        return _ProcessInvocation(request=request, decision=decision, result=result)
 
     def _output(self, digest: str | None) -> str:
         return "" if digest is None else self.output_reader(digest).decode("utf-8", "replace")
@@ -621,9 +715,13 @@ class ClaudeCodeCliWorkerAdapter(CliWorkerAdapter):
 
     def _extract_payload(self, output: str) -> str:
         wrapper = json.loads(output)
-        if isinstance(wrapper, dict) and "structured_output" in wrapper:
-            return json.dumps(wrapper["structured_output"], separators=(",", ":"))
-        return output
+        if (
+            not isinstance(wrapper, dict)
+            or "structured_output" not in wrapper
+            or wrapper["structured_output"] is None
+        ):
+            raise _WorkerProtocolDiagnostic("WORKER_STRUCTURED_OUTPUT_MISSING", "transport")
+        return json.dumps(wrapper["structured_output"], separators=(",", ":"))
 
 
 class OllamaCliWorkerAdapter(CliWorkerAdapter):
@@ -1094,23 +1192,98 @@ def worker_proposal_schema_json() -> bytes:
     return canonical_json(schema).encode("utf-8")
 
 
+def _sanitized_exception(error: Exception | None) -> tuple[str | None, str | None]:
+    if error is None:
+        return None, None
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(error))
+    value = re.sub(
+        r"(?i)(token|secret|password|credential|api[_-]?key|authorization)"
+        r"(\s*[:=]\s*)[^,;\s]+",
+        r"\1\2<redacted>",
+        value,
+    )
+    return type(error).__name__[:200], value.strip()[:1_000] or type(error).__name__
+
+
+def _effective_timeout(invocation: _ProcessInvocation) -> float:
+    configured = invocation.request.timeout_seconds
+    limits = invocation.decision.limits
+    candidate = limits.get("max_wall_seconds") if isinstance(limits, Mapping) else None
+    if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+        return min(configured, float(candidate))
+    return configured
+
+
+def _output_size(result: ExecutionResult, name: str) -> int:
+    usage = result.resource_usage
+    value = usage.get(name) if isinstance(usage, Mapping) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
 def _worker_failure(
     request: WorkerRequest,
     started: float,
     code: StableFailureCode,
     message: str,
     *,
-    stdout_artifact_digest: str | None = None,
-    stderr_artifact_digest: str | None = None,
+    adapter: str,
+    stage: Literal["process", "transport", "envelope", "typed_result"] = "process",
+    diagnostic_code: str | None = None,
+    invocation: _ProcessInvocation | None = None,
+    retryable: bool = False,
+    status: Literal["failed", "cancelled", "indeterminate"] = "failed",
+    error: Exception | None = None,
 ) -> WorkerResult:
-    return WorkerResult(
+    process = None if invocation is None else invocation.result
+    failure = StableFailure(code=code, message=message[:2_000], retryable=retryable)
+    result = WorkerResult(
         id=identifier("worker-result"),
         run_id=request.run_id,
         created_at=now(),
         request_digest=request.content_digest or "",
-        status="failed",
-        failure=StableFailure(code=code, message=message[:2_000]),
+        status=status,
+        failure=failure,
         duration_seconds=time.monotonic() - started,
-        stdout_artifact_digest=stdout_artifact_digest,
-        stderr_artifact_digest=stderr_artifact_digest,
+        stdout_artifact_digest=None if process is None else process.stdout_artifact_digest,
+        stderr_artifact_digest=None if process is None else process.stderr_artifact_digest,
     )
+    assert result.content_digest is not None
+    exception_type, exception_message = _sanitized_exception(error)
+    diagnostic = WorkerBoundaryDiagnostic(
+        id=identifier("worker-boundary-diagnostic"),
+        run_id=request.run_id,
+        created_at=now(),
+        adapter=adapter,
+        stage=stage,
+        code=diagnostic_code or code.value,
+        retryable=retryable,
+        graph_run_id=request.graph_run_id,
+        node_id=request.node_id,
+        accepted_graph_revision_digest=request.accepted_graph_revision_digest,
+        generation=request.generation,
+        attempt=request.attempt,
+        worker_request_id=request.id,
+        worker_request_digest=request.content_digest or "",
+        worker_result_id=result.id,
+        worker_result_digest=result.content_digest,
+        process_request_id=None if invocation is None else invocation.request.id,
+        process_request_digest=(None if invocation is None else invocation.request.content_digest),
+        process_result_id=None if process is None else process.id,
+        process_result_digest=None if process is None else process.content_digest,
+        exception_type=exception_type,
+        exception_message=exception_message,
+        process_status=None if process is None else process.status,
+        exit_code=None if process is None else process.exit_code,
+        duration_seconds=result.duration_seconds,
+        configured_timeout_seconds=(
+            None if invocation is None else invocation.request.timeout_seconds
+        ),
+        effective_timeout_seconds=(None if invocation is None else _effective_timeout(invocation)),
+        stdout_bytes=0 if process is None else _output_size(process, "stdout_bytes"),
+        stderr_bytes=0 if process is None else _output_size(process, "stderr_bytes"),
+        stdout_artifact_digest=None if process is None else process.stdout_artifact_digest,
+        stderr_artifact_digest=None if process is None else process.stderr_artifact_digest,
+    )
+    return result.model_copy(update={"boundary_diagnostic": diagnostic})

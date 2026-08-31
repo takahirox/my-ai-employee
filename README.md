@@ -228,10 +228,11 @@ effective executable is recorded with worker availability provenance. See the
 complete, updated [`operator config`](examples/operator-config.yaml) and
 [`Project Harness`](examples/project-v2/.fleet/project.yaml) examples.
 
-The Claude Code adapter currently disables Claude tools completely, so it is most
-useful when sufficient bounded context is already present in the goal. Codex CLI is
-the source-aware primary adapter for v0.2. Direct OpenAI or Anthropic API keys are
-neither required nor supported by this release.
+The Claude Code worker adapter exposes only read-only repository inspection
+(`Read`, `Glob`, and `Grep`) under safe/manual permission mode. Claude planning,
+assessment, and review calls remain tool-disabled. Codex CLI is the source-aware
+primary adapter for v0.2. Direct OpenAI or Anthropic API keys are neither required
+nor supported by this release.
 
 Inspect and control a run from another terminal:
 

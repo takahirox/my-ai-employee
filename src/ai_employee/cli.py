@@ -200,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("run_id")
     replay.add_argument("--db")
 
-    resume = commands.add_parser("resume", help="resume a paused run")
+    resume = commands.add_parser("resume", help="start a planned run or resume a paused run")
     resume.add_argument("run_id")
     resume.add_argument("--db")
 
@@ -2155,8 +2155,8 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
 
 
 def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
-    if run.status != "paused" or run.repository is None:
-        raise ValueError("only an authoritative paused graph can resume")
+    if run.status not in {"planned", "paused"} or run.repository is None:
+        raise ValueError("only an authoritative planned or paused graph can start")
     return _work(
         argparse.Namespace(
             # Resume the exact explicit authority source; never discover a new default.

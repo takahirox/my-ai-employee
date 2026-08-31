@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from time import monotonic
 from typing import ClassVar, Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, model_validator
@@ -35,6 +37,7 @@ from .domain.v2 import (
     NonMutatingResultAcceptance,
     PredecessorOutputReference,
     StableFailureCode,
+    WorkerBoundaryDiagnostic,
     WorkerContextManifest,
     WorkerRequest,
     WorkerResult,
@@ -848,7 +851,7 @@ class TaskOrchestrator:
             _validate_revision_history(acceptances)
             _load_plan_review_history(self.store, graph_run, acceptances)
             if (
-                graph_run.status != "paused"
+                graph_run.status not in {"planned", "paused"}
                 or graph_run.goal_id != goal.id
                 or graph_run.goal != goal
                 or graph_run.execution_policy != policy
@@ -876,29 +879,33 @@ class TaskOrchestrator:
                 or acceptances[-1].accepted_revision.content_digest
                 != graph_run.accepted_graph_revision_digest
             ):
-                raise ValueError("only the authoritative paused accepted graph can resume")
+                raise ValueError("only an authoritative planned or paused graph can start")
             acceptance = acceptances[-1]
             accepted = acceptance.accepted_revision
             graph_digest = _required_digest(accepted.content_digest)
+            starting_planned = graph_run.status == "planned"
             graph_run = graph_run.model_copy(
                 update={
                     "status": "running",
-                    "generation": graph_run.generation + 1,
+                    "generation": (
+                        graph_run.generation if starting_planned else graph_run.generation + 1
+                    ),
                     "failure_code": None,
                 }
             )
-            self.store.clear_control(run_id)
-            self.store.put(
-                "graph_control_fact_v2",
-                GraphControlFact(
-                    id=identifier("graph-control"),
+            if not starting_planned:
+                self.store.clear_control(run_id)
+                self.store.put(
+                    "graph_control_fact_v2",
+                    GraphControlFact(
+                        id=identifier("graph-control"),
+                        run_id=run_id,
+                        created_at=now(),
+                        action="resume",
+                        generation=graph_run.generation,
+                    ),
                     run_id=run_id,
-                    created_at=now(),
-                    action="resume",
-                    generation=graph_run.generation,
-                ),
-                run_id=run_id,
-            )
+                )
             self._save_run(graph_run)
         elif replan:
             assert proposal is not None and previous_acceptance is not None
@@ -1153,19 +1160,6 @@ class TaskOrchestrator:
             }
         for record in records.values():
             self._save_node(record)
-        if plan_only:
-            return graph_run
-        if proposal is not None and not self.bounded_graph_execution:
-            graph_run = graph_run.model_copy(
-                update={
-                    "status": "failed",
-                    "generation": graph_run.generation + 1,
-                    "failure_code": "GRAPH_EXECUTION_UNAVAILABLE",
-                }
-            )
-            self._save_run(graph_run)
-            return graph_run
-
         independent_node_assessment = (
             self.independent_node_assessment
             and self.routing_mode is RoutingMode.ADAPTIVE
@@ -1185,6 +1179,18 @@ class TaskOrchestrator:
                 harness_digest,
                 invoke=not resume,
             )
+        if plan_only:
+            return graph_run
+        if proposal is not None and not self.bounded_graph_execution:
+            graph_run = graph_run.model_copy(
+                update={
+                    "status": "failed",
+                    "generation": graph_run.generation + 1,
+                    "failure_code": "GRAPH_EXECUTION_UNAVAILABLE",
+                }
+            )
+            self._save_run(graph_run)
+            return graph_run
 
         evidence_by_node: dict[str, NodeEvidenceRecord] = {}
         if resume or replan:
@@ -1219,7 +1225,14 @@ class TaskOrchestrator:
                     )
         active: dict[
             Future[NodeExecutionResult],
-            tuple[str, Node, WorkerRequest, NodeReservationRecord],
+            tuple[
+                str,
+                Node,
+                WorkerRequest,
+                NodeReservationRecord,
+                ExecutionStrategy,
+                float,
+            ],
         ] = {}
         stop_action: Literal["pause", "cancel"] | None = None
         limits: dict[str, int | float] = {
@@ -1393,7 +1406,9 @@ class TaskOrchestrator:
                         )
                         continue
                     predecessor_outputs, predecessor_evidence_digests = predecessor_context
-                    prior_results = tuple(item.worker_result_digest for item in predecessor_outputs)
+                    prior_results = tuple(
+                        _required_digest(item.worker_result_digest) for item in predecessor_outputs
+                    )
                     prior_artifacts = tuple(
                         artifact.artifact_digest
                         for item in predecessor_outputs
@@ -1480,7 +1495,14 @@ class TaskOrchestrator:
                         worker_request_digest=request.content_digest,
                     )
                     future = pool.submit(self.runner, node, request, route.selected_strategy)
-                    active[future] = (node_id, node, request, reservation)
+                    active[future] = (
+                        node_id,
+                        node,
+                        request,
+                        reservation,
+                        route.selected_strategy,
+                        monotonic(),
+                    )
 
                 if not active:
                     if any(item.status == "pending" for item in records.values()):
@@ -1494,7 +1516,7 @@ class TaskOrchestrator:
                     continue
                 completed, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
                 for future in sorted(completed, key=lambda item: active[item][0]):
-                    node_id, node, request, reservation = active.pop(future)
+                    node_id, node, request, reservation, strategy, started_at = active.pop(future)
                     try:
                         result = future.result()
                         self._persist_result(
@@ -1659,7 +1681,10 @@ class TaskOrchestrator:
                                         else review_decision.reason_code
                                     ),
                                 )
-                        elif current.evaluator_decision is EvaluationDecision.FAIL:
+                        elif (
+                            current.evaluator_decision is EvaluationDecision.FAIL
+                            and result.worker_result.status == "succeeded"
+                        ):
                             repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
                             repair_limit = graph_run.max_repairs
                             remaining = cast(
@@ -1766,6 +1791,35 @@ class TaskOrchestrator:
                         )
                         retry_count = loop_counts[(node_id, LoopAction.RETRY)]
                         retry_resources_available = _node_resources_remain(node, remaining)
+                        retryable = retry_count < retry_cap and retry_resources_available
+                        exception_type, exception_message = _sanitized_boundary_exception(error)
+                        diagnostic = WorkerBoundaryDiagnostic(
+                            id=identifier("worker-boundary-diagnostic"),
+                            run_id=request.run_id,
+                            created_at=now(),
+                            adapter=strategy.backend,
+                            stage="runner",
+                            code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
+                            retryable=retryable,
+                            graph_run_id=run_id,
+                            node_id=node.id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=node.generation,
+                            attempt=node.attempt,
+                            worker_request_id=request.id,
+                            worker_request_digest=_required_digest(request.content_digest),
+                            exception_type=exception_type,
+                            exception_message=exception_message,
+                            duration_seconds=max(0.0, monotonic() - started_at),
+                            configured_timeout_seconds=node.resource_budget.wall_seconds,
+                            effective_timeout_seconds=min(
+                                node.resource_budget.wall_seconds,
+                                float(
+                                    remaining.get("wall_seconds", node.resource_budget.wall_seconds)
+                                ),
+                            ),
+                        )
+                        self.store.put("worker_boundary_diagnostic_v2", diagnostic, run_id=run_id)
                         if retry_count < retry_cap and retry_resources_available:
                             self._save_loop_transition(
                                 LoopTransitionRecord(
@@ -1773,7 +1827,7 @@ class TaskOrchestrator:
                                     run_id=run_id,
                                     created_at=now(),
                                     action=LoopAction.RETRY,
-                                    reason_code=f"WORKER_BOUNDARY:{type(error).__name__}",
+                                    reason_code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
                                     attempt=node.attempt,
@@ -1794,7 +1848,9 @@ class TaskOrchestrator:
                                 attempt=records[node_id].attempt + 1,
                                 sequence=0,
                                 status="pending",
-                                failure_code=f"RETRY_AFTER:{type(error).__name__}",
+                                failure_code=(
+                                    f"RETRY_AFTER:{StableFailureCode.WORKER_BOUNDARY_ERROR.value}"
+                                ),
                             )
                             self._save_node(records[node_id])
                         else:
@@ -1813,7 +1869,7 @@ class TaskOrchestrator:
                                     reason_code=(
                                         reason
                                         if enabled
-                                        else f"WORKER_BOUNDARY:{type(error).__name__}"
+                                        else StableFailureCode.WORKER_BOUNDARY_ERROR.value
                                     ),
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
@@ -1827,11 +1883,7 @@ class TaskOrchestrator:
                             records[node_id] = self._advance(
                                 records[node_id],
                                 status="failed",
-                                failure_code=(
-                                    f"LOOP_ESCALATED:{reason}"
-                                    if enabled
-                                    else f"WORKER_BOUNDARY:{type(error).__name__}"
-                                ),
+                                failure_code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
                             )
 
         authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
@@ -1899,11 +1951,23 @@ class TaskOrchestrator:
             records[node_id].status == "passed" for node_id in candidate.terminal_node_ids
         )
         completed_ok = node_pass and terminal_pass and goal_decision is EvaluationDecision.PASS
+        stable_codes = {item.value for item in StableFailureCode}
+        exact_failures = {
+            item.failure_code for item in records.values() if item.failure_code in stable_codes
+        }
         graph_run = graph_run.model_copy(
             update={
                 "status": "completed" if completed_ok else "failed",
                 "goal_evaluator_digest": goal_evaluation.content_digest,
-                "failure_code": None if completed_ok else "GOAL_OR_NODE_EVALUATION_FAILED",
+                "failure_code": (
+                    None
+                    if completed_ok
+                    else (
+                        next(iter(exact_failures))
+                        if len(exact_failures) == 1
+                        else "GOAL_OR_NODE_EVALUATION_FAILED"
+                    )
+                ),
             }
         )
         self._save_run(graph_run)
@@ -2813,6 +2877,12 @@ class TaskOrchestrator:
                 if result_acceptance.failure_code is None:
                     raise ValueError("rejected typed result has no stable failure code")
                 self.store.put("worker_result_v2", worker_result, run_id=request.graph_run_id)
+                if worker_result.boundary_diagnostic is not None:
+                    self.store.put(
+                        "worker_boundary_diagnostic_v2",
+                        worker_result.boundary_diagnostic,
+                        run_id=request.graph_run_id,
+                    )
                 records[node.id] = self._advance(
                     records[node.id],
                     status="failed",
@@ -2836,7 +2906,7 @@ class TaskOrchestrator:
                 raise ValueError("accepted typed-result binding is stale")
             if result_acceptance.artifact not in result.artifact_descriptors:
                 raise ValueError("accepted typed-result artifact is absent or stale")
-        if self.bounded_graph_execution:
+        if self.bounded_graph_execution and worker_result.status == "succeeded":
             if not result.artifact_descriptors:
                 raise ValueError("bounded node result has no authoritative artifact descriptor")
             for descriptor in result.artifact_descriptors:
@@ -2853,6 +2923,12 @@ class TaskOrchestrator:
                 ):
                     raise ValueError("node artifact descriptor is absent or stale")
         self.store.put("worker_result_v2", worker_result, run_id=request.run_id)
+        if worker_result.boundary_diagnostic is not None:
+            self.store.put(
+                "worker_boundary_diagnostic_v2",
+                worker_result.boundary_diagnostic,
+                run_id=request.graph_run_id or request.run_id,
+            )
         if patch is not None:
             self.store.put(
                 "node_patch_v2",
@@ -2910,7 +2986,13 @@ class TaskOrchestrator:
             evaluator_digest=evaluation.content_digest,
             evaluator_decision=decision,
             failure_code=(
-                None if decision is EvaluationDecision.PASS else "NODE_EVALUATION_NOT_PASS"
+                None
+                if decision is EvaluationDecision.PASS
+                else (
+                    worker_result.failure.code.value
+                    if worker_result.failure is not None
+                    else "NODE_EVALUATION_NOT_PASS"
+                )
             ),
             workspace_id=result.workspace_id,
             workspace_digest=(None if patch is None else patch.workspace.content_digest),
@@ -3665,6 +3747,17 @@ def _node_worker_run_id(graph_run_id: str, node: Node) -> str:
         }
     )
     return f"node-{digest[:32]}"
+
+
+def _sanitized_boundary_exception(error: Exception) -> tuple[str, str]:
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(error))
+    value = re.sub(
+        r"(?i)(token|secret|password|credential|api[_-]?key|authorization)"
+        r"(\s*[:=]\s*)[^,;\s]+",
+        r"\1\2<redacted>",
+        value,
+    )
+    return type(error).__name__[:200], value.strip()[:1_000] or type(error).__name__
 
 
 def _planner_node_hints(node: Node) -> PlannerNodeRoutingHints:
