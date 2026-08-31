@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from time import monotonic
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from pydantic import RootModel
@@ -716,52 +720,262 @@ def compare_runs(store: SQLiteStore, left_id: str, right_id: str) -> dict[str, A
     }
 
 
+_SSE_HEARTBEAT_SECONDS = 15.0
+_SSE_POLL_SECONDS = 0.1
+_SSE_COALESCE_SECONDS = 0.25
+_SSE_MAX_CLIENTS = 32
+_SSE_MAX_EVENT_BYTES = 256
+
+
+def _open_read_only_store(path: str) -> SQLiteStore:
+    """Open the Inspector database without schema setup or mutation privileges."""
+
+    if path == ":memory:":
+        raise ValueError("the concurrent Inspector requires a file-backed SQLite database")
+    reader = SQLiteStore.__new__(SQLiteStore)
+    reader.path = str(Path(path).expanduser())
+    uri = f"{Path(reader.path).resolve().as_uri()}?mode=ro"
+    reader._connection = sqlite3.connect(uri, uri=True, timeout=10.0)
+    try:
+        reader._connection.row_factory = sqlite3.Row
+        reader._connection.execute("PRAGMA query_only = ON")
+        reader._connection.execute("PRAGMA busy_timeout = 10000")
+    except BaseException:
+        reader._connection.close()
+        raise
+    return reader
+
+
+class _FreshnessMonitor:
+    """Coalesce SQLite commits into bounded, content-free freshness markers."""
+
+    def __init__(self, database_path: str) -> None:
+        self._database_path = database_path
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._sequence = 0
+        self._clients = 0
+        self._closed = False
+        self._failed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="fleet-inspector-freshness",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait(timeout=2.0)
+
+    @property
+    def sequence(self) -> int:
+        with self._condition:
+            return self._sequence
+
+    @property
+    def running(self) -> bool:
+        with self._condition:
+            return not self._closed and not self._failed
+
+    @property
+    def client_count(self) -> int:
+        with self._condition:
+            return self._clients
+
+    @property
+    def thread_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def acquire_client(self) -> bool:
+        with self._condition:
+            if self._closed or self._failed or self._clients >= _SSE_MAX_CLIENTS:
+                return False
+            self._clients += 1
+            return True
+
+    def release_client(self) -> None:
+        with self._condition:
+            self._clients -= 1
+
+    def wait(self, after: int, timeout: float) -> int | None:
+        with self._condition:
+            changed = self._condition.wait_for(
+                lambda: self._sequence != after or self._closed or self._failed,
+                timeout=timeout,
+            )
+            if not changed or self._sequence == after:
+                return None
+            return self._sequence
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        try:
+            with _open_read_only_store(self._database_path) as reader:
+                row = reader._connection.execute("PRAGMA data_version").fetchone()
+                if row is None:
+                    raise RuntimeError("SQLite did not return data_version")
+                version = int(row[0])
+                self._ready.set()
+                while not self._stop.wait(_SSE_POLL_SECONDS):
+                    row = reader._connection.execute("PRAGMA data_version").fetchone()
+                    if row is None:
+                        raise RuntimeError("SQLite did not return data_version")
+                    observed = int(row[0])
+                    if observed == version:
+                        continue
+                    version = observed
+                    deadline = monotonic() + _SSE_COALESCE_SECONDS
+                    while monotonic() < deadline and not self._stop.wait(_SSE_POLL_SECONDS):
+                        row = reader._connection.execute("PRAGMA data_version").fetchone()
+                        if row is None:
+                            raise RuntimeError("SQLite did not return data_version")
+                        version = int(row[0])
+                    with self._condition:
+                        if self._closed:
+                            return
+                        self._sequence += 1
+                        self._condition.notify_all()
+        except (OSError, sqlite3.Error, RuntimeError):
+            with self._condition:
+                self._failed = True
+                self._condition.notify_all()
+        finally:
+            self._ready.set()
+
+
+class _InspectorServer(ThreadingHTTPServer):
+    """Threaded read-only server with one bounded database monitor."""
+
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], database_path: str) -> None:
+        self.monitor: _FreshnessMonitor | None = None
+        super().__init__(address, _InspectorHandler)
+        self.database_path = database_path
+        self.monitor = _FreshnessMonitor(database_path)
+
+    def server_close(self) -> None:
+        if self.monitor is not None:
+            self.monitor.close()
+        super().server_close()
+
+
+class _InspectorHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/events":
+            self._serve_events()
+            return
+        if parsed.path == "/":
+            self._send_body(_INDEX.encode(), "text/html; charset=utf-8")
+            return
+
+        server = cast(_InspectorServer, self.server)
+        try:
+            with _open_read_only_store(server.database_path) as store:
+                if parsed.path == "/api/runs":
+                    repository_id = parse_qs(parsed.query).get("repository_id", [None])[0]
+                    body = canonical_json(
+                        {"runs": store.list_run_repositories(repository_id)}
+                    ).encode()
+                elif parsed.path.startswith("/api/runs/") and parsed.path.endswith(
+                    "/explanation"
+                ):
+                    run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
+                    try:
+                        from .run_explanation import explain_any_run
+
+                        explanation = explain_any_run(store, run_id)
+                        repository = store.repository_for_run(run_id)
+                        if repository is not None:
+                            explanation["repository_context"] = repository
+                        body = canonical_json(explanation).encode()
+                    except KeyError:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                elif parsed.path.startswith("/api/runs/"):
+                    run_id = parsed.path.removeprefix("/api/runs/")
+                    try:
+                        body = canonical_json(inspect_any_run(store, run_id)).encode()
+                    except KeyError:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                else:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+        except (OSError, sqlite3.Error):
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        self._send_body(body, "application/json")
+
+    def _send_body(self, body: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_events(self) -> None:
+        server = cast(_InspectorServer, self.server)
+        monitor = server.monitor
+        if monitor is None:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if not monitor.acquire_client():
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            self.wfile.write(b"retry: 1000\n\n")
+            self.wfile.flush()
+            sequence = monitor.sequence
+            while monitor.running:
+                next_sequence = monitor.wait(sequence, _SSE_HEARTBEAT_SECONDS)
+                if not monitor.running:
+                    break
+                if next_sequence is None:
+                    event = b": heartbeat\n\n"
+                else:
+                    sequence = next_sequence
+                    event = _freshness_event()
+                self.wfile.write(event)
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            monitor.release_client()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def _freshness_event() -> bytes:
+    payload = canonical_json({"type": "freshness"}).encode()
+    event = b"event: freshness\ndata: " + payload + b"\n\n"
+    if len(event) > _SSE_MAX_EVENT_BYTES:
+        raise ValueError("Inspector freshness event exceeded its fixed bound")
+    return event
+
+
 def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None:
     """Serve a local read-only JSON/HTML Inspector until interrupted."""
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/runs":
-                repository_id = parse_qs(parsed.query).get("repository_id", [None])[0]
-                body = canonical_json({"runs": store.list_run_repositories(repository_id)}).encode()
-                content_type = "application/json"
-            elif parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
-                run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
-                try:
-                    from .run_explanation import explain_any_run
-
-                    explanation = explain_any_run(store, run_id)
-                    repository = store.repository_for_run(run_id)
-                    if repository is not None:
-                        explanation["repository_context"] = repository
-                    body = canonical_json(explanation).encode()
-                except KeyError:
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
-                content_type = "application/json"
-            elif parsed.path.startswith("/api/runs/"):
-                run_id = parsed.path.removeprefix("/api/runs/")
-                try:
-                    body = canonical_json(inspect_any_run(store, run_id)).encode()
-                except KeyError:
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
-                content_type = "application/json"
-            elif parsed.path == "/":
-                body = _INDEX.encode()
-                content_type = "text/html; charset=utf-8"
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            return
-
-    HTTPServer((host, port), Handler).serve_forever()
+    server = _InspectorServer((host, port), store.path)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()

@@ -267,6 +267,15 @@ attempts, results, evidence, reviews, and loop decisions. Accepted revisions can
 selected for historical replan comparison; raw Inspector and explanation JSON remain
 available in adjacent tabs. Loading, revision selection, and refresh perform GETs only.
 
+While the page is open, a dependency-free `EventSource` GET listens for bounded,
+freshness-only notifications. The server watches the exact same file-backed SQLite database
+selected by `fleet serve` with `PRAGMA data_version`, so commits from other connections are
+detected in WAL mode and burst commits are coalesced. Notifications contain no run, repository,
+record, or artifact data. The browser reconnects automatically and refreshes the run catalog and
+selected run while preserving its selected task, tab, and available historical revision. If SSE
+is unavailable or disconnected, the status badge reports that state and the manual Refresh button
+remains the fallback. Closing the page or server releases its client and monitoring resources.
+
 Network retrieval and project-local installation are supported only through
 typed, digest-bound services. The example Harness disables both. Enabling them
 requires an explicit domain/ecosystem policy and may require a digest-bound human
