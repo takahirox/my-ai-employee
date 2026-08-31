@@ -32,12 +32,34 @@ Fleet expands `~`, creates missing database directories privately, restricts the
 to the current user, and uses WAL journaling plus a busy timeout for concurrent local
 commands. Explicit `--db` remains available for isolated runs. For example,
 `FLEET_DB=~/fleet/team.db fleet inspect RUN_ID` selects an environment default, while
-`fleet inspect RUN_ID --db /tmp/one.db` overrides it.
+`fleet inspect RUN_ID --db ~/fleet/one.db` overrides it.
 
 Repository policy remains local at `REPOSITORY/.fleet/project.yaml`; only execution history
 is global by default. The `eval` command deliberately retains `.fleet/evals.db` as its
 separate default and does not consult `FLEET_DB`, because evaluation databases belong to
 their reproducible experiment fixtures. `fleet eval --db PATH` still overrides that default.
+
+### Explicit isolation and testing databases
+
+Use a temporary database only when a run must be intentionally isolated from normal Fleet
+history, such as a disposable test. Pass the same explicit path to every command that needs that
+history, including its Inspector:
+
+```bash
+fleet run examples/demo_graph.yaml --run-id isolated-test \
+  --db "${TMPDIR:-/tmp}/fleet-isolated.db"
+fleet serve --db "${TMPDIR:-/tmp}/fleet-isolated.db"
+```
+
+`fleet work` and `fleet run` warn on stderr when `--db` or `FLEET_DB` selects a database
+under the platform temporary directory. The run is still accepted, and JSON stdout remains
+machine-readable; the warning gives the matching `fleet serve --db PATH` command because the
+default Inspector will not contain that isolated history.
+
+A temporary repository or Fleet-created worktree does not require a temporary database. AI
+agents and operators should normally omit `--db` and leave `FLEET_DB` unset for temporary
+repositories and worktrees so their runs remain visible in the shared default Inspector. Select
+a temporary database only when the operator explicitly wants database isolation.
 
 To migrate an older repository-local `.fleet/fleet.db`, first stop every Fleet command using
 that database. The following SQLite backup refuses to overwrite an existing global database
@@ -98,7 +120,7 @@ mkdir -p /path/to/project/.fleet
 cp examples/project-v2/.fleet/project.yaml /path/to/project/.fleet/project.yaml
 fleet project /path/to/project
 fleet work "Make one small objectively verifiable improvement" \
-  --repo /path/to/project --worker codex_cli --db /tmp/fleet-work.db --json
+  --repo /path/to/project --worker codex_cli --json
 ```
 
 The selected CLI must already be installed and authenticated by its own official
@@ -111,8 +133,7 @@ Ollama model directly. For example:
 
 ```bash
 fleet work "Create a reviewed design note" --repo /path/to/project \
-  --worker ollama_cli --model qwen3-coder:30b \
-  --db /tmp/fleet-local.db --json
+  --worker ollama_cli --model qwen3-coder:30b --json
 ```
 
 The named model must already be available in local Ollama; Fleet
@@ -215,14 +236,14 @@ neither required nor supported by this release.
 Inspect and control a run from another terminal:
 
 ```bash
-fleet inspect RUN_ID --db /tmp/fleet-work.db
-fleet explain RUN_ID --db /tmp/fleet-work.db
-fleet logs RUN_ID --db /tmp/fleet-work.db
-fleet approvals list --run RUN_ID --db /tmp/fleet-work.db
-fleet approvals approve APPROVAL_ID --request-digest REQUEST_DIGEST --db /tmp/fleet-work.db
-fleet resume RUN_ID --db /tmp/fleet-work.db
-fleet diff RUN_ID --db /tmp/fleet-work.db
-fleet promote RUN_ID --patch-digest PATCH_DIGEST --db /tmp/fleet-work.db
+fleet inspect RUN_ID
+fleet explain RUN_ID
+fleet logs RUN_ID
+fleet approvals list --run RUN_ID
+fleet approvals approve APPROVAL_ID --request-digest REQUEST_DIGEST
+fleet resume RUN_ID
+fleet diff RUN_ID
+fleet promote RUN_ID --patch-digest PATCH_DIGEST
 ```
 
 Compare exact fixed-routing strategies over repeated runs of one clean fixture:
@@ -268,8 +289,10 @@ selected for historical replan comparison; raw Inspector and explanation JSON re
 available in adjacent tabs. Loading, revision selection, and refresh perform GETs only.
 
 While the page is open, a dependency-free `EventSource` GET listens for bounded,
-freshness-only notifications. The server watches the exact same file-backed SQLite database
-selected by `fleet serve` with `PRAGMA data_version`, so commits from other connections are
+freshness-only notifications. One Inspector process and its SSE monitor observe exactly one
+SQLite database: the resolved path printed by `fleet serve`. They do not aggregate or discover
+runs in other database files. The server watches that file-backed database with
+`PRAGMA data_version`, so commits from other connections are
 detected in WAL mode and burst commits are coalesced. Notifications contain no run, repository,
 record, or artifact data. The browser reconnects automatically and refreshes the run catalog and
 selected run while preserving its selected task, tab, and available historical revision. If SSE
