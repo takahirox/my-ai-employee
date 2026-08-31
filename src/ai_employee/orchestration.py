@@ -718,7 +718,8 @@ class WorkCoordinator:
             else:
                 return self._update(run, status="failed", failure_code="UNSUPPORTED_ACTION")
             self.store.put("action_result_v2", result, run_id=run.id)
-            retain(_mediated_result_artifacts(result, executor))
+            artifact_service = installer if isinstance(result, InstallResult) else executor
+            retain(_mediated_result_artifacts(result, artifact_service))
             self._event(
                 run.id,
                 "action_finished",
