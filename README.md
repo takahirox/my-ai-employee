@@ -201,6 +201,13 @@ bodies, or mutates/migrates the database. `fleet inspect` remains the detailed r
 forensic projection. The local Inspector exposes the same summary at
 `/api/runs/RUN_ID/explanation`.
 
+Start the browser Inspector with `fleet serve --db PATH`. Its dependency-free DAG view
+shows entry and terminal tasks, parallel branches, persisted task states and remaining
+work. Selecting a task opens its persisted criteria, routing and predecessor context,
+attempts, results, evidence, reviews, and loop decisions. Accepted revisions can be
+selected for historical replan comparison; raw Inspector and explanation JSON remain
+available in adjacent tabs. Loading, revision selection, and refresh perform GETs only.
+
 Network retrieval and project-local installation are supported only through
 typed, digest-bound services. The example Harness disables both. Enabling them
 requires an explicit domain/ecosystem policy and may require a digest-bound human

@@ -44,6 +44,7 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
 )
+from .inspector_ui import INDEX as _INDEX
 from .parent_review import (
     ParentSemanticRepairRequest,
     ParentSemanticReviewDecision,
@@ -132,6 +133,9 @@ def inspect_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
                 }
                 for node in run.accepted_graph.graph.nodes
             ],
+            "edges": [_json_model(item) for item in run.accepted_graph.graph.edges],
+            "entry_task_ids": list(run.accepted_graph.graph.entry_node_ids),
+            "terminal_task_ids": list(run.accepted_graph.graph.terminal_node_ids),
         },
         "transitions": [_json_model(item) for item in run.transitions],
         "node_transitions": [
@@ -736,6 +740,7 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
                 return
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -744,15 +749,3 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
             return
 
     HTTPServer((host, port), Handler).serve_forever()
-
-
-_INDEX = """<!doctype html><meta charset=utf-8><title>Fleet Inspector</title>
-<style>
-body{font:14px system-ui;max-width:1000px;margin:2rem auto}
-input{width:24rem}pre{white-space:pre-wrap}
-</style>
-<h1>Fleet Inspector</h1><p>Read-only local projection</p>
-<input id=r placeholder="run id"><button onclick="loadRun()">Inspect</button><pre id=o></pre>
-<script>async function loadRun(){let r=document.querySelector('#r').value;
-let x=await fetch('/api/runs/'+encodeURIComponent(r));document.querySelector('#o').textContent=
-x.ok?JSON.stringify(await x.json(),null,2):'Run not found'}</script>"""
