@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 import getpass
 import io
+import os
+import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 from collections.abc import Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -15,7 +19,7 @@ from typing import Literal, cast
 
 from . import __version__
 from .config import OperatorConfig, WorkerName, load_operator_config
-from .database import resolve_database_path
+from .database import DATABASE_ENVIRONMENT_VARIABLE, resolve_database_path
 from .demo import run_demo
 from .domain import (
     CompletionCriterion,
@@ -296,6 +300,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _warn_for_explicit_temporary_database(command: str, database_path: str) -> None:
+    if command not in {"run", "work"}:
+        return
+    resolved_path = Path(database_path).resolve()
+    temporary_directory = Path(tempfile.gettempdir()).resolve()
+    if not resolved_path.is_relative_to(temporary_directory):
+        return
+    serve_command = shlex.join(("fleet", "serve", "--db", str(resolved_path)))
+    print(
+        f"warning: temporary database {resolved_path} is absent from the default Inspector; "
+        f"run `{serve_command}` to inspect it.",
+        file=sys.stderr,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "project":
@@ -312,7 +331,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "eval":
         return _eval(args)
+    database_was_explicitly_selected = (
+        args.db is not None or DATABASE_ENVIRONMENT_VARIABLE in os.environ
+    )
     args.db = str(resolve_database_path(args.db))
+    if database_was_explicitly_selected:
+        _warn_for_explicit_temporary_database(args.command, args.db)
     if args.command == "work":
         return _work(args)
     with SQLiteStore(args.db) as store:
@@ -409,6 +433,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "compare":
             print(canonical_json(compare_runs(store, args.left_run_id, args.right_run_id)))
         elif args.command == "serve":
+            database_path = Path(store.path).resolve()
+            print(
+                f"Fleet Inspector: http://{args.host}:{args.port} (database: {database_path})",
+                flush=True,
+            )
             serve(store, args.host, args.port)
     return 0
 
