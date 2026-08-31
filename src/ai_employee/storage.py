@@ -30,6 +30,30 @@ from .serialization import canonical_json
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
+_RUN_ID_TABLES = (
+    "records",
+    "events",
+    "checkpoints",
+    "controls",
+    "work_events_v2",
+    "work_checkpoints_v2",
+    "graph_claims_v2",
+    "graph_reservations_v2",
+)
+
+
+def _existing_run_id_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+            + ",".join("?" for _item in _RUN_ID_TABLES)
+            + ")",
+            _RUN_ID_TABLES,
+        )
+    }
+    return tuple(table for table in _RUN_ID_TABLES if table in existing)
+
 
 def _repository_details(repository: str | Path) -> tuple[str, str]:
     """Return a stable local identity and display path for a repository."""
@@ -309,10 +333,14 @@ class SQLiteStore:
             claimed = connection.execute(
                 "SELECT 1 FROM run_repositories WHERE run_id=?", (run_id,)
             ).fetchone()
-            persisted = connection.execute(
-                "SELECT 1 FROM records WHERE run_id=? LIMIT 1", (run_id,)
-            ).fetchone()
-            if claimed is not None or persisted is not None:
+            persisted = any(
+                connection.execute(
+                    f"SELECT 1 FROM {table} WHERE run_id=? LIMIT 1", (run_id,)
+                ).fetchone()
+                is not None
+                for table in _existing_run_id_tables(connection)
+            )
+            if claimed is not None or persisted:
                 raise ValueError(f"run ID {run_id!r} already exists; choose a different --run-id")
             connection.execute(
                 "INSERT OR IGNORE INTO repositories(repository_id,repository) VALUES(?,?)",
@@ -343,11 +371,15 @@ class SQLiteStore:
     ) -> tuple[dict[str, str | None], ...]:
         """List registered and legacy run IDs, optionally filtered by repository."""
 
+        run_sources = ["SELECT run_id FROM run_repositories"]
+        run_sources.extend(
+            f"SELECT DISTINCT run_id FROM {table} WHERE run_id IS NOT NULL"
+            for table in _existing_run_id_tables(self._connection)
+        )
         rows = self._connection.execute(
             "WITH run_ids(run_id) AS ("
-            "SELECT run_id FROM run_repositories "
-            "UNION SELECT DISTINCT run_id FROM records WHERE run_id IS NOT NULL"
-            ") SELECT run_ids.run_id,run_repositories.repository_id,repositories.repository "
+            + " UNION ".join(run_sources)
+            + ") SELECT run_ids.run_id,run_repositories.repository_id,repositories.repository "
             "FROM run_ids "
             "LEFT JOIN run_repositories USING(run_id) "
             "LEFT JOIN repositories USING(repository_id) "

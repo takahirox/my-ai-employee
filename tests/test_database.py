@@ -107,6 +107,28 @@ def test_repository_filtering_legacy_visibility_and_run_id_collisions(tmp_path: 
         store.claim_run_id("second-run", second_repository)
         legacy = Goal(id="legacy-goal", statement="legacy")
         store.put("goal", legacy, run_id="legacy-run")
+        store._connection.execute(
+            "INSERT INTO events(event_id,run_id,event_type,payload) VALUES(?,?,?,?)",
+            ("legacy-event", "event-only-run", "legacy", "{}"),
+        )
+        store._connection.execute(
+            "INSERT INTO checkpoints(run_id,generation,payload) VALUES(?,?,?)",
+            ("checkpoint-only-run", 0, "{}"),
+        )
+        store._connection.execute(
+            "INSERT INTO controls(run_id,action) VALUES(?,?)",
+            ("control-only-run", "pause"),
+        )
+        store.migrate_v2()
+        store._connection.execute(
+            "INSERT INTO work_events_v2(event_id,run_id,payload) VALUES(?,?,?)",
+            ("legacy-work-event", "work-event-only-run", "{}"),
+        )
+        store._connection.execute(
+            "INSERT INTO work_checkpoints_v2(run_id,generation,payload) VALUES(?,?,?)",
+            ("work-checkpoint-only-run", 0, "{}"),
+        )
+        store._connection.commit()
 
         first_context = store.repository_for_run("first-run")
         second_context = store.repository_for_run("second-run")
@@ -118,9 +140,14 @@ def test_repository_filtering_legacy_visibility_and_run_id_collisions(tmp_path: 
         assert [item["run_id"] for item in first_runs] == ["first-run"]
         all_runs = store.list_run_repositories()
         assert {item["run_id"] for item in all_runs} == {
+            "checkpoint-only-run",
+            "control-only-run",
+            "event-only-run",
             "first-run",
             "second-run",
             "legacy-run",
+            "work-checkpoint-only-run",
+            "work-event-only-run",
         }
         assert next(item for item in all_runs if item["run_id"] == "legacy-run") == {
             "run_id": "legacy-run",
@@ -132,3 +159,12 @@ def test_repository_filtering_legacy_visibility_and_run_id_collisions(tmp_path: 
             store.claim_run_id("first-run", first_repository)
         with pytest.raises(ValueError, match=r"already exists.*different --run-id"):
             store.claim_run_id("legacy-run", second_repository)
+        for legacy_run_id in (
+            "checkpoint-only-run",
+            "control-only-run",
+            "event-only-run",
+            "work-checkpoint-only-run",
+            "work-event-only-run",
+        ):
+            with pytest.raises(ValueError, match=r"already exists.*different --run-id"):
+                store.claim_run_id(legacy_run_id, second_repository)
