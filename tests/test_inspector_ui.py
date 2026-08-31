@@ -25,6 +25,7 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     document.feed(_INDEX)
     assert document.ids >= {
         "app",
+        "connection-status",
         "details",
         "explanation",
         "graph",
@@ -47,6 +48,9 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "renderGraph",
         "Repository filter",
         "Typed result acceptances",
+        "Live",
+        "Reconnecting",
+        "Disconnected",
     ):
         assert marker in _INDEX
 
@@ -68,6 +72,15 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "method:'PUT'" not in _INDEX
     assert "method:'DELETE'" not in _INDEX
     assert "Promise.all([getJSON('/api/runs/'" in _INDEX
+    assert "new EventSource('/api/events')" in _INDEX
+    assert "eventSource.addEventListener('freshness'" in _INDEX
+    assert "eventSource.onerror" in _INDEX
+    assert "eventSource.close()" in _INDEX
+    assert "await refreshRunCatalog()" in _INDEX
+    assert "await load(true)" in _INDEX
+    assert "selectedRevision=preserve&&" in _INDEX
+    assert "!revisionTasks().some(x=>x.id===selectedTask)" in _INDEX
+    assert "selectTab(selectedTab)" in _INDEX
     assert "succeeded:'completed'" in _INDEX
     assert ".filter(x=>x.target_id===id).map(x=>x.source_id)" in _INDEX
     assert "Current unaccepted proposal" in _INDEX

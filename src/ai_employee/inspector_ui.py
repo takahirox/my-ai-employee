@@ -55,8 +55,12 @@ font-size:.72rem;
 padding:.15rem .45rem;
 border:1px solid #64748b;
 border-radius:99px}
-.readonly{
+.readonly,
+.connection.live{
 color:#8de6b0}
+.connection.reconnecting{
+color:#facc6b}
+.connection.disconnected,
 .error{
 color:#ff9a9a}
 main{
@@ -209,6 +213,7 @@ width:45vw}
 <header>
 <h1>Fleet Inspector</h1>
 <span class="badge readonly">Read only</span>
+<span id="connection-status" class="badge connection reconnecting">Connecting</span>
 <label>Repository <select id="repository-filter" aria-label="Repository filter">
 <option value="">All repositories</option>
 </select>
@@ -278,7 +283,12 @@ const $=s=>document.querySelector(s);
 let raw=null,
 story=null,
 selectedRevision=null,
-selectedTask=null;
+selectedTask=null,
+selectedTab='dag',
+eventSource=null,
+reconnectFailures=0,
+refreshQueued=false,
+refreshActive=false;
 const text=v=>v===null||
 v===undefined||
 v===''?
@@ -306,6 +316,8 @@ $('#message').className=error?
 
 async function filterRunList(){
 const repository=$('#repository-filter').value,
+selectedRun=$('#run-list').value||
+$('#run').value.trim(),
 suffix=repository?
 '?repository_id='+encodeURIComponent(repository):'',
 payload=await getJSON('/api/runs'+suffix),
@@ -322,6 +334,7 @@ option.textContent=item.run_id+
 ' · '+item.repository:' · legacy/unassigned');
 return option}
 ));
+if(runs.some(item=>item.run_id===selectedRun))$('#run-list').value=selectedRun;
 message('Repository filter matched '+runs.length+' persisted run(s).')}
 
 async function refreshRunCatalog(){
@@ -368,6 +381,8 @@ null);
 $('#app').classList.remove('hidden');
 message('Loaded persisted state. Refresh is read only.');
 render();
+if(Array.from($('#run-list').options).some(option=>option.value===id))
+$('#run-list').value=id;
 history.replaceState(null,
 '',
 '?run='+
@@ -439,7 +454,8 @@ renderGraph();
 if(selectedTask&&
 !revisionTasks().some(x=>x.id===selectedTask))selectedTask=null;
 renderDetails(selectedTask&&
-taskView(selectedTask))}
+taskView(selectedTask));
+selectTab(selectedTab)}
 
 function renderRevision(){
 const root=$('#revision-story'),
@@ -823,6 +839,7 @@ pre);
 root.append(details)}
 
 function selectTab(name){
+selectedTab=name;
 for(const button of document.querySelectorAll('[data-tab]'))button.setAttribute('aria-selected',
 String(button.dataset.tab===name));
 for(const id of ['dag',
@@ -836,6 +853,54 @@ null,
 if(name==='explanation')$('#explanation').textContent=JSON.stringify(story,
 null,
 2)}
+
+function connectionStatus(state,
+label){
+const status=$('#connection-status');
+status.className='badge connection '+
+state;
+status.textContent=label}
+
+async function refreshFreshState(){
+refreshQueued=true;
+if(refreshActive)return;
+refreshActive=true;
+try{
+while(refreshQueued){
+refreshQueued=false;
+await refreshRunCatalog();
+if($('#run').value.trim())await load(true)}
+}
+catch(error){
+message(error.message,
+true)}
+finally{
+refreshActive=false}
+}
+
+function connectEvents(){
+if(!window.EventSource){
+connectionStatus('disconnected',
+'Disconnected');
+return}
+eventSource=new EventSource('/api/events');
+eventSource.onopen=()=>{
+reconnectFailures=0;
+connectionStatus('live',
+'Live');
+refreshFreshState();
+};
+eventSource.addEventListener('freshness',
+()=>refreshFreshState());
+eventSource.onerror=()=>{
+reconnectFailures+=1;
+const disconnected=eventSource.readyState===EventSource.CLOSED||
+reconnectFailures>=3;
+connectionStatus(disconnected?
+'disconnected':'reconnecting',
+disconnected?
+'Disconnected':'Reconnecting')};
+}
 
 $('#inspect').addEventListener('click',
 ()=>load());
@@ -868,7 +933,13 @@ if(initial){
 $('#run').value=initial;
 load()}
 refreshRunCatalog().catch(error=>message(error.message,
-true));
+true)).finally(()=>connectEvents());
+window.addEventListener('beforeunload',
+()=>{
+if(eventSource)eventSource.close();
+connectionStatus('disconnected',
+'Disconnected')}
+);
 
 </script>
 </body>
