@@ -100,6 +100,13 @@ class ServiceTests(unittest.TestCase):
                     request.close()
 
                     request = http.client.HTTPConnection(host, port, timeout=2.0)
+                    request.request("GET", "/api/overview")
+                    response = request.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(response.read()), {"active": [], "history": []})
+                    request.close()
+
+                    request = http.client.HTTPConnection(host, port, timeout=2.0)
                     request.request("POST", "/api/runs")
                     response = request.getresponse()
                     self.assertEqual(response.status, 501)

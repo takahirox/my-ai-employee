@@ -711,6 +711,216 @@ def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     raise KeyError(run_id)
 
 
+_TERMINAL_RUN_STATES = frozenset(
+    {
+        "cancelled",
+        "completed",
+        "failed",
+        "rejected",
+        "succeeded",
+    }
+)
+_ACTIVE_TASK_STATES = frozenset({"active", "claimed", "routed", "running"})
+_ATTENTION_TASK_STATES = frozenset({"blocked", "failed"})
+_ATTENTION_RUN_STATES = frozenset(
+    {"failed", "paused", "planned", "ready_to_promote", "waiting_approval"}
+)
+_ATTENTION_LOOP_ACTIONS = frozenset({"ESCALATE", "REPAIR", "REPLAN", "RETRY"})
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_dicts(value: Any) -> list[dict[str, Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _goal_statement(projection: dict[str, Any], run: dict[str, Any]) -> str | None:
+    goal = projection.get("goal", run.get("goal"))
+    if isinstance(goal, str):
+        return goal
+    if isinstance(goal, dict) and isinstance(goal.get("statement"), str):
+        statement = goal["statement"]
+        return str(statement)
+    return None
+
+
+def _accepted_graph(projection: dict[str, Any]) -> dict[str, Any]:
+    graph = projection.get("graph_acceptance") or projection.get("graph")
+    graph = _as_dict(graph)
+    accepted_revision = _as_dict(graph.get("accepted_revision"))
+    if accepted_revision:
+        return _as_dict(accepted_revision.get("graph"))
+    nested = _as_dict(graph.get("graph"))
+    return nested or graph
+
+
+def _latest_node_facts(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    # Graph-run inspection already projects exactly one authoritative latest
+    # record per node. Do not reconstruct latest state from UUID-sorted history.
+    latest = _as_dicts(projection.get("nodes"))
+    if latest:
+        return latest
+    graph_nodes = _as_dicts(_as_dict(projection.get("graph")).get("nodes"))
+    return graph_nodes
+
+
+def _attention_facts(
+    projection: dict[str, Any], run: dict[str, Any], status: str, latest_nodes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    attention: list[dict[str, Any]] = []
+    for record in latest_nodes:
+        task_status = record.get("status", record.get("state"))
+        if task_status in _ATTENTION_TASK_STATES:
+            attention.append(
+                {
+                    "kind": "task",
+                    "task_id": record.get("node_id", record.get("id")),
+                    "condition": task_status,
+                }
+            )
+    failure_code = projection.get("failure_code") or run.get("failure_code")
+    if failure_code:
+        attention.append({"kind": "run", "condition": failure_code})
+    elif status in _ATTENTION_RUN_STATES:
+        attention.append({"kind": "run", "condition": status})
+
+    approvals = _as_dicts(projection.get("approvals"))
+    if any(item.get("decision") == "pending" for item in approvals):
+        attention.append({"kind": "approval", "condition": "approval_required"})
+    plan_review = _as_dict(projection.get("plan_review"))
+    if plan_review.get("status") == "blocked":
+        attention.append({"kind": "plan_review", "condition": "blocked"})
+
+    transitions = _as_dicts(projection.get("loop_transitions"))
+    if transitions:
+        action = transitions[-1].get("action")
+        if action in _ATTENTION_LOOP_ACTIONS:
+            attention.append({"kind": "loop", "condition": str(action).lower()})
+
+    controls = _as_dicts(projection.get("controls"))
+    if controls and controls[-1].get("action") in {"cancel", "pause"}:
+        attention.append({"kind": "control", "condition": controls[-1]["action"]})
+
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[object, ...]] = set()
+    for item in attention:
+        key = (item.get("kind"), item.get("task_id"), item.get("condition"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def inspect_fleet_runs(store: SQLiteStore, repository_id: str | None = None) -> dict[str, Any]:
+    """Project a live, read-only summary of top-level persisted Fleet runs."""
+
+    active: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+    child_work_run_ids = {
+        item.work_run_id
+        for item in store.list_records("node_execution_v2", NodeExecutionRecord)
+        if item.work_run_id is not None
+    }
+    for context in store.list_run_repositories(repository_id):
+        run_id = context["run_id"]
+        if not isinstance(run_id, str):
+            continue
+        if run_id in child_work_run_ids:
+            continue
+        try:
+            projection = inspect_any_run(store, run_id)
+        except KeyError:
+            # Old event/checkpoint-only IDs remain discoverable without inventing facts.
+            item: dict[str, Any] = {
+                **context,
+                "goal": None,
+                "status": "not_recorded",
+                "generation": None,
+                "progress": {"completed": 0, "total": 0},
+                "active_task": None,
+                "active_tasks": [],
+                "phase": "Persisted legacy records",
+                "requires_attention": False,
+                "attention": [],
+            }
+            history.append(item)
+            continue
+
+        status = str(projection.get("state") or "not_recorded")
+        run = _as_dict(projection.get("run"))
+        goal_statement = _goal_statement(projection, run)
+        graph = _accepted_graph(projection)
+        graph_nodes = _as_dicts(graph.get("nodes"))
+        node_ids: list[str] = [
+            str(node["id"]) for node in graph_nodes if isinstance(node.get("id"), str)
+        ]
+        node_labels: dict[str, str] = {
+            str(node["id"]): str(node.get("name") or node.get("objective") or node["id"])
+            for node in graph_nodes
+            if isinstance(node.get("id"), str)
+        }
+        latest_node_records = _latest_node_facts(projection)
+        if not node_ids:
+            node_ids = [
+                str(record.get("node_id", record.get("id")))
+                for record in latest_node_records
+                if record.get("node_id", record.get("id")) is not None
+            ]
+        latest_nodes = {
+            str(record.get("node_id", record.get("id"))): record
+            for record in latest_node_records
+            if record.get("node_id", record.get("id")) is not None
+        }
+        completed = len(
+            [
+                node_id
+                for node_id in node_ids
+                if latest_nodes.get(node_id, {}).get(
+                    "status", latest_nodes.get(node_id, {}).get("state")
+                )
+                in {"completed", "passed", "succeeded"}
+            ]
+        )
+        active_tasks = [
+            {
+                "id": node_id,
+                "label": node_labels.get(node_id, node_id),
+                "status": record.get("status", record.get("state")),
+            }
+            for node_id, record in latest_nodes.items()
+            if record.get("status", record.get("state")) in _ACTIVE_TASK_STATES
+        ]
+        attention = _attention_facts(projection, run, status, latest_node_records)
+        active_task = active_tasks[0]["label"] if active_tasks else None
+        loop_attention = next(
+            (item["condition"] for item in reversed(attention) if item["kind"] == "loop"), None
+        )
+        item = {
+            **context,
+            "goal": goal_statement,
+            "status": status,
+            "generation": projection.get("generation"),
+            "progress": {"completed": completed, "total": len(node_ids)},
+            "active_task": active_task,
+            "active_tasks": active_tasks,
+            "phase": (
+                str(loop_attention).title()
+                if loop_attention is not None
+                else f"Task: {active_task}"
+                if active_task is not None
+                else status.replace("_", " ").title()
+            ),
+            "requires_attention": bool(attention),
+            "attention": attention,
+        }
+        (history if status in _TERMINAL_RUN_STATES else active).append(item)
+    active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
+    history.sort(key=lambda item: str(item["run_id"]), reverse=True)
+    return {"active": active, "history": history}
+
+
 def _attach_repository_context(
     store: SQLiteStore, run_id: str, projection: dict[str, Any]
 ) -> dict[str, Any]:
@@ -899,7 +1109,10 @@ class _InspectorHandler(BaseHTTPRequestHandler):
         server = cast(_InspectorServer, self.server)
         try:
             with _open_read_only_store(server.database_path) as store:
-                if parsed.path == "/api/runs":
+                if parsed.path == "/api/overview":
+                    repository_id = parse_qs(parsed.query).get("repository_id", [None])[0]
+                    body = canonical_json(inspect_fleet_runs(store, repository_id)).encode()
+                elif parsed.path == "/api/runs":
                     repository_id = parse_qs(parsed.query).get("repository_id", [None])[0]
                     body = canonical_json(
                         {"runs": store.list_run_repositories(repository_id)}
