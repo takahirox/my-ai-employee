@@ -37,7 +37,7 @@ from ai_employee.domain.v2 import (
     WorkspaceSnapshot,
 )
 from ai_employee.inspector import inspect_work_run
-from ai_employee.orchestration import WorkCoordinator, WorkRun
+from ai_employee.orchestration import WorkCoordinator, WorkRun, _mediated_result_artifacts
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
@@ -59,6 +59,45 @@ from ai_employee.worker_adapters import (
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
+
+
+def test_install_process_outputs_retain_the_original_process_provenance() -> None:
+    descriptor = ArtifactDescriptor(
+        id="artifact-1",
+        run_id="work-1",
+        created_at=NOW,
+        media_type="text/plain",
+        logical_kind="process_stdout",
+        producer_action_id="process-result-1",
+        size_bytes=1,
+        artifact_digest=ZERO,
+        source={"request_digest": ZERO},
+        store_locator=f"sha256/{ZERO[:2]}/{ZERO}",
+    )
+
+    class Resolver:
+        def output_descriptor(
+            self, digest: str, logical_kind: str, producer_action_id: str
+        ) -> ArtifactDescriptor:
+            assert (digest, logical_kind, producer_action_id) == (
+                ZERO,
+                "process_stdout",
+                "process-result-1",
+            )
+            return descriptor
+
+    result = InstallResult(
+        id="install-result-1",
+        run_id="work-1",
+        created_at=NOW,
+        request_digest=ZERO,
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest=ZERO,
+        resource_usage={"process_result_id": "process-result-1"},
+    )
+
+    assert _mediated_result_artifacts(result, Resolver()) == (descriptor,)
 
 
 def test_cli_environment_inherits_only_required_local_state() -> None:

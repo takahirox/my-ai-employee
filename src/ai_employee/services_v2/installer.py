@@ -194,6 +194,7 @@ class ProjectLocalInstaller:
                 {
                     "inventory_before": len(before),
                     "inventory_after": len(after),
+                    "process_result_id": executed.id,
                     "process_result_digest": executed.content_digest,
                 }
             ),

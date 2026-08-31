@@ -46,6 +46,7 @@ from .domain.v2 import (
     EditIntentRequest,
     ExecutionResult,
     InstallRequest,
+    InstallResult,
     NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
@@ -1075,12 +1076,18 @@ def _mediated_result_artifacts(
         descriptors.append(result.artifact)
     resolver = getattr(service, "output_descriptor", None)
     if callable(resolver):
+        producer_action_id = result.id
+        if isinstance(result, InstallResult):
+            process_result_id = result.resource_usage.get("process_result_id")
+            if not isinstance(process_result_id, str) or not process_result_id:
+                raise ValueError("install result is missing process output provenance")
+            producer_action_id = process_result_id
         for digest, logical_kind in (
             (result.stdout_artifact_digest, "process_stdout"),
             (result.stderr_artifact_digest, "process_stderr"),
         ):
             if digest is not None:
-                descriptor = resolver(digest, logical_kind, result.id)
+                descriptor = resolver(digest, logical_kind, producer_action_id)
                 if not isinstance(descriptor, ArtifactDescriptor):
                     raise TypeError("service returned a non-descriptor artifact reference")
                 descriptors.append(descriptor)
