@@ -887,9 +887,7 @@ class _InspectorHandler(BaseHTTPRequestHandler):
                     body = canonical_json(
                         {"runs": store.list_run_repositories(repository_id)}
                     ).encode()
-                elif parsed.path.startswith("/api/runs/") and parsed.path.endswith(
-                    "/explanation"
-                ):
+                elif parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
                     run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
                     try:
                         from .run_explanation import explain_any_run
