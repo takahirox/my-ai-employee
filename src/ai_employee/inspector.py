@@ -6,7 +6,7 @@ import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import RootModel
 
@@ -676,19 +676,27 @@ def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     try:
         from .eval_framework import inspect_experiment
 
-        return _json_model(inspect_experiment(store, run_id))
+        projection = _json_model(inspect_experiment(store, run_id))
     except KeyError:
         pass
-    try:
-        return inspect_graph_run(store, run_id)
-    except KeyError:
+    else:
+        return _attach_repository_context(store, run_id, projection)
+    for inspector in (inspect_graph_run, inspect_failed_plan_review, inspect_work_run, inspect_run):
         try:
-            return inspect_failed_plan_review(store, run_id)
+            projection = inspector(store, run_id)
         except KeyError:
-            try:
-                return inspect_work_run(store, run_id)
-            except KeyError:
-                return inspect_run(store, run_id)
+            continue
+        return _attach_repository_context(store, run_id, projection)
+    raise KeyError(run_id)
+
+
+def _attach_repository_context(
+    store: SQLiteStore, run_id: str, projection: dict[str, Any]
+) -> dict[str, Any]:
+    repository = store.repository_for_run(run_id)
+    if repository is not None:
+        projection["repository_context"] = repository
+    return projection
 
 
 def _json_model(value: object) -> dict[str, Any]:
@@ -714,12 +722,20 @@ def serve(store: SQLiteStore, host: str = "127.0.0.1", port: int = 8765) -> None
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
+            if parsed.path == "/api/runs":
+                repository_id = parse_qs(parsed.query).get("repository_id", [None])[0]
+                body = canonical_json({"runs": store.list_run_repositories(repository_id)}).encode()
+                content_type = "application/json"
+            elif parsed.path.startswith("/api/runs/") and parsed.path.endswith("/explanation"):
                 run_id = parsed.path.removeprefix("/api/runs/").removesuffix("/explanation")
                 try:
                     from .run_explanation import explain_any_run
 
-                    body = canonical_json(explain_any_run(store, run_id)).encode()
+                    explanation = explain_any_run(store, run_id)
+                    repository = store.repository_for_run(run_id)
+                    if repository is not None:
+                        explanation["repository_context"] = repository
+                    body = canonical_json(explanation).encode()
                 except KeyError:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
