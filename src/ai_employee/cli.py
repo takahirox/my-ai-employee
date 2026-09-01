@@ -229,16 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
     work.add_argument("goal")
     work.add_argument("--repo", default=".")
     work.add_argument(
-        "--worker",
-        choices=("codex_cli", "claude_code_cli", "ollama_cli"),
-        default=None,
-    )
-    work.add_argument("--model", help="explicit worker model (for example qwen3-coder:30b)")
-    work.add_argument(
         "--routing-mode",
-        choices=("legacy", "fixed", "adaptive"),
+        choices=("fixed", "adaptive"),
         default="adaptive",
-        help="selection mode (default: adaptive; legacy enables explicit worker/model use)",
+        help="Graph strategy selection mode (default: adaptive)",
     )
     work.add_argument("--strategy", help="exact strategy ID for fixed routing")
     work.add_argument(
@@ -550,8 +544,6 @@ def _eval(args: argparse.Namespace) -> int:
         work_args = argparse.Namespace(
             goal=scenario.goal,
             repo=scenario.repository,
-            worker=None,
-            model=None,
             routing_mode="fixed",
             strategy=binding.strategy.id,
             strategy_set=binding.strategy_set,
@@ -645,32 +637,22 @@ def _work(args: argparse.Namespace) -> int:
     repository = Path(args.repo).resolve()
     requested_run_id = getattr(args, "run_id", None)
     run_id = (requested_run_id or identifier("work")) if resume_run is None else resume_run.id
-    routing_enabled = args.routing_mode != "legacy"
+    routing_enabled = args.routing_mode in {"fixed", "adaptive"}
+    if not routing_enabled:
+        raise ValueError("--routing-mode must be fixed or adaptive")
     if args.routing_mode == "fixed" and args.strategy is None:
         raise ValueError("--routing-mode fixed requires --strategy")
     if args.routing_mode == "adaptive" and args.strategy is not None:
         raise ValueError("--routing-mode adaptive rejects --strategy")
-    if args.routing_mode == "legacy" and args.strategy is not None:
-        raise ValueError("--strategy requires --routing-mode fixed")
-    if args.routing_mode == "legacy" and args.strategy_set is not None:
-        raise ValueError("--strategy-set requires fixed or adaptive routing")
     if args.routing_mode != "adaptive" and args.assessment_strategy is not None:
         raise ValueError("--assessment-strategy requires adaptive routing")
     if args.routing_mode != "adaptive" and args.planner_strategy is not None:
         raise ValueError("--planner-strategy requires adaptive routing")
-    if routing_enabled and args.model is not None:
-        raise ValueError("--routing-mode cannot be combined with --model")
-    if routing_enabled and args.worker is not None:
-        raise ValueError("--routing-mode cannot be combined with --worker")
-    if args.worker == "ollama_cli" and not args.model:
-        raise ValueError("--worker ollama_cli requires --model")
     if args.max_concurrency < 1:
         raise ValueError("--max-concurrency must be positive")
     if args.max_concurrency > 1 and args.routing_mode != "adaptive":
         raise ValueError("task-graph planning requires adaptive routing")
     harness = discover_project_harness(repository)
-    if harness.verification.review.independent_task_review and not routing_enabled:
-        raise ValueError("independent task review requires configured routing")
     try:
         goal = (
             _work_goal(
@@ -724,9 +706,6 @@ def _work(args: argparse.Namespace) -> int:
         and operator_config_digest(operator_config) != resume_run.operator_config_digest
     ):
         raise ValueError("operator configuration changed since the graph was accepted")
-    worker_name = cast(WorkerName, args.worker or "codex_cli")
-    worker_model = args.model
-    worker_effort: str | None = None
     task_assessment = None
     assessment_strategy = None
     selected_strategy = None
@@ -839,13 +818,10 @@ def _work(args: argparse.Namespace) -> int:
                 allowed_backends=harness.worker.allowed,
                 local_backend_allowed=harness.worker.local_backend,
             )
-            worker_name = cast(WorkerName, selected_strategy.backend)
-            worker_model = selected_strategy.model
-            worker_effort = selected_strategy.effort
     worker_command = (
         None
-        if selected_strategy is None and routing_enabled
-        else operator_config.worker_command(worker_name)
+        if selected_strategy is None
+        else operator_config.worker_command(cast(WorkerName, selected_strategy.backend))
     )
     assessment_command = (
         None
@@ -1124,10 +1100,9 @@ def _work(args: argparse.Namespace) -> int:
                 allowed_backends=harness.worker.allowed,
                 local_backend_allowed=harness.worker.local_backend,
             )
-            worker_name = cast(WorkerName, selected_strategy.backend)
-            worker_model = selected_strategy.model
-            worker_effort = selected_strategy.effort
-            worker_command = operator_config.worker_command(worker_name)
+            worker_command = operator_config.worker_command(
+                cast(WorkerName, selected_strategy.backend)
+            )
             planner_schema_path: str | None = None
             if planner_strategy.backend == "codex_cli":
                 planner_schema = assessment_directory / "proposed-graph.json"
@@ -1235,20 +1210,7 @@ def _work(args: argparse.Namespace) -> int:
                 timeout_seconds=harness.budgets.wall_seconds,
             )
 
-        def worker_factory(
-            snapshot: WorkspaceSnapshot | None, cancellation: Cancellation
-        ) -> WorkerAdapter:
-            return build_worker_adapter(
-                snapshot,
-                cancellation,
-                bound_run_id=run_id,
-                bound_worker_name=worker_name,
-                bound_model=worker_model,
-                bound_effort=worker_effort,
-                bound_store=store,
-            )
-
-        if harness.provisional or worker_name not in harness.worker.allowed:
+        if harness.provisional:
             print(
                 canonical_json(
                     {
@@ -1261,54 +1223,10 @@ def _work(args: argparse.Namespace) -> int:
                 )
             )
             return 3
-        verification_requests = tuple(
-            ProcessRequest(
-                id=identifier("verification-request"),
-                run_id=run_id,
-                created_at=now(),
-                argv=harness.commands[name].argv,
-                cwd=harness.commands[name].cwd,
-                inherit_environment=harness.commands[name].inherit_environment,
-                timeout_seconds=min(300.0, harness.budgets.wall_seconds),
-                budget_class="verification",
-                purpose=f"required Harness verification: {name}",
-            )
-            for name in harness.verification.required
-        )
         workspace = GitWorkspaceManager(workspace_root, artifacts)
         harness_digest = project_harness_digest(harness)
         operator_digest = operator_config_digest(operator_config)
         effective_policy_digest = canonical_digest((policy.content_digest,))
-        coordinator = WorkCoordinator(
-            store,
-            DeterministicRuntime({}, store=store),
-            workspace,
-            worker_factory,
-            lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
-            lambda descriptor: artifacts.open_verified(descriptor).read(),
-            (policy,),
-            task_assessment=(task_assessment if selected_strategy is not None else None),
-            assessment_strategy=assessment_strategy,
-            selected_strategy=selected_strategy,
-            strategy_set=(effective_strategy_set if selected_strategy is not None else None),
-            approval_service=DigestApprovalService(store, operator_label="local-operator"),
-            download_client=RestrictedDownloadClient(
-                artifacts,
-                enabled=harness.network.mode.value != "disabled",
-                allowed_domains=harness.network.https_domains,
-                allowed_ports=harness.network.ports or (443,),
-            ),
-            installer_factory=lambda snapshot: ProjectLocalInstaller(
-                snapshot.isolated_worktree,
-                executor_for(Path(snapshot.isolated_worktree)),
-                artifacts,
-                network_mediated=harness.network.mode.value != "disabled",
-            ),
-            verification_requests=verification_requests,
-            protected_paths=harness.paths.protected,
-            allowed_processes=tuple(command.argv for command in harness.commands.values()),
-            artifact_store=artifacts,
-        )
         head = (
             __import__("subprocess")
             .run(
@@ -1579,30 +1497,6 @@ def _work(args: argparse.Namespace) -> int:
                 )
             )
             return 0 if graph_run.status in {"planned", "completed", "ready_to_promote"} else 5
-        run = coordinator.start(
-            args.goal,
-            str(repository),
-            head,
-            worker_name=worker_name,
-            plan_only=args.plan_only,
-            run_id=run_id,
-        )
-        print(
-            canonical_json(
-                {
-                    "schema_version": "2",
-                    "run_id": run.id,
-                    "status": run.status,
-                    "stable_code": run.failure_code,
-                    "next_actions": _next_actions(run),
-                }
-            )
-        )
-        if run.failure_code and "WORKER" in run.failure_code:
-            return 6
-        if run.status == "waiting_approval" and args.non_interactive:
-            return 4
-        return 0 if run.status not in {"failed", "cancelled"} else 5
 
 
 def _approvals(store: SQLiteStore, args: argparse.Namespace) -> int:
@@ -2236,8 +2130,6 @@ def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
             repo=run.repository,
             goal=run.goal.statement,
             db=store.path,
-            worker=None,
-            model=None,
             routing_mode=run.routing_mode.value,
             strategy=run.fixed_strategy_id,
             strategy_set=run.strategy_set,
