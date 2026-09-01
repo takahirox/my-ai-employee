@@ -196,8 +196,7 @@ def _canonicalize_graph_payload(
         )
         if missing:
             raise ValueError(
-                "mutating ProposedGraph resource budget omits repair reserve: "
-                + ", ".join(missing)
+                "mutating ProposedGraph resource budget omits repair reserve: " + ", ".join(missing)
             )
     return graph
 

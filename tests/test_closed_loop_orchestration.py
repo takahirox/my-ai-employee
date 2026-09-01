@@ -349,9 +349,7 @@ def test_malformed_patch_protocol_failure_gets_one_bound_correction_turn(
         )
 
     with SQLiteStore(tmp_path / "protocol-repair.db") as store:
-        orchestrator, run = _run(
-            store, graph, goal, runner, run_id="closed-loop-protocol-repair"
-        )
+        orchestrator, run = _run(store, graph, goal, runner, run_id="closed-loop-protocol-repair")
         replay = orchestrator.replay("closed-loop-protocol-repair")
 
     assert run.status == "completed"
@@ -457,9 +455,7 @@ def test_failed_parent_evaluation_resumes_one_writing_node_with_exact_feedback(
         )
         store.put("parent_candidate_evaluation_v2", evaluation, run_id=failed.id)
 
-        assert orchestrator.prepare_parent_repair(
-            failed.id, evaluation.content_digest or ZERO
-        )
+        assert orchestrator.prepare_parent_repair(failed.id, evaluation.content_digest or ZERO)
         resumed = orchestrator.run(
             goal,
             graph,
@@ -563,9 +559,7 @@ def test_correctable_verification_with_zero_repair_budget_reports_exhaustion(
         )
 
     with SQLiteStore(tmp_path / "zero-repair.db") as store:
-        orchestrator, run = _run(
-            store, graph, goal, runner, run_id="closed-loop-zero-repair"
-        )
+        orchestrator, run = _run(store, graph, goal, runner, run_id="closed-loop-zero-repair")
         replay = orchestrator.replay("closed-loop-zero-repair")
 
     assert run.failure_code == "LOOP_ESCALATED:REPAIR_BUDGET_EXHAUSTED"

@@ -785,13 +785,10 @@ def _authoritative_node_result(
             failure_code=StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
         )
     repairable_verification_failure = (
-        writing
-        and run.status == "failed"
-        and run.failure_code == "VERIFICATION_FAILED"
+        writing and run.status == "failed" and run.failure_code == "VERIFICATION_FAILED"
     )
     if (
-        run.status != expected_status
-        and not repairable_verification_failure
+        run.status != expected_status and not repairable_verification_failure
     ) or worker_result.status != "succeeded":
         raise ValueError("inner work run did not reach its authoritative terminal state")
     descriptors = tuple(

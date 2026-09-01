@@ -2267,9 +2267,10 @@ def _next_actions(run: object) -> tuple[str, ...]:
             f"fleet explain {run_id}",
             f"fleet logs {run_id}",
         ]
-        if getattr(run, "patch_artifact_id", None) is not None or getattr(
-            run, "parent_candidate_artifact_id", None
-        ) is not None:
+        if (
+            getattr(run, "patch_artifact_id", None) is not None
+            or getattr(run, "parent_candidate_artifact_id", None) is not None
+        ):
             actions.insert(1, f"fleet diff {run_id}")
         return tuple(actions)
     return (f"fleet inspect {run_id}",) if run_id else ()
@@ -2286,9 +2287,7 @@ def _work_goal(
     """Bind the original Goal to exact declared parent verification evidence."""
 
     processes_allowed = (
-        task_kind is GoalTaskKind.MUTATING
-        if processes_authorized is None
-        else processes_authorized
+        task_kind is GoalTaskKind.MUTATING if processes_authorized is None else processes_authorized
     )
     if task_kind is GoalTaskKind.NON_MUTATING:
         return Goal(

@@ -598,13 +598,9 @@ class WorkCoordinator:
             failure_code = StableFailureCode.TYPED_RESULT_STALE
         elif request.task_kind.value != "non_mutating":
             failure_code = StableFailureCode.TYPED_RESULT_MALFORMED
-        elif (
-            any(
-                proposal.kind is not ActionKind.PROCESS
-                for proposal in worker_result.proposals
-            )
-            or (submitted_action_count and not request.processes_authorized)
-        ):
+        elif any(
+            proposal.kind is not ActionKind.PROCESS for proposal in worker_result.proposals
+        ) or (submitted_action_count and not request.processes_authorized):
             failure_code = StableFailureCode.TYPED_RESULT_ACTIONS_FORBIDDEN
 
         artifact: ArtifactDescriptor | None = None
@@ -801,9 +797,7 @@ class WorkCoordinator:
                 and line[6:] != "/dev/null"
             )
             if any(
-                fnmatch(path, pattern)
-                for path in changed_paths
-                for pattern in self.protected_paths
+                fnmatch(path, pattern) for path in changed_paths for pattern in self.protected_paths
             ):
                 return self._update(run, status="failed", failure_code="REVIEW_BLOCKED")
             run = self._update(

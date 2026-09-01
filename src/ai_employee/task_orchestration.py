@@ -1717,17 +1717,14 @@ class TaskOrchestrator:
                                         else review_decision.reason_code
                                     ),
                                 )
-                        elif (
-                            current.evaluator_decision is EvaluationDecision.FAIL
-                            and (
-                                result.worker_result.status == "succeeded"
-                                or current.failure_code
-                                in {
-                                    StableFailureCode.WORKER_PROTOCOL_ERROR.value,
-                                    StableFailureCode.WORKER_EMPTY_OUTPUT.value,
-                                    StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
-                                }
-                            )
+                        elif current.evaluator_decision is EvaluationDecision.FAIL and (
+                            result.worker_result.status == "succeeded"
+                            or current.failure_code
+                            in {
+                                StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+                                StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                                StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+                            }
                         ):
                             repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
                             repair_limit = graph_run.max_repairs
@@ -2048,10 +2045,7 @@ class TaskOrchestrator:
             item.failure_code
             for item in records.values()
             if item.failure_code in stable_codes
-            or (
-                item.failure_code is not None
-                and item.failure_code.startswith("LOOP_ESCALATED:")
-            )
+            or (item.failure_code is not None and item.failure_code.startswith("LOOP_ESCALATED:"))
         }
         graph_run = graph_run.model_copy(
             update={
@@ -2455,8 +2449,7 @@ class TaskOrchestrator:
             or len(writing_nodes) != 1
             or len(evaluations) != 1
             or evaluations[0].status != "failed"
-            or evaluations[0].accepted_graph_revision_digest
-            != run.accepted_graph_revision_digest
+            or evaluations[0].accepted_graph_revision_digest != run.accepted_graph_revision_digest
         ):
             return False
         node = writing_nodes[0]
@@ -2519,11 +2512,7 @@ class TaskOrchestrator:
                     limit=run.max_repairs,
                 )
             )
-            self._save_run(
-                run.model_copy(
-                    update={"failure_code": f"LOOP_ESCALATED:{reason}"}
-                )
-            )
+            self._save_run(run.model_copy(update={"failure_code": f"LOOP_ESCALATED:{reason}"}))
             return False
         self._save_loop_transition(
             LoopTransitionRecord(
@@ -2558,9 +2547,7 @@ class TaskOrchestrator:
             )
         )
         self._save_run(
-            run.model_copy(
-                update={"status": "paused", "failure_code": "PARENT_REPAIR_PENDING"}
-            )
+            run.model_copy(update={"status": "paused", "failure_code": "PARENT_REPAIR_PENDING"})
         )
         return True
 
@@ -2875,9 +2862,7 @@ class TaskOrchestrator:
             raise ValueError("accepted task-review repair context exceeds the worker bound")
         return value
 
-    def _node_evaluation_repair_goal(
-        self, node: Node, feedback: tuple[Digest, ...]
-    ) -> str:
+    def _node_evaluation_repair_goal(self, node: Node, feedback: tuple[Digest, ...]) -> str:
         """Render compact exact verifier feedback without exposing artifact bodies."""
 
         lines = [node.objective or node.name, "", "Accepted deterministic repair evidence:"]
@@ -2887,9 +2872,7 @@ class TaskOrchestrator:
             *self.store.list_records("action_result_v2", ExecutionResult),
         )
         matched = tuple(
-            result
-            for result in execution_results
-            if result.content_digest in verification_digests
+            result for result in execution_results if result.content_digest in verification_digests
         )
         for result in matched:
             failure = result.failure
@@ -2917,9 +2900,7 @@ class TaskOrchestrator:
                 f"(stage: {diagnostic.stage}; diagnostic: {diagnostic.content_digest})"
             )
         if not matched and not diagnostics:
-            lines.append(
-                f"- NODE_EVALUATION_NOT_PASS (evidence: {','.join(feedback)})"
-            )
+            lines.append(f"- NODE_EVALUATION_NOT_PASS (evidence: {','.join(feedback)})")
         lines.append(
             "Repair only this node's bounded objective, then return a complete replacement patch."
         )
@@ -2928,9 +2909,7 @@ class TaskOrchestrator:
             raise ValueError("accepted node repair context exceeds the worker bound")
         return value
 
-    def _parent_evaluation_repair_goal(
-        self, node: Node, feedback: tuple[Digest, ...]
-    ) -> str:
+    def _parent_evaluation_repair_goal(self, node: Node, feedback: tuple[Digest, ...]) -> str:
         from .graph_evaluation import ParentCandidateEvaluationRecord
 
         evaluations = self.store.list_records(
@@ -3708,11 +3687,14 @@ class TaskOrchestrator:
         verification_results = self.store.list_records(
             "verification_result_v2", ExecutionResult, run_id=worker_result.run_id
         )
-        if tuple(
-            item.content_digest
-            for item in verification_results
-            if item.content_digest in prior.verification_result_digests
-        ) != prior.verification_result_digests:
+        if (
+            tuple(
+                item.content_digest
+                for item in verification_results
+                if item.content_digest in prior.verification_result_digests
+            )
+            != prior.verification_result_digests
+        ):
             return False
         return bool(
             worker_result.content_digest == prior.worker_result_digest
