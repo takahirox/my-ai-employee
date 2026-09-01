@@ -760,7 +760,6 @@ def test_all_worker_transport_schemas_share_exact_evidence_ref_constraints() -> 
     expected = {
         "type": "array",
         "maxItems": 64,
-        "uniqueItems": True,
         "items": {"type": "string", "pattern": DIGEST_PATTERN},
     }
 

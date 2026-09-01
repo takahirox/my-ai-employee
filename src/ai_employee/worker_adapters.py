@@ -1010,7 +1010,6 @@ def _constrain_evidence_ref_schemas(value: object) -> None:
             properties["evidence_refs"] = {
                 "type": "array",
                 "maxItems": 64,
-                "uniqueItems": True,
                 "items": {"type": "string", "pattern": DIGEST_PATTERN},
             }
         for nested in value.values():
@@ -1281,7 +1280,6 @@ def worker_proposal_schema_json() -> bytes:
             "evidence_refs": {
                 "type": "array",
                 "maxItems": 64,
-                "uniqueItems": True,
                 "items": {"type": "string", "pattern": DIGEST_PATTERN},
             },
         },
