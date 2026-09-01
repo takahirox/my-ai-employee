@@ -118,7 +118,13 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "'aria-label'," in _INDEX
     assert "const taskOrPhase=run.active_task||run.phase||" in _INDEX
     assert "attention.title=attentionConditions.length?" in _INDEX
-    assert "attentionConditions.length+' warning'" in _INDEX
+    assert "attentionCount+' warning'" in _INDEX
+    assert "id=\"warning-summary\"" in _INDEX
+    assert "function renderWarningSummary(){" in _INDEX
+    assert "const warnings=maps(raw.attention);" in _INDEX
+    assert "button.dataset.taskId=task.id" in _INDEX
+    assert "Persisted attention facts were not recorded" in _INDEX
+    assert "Open run explanation" in _INDEX
     assert "['Active task',run.active_task]" not in _INDEX
     assert "['Phase',run.phase]" not in _INDEX
     assert "['Attention',run.attention.length?" not in _INDEX
@@ -269,6 +275,9 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
                     "created_at": "2026-01-01T00:00:15.234567Z",
                 }
             ],
+            "attention": [],
+            "attention_count": 0,
+            "attention_available": True,
         },
         "done": {
             "state": "failed",
@@ -284,6 +293,12 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
                 }
             ],
             "controls": [],
+            "attention": [
+                {"kind": "task", "task_id": "only", "condition": "failed"},
+                {"kind": "run", "condition": "EVALUATION_FAILED"},
+            ],
+            "attention_count": 2,
+            "attention_available": True,
         },
     }
     with patch(
@@ -308,12 +323,16 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
         "last_updated_at": "2026-01-01T00:00:15.234567Z",
         "requires_attention": False,
         "attention": [],
+        "attention_count": 0,
+        "attention_available": True,
     }
     assert result["history"][0]["attention"] == [
         {"kind": "task", "task_id": "only", "condition": "failed"},
         {"kind": "run", "condition": "EVALUATION_FAILED"},
     ]
     assert result["history"][0]["requires_attention"] is True
+    assert result["history"][0]["attention_count"] == 2
+    assert result["history"][0]["attention_available"] is True
     assert result["history"][0]["last_updated_at"] == "2025-12-31T23:59:59.654321Z"
 
 
@@ -330,12 +349,25 @@ def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> Non
             return [SimpleNamespace(work_run_id="child")]
 
     projections = {
-        "normal": {"state": "running", "goal": "Normal", "nodes": []},
+        "normal": {
+            "state": "running",
+            "goal": "Normal",
+            "nodes": [],
+            "attention": [],
+            "attention_count": 0,
+            "attention_available": True,
+        },
         "attention": {
             "state": "waiting_approval",
             "goal": "Needs approval",
             "nodes": [],
             "approvals": [{"decision": "pending"}],
+            "attention": [
+                {"kind": "run", "condition": "waiting_approval"},
+                {"kind": "approval", "condition": "approval_required"},
+            ],
+            "attention_count": 2,
+            "attention_available": True,
         },
     }
     with patch(

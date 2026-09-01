@@ -77,6 +77,37 @@ margin-bottom:.8rem}
 .summary,
 .muted{
 color:var(--muted)}
+.run-warning-summary{
+border:1px solid #f59e0b;
+border-radius:10px;
+background:#211d19;
+padding:.7rem .85rem;
+margin:0 0 .8rem}
+.run-warning-summary h2{
+font-size:1rem;
+margin:0}
+.warning-list{
+margin:.5rem 0 0;
+padding-left:1.25rem}
+.warning-item{
+margin:.45rem 0}
+.warning-row{
+display:flex;
+align-items:center;
+gap:.5rem;
+flex-wrap:wrap}
+.warning-row button{
+padding:.3rem .5rem}
+.warning-item details{
+margin-top:.25rem}
+.warning-item pre{
+white-space:pre-wrap;
+overflow-wrap:anywhere;
+background:#080f1c;
+padding:.55rem;
+border-radius:6px;
+max-height:15rem;
+overflow:auto}
 .tabs button[aria-selected=true]{
 background:#29496f}
 .overview-head{
@@ -249,6 +280,9 @@ text-transform:uppercase}
 .node.current{
 outline:3px solid #fff8;
 outline-offset:3px}
+.node.selected{
+outline:3px solid #60a5fa;
+outline-offset:3px}
 .node.entry:before{
 content:'ENTRY';
 font-size:.62rem}
@@ -392,6 +426,8 @@ or evaluators.</div>
 </div>
 <div id="summary" class="summary">
 </div>
+<section id="warning-summary" class="run-warning-summary hidden" aria-live="polite">
+</section>
 <div class="tabs" role="tablist">
 <button data-tab="dag" aria-selected="true">DAG</button>
 <button data-tab="raw" aria-selected="false">Raw Inspector record</button>
@@ -584,14 +620,20 @@ completed+' of '+total+' tasks completed');
 const progressText=document.createElement('span');
 progressText.textContent=completed+'/'+total;
 progressGroup.append(progress,progressText);
-const attentionConditions=maps(run.attention).map(x=>x.task_id?
-x.task_id+': '+x.condition:x.condition);
 const attention=document.createElement('span');
 attention.className='attention';
+if(run.attention_available===false){
+attention.title='Persisted warning facts were not recorded for this historical run';
+attention.textContent='Warnings unknown'}
+else{
+const attentionConditions=maps(run.attention).map(x=>x.task_id?
+x.task_id+': '+x.condition:x.condition),
+attentionCount=Number.isInteger(run.attention_count)?
+run.attention_count:attentionConditions.length;
 attention.title=attentionConditions.length?
 attentionConditions.join(', '):'No persisted attention conditions';
-attention.textContent=attentionConditions.length+' warning'+
-(attentionConditions.length===1?'':'s');
+attention.textContent=attentionCount+' warning'+
+(attentionCount===1?'':'s')}
 const activity=document.createElement('p');
 activity.className='run-activity';
 const taskOrPhase=run.active_task||run.phase||
@@ -749,12 +791,117 @@ remaining.length+
 ' · next: '+
 story.current_state.next_action:'');
 renderRevision();
+renderWarningSummary();
 renderGraph();
 if(selectedTask&&
 !revisionTasks().some(x=>x.id===selectedTask))selectedTask=null;
 renderDetails(selectedTask&&
 taskView(selectedTask));
 selectTab(selectedTab)}
+
+function attentionEvidence(item){
+const digest=selectedRevision?.digest||story.graph?.digest;
+if(item.kind==='task'){
+const matches=maps(raw.node_history).concat(maps(raw.nodes)).filter(x=>
+x.node_id===item.task_id&&
+(!digest||!x.accepted_graph_revision_digest||
+x.accepted_graph_revision_digest===digest));
+const record=matches.at(-1);
+return record?{source:'persisted node record',record}:null}
+if(item.kind==='run')return{
+source:'persisted run and explanation records',
+state:raw.state,
+failure_code:raw.failure_code||raw.run?.failure_code,
+failure_path:story.failure_path};
+if(item.kind==='loop'){
+const record=maps(raw.loop_transitions).filter(x=>
+String(x.action||x.decision||'').toLowerCase()===item.condition).at(-1);
+return record?{source:'persisted loop transition',record}:null}
+if(item.kind==='approval'){
+const record=maps(raw.approvals).concat(maps(raw.approval_requests)).filter(x=>
+String(x.decision||x.status||'').toLowerCase()==='pending').at(-1);
+return record?{source:'persisted approval record',record}:null}
+if(item.kind==='plan_review')return raw.plan_review?
+{source:'persisted plan review',record:raw.plan_review}:null;
+if(item.kind==='control'){
+const record=maps(raw.controls).filter(x=>
+String(x.action||'').toLowerCase()===item.condition).at(-1);
+return record?{source:'persisted control record',record}:null}
+return null}
+
+function focusWarningTask(taskId){
+const current=maps(story.graph?.evolution).find(x=>
+x.digest===story.graph?.digest);
+if(current)selectedRevision=current;
+selectedTask=taskId;
+selectedTab='dag';
+render();
+requestAnimationFrame(()=>{
+const node=[...document.querySelectorAll('.node')].find(x=>
+x.dataset.taskId===taskId);
+node?.focus();
+$('#details').scrollIntoView({block:'nearest'})})}
+
+function renderWarningSummary(){
+const root=$('#warning-summary');
+root.replaceChildren();
+root.classList.remove('hidden');
+const heading=document.createElement('h2');
+if(raw.attention_available===false){
+heading.textContent='Warning details unavailable';
+const note=document.createElement('p');
+note.className='muted';
+note.textContent='Persisted attention facts were not recorded for this historical run.';
+root.append(heading,note);
+return}
+const warnings=maps(raw.attention);
+if(!warnings.length){
+root.classList.add('hidden');
+return}
+const count=Number.isInteger(raw.attention_count)?
+raw.attention_count:warnings.length;
+heading.textContent='Warnings ('+count+')';
+const list=document.createElement('ul');
+list.className='warning-list';
+for(const item of warnings){
+const row=document.createElement('li'),
+line=document.createElement('div'),
+label=document.createElement('strong');
+row.className='warning-item';
+line.className='warning-row';
+label.textContent=item.kind==='task'?
+'Task '+text(item.task_id)+': '+text(item.condition):
+text(item.kind)+': '+text(item.condition);
+line.append(label);
+const action=document.createElement('button');
+if(item.kind==='task'){
+action.textContent='Focus task';
+action.setAttribute('aria-label','Focus warning task '+text(item.task_id));
+action.addEventListener('click',()=>focusWarningTask(item.task_id))}
+else{
+action.textContent='Open run explanation';
+action.addEventListener('click',()=>{
+selectTab('explanation');
+$('#explanation').tabIndex=-1;
+$('#explanation').focus()})}
+line.append(action);
+row.append(line);
+const evidence=attentionEvidence(item);
+if(evidence){
+const details=document.createElement('details'),
+summary=document.createElement('summary'),
+pre=document.createElement('pre');
+summary.textContent='Persisted source';
+pre.textContent=JSON.stringify(evidence,null,2);
+details.append(summary,pre);
+row.append(details)}
+else{
+const absent=document.createElement('span');
+absent.className='muted';
+absent.textContent='Persisted source not recorded';
+row.append(absent)}
+list.append(row)}
+root.append(heading,list)}
 
 function renderRevision(){
 const root=$('#revision-story'),
@@ -1107,7 +1254,11 @@ task.style_state+
 ' terminal':'')+
 (currentRevision()&&
 task.position==='active'?
-' current':'');
+' current':'')+
+(selectedTask===task.id?
+' selected':'');
+button.dataset.taskId=task.id;
+if(selectedTask===task.id)button.setAttribute('aria-current','true');
 button.style.left=points[task.id].x+
 'px';
 button.style.top=points[task.id].y+
@@ -1136,6 +1287,9 @@ button.append(status,name,facts);
 button.addEventListener('click',
 ()=>{
 selectedTask=task.id;
+for(const node of document.querySelectorAll('.node')){
+node.classList.toggle('selected',node.dataset.taskId===task.id);
+node.toggleAttribute('aria-current',node.dataset.taskId===task.id)}
 renderDetails(task)}
 );
 root.append(button)}

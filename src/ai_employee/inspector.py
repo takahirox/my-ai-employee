@@ -1033,6 +1033,8 @@ def inspect_fleet_runs(
                 "last_updated_at": None,
                 "requires_attention": False,
                 "attention": [],
+                "attention_count": None,
+                "attention_available": False,
             }
             history.append(item)
             continue
@@ -1081,7 +1083,7 @@ def inspect_fleet_runs(
             for node_id, record in latest_nodes.items()
             if record.get("status", record.get("state")) in _ACTIVE_TASK_STATES
         ]
-        attention = _attention_facts(projection, run, status, latest_node_records)
+        attention = _as_dicts(projection.get("attention"))
         active_task = active_tasks[0]["label"] if active_tasks else None
         loop_attention = next(
             (item["condition"] for item in reversed(attention) if item["kind"] == "loop"), None
@@ -1104,6 +1106,8 @@ def inspect_fleet_runs(
             "last_updated_at": _latest_persisted_activity_at(projection),
             "requires_attention": bool(attention),
             "attention": attention,
+            "attention_count": projection.get("attention_count", len(attention)),
+            "attention_available": projection.get("attention_available", True),
         }
         (history if status in _TERMINAL_RUN_STATES else active).append(item)
     active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
@@ -1114,6 +1118,12 @@ def inspect_fleet_runs(
 def _attach_repository_context(
     store: SQLiteStore, run_id: str, projection: dict[str, Any]
 ) -> dict[str, Any]:
+    run = _as_dict(projection.get("run"))
+    status = str(projection.get("state") or "not_recorded")
+    attention = _attention_facts(projection, run, status, _latest_node_facts(projection))
+    projection["attention"] = attention
+    projection["attention_count"] = len(attention)
+    projection["attention_available"] = True
     repository = store.repository_for_run(run_id)
     if repository is not None:
         projection["repository_context"] = repository
