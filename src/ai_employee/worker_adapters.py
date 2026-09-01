@@ -1067,7 +1067,7 @@ def _diff_header_value(line: str, prefix: str) -> str:
         value = value[:-1]
     if value.endswith("\r"):
         value = value[:-1]
-    return value
+    return value.split("\t", 1)[0]
 
 
 def _safe_diff_path(value: str) -> bool:
@@ -1140,7 +1140,8 @@ def _normalize_headerless_diff_sections(value: str) -> str:
                         section_new_file = False
                 else:
                     path, section_new_file = _headerless_file_pair(line, next_line)
-                    normalized.append(f"diff --git a/{path} b/{path}\n")
+                    line_ending = "\r\n" if line.endswith("\r\n") else "\n"
+                    normalized.append(f"diff --git a/{path} b/{path}{line_ending}")
                     section_delimited = True
                     section_has_hunk = False
                     in_hunk = False

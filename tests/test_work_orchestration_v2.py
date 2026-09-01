@@ -1121,6 +1121,76 @@ def test_cli_worker_synthesizes_only_missing_file_delimiters_idempotently() -> N
     assert _normalize_unified_diff(payload.unified_diff) == payload.unified_diff
 
 
+def test_cli_worker_strips_header_timestamps_and_preserves_crlf_delimiters() -> None:
+    patch = (
+        "--- a/timed.txt\t2026-09-02 00:00:00 +0000\r\n"
+        "+++ b/timed.txt\t2026-09-02 00:01:00 +0000\r\n"
+        "@@ -1 +1 @@\r\n"
+        "-before\r\n"
+        "+after\r\n"
+    )
+
+    assert _normalize_unified_diff(patch) == "diff --git a/timed.txt b/timed.txt\r\n" + patch
+
+
+def test_cli_worker_preserves_explicit_rename_section_byte_for_byte() -> None:
+    patch = (
+        "diff --git a/old.txt b/new.txt\n"
+        "similarity index 80%\n"
+        "rename from old.txt\n"
+        "rename to new.txt\n"
+        "--- a/old.txt\n"
+        "+++ b/new.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    )
+
+    assert _normalize_unified_diff(patch) == patch
+
+
+def test_cli_worker_preserves_three_file_six_hunk_headerless_incident() -> None:
+    paths = ("first.txt", "second.txt", "third.txt")
+    patch = (
+        "--- a/first.txt\n"
+        "+++ b/first.txt\n"
+        "@@ -1 +1 @@\n"
+        "-first old one\n"
+        "+first new one\n"
+        "@@ -3 +3 @@\n"
+        "-first old two\n"
+        "+first new two\n"
+        "--- a/second.txt\n"
+        "+++ b/second.txt\n"
+        "@@ -2 +2 @@\n"
+        "-second old one\n"
+        "+second new one\n"
+        "@@ -4 +4 @@\n"
+        "-second old two\n"
+        "+second new two\n"
+        "--- a/third.txt\n"
+        "+++ b/third.txt\n"
+        "@@ -5 +5 @@\n"
+        "-third old one\n"
+        "+third new one\n"
+        "@@ -7 +7 @@\n"
+        "-third old two\n"
+        "+third new two\n"
+    )
+    expected = patch
+    for path in paths:
+        expected = expected.replace(
+            f"--- a/{path}\n",
+            f"diff --git a/{path} b/{path}\n--- a/{path}\n",
+            1,
+        )
+
+    normalized = _normalize_unified_diff(patch)
+
+    assert normalized.count("diff --git ") == 3
+    assert normalized == expected
+
+
 def test_cli_worker_does_not_split_header_shaped_hunk_content() -> None:
     patch = (
         "--- a/first.txt\n"
@@ -1147,11 +1217,14 @@ def test_cli_worker_does_not_split_header_shaped_hunk_content() -> None:
 @pytest.mark.parametrize(
     "patch",
     (
-        "--- a/../escape.txt\n+++ b/../escape.txt\n",
-        "--- /etc/passwd\n+++ b/etc/passwd\n",
-        "--- c/file.txt\n+++ b/file.txt\n",
-        "--- a/old.txt\n+++ b/new.txt\n",
-        "--- a/orphan.txt\n@@ -1 +1 @@\n",
+        pytest.param('--- "a/file.txt"\n+++ "b/file.txt"\n', id="quoted"),
+        pytest.param("--- \n+++ \n", id="empty"),
+        pytest.param("--- /dev/null\n+++ /dev/null\n", id="double-dev-null"),
+        pytest.param("--- a/file.txt\n+++ c/file.txt\n", id="bad-prefix"),
+        pytest.param("--- a/../escape.txt\n+++ b/../escape.txt\n", id="traversal"),
+        pytest.param("--- a//etc/passwd\n+++ b//etc/passwd\n", id="absolute"),
+        pytest.param("--- a/old.txt\n+++ b/new.txt\n", id="rename"),
+        pytest.param("--- a/orphan.txt\n@@ -1 +1 @@\n", id="non-adjacent-pair"),
     ),
 )
 def test_cli_worker_rejects_unsafe_or_unrecognized_headerless_paths(patch: str) -> None:
@@ -1189,7 +1262,22 @@ def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> N
     assert result.boundary_diagnostic.code == "WORKER_ENVELOPE_MALFORMED"
 
 
-def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> None:
+_HEADERLESS_TWO_FILE_PATCH = (
+    "--- a/first.txt\n"
+    "+++ b/first.txt\n"
+    "@@ -1 +1 @@\n"
+    "-before one\n"
+    "+after one\n"
+    "--- a/second.txt\n"
+    "+++ b/second.txt\n"
+    "@@ -1 +1 @@\n"
+    "-before two\n"
+    "+after two\n"
+)
+_HEADERLESS_TWO_FILE_PATHS = ("first.txt", "second.txt")
+
+
+def _headerless_workspace(tmp_path: Path) -> tuple[GitWorkspaceManager, WorkspaceSnapshot]:
     repository = tmp_path / "headerless-repo"
     repository.mkdir()
     subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
@@ -1200,8 +1288,8 @@ def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> 
     subprocess.run(
         ("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True
     )
-    (repository / "existing.txt").write_text("before\n")
-    (repository / "deleted.txt").write_text("deleted\n")
+    (repository / "first.txt").write_text("before one\n")
+    (repository / "second.txt").write_text("before two\n")
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
     subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
     head = subprocess.check_output(
@@ -1220,23 +1308,13 @@ def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> 
             base_commit=head,
         )
     )
-    patch = (
-        "--- a/existing.txt\n"
-        "+++ b/existing.txt\n"
-        "@@ -1 +1 @@\n"
-        "-before\n"
-        "+after\n"
-        "--- /dev/null\n"
-        "+++ b/created.txt\n"
-        "@@ -0,0 +1 @@\n"
-        "+created\n"
-        "--- a/deleted.txt\n"
-        "+++ /dev/null\n"
-        "@@ -1 +0,0 @@\n"
-        "-deleted\n"
-    )
+    return manager, snapshot
+
+
+def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> None:
+    manager, snapshot = _headerless_workspace(tmp_path)
     envelope = _validate_worker_envelope(
-        _edit_envelope(patch, ("existing.txt", "created.txt", "deleted.txt"))
+        _edit_envelope(_HEADERLESS_TWO_FILE_PATCH, _HEADERLESS_TWO_FILE_PATHS)
     )
     request = envelope.proposals[0].payload
     assert isinstance(request, EditIntentRequest)
@@ -1246,10 +1324,55 @@ def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> 
     )
 
     assert result.status == "succeeded"
+    assert result.resource_usage["changed_paths"] == _HEADERLESS_TWO_FILE_PATHS
     isolated = Path(snapshot.isolated_worktree)
-    assert (isolated / "existing.txt").read_text() == "after\n"
-    assert (isolated / "created.txt").read_text() == "created\n"
-    assert not (isolated / "deleted.txt").exists()
+    assert (isolated / "first.txt").read_text() == "after one\n"
+    assert (isolated / "second.txt").read_text() == "after two\n"
+
+
+def test_headerless_sections_reject_base_mismatch_through_workspace_manager(
+    tmp_path: Path,
+) -> None:
+    manager, snapshot = _headerless_workspace(tmp_path)
+    mismatched_patch = _HEADERLESS_TWO_FILE_PATCH.replace(
+        "-before one\n", "-not the base\n", 1
+    )
+    envelope = _validate_worker_envelope(
+        _edit_envelope(mismatched_patch, _HEADERLESS_TWO_FILE_PATHS)
+    )
+    request = envelope.proposals[0].payload
+    assert isinstance(request, EditIntentRequest)
+
+    result = manager.apply_edit(
+        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+    )
+
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+    isolated = Path(snapshot.isolated_worktree)
+    assert (isolated / "first.txt").read_text() == "before one\n"
+    assert (isolated / "second.txt").read_text() == "before two\n"
+
+
+def test_headerless_sections_reject_declared_paths_mismatch_through_workspace_manager(
+    tmp_path: Path,
+) -> None:
+    manager, snapshot = _headerless_workspace(tmp_path)
+    envelope = _validate_worker_envelope(
+        _edit_envelope(_HEADERLESS_TWO_FILE_PATCH, ("first.txt",))
+    )
+    request = envelope.proposals[0].payload
+    assert isinstance(request, EditIntentRequest)
+
+    result = manager.apply_edit(
+        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+    )
+
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.INVALID_REQUEST
+    isolated = Path(snapshot.isolated_worktree)
+    assert (isolated / "first.txt").read_text() == "before one\n"
+    assert (isolated / "second.txt").read_text() == "before two\n"
 
 
 def test_cli_worker_recomputes_untrusted_proposal_and_request_digests() -> None:
