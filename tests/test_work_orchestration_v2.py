@@ -336,6 +336,23 @@ def test_scripted_adapter_rejects_prose_command_injection() -> None:
     assert channel.submissions == 0
 
 
+def test_scripted_adapter_rejects_empty_edit_required_mutating_envelope() -> None:
+    adapter = ScriptedWorkerAdapter(
+        [{"schema_version": "2", "proposals": (), "assistant_note": ""}]
+    )
+    request = worker_request().model_copy(
+        update={"required_capabilities": ("edit_intent",)}
+    )
+
+    result = adapter.propose(request, Channel())  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "MUTATING_ENVELOPE_EMPTY"
+
+
 def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
     local_goal = "Fix the local parser bug"
     broad_goal = "Exhaustively audit every authentication path for security defects"
@@ -373,6 +390,7 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
         assert payload["writable_scratch_directory"] == "/tmp/fleet-worker-run-1"
         assert "Return only the strict JSON envelope" in payload["instruction"]
         assert "read-only tools" in payload["instruction"]
+        assert "must still return a typed edit proposal" in payload["instruction"]
         assert "current working directory" in payload["instruction"]
         assert "only below that exact directory" in payload["instruction"]
         assert "supplied run_id" in payload["instruction"]

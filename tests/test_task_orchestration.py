@@ -164,6 +164,36 @@ def test_fixed_compatibility_graph_preserves_non_mutating_contract_and_budget() 
     assert fallback.description == "the node-bound worker result is accepted"
 
 
+def test_mutating_compatibility_graph_reserves_one_bounded_repair() -> None:
+    criterion = CompletionCriterion(
+        id="verified-edit",
+        description="the edit is verified",
+        verification_requirement_ids=("test", "lint", "typecheck"),
+    )
+    graph = one_node_graph(
+        Goal(
+            id="mutating-goal",
+            statement="make one verified edit",
+            completion_criteria=(criterion,),
+        ),
+        graph_id="mutating-graph",
+        node_id="mutating-node",
+        required_capabilities=("edit_intent", "process"),
+        max_wall_seconds=12.0,
+    )
+
+    node = graph.nodes[0]
+    assert node.resource_budget.processes == 3
+    assert node.resource_budget.wall_seconds == 6.0
+    assert graph.budget.max_attempts == 2
+    assert graph.budget.max_repairs == 1
+    assert graph.budget.max_loop_iterations == 2
+    assert graph.budget.max_worker_turns == 2
+    assert graph.budget.max_processes == 6
+    assert graph.budget.max_wall_seconds == 12.0
+    assert graph.budget.max_artifact_bytes == 2_000_000
+
+
 def _criterion(name: str) -> CompletionCriterion:
     return CompletionCriterion(id=f"criterion-{name}", description=f"{name} is complete")
 

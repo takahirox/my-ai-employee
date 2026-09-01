@@ -727,6 +727,17 @@ def one_node_graph(
 ) -> Graph:
     """Represent the compatibility path as the degenerate accepted task DAG."""
 
+    writing = goal.task_kind is GoalTaskKind.MUTATING and "edit_intent" in required_capabilities
+    verification_processes = max(
+        1,
+        len(
+            {
+                requirement
+                for criterion in goal.completion_criteria
+                for requirement in criterion.verification_requirement_ids
+            }
+        ),
+    )
     criteria = goal.completion_criteria or (
         CompletionCriterion(
             id=f"criterion-{node_id}",
@@ -746,18 +757,31 @@ def one_node_graph(
         output_contract=OutputContract(id=f"contract-{node_id}"),
         required_capabilities=required_capabilities,
         completion_criteria=criteria,
-        resource_budget=NodeResourceBudget(wall_seconds=max_wall_seconds),
+        resource_budget=NodeResourceBudget(
+            processes=verification_processes if writing else 1,
+            wall_seconds=max_wall_seconds / 2 if writing else max_wall_seconds,
+        ),
+    )
+    budget = (
+        Budget(
+            max_attempts=2,
+            max_repairs=1,
+            max_loop_iterations=2,
+            max_nodes=1,
+            max_wall_seconds=max_wall_seconds,
+            max_worker_turns=2,
+            max_processes=verification_processes * 2,
+            max_artifact_bytes=2_000_000,
+        )
+        if writing
+        else Budget(max_attempts=1, max_nodes=1, max_wall_seconds=max_wall_seconds)
     )
     return Graph(
         id=graph_id,
         nodes=(node,),
         entry_node_ids=(node.id,),
         terminal_node_ids=(node.id,),
-        budget=Budget(
-            max_attempts=1,
-            max_nodes=1,
-            max_wall_seconds=max_wall_seconds,
-        ),
+        budget=budget,
     )
 
 

@@ -154,6 +154,11 @@ class ScriptedWorkerAdapter:
                 ),
                 error=error,
             )
+        empty_failure = _empty_mutating_envelope_failure(
+            request, envelope, started, adapter=self.adapter
+        )
+        if empty_failure is not None:
+            return empty_failure
         for proposal in envelope.proposals:
             mediated_channel.submit(proposal)
         return WorkerResult(
@@ -391,6 +396,15 @@ class CliWorkerAdapter:
                 invocation=invocation,
                 error=evidence_error or error,
             )
+        empty_failure = _empty_mutating_envelope_failure(
+            request,
+            envelope,
+            started,
+            adapter=self.adapter,
+            invocation=invocation,
+        )
+        if empty_failure is not None:
+            return empty_failure
         typed_result = envelope.non_mutating_result
         if typed_result is not None:
             allowed = set(authoritative_worker_evidence_digests(request))
@@ -831,8 +845,11 @@ def _bounded_prompt(
         "writable_scratch_directory": scratch_directory,
         "instruction": (
             "Return only the strict JSON envelope. The repository is the current working "
-            "directory; you may inspect its files with read-only tools. Use minimal_sufficient as "
-            "the default: propose the smallest change sufficient for the supplied node goal and "
+            "directory and its filesystem is read-only to the worker; you may inspect its files "
+            "with read-only tools. A mutating task that requires edit_intent must still return a "
+            "typed edit proposal; read-only filesystem authority forbids direct edits, not "
+            "proposals. Use minimal_sufficient as the default: propose the smallest change "
+            "sufficient for the supplied node goal and "
             "accepted plan, prefer existing mechanisms, stay within both, and omit optional "
             "follow-on work. Broader investigation depth or coverage is required only when it is "
             "explicit in the supplied node goal; do not infer it from importance, security "
@@ -1484,6 +1501,37 @@ def _output_size(result: ExecutionResult, name: str) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return 0
+
+
+def _empty_mutating_envelope_failure(
+    request: WorkerRequest,
+    envelope: WorkerProposalEnvelope,
+    started: float,
+    *,
+    adapter: str,
+    invocation: _ProcessInvocation | None = None,
+) -> WorkerResult | None:
+    """Reject actionless responses only when an accepted edit action is required."""
+
+    if (
+        request.task_kind.value != "mutating"
+        or "edit_intent" not in request.required_capabilities
+        or envelope.proposals
+        or envelope.non_mutating_result is not None
+    ):
+        return None
+    message = "mutating worker returned no typed edit proposal"
+    return _worker_failure(
+        request,
+        started,
+        StableFailureCode.WORKER_PROTOCOL_ERROR,
+        message,
+        adapter=adapter,
+        stage="envelope",
+        diagnostic_code="MUTATING_ENVELOPE_EMPTY",
+        invocation=invocation,
+        error=ValueError(message),
+    )
 
 
 def _worker_failure(
