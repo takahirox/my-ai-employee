@@ -127,9 +127,17 @@ class LocalProcessExecutor:
                     failure=self._failure(StableFailureCode.SPAWN_FAILED, str(error)),
                 )
             try:
-                stdout, stderr, exceeded, cancelled, timed_out, cleanup = self._capture(
-                    process, request, cancellation, started, timeout
-                )
+                (
+                    stdout,
+                    stderr,
+                    stdout_exceeded,
+                    stderr_exceeded,
+                    stdout_observed,
+                    stderr_observed,
+                    cancelled,
+                    timed_out,
+                    cleanup,
+                ) = self._capture(process, request, cancellation, started, timeout)
             finally:
                 if stdin_handle is not None:
                     stdin_handle.close()
@@ -143,7 +151,7 @@ class LocalProcessExecutor:
             elif timed_out:
                 failure = self._failure(StableFailureCode.TIMEOUT, "process timed out")
                 status = "failed"
-            elif exceeded:
+            elif stdout_exceeded:
                 failure = self._failure(
                     StableFailureCode.BUDGET_EXCEEDED, "process output exceeded its byte budget"
                 )
@@ -172,8 +180,12 @@ class LocalProcessExecutor:
                         .sha256("\0".join(argv).encode())
                         .hexdigest(),
                         "policy_digest": decision.effective_policy_digest,
-                        "stdout_bytes": len(stdout),
-                        "stderr_bytes": len(stderr),
+                        "stdout_bytes": stdout_observed,
+                        "stderr_bytes": stderr_observed,
+                        "stdout_retained_bytes": len(stdout),
+                        "stderr_retained_bytes": len(stderr),
+                        "stdout_truncated": stdout_exceeded,
+                        "stderr_truncated": stderr_exceeded,
                         "process_group_cleanup": cleanup,
                     }
                 ),
@@ -204,7 +216,7 @@ class LocalProcessExecutor:
         cancellation: Cancellation,
         started: float,
         timeout: float,
-    ) -> tuple[bytes, bytes, bool, bool, bool, str]:
+    ) -> tuple[bytes, bytes, bool, bool, int, int, bool, bool, str]:
         assert process.stdout is not None and process.stderr is not None
         selector = selectors.DefaultSelector()
         stdout_buffer = bytearray()
@@ -215,13 +227,14 @@ class LocalProcessExecutor:
         selector.register(
             process.stderr, selectors.EVENT_READ, (stderr_buffer, request.stderr_bytes)
         )
-        exceeded = cancelled = timed_out = False
+        stdout_exceeded = stderr_exceeded = cancelled = timed_out = False
+        stdout_observed = stderr_observed = 0
         cleanup = "not_required"
         while selector.get_map():
             elapsed = time.monotonic() - started
             cancelled = cancellation.cancelled()
             timed_out = elapsed >= timeout
-            if exceeded and not cancelled and not timed_out and process.poll() is None:
+            if stdout_exceeded and not cancelled and not timed_out and process.poll() is None:
                 try:
                     process.wait(timeout=0.05)
                 except subprocess.TimeoutExpired:
@@ -240,12 +253,27 @@ class LocalProcessExecutor:
                     continue
                 available = max(0, limit - len(buffer))
                 buffer.extend(chunk[:available])
-                exceeded = exceeded or len(chunk) > available
+                if key.fileobj is process.stdout:
+                    stdout_observed += len(chunk)
+                    stdout_exceeded = stdout_exceeded or len(chunk) > available
+                else:
+                    stderr_observed += len(chunk)
+                    stderr_exceeded = stderr_exceeded or len(chunk) > available
             if process.poll() is not None and not selector.get_map():
                 break
         process.wait()
         selector.close()
-        return bytes(stdout_buffer), bytes(stderr_buffer), exceeded, cancelled, timed_out, cleanup
+        return (
+            bytes(stdout_buffer),
+            bytes(stderr_buffer),
+            stdout_exceeded,
+            stderr_exceeded,
+            stdout_observed,
+            stderr_observed,
+            cancelled,
+            timed_out,
+            cleanup,
+        )
 
     def _terminate_group(self, process: subprocess.Popen[bytes]) -> str:
         if process.poll() is not None:

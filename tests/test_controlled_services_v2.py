@@ -183,6 +183,43 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     assert failed.failure.code.value == "BUDGET_EXCEEDED"
 
 
+@pytest.mark.parametrize("stderr_size", (3, 4, 5, 17))
+def test_process_executor_truncates_diagnostic_stderr_without_failing_valid_stdout(
+    tmp_path: Path,
+    stderr_size: int,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store)
+    request = ProcessRequest(
+        id=f"stderr-{stderr_size}",
+        run_id="run-stderr",
+        created_at=NOW,
+        argv=(
+            "/bin/sh",
+            "-c",
+            f"printf valid; printf '%0{stderr_size}d' 0 >&2",
+        ),
+        timeout_seconds=10.0,
+        stdout_bytes=100,
+        stderr_bytes=4,
+        purpose="retain bounded diagnostics without losing valid output",
+    )
+
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert result.status == "succeeded"
+    assert result.stderr_artifact_digest is not None
+    descriptor = executor.output_descriptor(result.stderr_artifact_digest)
+    descriptor_path = (
+        store.content_root / descriptor.artifact_digest[:2] / descriptor.artifact_digest
+    )
+    assert len(descriptor_path.read_bytes()) == min(stderr_size, 4)
+    assert result.resource_usage["stderr_bytes"] == stderr_size
+    assert result.resource_usage["stderr_retained_bytes"] == min(stderr_size, 4)
+    assert result.resource_usage["stderr_truncated"] is (stderr_size > 4)
+    assert result.resource_usage["stdout_truncated"] is False
+
+
 def test_process_output_descriptor_requires_exact_provenance_when_digest_repeats(
     tmp_path: Path,
 ) -> None:
