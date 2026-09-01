@@ -329,6 +329,34 @@ color:var(--muted)}
 .details h2{
 font-size:1rem;
 margin-top:0}
+.task-summary,
+.task-activity{
+border:1px solid #293752;
+border-radius:8px;
+padding:.7rem .8rem;
+margin-bottom:.8rem}
+.task-summary h3,
+.task-activity h3{
+font-size:.9rem;
+margin:0 0 .4rem}
+.task-summary p{
+margin:.25rem 0;
+line-height:1.45}
+.task-activity ol{
+list-style:none;
+padding:0;
+margin:.2rem 0 0}
+.task-activity li{
+display:grid;
+grid-template-columns:minmax(7rem,auto) 1fr;
+gap:.55rem;
+padding:.3rem 0;
+border-top:1px solid #293752}
+.task-activity li:first-child{
+border-top:0}
+.activity-time{
+color:var(--muted);
+font-size:.75rem}
 .details details,
 #revision-story details{
 border-top:1px solid #293752;
@@ -990,6 +1018,77 @@ return ['routed',
 status:position(task)==='completed'?
 'passed':position(task)}
 
+function activityTimestamp(record){
+return record?.transitioned_at||
+record?.created_at||
+record?.last_persisted_activity_at||
+record?.finished_at||
+record?.running_started_at||
+null}
+
+function taskActivities(id,
+digest,
+attempts,
+resultDigests,
+records,
+reviews,
+loopTransitions){
+const activity=[],
+push=(record,label,detail=null)=>activity.push({
+timestamp:activityTimestamp(record),
+label,
+detail});
+for(const record of attempts){
+const attempt=Number(record.attempt)+1,
+status=record.status;
+if(status==='pending')push(record,'Worker attempt '+attempt+' queued');
+else if(status==='routed')push(record,'Worker strategy selected for attempt '+attempt);
+else if(status==='running')push(record,'Worker attempt '+attempt+' started');
+else if(status==='passed')push(record,'Task passed evaluation');
+else if(status==='failed')push(record,
+'Worker attempt '+attempt+' failed',record.failure_code);
+else if(status==='blocked')push(record,'Task blocked',record.failure_code);
+else if(status==='cancelled')push(record,'Task cancelled',record.failure_code)}
+for(const result of maps(raw.worker_results).filter(x=>
+resultDigests.has(x.content_digest))){
+push(result,'Worker result persisted: '+text(result.status));
+for(const proposal of maps(result.proposals)){
+if(proposal.kind==='edit_intent'){
+const paths=Array.isArray(proposal.payload?.paths)?proposal.payload.paths:[];
+push(proposal,'Proposed edits to '+paths.length+' file'+
+(paths.length===1?'':'s'),paths.slice(0,3).join(', '))}
+else push(proposal,'Proposed '+text(proposal.kind).replaceAll('_',' ')+' action')}}
+for(const descriptor of attempts.flatMap(x=>maps(x.artifact_descriptors)))push(
+descriptor,
+'Produced '+text(descriptor.logical_kind).replaceAll('_',' ')+' artifact');
+for(const acceptance of records('typed_result_acceptances'))push(
+acceptance,
+text(acceptance.status)+' typed result',acceptance.failure_code);
+for(const evidence of records('node_evidence'))push(
+evidence,'Completion evidence recorded');
+for(const decision of records('node_evaluator_decisions'))push(
+decision,'Evaluation decision recorded',
+decision.decision?.outcome||decision.decision?.status||decision.decision);
+for(const diagnostic of maps(raw.worker_boundary_diagnostics).filter(x=>
+x.node_id===id&&
+(!digest||x.accepted_graph_revision_digest===digest)))push(
+diagnostic,'Worker boundary event: '+text(diagnostic.stage),diagnostic.code);
+for(const transition of loopTransitions)push(
+transition,'Loop decision: '+text(transition.action),transition.reason_code);
+for(const decision of maps(reviews.decisions).filter(x=>
+x.node_id===id&&
+(!digest||x.accepted_graph_revision_digest===digest)))push(
+decision,'Task review decision recorded',decision.action||decision.decision);
+const unique=[],
+seen=new Set();
+for(const item of activity.sort((a,b)=>
+String(b.timestamp||'').localeCompare(String(a.timestamp||'')))){
+const key=[item.timestamp,item.label,text(item.detail)].join('|');
+if(!seen.has(key)){
+seen.add(key);
+unique.push(item)}}
+return unique.slice(0,6)}
+
 function taskView(id){
 const task=revisionTasks().find(x=>x.id===id)||
 {
@@ -1043,7 +1142,13 @@ sequence:x.sequence}
 resultDigests=new Set(attempts.map(x=>x.worker_result_digest).filter(Boolean)),
 reviews=raw.task_reviews||
 {
-}
+},
+loopTransitions=maps(raw.loop_transitions).filter(x=>(x.node_id===id||
+(x.node_id===null&&
+Array.isArray(selectedRevision?.triggered_by_task_ids)&&
+selectedRevision.triggered_by_task_ids.includes(id)))&&
+x.accepted_graph_revision_digest===digest),
+activity=taskActivities(id,digest,attempts,resultDigests,records,reviews,loopTransitions)
 ;
 return{
 id,
@@ -1066,6 +1171,8 @@ definition.state||
 operational_status:operationalStatus,
 attempt:latest.attempt,
 selected_strategy_id:selectedStrategy,
+activity,
+latest_loop_transition:loopTransitions.at(-1),
 operational:{
 status:operationalStatus,
 running_started_at:latest.running_started_at,
@@ -1295,6 +1402,90 @@ renderDetails(task)}
 root.append(button)}
 }
 
+function taskStageSummary(task){
+const status=task.operational_status,
+attempt=task.attempt===null||task.attempt===undefined?
+'Not recorded':String(Number(task.attempt)+1),
+failure=task.operational.failure_code;
+let stage;
+if(status==='running'||status==='overdue')stage=
+'Worker attempt '+attempt+' is '+status+'. Elapsed: '+
+duration(task.operational.elapsed_seconds)+'.';
+else if(status==='routed')stage='Worker attempt '+attempt+' is routed to '+
+text(task.selected_strategy_id)+'.';
+else if(status==='passed')stage='The task passed evaluation with '+
+task.operational.verification_count+' verification record'+
+(task.operational.verification_count===1?'':'s')+'.';
+else if(status==='failed')stage='The task failed'+
+(failure?' with '+failure:'')+'.';
+else if(status==='blocked')stage='The task is blocked'+
+(failure?' by '+failure:'')+'.';
+else if(status==='cancelled')stage='The task was cancelled'+
+(failure?' with '+failure:'')+'.';
+else stage='The task is '+text(status)+'.';
+const loop=task.latest_loop_transition;
+if(loop)stage+=' Latest loop decision: '+text(loop.action)+
+(loop.reason_code?' ('+loop.reason_code+')':'')+'.';
+return stage}
+
+function renderTaskSummary(root,task){
+const section=document.createElement('section'),
+heading=document.createElement('h3'),
+objective=document.createElement('p'),
+stage=document.createElement('p'),
+objectiveLabel=document.createElement('b'),
+stageLabel=document.createElement('b');
+section.className='task-summary';
+heading.textContent='Task Summary';
+objectiveLabel.textContent='Objective: ';
+stageLabel.textContent='Stage: ';
+objective.append(objectiveLabel,
+document.createTextNode(task.objective||'Not recorded'));
+stage.append(stageLabel,document.createTextNode(taskStageSummary(task)));
+section.append(heading,objective,stage);
+root.append(section)}
+
+function renderTaskActivity(root,task){
+const section=document.createElement('section'),
+heading=document.createElement('h3'),
+list=document.createElement('ol'),
+items=[...task.activity];
+section.className='task-activity';
+heading.textContent='Current / Recent Activity';
+if(['running','overdue'].includes(task.operational_status))items.unshift({
+current:true,
+timestamp:task.operational.last_persisted_activity_at||
+task.operational.running_started_at,
+label:'Worker attempt '+
+(task.attempt===null||task.attempt===undefined?
+'Not recorded':String(Number(task.attempt)+1))+' is '+
+task.operational_status,
+detail:null});
+if(!items.length){
+const absent=document.createElement('p');
+absent.className='muted';
+absent.textContent='Not recorded';
+section.append(heading,absent);
+root.append(section);
+return}
+for(const item of items){
+const row=document.createElement('li'),
+time=document.createElement('time'),
+description=document.createElement('span');
+time.className='activity-time';
+if(item.timestamp){
+time.dateTime=item.timestamp;
+time.title=item.timestamp;
+time.textContent=item.current?'Current · '+shortTime(item.timestamp):
+shortTime(item.timestamp)}
+else time.textContent=item.current?'Current':'Time not recorded';
+description.textContent=item.label+
+(item.detail?' · '+text(item.detail):'');
+row.append(time,description);
+list.append(row)}
+section.append(heading,list);
+root.append(section)}
+
 function renderDetails(task){
 const root=$('#details');
 root.replaceChildren();
@@ -1309,6 +1500,8 @@ p.className='muted';
 p.textContent='Select a task. Facts not persisted are shown as Not recorded.';
 root.append(p);
 return}
+renderTaskSummary(root,task);
+renderTaskActivity(root,task);
 add(root,
 'Operational facts',
 task.details.operational_facts,

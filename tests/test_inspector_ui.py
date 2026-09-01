@@ -66,6 +66,8 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "taskView",
         "renderGraph",
         "Repository filter",
+        "Task Summary",
+        "Current / Recent Activity",
         "Typed result acceptances",
         "Live",
         "Reconnecting",
@@ -149,15 +151,42 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "verification_count",
         "state-overdue",
         "aria-label",
+        "taskActivities",
+        "renderTaskSummary",
+        "renderTaskActivity",
         "@media(max-width:600px)",
     ):
         assert marker in _INDEX
-    card_source = _INDEX[_INDEX.index("function cardFacts"): _INDEX.index(
-        "function renderDetails"
-    )]
+    card_source = _INDEX[
+        _INDEX.index("function cardFacts"): _INDEX.index("function renderGraph")
+    ]
     assert "task.objective" not in card_source
     assert "content_digest" not in card_source
     assert "routing_reasons" not in card_source
+    activity_source = _INDEX[
+        _INDEX.index("function taskActivities"): _INDEX.index("function taskView")
+    ]
+    for persisted_source in (
+        "node_history",
+        "worker_results",
+        "artifact_descriptors",
+        "typed_result_acceptances",
+        "node_evidence",
+        "node_evaluator_decisions",
+        "worker_boundary_diagnostics",
+        "loop_transitions",
+    ):
+        assert persisted_source in _INDEX
+    assert "assistant_note" not in activity_source
+    details_source = _INDEX[
+        _INDEX.index("function renderDetails"): _INDEX.index("function add(")
+    ]
+    assert details_source.index("renderTaskSummary") < details_source.index(
+        "'Operational facts'"
+    )
+    assert details_source.index("renderTaskActivity") < details_source.index(
+        "'Operational facts'"
+    )
 
 
 def _execution_record(
