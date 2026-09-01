@@ -1734,14 +1734,19 @@ class TaskOrchestrator:
                                         else review_decision.reason_code
                                     ),
                                 )
-                        elif current.evaluator_decision is EvaluationDecision.FAIL and (
-                            result.worker_result.status == "succeeded"
-                            or current.failure_code
-                            in {
-                                StableFailureCode.WORKER_PROTOCOL_ERROR.value,
-                                StableFailureCode.WORKER_EMPTY_OUTPUT.value,
-                                StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
-                            }
+                        elif (
+                            current.failure_code
+                            != StableFailureCode.VERIFICATION_BINDING_INVALID.value
+                            and current.evaluator_decision is EvaluationDecision.FAIL
+                            and (
+                                result.worker_result.status == "succeeded"
+                                or current.failure_code
+                                in {
+                                    StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+                                    StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                                    StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+                                }
+                            )
                         ):
                             repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
                             repair_limit = graph_run.max_repairs

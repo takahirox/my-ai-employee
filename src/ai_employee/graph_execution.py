@@ -33,7 +33,15 @@ from .graph_composition import (
     NodePatchArtifact,
 )
 from .graph_evaluation import ParentCandidateEvaluationRecord, ParentCandidateEvaluationReplay
-from .orchestration import WorkCoordinator, WorkRun
+from .orchestration import (
+    WorkCoordinator,
+    WorkRun,
+    _acceptance_evidence_is_authoritative,
+    _authoritative_node_verification_results,
+    _mandatory_acceptance_is_satisfied,
+    _node_verification_configuration_is_valid,
+    _persisted_node_verification_configuration_is_valid,
+)
 from .promotion_approval import (
     PromotionApprovalTrustKernel,
     PromotionPolicyDecision,
@@ -784,8 +792,47 @@ def _authoritative_node_result(
             result_acceptance=result_acceptance,
             failure_code=StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
         )
+    binding_configuration_valid = _node_verification_configuration_is_valid(
+        run.id,
+        node.completion_criteria,
+        coordinator.verification_requests,
+        coordinator.verification_bindings,
+    ) and _persisted_node_verification_configuration_is_valid(
+        store,
+        run.id,
+        node.completion_criteria,
+        coordinator.verification_requests,
+        coordinator.verification_bindings,
+    )
+    if not binding_configuration_valid:
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=run.workspace_id,
+            result_acceptance=result_acceptance,
+            failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+        )
+    if run.failure_code == StableFailureCode.VERIFICATION_BINDING_INVALID.value:
+        raise ValueError("valid node verification was classified as an invalid binding")
+    authoritative_verification_results = _authoritative_node_verification_results(
+        store,
+        run,
+        node.completion_criteria,
+        coordinator.verification_requests,
+        coordinator.verification_bindings,
+    )
+    if authoritative_verification_results is None:
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=run.workspace_id,
+            result_acceptance=result_acceptance,
+            failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+        )
     repairable_verification_failure = (
-        writing and run.status == "failed" and run.failure_code == "VERIFICATION_FAILED"
+        writing
+        and run.status == "failed"
+        and run.failure_code == StableFailureCode.VERIFICATION_FAILED.value
     )
     if (
         run.status != expected_status and not repairable_verification_failure
@@ -879,28 +926,9 @@ def _authoritative_node_result(
         ):
             raise ValueError("patch is empty or not bound to the exact workspace")
 
-    results = verification_results
-    result_by_request = {item.request_digest: item for item in results}
-    verification_digests: list[str] = []
-    for verification_request in coordinator.verification_requests:
-        result = result_by_request.get(verification_request.content_digest or "")
-        if result is None and repairable_verification_failure:
-            break
-        persisted_request = store.get(
-            "verification_request_v2", verification_request.id, type(verification_request)
-        )
-        if (
-            persisted_request != verification_request
-            or result is None
-            or result.run_id != run.id
-            or result.content_digest is None
-        ):
-            raise ValueError("required Harness verification is absent or stale")
-        verification_digests.append(result.content_digest)
-        if result.status != "succeeded":
-            if not repairable_verification_failure:
-                raise ValueError("required Harness verification failed unexpectedly")
-            break
+    verification_digests = tuple(
+        _required(item.content_digest) for item in authoritative_verification_results
+    )
     if tuple(verification_digests) != run.verification_result_digests:
         raise ValueError("WorkRun verification ledger does not match persisted results")
     if run.acceptance_ledger_id is None:
@@ -910,6 +938,15 @@ def _authoritative_node_result(
         item.id for item in node.completion_criteria
     ):
         raise ValueError("acceptance ledger does not map the declared node criteria")
+    result_digest_by_request = {
+        item.request_digest: _required(item.content_digest)
+        for item in authoritative_verification_results
+        if item.status == "succeeded"
+    }
+    verification_by_requirement = {
+        binding.requirement_id: result_digest_by_request.get(binding.process_request_digest, "")
+        for binding in coordinator.verification_bindings
+    }
     authoritative_refs = {
         *verification_digests,
         run.review_digest,
@@ -922,6 +959,31 @@ def _authoritative_node_result(
             or not set(evidence.evidence_refs) <= {item for item in authoritative_refs if item}
         ):
             raise ValueError("criterion cites non-authoritative or empty evidence")
+    if not _acceptance_evidence_is_authoritative(
+        node.completion_criteria,
+        ledger.criteria,
+        verification_by_requirement,
+        descriptors,
+    ):
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=workspace.id,
+            result_acceptance=result_acceptance,
+            failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+        )
+    if not repairable_verification_failure and not _mandatory_acceptance_is_satisfied(
+        node.completion_criteria, ledger.criteria
+    ):
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=ledger.criteria,
+            workspace_id=workspace.id,
+            artifact_descriptors=descriptors,
+            result_acceptance=result_acceptance,
+            acceptance_ledger_digest=_required(ledger.content_digest),
+            failure_code=StableFailureCode.VERIFICATION_FAILED.value,
+        )
     node_patch = (
         None
         if patch is None
@@ -935,7 +997,7 @@ def _authoritative_node_result(
             worker_request_digest=_required(request.content_digest),
             worker_result_digest=_required(worker_result.content_digest),
             acceptance_ledger_digest=_required(ledger.content_digest),
-            verification_result_digests=tuple(verification_digests),
+            verification_result_digests=verification_digests,
             workspace=workspace,
             patch=patch,
         )

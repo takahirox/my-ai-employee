@@ -38,8 +38,10 @@ from .domain.v2 import (
     DownloadResult,
     ExecutionResult,
     InstallResult,
+    NodeVerificationBinding,
     NonMutatingResultAcceptance,
     PolicyDecision,
+    ProcessRequest,
     PromotionRecord,
     WorkerAvailability,
     WorkerBoundaryDiagnostic,
@@ -259,6 +261,16 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             _json_model(item)
             for item in store.list_records("verification_result_v2", ExecutionResult, run_id=run_id)
         ],
+        "verification_requests": [
+            _json_model(item)
+            for item in store.list_records("verification_request_v2", ProcessRequest, run_id=run_id)
+        ],
+        "verification_bindings": [
+            _json_model(item)
+            for item in store.list_records(
+                "node_verification_binding_v2", NodeVerificationBinding, run_id=run_id
+            )
+        ],
         "artifacts": [_json_model(item) for item in artifacts],
         "patch": None if patch is None else _json_model(patch),
         "acceptance": [
@@ -337,11 +349,7 @@ def _node_execution_projection(
         if running_started_at is None
         else max(0.0, (elapsed_end - running_started_at).total_seconds())
     )
-    overdue = (
-        record.status == "running"
-        and deadline_at is not None
-        and observed_at >= deadline_at
-    )
+    overdue = record.status == "running" and deadline_at is not None and observed_at >= deadline_at
     projection = _json_model(record)
     projection.update(
         {
@@ -432,9 +440,7 @@ def inspect_graph_run(
         ):
             latest_nodes[node_record.node_id] = node_record
     routes = store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
-    reservations = store.list_records(
-        "node_reservation_v2", NodeReservationRecord, run_id=run_id
-    )
+    reservations = store.list_records("node_reservation_v2", NodeReservationRecord, run_id=run_id)
     observed_at = ensure_utc(clock())
     graph_nodes = (
         {}
@@ -948,9 +954,7 @@ def _attention_facts(
 ) -> list[dict[str, Any]]:
     attention: list[dict[str, Any]] = []
     for record in latest_nodes:
-        task_status = record.get("operational_status") or record.get(
-            "status", record.get("state")
-        )
+        task_status = record.get("operational_status") or record.get("status", record.get("state"))
         if task_status in _ATTENTION_TASK_STATES:
             attention.append(
                 {

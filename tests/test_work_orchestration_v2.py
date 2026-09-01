@@ -5,6 +5,7 @@ import subprocess
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -31,6 +32,7 @@ from ai_employee.domain.v2 import (
     EditIntentRequest,
     ExecutionResult,
     InstallResult,
+    NodeVerificationBinding,
     NonMutatingResult,
     PolicyDecision,
     ProcessRequest,
@@ -43,9 +45,15 @@ from ai_employee.domain.v2 import (
     WorkspaceSnapshot,
 )
 from ai_employee.inspector import inspect_work_run
-from ai_employee.orchestration import WorkCoordinator, WorkRun, _mediated_result_artifacts
+from ai_employee.orchestration import (
+    WorkCoordinator,
+    WorkRun,
+    _mediated_result_artifacts,
+    _node_verification_configuration_is_valid,
+)
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
+from ai_employee.serialization import canonical_digest
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
@@ -1500,6 +1508,158 @@ def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -
         assert run.status == "planned"
         assert run.workspace_id is None
         assert store.load_work_checkpoint(run.id)[1]["status"] == "planned"
+
+
+def test_node_verification_bindings_are_explicit_content_bound_and_one_to_one() -> None:
+    run_id = "node-run"
+    requirements = ("test", "lint", "typecheck")
+    criteria = tuple(
+        CompletionCriterion(
+            id=f"criterion-{requirement}",
+            description=f"{requirement} passes",
+            verification_requirement_ids=(requirement,),
+        )
+        for requirement in requirements
+    )
+    requests = tuple(
+        ProcessRequest(
+            id=f"opaque-{uuid4().hex}",
+            run_id=run_id,
+            created_at=NOW,
+            argv=(requirement,),
+            purpose="offline verification",
+        )
+        for requirement in requirements
+    )
+    bindings = tuple(
+        NodeVerificationBinding(
+            id=f"binding-{requirement}",
+            run_id=run_id,
+            created_at=NOW,
+            requirement_id=requirement,
+            process_request_id=request.id,
+            process_request_digest=request.content_digest or ZERO,
+        )
+        for requirement, request in zip(requirements, requests, strict=True)
+    )
+    assert _node_verification_configuration_is_valid(run_id, criteria, requests, bindings)
+
+    rebound = requests[0].model_copy(update={"id": f"opaque-{uuid4().hex}"})
+    rebound_binding = bindings[0].model_copy(
+        update={"process_request_id": rebound.id, "content_digest": None}
+    )
+    assert _node_verification_configuration_is_valid(
+        run_id,
+        criteria,
+        (rebound, *requests[1:]),
+        (rebound_binding, *bindings[1:]),
+    )
+
+    unknown = bindings[0].model_copy(update={"requirement_id": "unknown", "content_digest": None})
+    stale = bindings[0].model_copy(update={"process_request_digest": ZERO, "content_digest": None})
+    duplicate = bindings[1].model_copy(update={"requirement_id": "test", "content_digest": None})
+    ambiguous_request = requests[0].model_copy(update={"id": f"opaque-{uuid4().hex}"})
+    ambiguous_binding = bindings[1].model_copy(
+        update={
+            "process_request_id": ambiguous_request.id,
+            "process_request_digest": ambiguous_request.content_digest,
+            "content_digest": None,
+        }
+    )
+    invalid_configurations = (
+        (requests, ()),
+        (requests, bindings[:-1]),
+        (requests, (unknown, *bindings[1:])),
+        (requests, (stale, *bindings[1:])),
+        (requests, (bindings[0], duplicate, bindings[2])),
+        (
+            (requests[0], ambiguous_request, requests[2]),
+            (bindings[0], ambiguous_binding, bindings[2]),
+        ),
+    )
+    assert all(
+        not _node_verification_configuration_is_valid(
+            run_id, criteria, invalid_requests, invalid_bindings
+        )
+        for invalid_requests, invalid_bindings in invalid_configurations
+    )
+
+
+def test_node_run_with_missing_binding_fails_closed_with_inspector_diagnostic(
+    tmp_path: Path,
+) -> None:
+    run_id = "node-missing-binding"
+    patch = (
+        b"diff --git a/file.txt b/file.txt\n"
+        b"--- a/file.txt\n"
+        b"+++ b/file.txt\n"
+        b"@@ -1 +1 @@\n-before\n+after\n"
+    )
+    policy = builtin_policy(run_id)
+    store = SQLiteStore(tmp_path / "missing-binding.db")
+    verification = ProcessRequest(
+        id=f"opaque-{uuid4().hex}",
+        run_id=run_id,
+        created_at=NOW,
+        argv=("python", "-m", "pytest"),
+        purpose="offline verification",
+    )
+    request = WorkerRequest(
+        id="accepted-node-request",
+        run_id=run_id,
+        created_at=NOW,
+        goal="make a verified change",
+        accepted_plan_digest=ZERO,
+        node_id="fix",
+        graph_run_id="graph-run",
+        accepted_graph_revision_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=canonical_digest([policy.content_digest]),
+        remaining_budgets={"worker_turns": 1},
+    )
+    coordinator = WorkCoordinator(
+        store,
+        DeterministicRuntime({}, store=store),
+        FakeWorkspace(patch),  # type: ignore[arg-type]
+        lambda _snapshot, _cancellation: ScriptedWorkerAdapter([WorkerProposalEnvelope()]),
+        lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+        lambda _descriptor: patch,
+        (policy,),
+        verification_requests=(verification,),
+        allowed_processes=(verification.argv,),
+    )
+    try:
+        run = coordinator.execute_node(
+            request,
+            (
+                CompletionCriterion(
+                    id="criterion-test",
+                    description="tests pass",
+                    verification_requirement_ids=("test",),
+                    required_artifact_ids=("workspace_patch",),
+                ),
+            ),
+            str(tmp_path),
+            "a" * 40,
+            worker_name="scripted",
+        )
+        assert run.status == "failed"
+        assert run.failure_code == StableFailureCode.VERIFICATION_BINDING_INVALID.value
+        assert run.acceptance_ledger_id is not None
+        ledger = store.get("acceptance_ledger_v2", run.acceptance_ledger_id, AcceptanceLedger)
+        assert ledger.criteria[0].disposition == "uncovered"
+        view = inspect_work_run(store, run.id)
+        diagnostic = next(
+            item for item in view["events"] if item["kind"] == "node_verification_binding_rejected"
+        )["details"]
+        assert diagnostic["stable_failure_code"] == "VERIFICATION_BINDING_INVALID"
+        assert diagnostic["graph_run_id"] == "graph-run"
+        assert diagnostic["node_id"] == "fix"
+        assert diagnostic["criteria"][0]["requirement_refs"] == ["test"]
+        assert diagnostic["requests"][0]["request_id"] == verification.id
+        assert diagnostic["bindings"] == []
+    finally:
+        store.close()
 
 
 def _complete_coordinator_run(

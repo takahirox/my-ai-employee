@@ -4,6 +4,7 @@ import subprocess
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -29,12 +30,14 @@ from ai_employee.domain import (
 from ai_employee.domain.browser import BrowserAction, BrowserCapture, BrowserScenario
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
+    AcceptanceLedger,
     ActionKind,
     ActionProposal,
     ArtifactDescriptor,
     DecisionOutcome,
     EditIntentRequest,
     ExecutionResult,
+    NodeVerificationBinding,
     PolicyDecision,
     ProcessRequest,
     PromotionRecord,
@@ -51,7 +54,7 @@ from ai_employee.graph_evaluation import (
     ParentCandidateEvaluationRecord,
 )
 from ai_employee.graph_execution import GraphExecutionService
-from ai_employee.inspector import inspect_graph_run
+from ai_employee.inspector import inspect_graph_run, inspect_work_run
 from ai_employee.orchestration import WorkCoordinator
 from ai_employee.parent_review import (
     ParentSemanticBasis,
@@ -74,7 +77,11 @@ from ai_employee.services_v2 import (
     PlaywrightBrowserEvaluationServices,
 )
 from ai_employee.storage import SQLiteStore
-from ai_employee.task_orchestration import NodeExecutionRecord
+from ai_employee.task_orchestration import (
+    LoopAction,
+    LoopTransitionRecord,
+    NodeExecutionRecord,
+)
 from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -139,12 +146,13 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         effort="bounded",
         capabilities=("edit_intent", "process"),
     )
+    verification_requirements = {"a": "test", "b": "lint", "c": "typecheck"}
 
     def criterion(name: str) -> CompletionCriterion:
         return CompletionCriterion(
             id=f"criterion-{name}",
             description=f"{name} verification passed",
-            verification_requirement_ids=(f"verify-{name}",),
+            verification_requirement_ids=(verification_requirements[name],),
             required_artifact_ids=("workspace_patch",),
         )
 
@@ -340,11 +348,19 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     ) -> WorkCoordinator:
         inner = SQLiteStore(database)
         verification = ProcessRequest(
-            id=f"verify-{selected_node.id}",
+            id=f"opaque-verification-{uuid4().hex}",
             run_id=request.run_id,
             created_at=NOW,
             argv=("verify", selected_node.id),
             purpose=f"required Harness verification: {selected_node.id}",
+        )
+        binding = NodeVerificationBinding(
+            id=f"binding-{selected_node.id}",
+            run_id=request.run_id,
+            created_at=NOW,
+            requirement_id=verification_requirements[selected_node.id],
+            process_request_id=verification.id,
+            process_request_digest=verification.content_digest or "0" * 64,
         )
         return WorkCoordinator(
             inner,
@@ -359,6 +375,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             ),
             selected_strategy=selected_strategy,
             verification_requests=(verification,),
+            verification_bindings=(binding,),
             allowed_processes=(verification.argv,),
             protected_paths=(".git/**",),
         )
@@ -724,6 +741,39 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             )
         assert len({by_node[name].workspace_id for name in ("a", "b")}) == 2
         assert all(item.status == "passed" for item in replay.nodes)
+        for name in ("a", "b", "c"):
+            inner_run = store.get_work_run(by_node[name].work_run_id or "missing")
+            ledger = store.get(
+                "acceptance_ledger_v2",
+                inner_run.acceptance_ledger_id or "missing",
+                AcceptanceLedger,
+            )
+            assert len(ledger.criteria) == 1
+            assert ledger.criteria[0].disposition == "satisfied"
+            assert set(inner_run.verification_result_digests) <= set(
+                ledger.criteria[0].evidence_refs
+            )
+            bindings = store.list_records(
+                "node_verification_binding_v2",
+                NodeVerificationBinding,
+                run_id=inner_run.id,
+            )
+            assert len(bindings) == 1
+            assert bindings[0].requirement_id == verification_requirements[name]
+            assert bindings[0].process_request_id.startswith("opaque-verification-")
+            inner_view = inspect_work_run(store, inner_run.id)
+            assert len(inner_view["verification_bindings"]) == 1
+            assert inner_view["verification_bindings"][0]["content_digest"] == (
+                bindings[0].content_digest
+            )
+            assert len(inner_view["verification_requests"]) == 1
+        node_transitions = store.list_records(
+            "loop_transition_v2", LoopTransitionRecord, run_id=run.id
+        )
+        assert not any(
+            item.action is LoopAction.REPAIR and item.node_id is not None
+            for item in node_transitions
+        )
         assert service.replay(run.id) == replay
         assert composition_calls == 1
         assert parent_process_calls == (

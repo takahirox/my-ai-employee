@@ -544,6 +544,30 @@ def test_non_repairable_evaluation_selects_terminal_fail(tmp_path: Path) -> None
     assert replay.loop_transitions[0].reason_code == "NODE_EVALUATION_NOT_PASS"
 
 
+def test_invalid_verification_binding_fails_without_semantic_repair(tmp_path: Path) -> None:
+    goal, graph, _node = _inputs(max_repairs=2)
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        return _result(request, "blocked").model_copy(
+            update={"failure_code": StableFailureCode.VERIFICATION_BINDING_INVALID.value}
+        )
+
+    with SQLiteStore(tmp_path / "invalid-binding.db") as store:
+        orchestrator, run = _run(store, graph, goal, runner, run_id="invalid-binding")
+        replay = orchestrator.replay("invalid-binding")
+
+    assert run.status == "failed"
+    assert run.failure_code == StableFailureCode.VERIFICATION_BINDING_INVALID.value
+    assert [item.action for item in replay.loop_transitions] == [LoopAction.FAIL]
+    assert replay.loop_transitions[0].reason_code == (
+        StableFailureCode.VERIFICATION_BINDING_INVALID.value
+    )
+
+
 def test_correctable_verification_with_zero_repair_budget_reports_exhaustion(
     tmp_path: Path,
 ) -> None:

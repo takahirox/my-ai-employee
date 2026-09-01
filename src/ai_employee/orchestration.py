@@ -47,6 +47,7 @@ from .domain.v2 import (
     ExecutionResult,
     InstallRequest,
     InstallResult,
+    NodeVerificationBinding,
     NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
@@ -149,6 +150,57 @@ class WorkEvent(BaseModel):
     details: object = None
 
 
+def _node_verification_diagnostic(
+    run: WorkRun,
+    requests: tuple[ProcessRequest, ...],
+    bindings: tuple[NodeVerificationBinding, ...],
+    *,
+    graph_run_id: str | None,
+    failure_code: StableFailureCode,
+    ledger: AcceptanceLedger,
+    results: tuple[ExecutionResult, ...] = (),
+) -> dict[str, object]:
+    """Build bounded Inspector-safe authority evidence without process output."""
+
+    results_by_request = {
+        item.request_digest: item.content_digest for item in results if item.content_digest
+    }
+    disposition_by_criterion = {item.criterion_id: item.disposition for item in ledger.criteria}
+    requests_by_id = {item.id: item for item in requests}
+    return {
+        "stable_failure_code": failure_code.value,
+        "graph_run_id": graph_run_id,
+        "accepted_graph_digest": run.accepted_graph_digest,
+        "node_id": run.node_id,
+        "generation": run.node_generation,
+        "attempt": run.node_attempt,
+        "ledger_digest": ledger.content_digest,
+        "criteria": tuple(
+            {
+                "criterion_id": criterion.id,
+                "mandatory": criterion.mandatory,
+                "disposition": disposition_by_criterion.get(criterion.id, "missing"),
+                "requirement_refs": criterion.verification_requirement_ids,
+            }
+            for criterion in run.completion_criteria
+        ),
+        "requests": tuple(
+            {"request_id": request.id, "request_digest": request.content_digest}
+            for request in requests
+        ),
+        "bindings": tuple(
+            {
+                "requirement_ref": binding.requirement_id,
+                "request_id": binding.process_request_id,
+                "request_digest": binding.process_request_digest,
+                "result_digest": results_by_request.get(binding.process_request_digest),
+                "request_present": binding.process_request_id in requests_by_id,
+            }
+            for binding in bindings
+        ),
+    }
+
+
 class _Cancellation:
     def __init__(self, store: SQLiteStore, run_id: str) -> None:
         self.store = store
@@ -204,6 +256,7 @@ class WorkCoordinator:
         installer_factory: Callable[[WorkspaceSnapshot], Installer] | None = None,
         max_worker_turns: int = 1,
         verification_requests: tuple[ProcessRequest, ...] = (),
+        verification_bindings: tuple[NodeVerificationBinding, ...] = (),
         protected_paths: tuple[str, ...] = (".git/**",),
         allowed_processes: tuple[tuple[str, ...], ...] = (),
         artifact_store: ArtifactStore | None = None,
@@ -237,6 +290,7 @@ class WorkCoordinator:
         self.installer_factory = installer_factory
         self.max_worker_turns = max_worker_turns
         self.verification_requests = verification_requests
+        self.verification_bindings = verification_bindings
         self.protected_paths = protected_paths
         self.allowed_processes = allowed_processes
         self.artifact_store = artifact_store
@@ -808,13 +862,64 @@ class WorkCoordinator:
 
         run = self._update(run, status="verifying")
         verification_digests: list[str] = []
-        criterion_verification_digests: list[str] = []
+        result_digest_by_request: dict[str, str] = {}
         verification_failed = False
+        binding_failed = False
+        node_bound = run.worker_request_digest is not None
+        if node_bound and not _node_verification_configuration_is_valid(
+            run.id,
+            run.completion_criteria,
+            self.verification_requests,
+            self.verification_bindings,
+        ):
+            ledger = AcceptanceLedger(
+                id=identifier("acceptance-ledger"),
+                run_id=run.id,
+                created_at=now(),
+                criteria=_uncovered_criterion_evidence(run.completion_criteria),
+            )
+            self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
+            self._event(
+                run.id,
+                "node_verification_binding_rejected",
+                "runtime",
+                details=_node_verification_diagnostic(
+                    run,
+                    self.verification_requests,
+                    self.verification_bindings,
+                    graph_run_id=self._graph_run_id(run),
+                    failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID,
+                    ledger=ledger,
+                ),
+            )
+            return self._update(
+                run,
+                status="failed",
+                failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+                acceptance_ledger_id=ledger.id,
+                output_artifact_ids=tuple(output_artifact_ids),
+            )
+        if node_bound:
+            for binding in self.verification_bindings:
+                self.store.put("node_verification_binding_v2", binding, run_id=run.id)
+            for request in self.verification_requests:
+                self.store.put("verification_request_v2", request, run_id=run.id)
+            if not _persisted_node_verification_configuration_is_valid(
+                self.store,
+                run.id,
+                run.completion_criteria,
+                self.verification_requests,
+                self.verification_bindings,
+            ):
+                binding_failed = True
         for request in self.verification_requests:
+            if binding_failed:
+                break
             if self.store.control(run.id) == "pause":
                 return self._update(run, status="paused")
             if request.run_id != run.id:
-                return self._update(run, status="failed", failure_code="STALE_VERIFICATION_REQUEST")
+                binding_failed = True
+                break
             verification_proposal = ActionProposal(
                 id=identifier("verification-proposal"),
                 run_id=run.id,
@@ -824,7 +929,8 @@ class WorkCoordinator:
                 payload=request,
                 reason="required Harness verification",
             )
-            self.store.put("verification_request_v2", request, run_id=run.id)
+            if not node_bound:
+                self.store.put("verification_request_v2", request, run_id=run.id)
             proposal_decision = self._decide(verification_proposal)
             if proposal_decision.outcome is not DecisionOutcome.ALLOW:
                 return self._update(run, status="failed", failure_code="VERIFICATION_POLICY_DENIED")
@@ -833,20 +939,53 @@ class WorkCoordinator:
                 bind_service_decision(request, proposal_decision),
                 cancellation,
             )
+            request_digest = request.content_digest or ""
+            if (
+                result.run_id != run.id
+                or result.request_digest != request_digest
+                or result.content_digest is None
+                or request_digest in result_digest_by_request
+            ):
+                binding_failed = True
+                break
             self.store.put("verification_result_v2", result, run_id=run.id)
             retain(_mediated_result_artifacts(result, executor))
-            verification_digests.append(result.content_digest or "")
+            verification_digests.append(result.content_digest)
+            result_digest_by_request[request_digest] = result.content_digest
             if result.status != "succeeded":
-                criterion_verification_digests.append("")
                 verification_failed = True
                 break
-            criterion_verification_digests.append(result.content_digest or "")
-
-        # Keep criterion/result cardinality deterministic when execution stops on the
-        # first failed verifier. Unexecuted requirements remain explicitly uncovered.
-        criterion_verification_digests.extend(
-            "" for _ in range(len(self.verification_requests) - len(criterion_verification_digests))
+        persisted_results = self.store.list_records(
+            "verification_result_v2", ExecutionResult, run_id=run.id
         )
+        if len(persisted_results) != len(result_digest_by_request) or any(
+            item.run_id != run.id
+            or item.content_digest is None
+            or result_digest_by_request.get(item.request_digest) != item.content_digest
+            for item in persisted_results
+        ):
+            binding_failed = True
+        successful_result_digest_by_request = {
+            item.request_digest: item.content_digest
+            for item in persisted_results
+            if item.status == "succeeded" and item.content_digest is not None
+        }
+
+        if node_bound:
+            verification_by_requirement = {
+                binding.requirement_id: successful_result_digest_by_request.get(
+                    binding.process_request_digest, ""
+                )
+                for binding in self.verification_bindings
+            }
+        else:
+            # Generic WorkCoordinator requests retain their pre-node identity behavior.
+            verification_by_requirement = {
+                request.id: successful_result_digest_by_request.get(
+                    request.content_digest or "", ""
+                )
+                for request in self.verification_requests
+            }
 
         if not run.capture_patch:
             artifacts = tuple(
@@ -855,8 +994,7 @@ class WorkCoordinator:
             )
             criteria = _declared_criterion_evidence(
                 run.completion_criteria,
-                self.verification_requests,
-                tuple(criterion_verification_digests),
+                verification_by_requirement,
                 artifacts,
             )
             ledger = AcceptanceLedger(
@@ -866,10 +1004,51 @@ class WorkCoordinator:
                 criteria=criteria,
             )
             self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
+            evidence_authoritative = _acceptance_evidence_is_authoritative(
+                run.completion_criteria,
+                ledger.criteria,
+                verification_by_requirement,
+                artifacts,
+            )
+            acceptance_satisfied = _mandatory_acceptance_is_satisfied(
+                run.completion_criteria, ledger.criteria
+            )
+            failed = (
+                binding_failed
+                or verification_failed
+                or (
+                    (node_bound or run.capture_patch)
+                    and (not evidence_authoritative or not acceptance_satisfied)
+                )
+            )
+            failure_code = (
+                StableFailureCode.VERIFICATION_BINDING_INVALID
+                if binding_failed or (node_bound and not evidence_authoritative)
+                else StableFailureCode.VERIFICATION_FAILED
+            )
+            if failed:
+                self._event(
+                    run.id,
+                    (
+                        "node_verification_binding_rejected"
+                        if failure_code is StableFailureCode.VERIFICATION_BINDING_INVALID
+                        else "mandatory_acceptance_rejected"
+                    ),
+                    "runtime",
+                    details=_node_verification_diagnostic(
+                        run,
+                        self.verification_requests,
+                        self.verification_bindings,
+                        graph_run_id=self._graph_run_id(run),
+                        failure_code=failure_code,
+                        ledger=ledger,
+                        results=tuple(persisted_results),
+                    ),
+                )
             return self._update(
                 run,
-                status="failed" if verification_failed else "completed",
-                failure_code="VERIFICATION_FAILED" if verification_failed else None,
+                status="failed" if failed else "completed",
+                failure_code=failure_code.value if failed else None,
                 verification_result_digests=tuple(verification_digests),
                 acceptance_ledger_id=ledger.id,
                 output_artifact_ids=tuple(output_artifact_ids),
@@ -885,8 +1064,7 @@ class WorkCoordinator:
         )
         criteria = _declared_criterion_evidence(
             run.completion_criteria,
-            self.verification_requests,
-            tuple(criterion_verification_digests),
+            verification_by_requirement,
             (patch,),
         )
         ledger = AcceptanceLedger(
@@ -896,11 +1074,50 @@ class WorkCoordinator:
             criteria=criteria,
         )
         self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
-        if verification_failed:
+        evidence_authoritative = _acceptance_evidence_is_authoritative(
+            run.completion_criteria,
+            ledger.criteria,
+            verification_by_requirement,
+            (patch,),
+        )
+        acceptance_satisfied = _mandatory_acceptance_is_satisfied(
+            run.completion_criteria, ledger.criteria
+        )
+        if (
+            binding_failed
+            or verification_failed
+            or (
+                (node_bound or run.capture_patch)
+                and (not evidence_authoritative or not acceptance_satisfied)
+            )
+        ):
+            failure_code = (
+                StableFailureCode.VERIFICATION_BINDING_INVALID
+                if binding_failed or (node_bound and not evidence_authoritative)
+                else StableFailureCode.VERIFICATION_FAILED
+            )
+            self._event(
+                run.id,
+                (
+                    "node_verification_binding_rejected"
+                    if failure_code is StableFailureCode.VERIFICATION_BINDING_INVALID
+                    else "mandatory_acceptance_rejected"
+                ),
+                "runtime",
+                details=_node_verification_diagnostic(
+                    run,
+                    self.verification_requests,
+                    self.verification_bindings,
+                    graph_run_id=self._graph_run_id(run),
+                    failure_code=failure_code,
+                    ledger=ledger,
+                    results=tuple(persisted_results),
+                ),
+            )
             return self._update(
                 run,
                 status="failed",
-                failure_code="VERIFICATION_FAILED",
+                failure_code=failure_code.value,
                 verification_result_digests=tuple(verification_digests),
                 review_digest=review_digest,
                 acceptance_ledger_id=ledger.id,
@@ -975,6 +1192,14 @@ class WorkCoordinator:
             acceptance_ledger_id=ledger.id,
             output_artifact_ids=tuple(output_artifact_ids),
         )
+
+    def _graph_run_id(self, run: WorkRun) -> str | None:
+        requests = tuple(
+            item
+            for item in self.store.list_records("worker_request_v2", WorkerRequest, run_id=run.id)
+            if item.content_digest == run.worker_request_digest
+        )
+        return requests[0].graph_run_id if len(requests) == 1 else None
 
     def _retain_artifacts(
         self, run_id: str, descriptors: tuple[ArtifactDescriptor, ...], retained: list[str]
@@ -1086,18 +1311,11 @@ class WorkCoordinator:
 
 def _declared_criterion_evidence(
     criteria: tuple[CompletionCriterion, ...],
-    verification_requests: tuple[ProcessRequest, ...],
-    verification_digests: tuple[str, ...],
+    verification_by_requirement: Mapping[str, str],
     artifacts: tuple[ArtifactDescriptor, ...],
 ) -> tuple[CriterionEvidence, ...]:
     """Map declared criteria only to exact first-party results and artifacts."""
 
-    if len(verification_requests) != len(verification_digests):
-        raise ValueError("verification request/result cardinality mismatch")
-    verification_by_id = {
-        request.id: digest
-        for request, digest in zip(verification_requests, verification_digests, strict=True)
-    }
     artifact_refs: dict[str, tuple[str, str]] = {}
     kinds: dict[str, list[ArtifactDescriptor]] = {}
     for artifact in artifacts:
@@ -1118,7 +1336,7 @@ def _declared_criterion_evidence(
         refs: list[str] = []
         missing = False
         for requirement_id in criterion.verification_requirement_ids:
-            digest = verification_by_id.get(requirement_id)
+            digest = verification_by_requirement.get(requirement_id)
             if not digest:
                 missing = True
             else:
@@ -1141,6 +1359,208 @@ def _declared_criterion_evidence(
             )
         )
     return tuple(result)
+
+
+def _uncovered_criterion_evidence(
+    criteria: tuple[CompletionCriterion, ...],
+) -> tuple[CriterionEvidence, ...]:
+    return tuple(
+        CriterionEvidence(criterion_id=criterion.id, disposition="uncovered")
+        for criterion in criteria
+    )
+
+
+def _node_verification_configuration_is_valid(
+    run_id: str,
+    criteria: tuple[CompletionCriterion, ...],
+    requests: tuple[ProcessRequest, ...],
+    bindings: tuple[NodeVerificationBinding, ...],
+) -> bool:
+    """Require an explicit one-to-one requirement/request content binding."""
+
+    declared = tuple(
+        dict.fromkeys(
+            requirement_id
+            for criterion in criteria
+            for requirement_id in criterion.verification_requirement_ids
+        )
+    )
+    if len(requests) != len(declared) or len(bindings) != len(declared):
+        return False
+    if len({request.id for request in requests}) != len(requests):
+        return False
+    request_digests = tuple(request.content_digest for request in requests)
+    if None in request_digests or len(set(request_digests)) != len(request_digests):
+        return False
+    if len({binding.id for binding in bindings}) != len(bindings):
+        return False
+    if len({binding.requirement_id for binding in bindings}) != len(bindings):
+        return False
+    if len({binding.process_request_id for binding in bindings}) != len(bindings):
+        return False
+    if len({binding.process_request_digest for binding in bindings}) != len(bindings):
+        return False
+    if {binding.requirement_id for binding in bindings} != set(declared):
+        return False
+    requests_by_id = {request.id: request for request in requests}
+    return all(
+        request.run_id == run_id
+        and binding.run_id == run_id
+        and binding.process_request_digest == request.content_digest
+        for binding in bindings
+        if (request := requests_by_id.get(binding.process_request_id)) is not None
+    ) and all(binding.process_request_id in requests_by_id for binding in bindings)
+
+
+def _persisted_node_verification_configuration_is_valid(
+    store: SQLiteStore,
+    run_id: str,
+    criteria: tuple[CompletionCriterion, ...],
+    requests: tuple[ProcessRequest, ...],
+    bindings: tuple[NodeVerificationBinding, ...],
+) -> bool:
+    if not _node_verification_configuration_is_valid(run_id, criteria, requests, bindings):
+        return False
+    persisted_requests = store.list_records(
+        "verification_request_v2", ProcessRequest, run_id=run_id
+    )
+    persisted_bindings = store.list_records(
+        "node_verification_binding_v2", NodeVerificationBinding, run_id=run_id
+    )
+    request_by_id = {item.id: item for item in persisted_requests}
+    binding_by_id = {item.id: item for item in persisted_bindings}
+    return (
+        len(request_by_id) == len(persisted_requests) == len(requests)
+        and len(binding_by_id) == len(persisted_bindings) == len(bindings)
+        and all(request_by_id.get(item.id) == item for item in requests)
+        and all(binding_by_id.get(item.id) == item for item in bindings)
+    )
+
+
+def _authoritative_node_verification_results(
+    store: SQLiteStore,
+    run: WorkRun,
+    criteria: tuple[CompletionCriterion, ...],
+    requests: tuple[ProcessRequest, ...],
+    bindings: tuple[NodeVerificationBinding, ...],
+) -> tuple[ExecutionResult, ...] | None:
+    """Replay exact persisted bindings and request/result digest authority."""
+
+    if not _persisted_node_verification_configuration_is_valid(
+        store, run.id, criteria, requests, bindings
+    ):
+        return None
+    results = store.list_records("verification_result_v2", ExecutionResult, run_id=run.id)
+    request_digests = tuple(request.content_digest or "" for request in requests)
+    expected = set(request_digests)
+    result_by_request: dict[str, ExecutionResult] = {}
+    for result in results:
+        if (
+            result.run_id != run.id
+            or result.content_digest is None
+            or result.request_digest not in expected
+            or result.request_digest in result_by_request
+        ):
+            return None
+        result_by_request[result.request_digest] = result
+    ordered: list[ExecutionResult] = []
+    gap = False
+    for digest in request_digests:
+        persisted_result = result_by_request.get(digest)
+        if persisted_result is None:
+            gap = True
+        elif gap:
+            return None
+        else:
+            ordered.append(persisted_result)
+    ordered_tuple = tuple(ordered)
+    if tuple(item.content_digest for item in ordered_tuple) != run.verification_result_digests:
+        return None
+    successful_terminal = run.status in {"ready_to_promote", "completed"}
+    verification_failure = (
+        run.status == "failed" and run.failure_code == StableFailureCode.VERIFICATION_FAILED.value
+    )
+    if successful_terminal:
+        if len(ordered_tuple) != len(requests) or any(
+            item.status != "succeeded" for item in ordered_tuple
+        ):
+            return None
+    elif verification_failure:
+        if len(ordered_tuple) < len(requests) and (
+            not ordered_tuple or ordered_tuple[-1].status == "succeeded"
+        ):
+            return None
+        if any(item.status != "succeeded" for item in ordered_tuple[:-1]):
+            return None
+    else:
+        return None
+    return ordered_tuple
+
+
+def _acceptance_evidence_is_authoritative(
+    criteria: tuple[CompletionCriterion, ...],
+    evidence: tuple[CriterionEvidence, ...],
+    verification_by_requirement: Mapping[str, str],
+    artifacts: tuple[ArtifactDescriptor, ...],
+) -> bool:
+    if tuple(item.criterion_id for item in evidence) != tuple(item.id for item in criteria):
+        return False
+    if len({item.criterion_id for item in evidence}) != len(evidence):
+        return False
+    artifact_by_id = {item.id: item for item in artifacts}
+    artifact_by_kind: dict[str, list[ArtifactDescriptor]] = {}
+    for artifact in artifacts:
+        artifact_by_kind.setdefault(artifact.logical_kind, []).append(artifact)
+    authoritative_refs = {
+        *(digest for digest in verification_by_requirement.values() if digest),
+        *(item.content_digest for item in artifacts if item.content_digest is not None),
+        *(item.artifact_digest for item in artifacts),
+    }
+    criteria_by_id = {item.id: item for item in criteria}
+    for item in evidence:
+        refs = set(item.evidence_refs)
+        if not refs <= authoritative_refs:
+            return False
+        if item.disposition != "satisfied":
+            continue
+        criterion = criteria_by_id[item.criterion_id]
+        if not item.evidence_refs:
+            return False
+        for requirement_id in criterion.verification_requirement_ids:
+            digest = verification_by_requirement.get(requirement_id)
+            if not digest or digest not in refs:
+                return False
+        for required in criterion.required_artifact_ids:
+            matches = (
+                (artifact_by_id[required],)
+                if required in artifact_by_id
+                else tuple(artifact_by_kind.get(required, ()))
+            )
+            if len(matches) != 1:
+                return False
+            descriptor = matches[0]
+            if (
+                descriptor.content_digest is None
+                or not {
+                    descriptor.content_digest,
+                    descriptor.artifact_digest,
+                }
+                <= refs
+            ):
+                return False
+    return True
+
+
+def _mandatory_acceptance_is_satisfied(
+    criteria: tuple[CompletionCriterion, ...],
+    evidence: tuple[CriterionEvidence, ...],
+) -> bool:
+    evidence_by_id = {item.criterion_id: item for item in evidence}
+    return all(
+        criterion.id in evidence_by_id and evidence_by_id[criterion.id].disposition == "satisfied"
+        for criterion in criteria
+        if criterion.mandatory
+    )
 
 
 def _mediated_result_artifacts(

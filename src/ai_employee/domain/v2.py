@@ -67,6 +67,7 @@ class StableFailureCode(StableStrEnum):
     TYPED_RESULT_ACTIONS_FORBIDDEN = "TYPED_RESULT_ACTIONS_FORBIDDEN"
     EVALUATOR_EXECUTION_UNAVAILABLE = "EVALUATOR_EXECUTION_UNAVAILABLE"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
+    VERIFICATION_BINDING_INVALID = "VERIFICATION_BINDING_INVALID"
     REVIEW_BLOCKED = "REVIEW_BLOCKED"
     WORKSPACE_CONFLICT = "WORKSPACE_CONFLICT"
     PROMOTION_FAILED = "PROMOTION_FAILED"
@@ -214,6 +215,15 @@ class ProcessRequest(DigestedRecordV2):
         if not math.isfinite(value):
             raise ValueError("timeout must be finite")
         return value
+
+
+class NodeVerificationBinding(DigestedRecordV2):
+    """Explicit semantic requirement binding to one opaque process request."""
+
+    schema_name: ClassVar[str] = "node_verification_binding"
+    requirement_id: Identifier
+    process_request_id: Identifier
+    process_request_digest: Digest
 
 
 class DownloadRequest(DigestedRecordV2):

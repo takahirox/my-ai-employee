@@ -55,6 +55,7 @@ from .domain.v2 import (
     ArtifactPutRequest,
     EditIntentRequest,
     ExecutionResult,
+    NodeVerificationBinding,
     PolicyDecision,
     ProcessRequest,
     PromotionRecord,
@@ -1292,6 +1293,24 @@ def _work(args: argparse.Namespace) -> int:
                     )
                     else ()
                 )
+                node_verification_binding_names = (
+                    node_verification_names if node_verification_requests else ()
+                )
+                node_verification_bindings = tuple(
+                    NodeVerificationBinding(
+                        id=identifier("node-verification-binding"),
+                        run_id=request.run_id,
+                        created_at=now(),
+                        requirement_id=name,
+                        process_request_id=process_request.id,
+                        process_request_digest=cast(str, process_request.content_digest),
+                    )
+                    for name, process_request in zip(
+                        node_verification_binding_names,
+                        node_verification_requests,
+                        strict=True,
+                    )
+                )
                 node_assessment = assess_task(
                     node.objective or node.name,
                     run_id=request.run_id,
@@ -1341,6 +1360,7 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     max_worker_turns=max(1, node.resource_budget.worker_turns),
                     verification_requests=node_verification_requests,
+                    verification_bindings=node_verification_bindings,
                     protected_paths=harness.paths.protected,
                     allowed_processes=tuple(command.argv for command in harness.commands.values()),
                     artifact_store=artifacts,
