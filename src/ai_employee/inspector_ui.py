@@ -87,17 +87,18 @@ gap:1rem;
 margin-bottom:1rem}
 .run-grid{
 display:grid;
-grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));
 gap:.8rem;
 margin-bottom:1.4rem}
 .run-card{
 display:block;
 width:100%;
+min-width:0;
 text-align:left;
 background:var(--panel);
 border:1px solid #293752;
 border-radius:10px;
-padding:1rem}
+padding:.7rem .8rem}
 .run-card:hover,
 .run-card:focus-visible{
 border-color:#60a5fa}
@@ -105,20 +106,52 @@ border-color:#60a5fa}
 border-color:#f59e0b;
 background:#211d19}
 .run-card h3{
-margin:0 0 .45rem;
-font-size:1rem}
-.run-card dl{
-display:grid;
-grid-template-columns:7rem 1fr;
-gap:.3rem .6rem;
-margin:.8rem 0 0}
-.run-card dt{
-color:var(--muted)}
-.run-card dd{
-margin:0;
+display:-webkit-box;
+margin:0 0 .3rem;
+font-size:1rem;
+line-height:1.25;
+max-height:2.5em;
+-webkit-line-clamp:2;
+-webkit-box-orient:vertical;
+overflow:hidden;
 overflow-wrap:anywhere}
+.run-repository,
+.run-activity{
+overflow:hidden;
+text-overflow:ellipsis;
+white-space:nowrap}
+.run-repository{
+margin-bottom:.45rem}
+.run-card-meta{
+display:flex;
+align-items:center;
+gap:.4rem;
+min-width:0;
+margin-bottom:.4rem}
+.run-status{
+max-width:45%;
+overflow:hidden;
+text-overflow:ellipsis;
+white-space:nowrap}
+.run-progress{
+display:flex;
+align-items:center;
+gap:.3rem;
+color:var(--muted);
+font-size:.75rem;
+min-width:0}
+.run-progress progress{
+width:3.5rem;
+height:.45rem;
+accent-color:#60a5fa}
 .attention{
-color:#ffcf86}
+color:#ffcf86;
+margin-left:auto;
+white-space:nowrap}
+.run-activity{
+margin:0;
+color:var(--muted);
+font-size:.82rem}
 .empty{
 padding:1rem;
 border:1px dashed #42516d;
@@ -405,25 +438,64 @@ card.className='run-card';
 card.classList.toggle('attention-card',Boolean(run.requires_attention));
 const title=document.createElement('h3');
 title.textContent=run.goal||run.run_id;
+title.title=run.goal||run.run_id;
+const repositoryText=run.repository||
+'Legacy / unassigned repository';
 const repository=document.createElement('div');
-repository.className='muted';
-repository.textContent=run.repository||'Legacy / unassigned repository';
-const details=document.createElement('dl');
-for(const [label,value] of [
-['Status',run.status],
-['Progress',run.progress.completed+' / '+run.progress.total],
-['Active task',run.active_task],
-['Phase',run.phase],
-['Attention',run.attention.length?
-run.attention.map(x=>x.task_id?
-x.task_id+': '+x.condition:x.condition).join(', '):
-'None persisted']]){
-const dt=document.createElement('dt'),dd=document.createElement('dd');
-dt.textContent=label;
-dd.textContent=text(value);
-if(label==='Attention'&&run.attention.length)dd.className='attention';
-details.append(dt,dd)}
-card.append(title,repository,details);
+repository.className='run-repository muted';
+repository.textContent=repositoryText;
+repository.title=repositoryText;
+const status=document.createElement('span');
+status.className='badge run-status state-'+
+({
+completed:'passed',
+succeeded:'passed',
+waiting_approval:'routed'}
+[run.status]||
+(['ready',
+'waiting',
+'routed',
+'running',
+'passed',
+'failed',
+'blocked',
+'cancelled',
+'retained'].includes(run.status)?
+run.status:'waiting'));
+status.textContent=text(run.status);
+status.title='Run status: '+text(run.status);
+const progressData=run.progress||{},
+completed=Number(progressData.completed)||0,
+total=Number(progressData.total)||0;
+const progressGroup=document.createElement('span');
+progressGroup.className='run-progress';
+const progress=document.createElement('progress');
+progress.max=Math.max(total,1);
+progress.value=Math.min(completed,progress.max);
+progress.setAttribute(
+'aria-label',
+completed+' of '+total+' tasks completed');
+const progressText=document.createElement('span');
+progressText.textContent=completed+'/'+total;
+progressGroup.append(progress,progressText);
+const attentionConditions=maps(run.attention).map(x=>x.task_id?
+x.task_id+': '+x.condition:x.condition);
+const attention=document.createElement('span');
+attention.className='attention';
+attention.title=attentionConditions.length?
+attentionConditions.join(', '):'No persisted attention conditions';
+attention.textContent=attentionConditions.length+' warning'+
+(attentionConditions.length===1?'':'s');
+const activity=document.createElement('p');
+activity.className='run-activity';
+const taskOrPhase=run.active_task||run.phase||
+'No active task or phase recorded';
+activity.textContent=taskOrPhase;
+activity.title=taskOrPhase;
+const meta=document.createElement('div');
+meta.className='run-card-meta';
+meta.append(status,progressGroup,attention);
+card.append(title,repository,meta,activity);
 card.addEventListener('click',()=>openRun(run.run_id));
 root.append(card)}
 }

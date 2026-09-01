@@ -100,6 +100,19 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "story.graph?.accepted===true" in _INDEX
     assert "removed_task_summaries" in _INDEX
     assert "stateReasons" in _INDEX
+    assert "-webkit-line-clamp:2" in _INDEX
+    assert "minmax(min(100%,280px),1fr)" in _INDEX
+    assert "title.title=run.goal||run.run_id" in _INDEX
+    assert "repository.title=repositoryText" in _INDEX
+    assert "className='badge run-status state-'" in _INDEX
+    assert "progress.setAttribute(" in _INDEX
+    assert "'aria-label'," in _INDEX
+    assert "const taskOrPhase=run.active_task||run.phase||" in _INDEX
+    assert "attention.title=attentionConditions.length?" in _INDEX
+    assert "attentionConditions.length+' warning'" in _INDEX
+    assert "['Active task',run.active_task]" not in _INDEX
+    assert "['Phase',run.phase]" not in _INDEX
+    assert "['Attention',run.attention.length?" not in _INDEX
 
 
 class _CatalogStore:
