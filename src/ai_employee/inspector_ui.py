@@ -148,10 +148,22 @@ accent-color:#60a5fa}
 color:#ffcf86;
 margin-left:auto;
 white-space:nowrap}
+.run-card-footer{
+display:flex;
+align-items:center;
+gap:.6rem;
+min-width:0}
 .run-activity{
+flex:1;
+min-width:0;
 margin:0;
 color:var(--muted);
 font-size:.82rem}
+.run-updated{
+flex:none;
+font-size:.75rem;
+margin-left:auto;
+white-space:nowrap}
 .empty{
 padding:1rem;
 border:1px dashed #42516d;
@@ -430,6 +442,7 @@ selectedRun=null,
 overview=null,
 eventSource=null,
 reconnectFailures=0,
+relativeTimeTimer=null,
 refreshQueued=false,
 refreshActive=false;
 const text=v=>v===null||
@@ -446,6 +459,36 @@ const shortTime=v=>{
 if(!v)return'Not recorded';
 const date=new Date(v);
 return Number.isNaN(date.getTime())?'Not recorded':date.toLocaleString()};
+const relativeTime=(v,
+now=Date.now())=>{
+const date=new Date(v),
+timestamp=date.getTime();
+if(Number.isNaN(timestamp))return'Not recorded';
+const distance=Math.abs(now-timestamp);
+if(distance<60000)return'just now';
+const units=[
+['day',86400000],
+['hour',3600000],
+['min',60000]],
+unit=units.find(item=>distance>=item[1])||
+units.at(-1),
+amount=Math.floor(distance/unit[1]),
+label=unit[0]+(amount===1?'':'s');
+return timestamp>now?
+'in '+amount+' '+label:
+amount+' '+label+' ago'};
+function refreshRelativeTimes(now=Date.now()){
+for(const updated of document.querySelectorAll(
+'.run-updated[data-timestamp]')){
+updated.textContent='Updated: '+
+relativeTime(updated.dataset.timestamp,
+now)}
+}
+function startRelativeTimeRefresh(){
+if(relativeTimeTimer!==null)return;
+relativeTimeTimer=window.setInterval(
+refreshRelativeTimes,
+30000)}
 const duration=v=>{
 const seconds=Number(v);
 if(v===null||
@@ -555,10 +598,28 @@ const taskOrPhase=run.active_task||run.phase||
 'No active task or phase recorded';
 activity.textContent=taskOrPhase;
 activity.title=taskOrPhase;
+const updated=document.createElement('span');
+updated.className='run-updated muted';
+if(run.last_updated_at){
+updated.dataset.timestamp=run.last_updated_at;
+updated.title='Last updated at '+run.last_updated_at;
+updated.setAttribute(
+'aria-label',
+'Last updated at '+run.last_updated_at);
+updated.textContent='Updated: '+relativeTime(run.last_updated_at)}
+else{
+updated.title='No trustworthy persisted update timestamp was recorded';
+updated.setAttribute(
+'aria-label',
+'Last updated: Not recorded');
+updated.textContent='Updated: Not recorded'}
 const meta=document.createElement('div');
 meta.className='run-card-meta';
 meta.append(status,progressGroup,attention);
-card.append(title,repository,meta,activity);
+const footer=document.createElement('div');
+footer.className='run-card-footer';
+footer.append(activity,updated);
+card.append(title,repository,meta,footer);
 card.addEventListener('click',()=>openRun(run.run_id));
 root.append(card)}
 }
@@ -1241,10 +1302,13 @@ const initial=new URLSearchParams(location.search).get('run');
 if(initial)selectedRun=initial;
 else showOverview();
 refreshRunCatalog().then(()=>initial?load():undefined).catch(error=>message(error.message,
-true)).finally(()=>connectEvents());
+true)).finally(()=>{
+startRelativeTimeRefresh();
+connectEvents()});
 window.addEventListener('beforeunload',
 ()=>{
 if(eventSource)eventSource.close();
+if(relativeTimeTimer!==null)window.clearInterval(relativeTimeTimer);
 connectionStatus('disconnected',
 'Disconnected')}
 );

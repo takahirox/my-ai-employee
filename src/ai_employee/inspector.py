@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -914,6 +915,34 @@ def _latest_node_facts(projection: dict[str, Any]) -> list[dict[str, Any]]:
     return graph_nodes
 
 
+def _latest_persisted_activity_at(projection: dict[str, Any]) -> str | None:
+    """Return the newest timestamp carried by a projected persisted record."""
+
+    candidates: list[datetime] = []
+    pending: list[object] = [projection]
+    timestamp_fields = {"created_at", "transitioned_at", "last_persisted_activity_at"}
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            is_node_fact = isinstance(value.get("node_id"), str) and (
+                "status" in value or "operational_status" in value
+            )
+            for key, item in value.items():
+                is_authoritative_timestamp = key in timestamp_fields and not (
+                    is_node_fact and key == "created_at"
+                )
+                if is_authoritative_timestamp and isinstance(item, str) and item.endswith("Z"):
+                    with suppress(ValueError):
+                        candidates.append(datetime.fromisoformat(f"{item[:-1]}+00:00"))
+                elif isinstance(item, (dict, list)):
+                    pending.append(item)
+        elif isinstance(value, list):
+            pending.extend(value)
+    if not candidates:
+        return None
+    return _timestamp(max(candidates))
+
+
 def _attention_facts(
     projection: dict[str, Any], run: dict[str, Any], status: str, latest_nodes: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -997,6 +1026,7 @@ def inspect_fleet_runs(
                 "active_task": None,
                 "active_tasks": [],
                 "phase": "Persisted v0.1 records",
+                "last_updated_at": None,
                 "requires_attention": False,
                 "attention": [],
             }
@@ -1067,6 +1097,7 @@ def inspect_fleet_runs(
                 if active_task is not None
                 else status.replace("_", " ").title()
             ),
+            "last_updated_at": _latest_persisted_activity_at(projection),
             "requires_attention": bool(attention),
             "attention": attention,
         }

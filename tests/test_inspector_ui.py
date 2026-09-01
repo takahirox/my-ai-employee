@@ -122,6 +122,14 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "['Active task',run.active_task]" not in _INDEX
     assert "['Phase',run.phase]" not in _INDEX
     assert "['Attention',run.attention.length?" not in _INDEX
+    assert "updated.dataset.timestamp=run.last_updated_at" in _INDEX
+    assert "updated.title='Last updated at '+run.last_updated_at" in _INDEX
+    assert "'Last updated at '+run.last_updated_at" in _INDEX
+    assert "updated.textContent='Updated: Not recorded'" in _INDEX
+    assert "relativeTime(updated.dataset.timestamp," in _INDEX
+    assert "window.setInterval(" in _INDEX
+    assert "refreshRelativeTimes," in _INDEX
+    assert "window.clearInterval(relativeTimeTimer)" in _INDEX
     for marker in (
         "cardFacts",
         "operational_status",
@@ -244,10 +252,23 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
                 ]
             },
             "nodes": [
-                {"node_id": "one", "status": "passed"},
-                {"node_id": "two", "status": "running"},
+                {
+                    "node_id": "one",
+                    "status": "passed",
+                    "last_persisted_activity_at": "2026-01-01T00:00:05.000000Z",
+                },
+                {
+                    "node_id": "two",
+                    "status": "running",
+                    "last_persisted_activity_at": "2026-01-01T00:00:10.123456Z",
+                },
             ],
-            "controls": [],
+            "controls": [
+                {
+                    "action": "resume",
+                    "created_at": "2026-01-01T00:00:15.234567Z",
+                }
+            ],
         },
         "done": {
             "state": "failed",
@@ -255,7 +276,13 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
             "goal": {"statement": "Old goal"},
             "failure_code": "EVALUATION_FAILED",
             "graph": {"nodes": [{"id": "only", "name": "Only task"}]},
-            "nodes": [{"node_id": "only", "status": "failed"}],
+            "nodes": [
+                {
+                    "node_id": "only",
+                    "status": "failed",
+                    "last_persisted_activity_at": "2025-12-31T23:59:59.654321Z",
+                }
+            ],
             "controls": [],
         },
     }
@@ -278,6 +305,7 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
         "active_task": "Current task",
         "active_tasks": [{"id": "two", "label": "Current task", "status": "running"}],
         "phase": "Task: Current task",
+        "last_updated_at": "2026-01-01T00:00:15.234567Z",
         "requires_attention": False,
         "attention": [],
     }
@@ -286,6 +314,7 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
         {"kind": "run", "condition": "EVALUATION_FAILED"},
     ]
     assert result["history"][0]["requires_attention"] is True
+    assert result["history"][0]["last_updated_at"] == "2025-12-31T23:59:59.654321Z"
 
 
 def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> None:
@@ -320,3 +349,31 @@ def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> Non
         {"kind": "run", "condition": "waiting_approval"},
         {"kind": "approval", "condition": "approval_required"},
     ]
+
+
+def test_fleet_overview_does_not_invent_missing_update_timestamp() -> None:
+    class Store(_CatalogStore):
+        def list_run_repositories(
+            self, repository_id: str | None = None
+        ) -> list[dict[str, str]]:
+            return [{"run_id": "old", "repository_id": "repo", "repository": "/repo"}]
+
+    projection = {
+        "state": "succeeded",
+        "goal": "Older run",
+        "nodes": [
+            {
+                "node_id": "old-node",
+                "status": "passed",
+                "created_at": "2025-01-01T00:00:00.000000Z",
+            }
+        ],
+    }
+    with patch(
+        "ai_employee.inspector.inspect_any_run",
+        return_value=projection,
+    ):
+        result = inspect_fleet_runs(Store())  # type: ignore[arg-type]
+
+    assert result["history"][0]["last_updated_at"] is None
+    assert "created_at" not in result["history"][0]
