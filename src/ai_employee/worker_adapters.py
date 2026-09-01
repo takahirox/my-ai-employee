@@ -1214,10 +1214,101 @@ def _normalize_new_file_diff(value: str) -> str:
     return "".join(chunks)
 
 
+def _normalize_existing_file_hunk_counts(value: str) -> str:
+    """Recount one structurally explicit existing-file hunk per file section."""
+
+    lines = value.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
+    if not starts:
+        return value
+
+    normalized: list[str] = [*lines[: starts[0]]]
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        section = lines[start:end]
+        diff_match = re.fullmatch(
+            r"diff --git a/([^ \t\r\n]+) b/([^ \t\r\n]+)(?:\r?\n)?",
+            section[0],
+        )
+        if diff_match is None:
+            normalized.extend(section)
+            continue
+        old_path, new_path = diff_match.groups()
+        if old_path != new_path or not _safe_diff_path(old_path):
+            normalized.extend(section)
+            continue
+
+        hunks = [index for index, line in enumerate(section) if line.startswith("@@ ")]
+        if len(hunks) != 1:
+            normalized.extend(section)
+            continue
+        hunk = hunks[0]
+        header_match = re.fullmatch(
+            r"(@@ -)(\d+)(?:,(\d+))?( \+)(\d+)(?:,(\d+))?"
+            r"( @@[^\r\n]*)(\r\n|\n)?",
+            section[hunk],
+        )
+        old_headers = [
+            index
+            for index, line in enumerate(section[:hunk])
+            if line.startswith("--- ")
+        ]
+        new_headers = [
+            index
+            for index, line in enumerate(section[:hunk])
+            if line.startswith("+++ ")
+        ]
+        if (
+            header_match is None
+            or len(old_headers) != 1
+            or len(new_headers) != 1
+            or new_headers[0] != old_headers[0] + 1
+            or _diff_header_value(section[old_headers[0]], "--- ") != f"a/{old_path}"
+            or _diff_header_value(section[new_headers[0]], "+++ ") != f"b/{old_path}"
+            or any(
+                line.startswith(("rename from ", "rename to ")) for line in section[:hunk]
+            )
+        ):
+            normalized.extend(section)
+            continue
+
+        body = section[hunk + 1 :]
+        if not body or not all(line.startswith((" ", "+", "-", "\\")) for line in body):
+            normalized.extend(section)
+            continue
+        observed_old = sum(line.startswith((" ", "-")) for line in body)
+        observed_new = sum(line.startswith((" ", "+")) for line in body)
+        if observed_old == 0 and observed_new == 0:
+            normalized.extend(section)
+            continue
+
+        expected_old = int(header_match.group(3) or "1")
+        expected_new = int(header_match.group(6) or "1")
+        if observed_old != expected_old or observed_new != expected_new:
+            old_count = (
+                f",{observed_old}"
+                if header_match.group(3) is not None or observed_old != 1
+                else ""
+            )
+            new_count = (
+                f",{observed_new}"
+                if header_match.group(6) is not None or observed_new != 1
+                else ""
+            )
+            section[hunk] = (
+                f"{header_match.group(1)}{header_match.group(2)}{old_count}"
+                f"{header_match.group(4)}{header_match.group(5)}{new_count}"
+                f"{header_match.group(7)}{header_match.group(8) or ''}"
+            )
+        normalized.extend(section)
+    return "".join(normalized)
+
+
 def _normalize_unified_diff(value: str) -> str:
     """Repair only unambiguous omitted context markers in existing-file hunks."""
 
-    normalized_headers = _normalize_headerless_diff_sections(value)
+    recounted = _normalize_existing_file_hunk_counts(value)
+    normalized_headers = _normalize_headerless_diff_sections(recounted)
     lines = _normalize_new_file_diff(normalized_headers).splitlines(keepends=True)
     normalized: list[str] = []
     in_hunk = False

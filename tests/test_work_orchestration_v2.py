@@ -1573,6 +1573,37 @@ def test_cli_worker_repairs_missing_existing_file_context_markers() -> None:
     assert "\n body{margin:0}\n" in payload.unified_diff
 
 
+def test_cli_worker_recounts_single_existing_hunk_per_explicit_file_section() -> None:
+    patch = (
+        "diff --git a/first.py b/first.py\r\n"
+        "--- a/first.py\r\n"
+        "+++ b/first.py\r\n"
+        "@@ -10,99 +10,77 @@ def first():\r\n"
+        " context\r\n"
+        "-old\r\n"
+        "+new\r\n"
+        "+extra\r\n"
+        "diff --git a/second.py b/second.py\n"
+        "--- a/second.py\n"
+        "+++ b/second.py\n"
+        "@@ -20,4 +20,5 @@ class Second:\n"
+        "-before\n"
+        "+after\n"
+    )
+    expected = patch.replace(
+        "@@ -10,99 +10,77 @@ def first():\r\n",
+        "@@ -10,2 +10,3 @@ def first():\r\n",
+    ).replace(
+        "@@ -20,4 +20,5 @@ class Second:\n",
+        "@@ -20,1 +20,1 @@ class Second:\n",
+    )
+
+    normalized = _normalize_unified_diff(patch)
+
+    assert normalized == expected
+    assert _normalize_unified_diff(normalized) == normalized
+
+
 @pytest.mark.parametrize(
     "hunk",
     (
@@ -1583,10 +1614,9 @@ def test_cli_worker_repairs_missing_existing_file_context_markers() -> None:
             "+:root{color:white}\n"
             "body{margin:1px}\n"
         ),
-        ("@@ -1,3 +1,3 @@\n :root{color:black}\n-body{margin:0}\n+body{margin:1px}\n"),
     ),
 )
-def test_cli_worker_rejects_ambiguous_or_count_inconsistent_existing_hunks(
+def test_cli_worker_rejects_unprefixed_count_inconsistent_existing_hunks(
     hunk: str,
 ) -> None:
     raw = json.dumps(
@@ -1621,6 +1651,61 @@ def test_cli_worker_rejects_ambiguous_or_count_inconsistent_existing_hunks(
 
     with pytest.raises(ValueError, match="ambiguous or inconsistent line counts"):
         _validate_worker_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    (
+        pytest.param(
+            "--- a/example.txt\n"
+            "+++ b/example.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            " only one line\n",
+            id="headerless",
+        ),
+        pytest.param(
+            "diff --git a/old.txt b/new.txt\n"
+            "rename from old.txt\n"
+            "rename to new.txt\n"
+            "--- a/old.txt\n"
+            "+++ b/new.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            " unchanged\n",
+            id="rename",
+        ),
+        pytest.param(
+            "diff --git a/example.txt b/example.txt\n"
+            "--- a/example.txt\n"
+            "+++ b/example.txt\n"
+            "@@ -1 +1 @@\n"
+            "-one\n"
+            "+one\n"
+            "@@ -3,2 +3,2 @@\n"
+            " two\n",
+            id="multiple-hunks",
+        ),
+        pytest.param(
+            "diff --git a/../escape.txt b/../escape.txt\n"
+            "--- a/../escape.txt\n"
+            "+++ b/../escape.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            " unchanged\n",
+            id="unsafe-path",
+        ),
+        pytest.param(
+            "diff --git a/example.txt b/example.txt\n"
+            "--- a/example.txt\n"
+            "index 1111111..2222222 100644\n"
+            "+++ b/example.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            " unchanged\n",
+            id="unclear-headers",
+        ),
+    ),
+)
+def test_cli_worker_does_not_recount_ambiguous_existing_file_sections(patch: str) -> None:
+    with pytest.raises(ValueError, match="ambiguous or inconsistent line counts"):
+        _normalize_unified_diff(patch)
 
 
 def test_headerless_ambiguous_hunk_records_exact_protocol_classification() -> None:
