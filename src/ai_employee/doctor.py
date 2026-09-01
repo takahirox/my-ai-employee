@@ -80,6 +80,32 @@ def doctor_from_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
             item.get("node_attempt_timeout_seconds") or 0
         ):
             add("DEADLINE_NOT_PROPAGATED", item)
+    for item in _records(projection.get("worker_budget_preflights")):
+        add(
+            "WORKER_BUDGET_INADEQUATE",
+            item,
+            denied_authorities=item.get("denied_authorities"),
+            timeout_profile_digest=item.get("timeout_profile_digest"),
+        )
+    for item in _records(projection.get("worker_attempt_heartbeats")):
+        if item.get("no_observable_progress"):
+            add(
+                "NO_OBSERVABLE_WORKER_PROGRESS",
+                item,
+                elapsed_seconds=item.get("elapsed_seconds"),
+                remaining_seconds=item.get("remaining_seconds"),
+                hard_timeout_reached=item.get("hard_timeout_reached"),
+                early_cancel_authorized=item.get("early_cancel_authorized"),
+            )
+    for item in _records(projection.get("timeout_recoveries")):
+        if item.get("action") != "same_strategy_retry":
+            add(
+                "TIMEOUT_RECOVERY_NOT_STARTED",
+                item,
+                action=item.get("action"),
+                normal_acceptance_required=item.get("normal_acceptance_required"),
+                alternate_fallback_authorized=item.get("alternate_fallback_authorized"),
+            )
     watchdogs = _records(projection.get("node_watchdogs"))
     for item in watchdogs:
         add("WATCHDOG_TIMEOUT", item, outcome=item.get("outcome"))

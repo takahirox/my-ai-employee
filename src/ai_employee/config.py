@@ -19,9 +19,24 @@ from pydantic import (
 
 from .domain import ExecutionStrategy, RoutingMode
 from .domain.base import FrozenDict, Identifier
+from .worker_supervision import WorkerSupervisionPolicy, WorkerTimeoutRule
 
 WorkerName = Literal["codex_cli", "claude_code_cli", "ollama_cli"]
 CONFIG_ENVIRONMENT_VARIABLE = "MY_AI_EMPLOYEE_CONFIG"
+
+
+def default_operator_worker_supervision() -> WorkerSupervisionPolicy:
+    """Preserve legacy short budgets until an operator opts into classified rules."""
+
+    return WorkerSupervisionPolicy(
+        rules=(
+            WorkerTimeoutRule(
+                id="compatibility",
+                recommended_timeout_seconds=600.0,
+                minimum_timeout_seconds=0.001,
+            ),
+        )
+    )
 DEFAULT_EXECUTABLES: Mapping[WorkerName, str] = {
     "codex_cli": "codex",
     "claude_code_cli": "claude",
@@ -294,6 +309,9 @@ class OperatorConfig(BaseModel):
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
     routing: OperatorRoutingConfig | None = Field(default_factory=default_operator_routing_config)
     promotion_auto_approval: PromotionAutoApprovalConfig = PromotionAutoApprovalConfig()
+    worker_supervision: WorkerSupervisionPolicy = Field(
+        default_factory=default_operator_worker_supervision
+    )
 
     @field_validator("workers")
     @classmethod

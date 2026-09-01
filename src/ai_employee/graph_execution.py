@@ -68,6 +68,7 @@ from .task_orchestration import (
 )
 from .task_planning import ProposedGraph
 from .task_review import TaskReviewSeverity
+from .worker_supervision import WorkerSupervisionPolicy
 
 
 class CoordinatorFactory(Protocol):
@@ -181,6 +182,8 @@ class GraphExecutionService:
             TaskReviewSeverity.CRITICAL,
             TaskReviewSeverity.HIGH,
         ),
+        worker_supervision_policy: WorkerSupervisionPolicy | None = None,
+        adapter_timeout_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.coordinator_factory = coordinator_factory
@@ -206,6 +209,8 @@ class GraphExecutionService:
         self.task_reviewer = task_reviewer
         self.independent_task_review = independent_task_review
         self.task_review_block_severities = tuple(task_review_block_severities)
+        self.worker_supervision_policy = worker_supervision_policy
+        self.adapter_timeout_seconds = adapter_timeout_seconds
         self.approval_service = approval_service or DigestApprovalService(
             store, operator_label="local-operator"
         )
@@ -503,6 +508,8 @@ class GraphExecutionService:
             task_reviewer=self.task_reviewer,
             independent_task_review=self.independent_task_review,
             task_review_block_severities=self.task_review_block_severities,
+            worker_supervision_policy=self.worker_supervision_policy,
+            adapter_timeout_seconds=self.adapter_timeout_seconds,
         )
 
     def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:

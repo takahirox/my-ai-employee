@@ -109,6 +109,12 @@ from .task_review import (
     TaskReviewRequest,
     TaskReviewResult,
 )
+from .worker_supervision import (
+    TimeoutRecoveryRecord,
+    WorkerAttemptHeartbeatRecord,
+    WorkerBudgetPreflightRecord,
+    WorkerTimeoutProfileRecord,
+)
 
 
 class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
@@ -630,11 +636,30 @@ def inspect_graph_run(
     timeout_authorities = store.list_records(
         "worker_timeout_authority_v2", WorkerTimeoutAuthorityRecord, run_id=run_id
     )
+    timeout_profiles = store.list_records(
+        "worker_timeout_profile_v2", WorkerTimeoutProfileRecord, run_id=run_id
+    )
+    timeout_preflights = store.list_records(
+        "worker_budget_preflight_v2", WorkerBudgetPreflightRecord, run_id=run_id
+    )
+    attempt_heartbeats = store.list_records(
+        "worker_attempt_heartbeat_v2", WorkerAttemptHeartbeatRecord, run_id=run_id
+    )
+    timeout_recoveries = store.list_records(
+        "timeout_recovery_v2", TimeoutRecoveryRecord, run_id=run_id
+    )
     watchdogs = store.list_records("node_watchdog_v2", NodeWatchdogRecord, run_id=run_id)
     control_propagations = store.list_records(
         "node_control_propagation_v2", NodeControlPropagationRecord, run_id=run_id
     )
-    child_run_ids = tuple(dict.fromkeys(item.child_run_id for item in timeout_authorities))
+    child_run_ids = tuple(
+        dict.fromkeys(
+            (
+                *(item.child_run_id for item in timeout_profiles),
+                *(item.child_run_id for item in timeout_authorities),
+            )
+        )
+    )
     child_worker_outcomes = {
         "results": [
             _json_model(item)
@@ -699,6 +724,10 @@ def inspect_graph_run(
         "claims": list(store.graph_claims(run_id)),
         "reservations": [_json_model(item) for item in reservations],
         "worker_timeout_authorities": [_json_model(item) for item in timeout_authorities],
+        "worker_timeout_profiles": [_json_model(item) for item in timeout_profiles],
+        "worker_budget_preflights": [_json_model(item) for item in timeout_preflights],
+        "worker_attempt_heartbeats": [_json_model(item) for item in attempt_heartbeats],
+        "timeout_recoveries": [_json_model(item) for item in timeout_recoveries],
         "node_watchdogs": [_json_model(item) for item in watchdogs],
         "node_control_propagations": [_json_model(item) for item in control_propagations],
         "child_worker_outcomes": child_worker_outcomes,

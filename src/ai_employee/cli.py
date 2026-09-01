@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -160,6 +160,7 @@ from .worker_adapters import (
     semantic_assessment_schema_json,
     worker_proposal_schema_json,
 )
+from .worker_supervision import WorkerTimeoutProfileRecord
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1336,11 +1337,25 @@ def _work(args: argparse.Namespace) -> int:
                 strategy: ExecutionStrategy,
             ) -> WorkCoordinator:
                 inner_store = SQLiteStore(db_path)
-                remaining = cast(Mapping[str, int | float], request.remaining_budgets)
-                node_timeout = float(
-                    remaining.get("wall_seconds", node.resource_budget.wall_seconds)
+                profiles = tuple(
+                    item
+                    for item in inner_store.list_records(
+                        "worker_timeout_profile_v2",
+                        WorkerTimeoutProfileRecord,
+                        run_id=run_id,
+                    )
+                    if (
+                        item.node_id == node.id
+                        and item.child_run_id == request.run_id
+                        and item.generation == node.generation
+                        and item.attempt == node.attempt
+                        and item.accepted_graph_revision_digest
+                        == request.accepted_graph_revision_digest
+                    )
                 )
-                policy_timeout = float(policy.max_wall_seconds or harness.budgets.wall_seconds)
+                if len(profiles) != 1:
+                    raise ValueError("worker launch requires one exact timeout profile")
+                timeout_profile = profiles[0]
                 timeout_authority = WorkerTimeoutAuthorityRecord(
                     id=identifier("worker-timeout-authority"),
                     run_id=run_id,
@@ -1353,14 +1368,23 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     generation=node.generation,
                     attempt=node.attempt,
-                    adapter_timeout_seconds=harness.budgets.wall_seconds,
-                    node_attempt_timeout_seconds=node_timeout,
-                    policy_timeout_seconds=min(policy_timeout, harness.budgets.wall_seconds),
-                    effective_timeout_seconds=min(
-                        harness.budgets.wall_seconds,
-                        node_timeout,
-                        policy_timeout,
+                    timeout_profile_digest=timeout_profile.content_digest,
+                    operator_config_digest=timeout_profile.operator_config_digest,
+                    rule_version=timeout_profile.rule_version,
+                    rule_id=timeout_profile.rule_id,
+                    recommended_timeout_seconds=(
+                        timeout_profile.recommended_timeout_seconds
                     ),
+                    profile_minimum_seconds=timeout_profile.profile_minimum_seconds,
+                    adapter_timeout_seconds=timeout_profile.adapter_timeout_seconds,
+                    node_attempt_timeout_seconds=(
+                        timeout_profile.accepted_node_timeout_seconds
+                    ),
+                    policy_timeout_seconds=timeout_profile.policy_timeout_seconds,
+                    remaining_run_timeout_seconds=(
+                        timeout_profile.remaining_run_timeout_seconds
+                    ),
+                    effective_timeout_seconds=timeout_profile.effective_timeout_seconds,
                 )
                 inner_store.put("worker_timeout_authority_v2", timeout_authority, run_id=run_id)
                 node_worker_name = cast(WorkerName, strategy.backend)
@@ -1529,6 +1553,8 @@ def _work(args: argparse.Namespace) -> int:
                 operator_config_digest=operator_digest,
                 operator_config_path=operator_config_path,
                 strategy_set=effective_strategy_set,
+                worker_supervision_policy=operator_config.worker_supervision,
+                adapter_timeout_seconds=harness.budgets.wall_seconds,
                 plan_reviewer=plan_reviewer,
                 plan_reviser=graph_planner,
                 node_assessor=semantic_assessor,

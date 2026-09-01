@@ -31,6 +31,8 @@ from .domain import (
     NodeResourceBudget,
     OutputContract,
     RoutingMode,
+    SemanticReasoningClass,
+    SemanticScope,
     SemanticTaskProfile,
     TaskAssessment,
 )
@@ -102,6 +104,18 @@ from .task_review import (
     TaskReviewSeverity,
     decide_task_review,
     validate_task_review_result,
+)
+from .worker_supervision import (
+    TimeoutRecoveryRecord,
+    WorkerAttemptObservation,
+    WorkerAttemptSupervisor,
+    WorkerBudgetPreflightRecord,
+    WorkerSupervisionPolicy,
+    WorkerTimeoutProfileRecord,
+    WorkerTimeoutRule,
+    inadequate_authorities,
+    select_node_timeout,
+    timeout_recovery_action,
 )
 
 NodeExecutionStatus = Literal[
@@ -423,19 +437,42 @@ class WorkerTimeoutAuthorityRecord(DigestedRecordV2):
     accepted_graph_revision_digest: Digest
     generation: int = Field(ge=0)
     attempt: int = Field(ge=0)
+    timeout_profile_digest: Digest | None = None
+    operator_config_digest: Digest | None = None
+    rule_version: str | None = None
+    rule_id: Identifier | None = None
+    recommended_timeout_seconds: float | None = Field(default=None, gt=0)
+    profile_minimum_seconds: float | None = Field(default=None, gt=0)
     adapter_timeout_seconds: float = Field(gt=0)
     node_attempt_timeout_seconds: float = Field(gt=0)
     policy_timeout_seconds: float = Field(gt=0)
+    remaining_run_timeout_seconds: float | None = Field(default=None, ge=0)
     effective_timeout_seconds: float = Field(gt=0)
 
     @model_validator(mode="after")
     def _effective_timeout_is_the_strict_minimum(self) -> Self:
-        if self.effective_timeout_seconds != min(
+        ceilings = [
             self.adapter_timeout_seconds,
             self.node_attempt_timeout_seconds,
             self.policy_timeout_seconds,
-        ):
+        ]
+        if self.remaining_run_timeout_seconds is not None:
+            ceilings.append(self.remaining_run_timeout_seconds)
+        if self.effective_timeout_seconds != min(ceilings):
             raise ValueError("effective worker timeout must equal every authority ceiling minimum")
+        profile_fields = (
+            self.timeout_profile_digest,
+            self.operator_config_digest,
+            self.rule_version,
+            self.rule_id,
+            self.recommended_timeout_seconds,
+            self.profile_minimum_seconds,
+            self.remaining_run_timeout_seconds,
+        )
+        if any(item is not None for item in profile_fields) and any(
+            item is None for item in profile_fields
+        ):
+            raise ValueError("profile-bound timeout authority fields must be complete")
         return self
 
 
@@ -452,6 +489,7 @@ class NodeWatchdogRecord(DigestedRecordV2):
     allowance_seconds: float = Field(gt=0)
     cleanup_grace_seconds: float = Field(ge=0)
     outcome: Literal["signal_sent", "cleanup_confirmed", "cleanup_failed"]
+    timeout_profile_digest: Digest | None = None
 
 
 class NodeControlPropagationRecord(DigestedRecordV2):
@@ -760,6 +798,8 @@ class TaskOrchestrator:
         owner_instance_id: Identifier | None = None,
         lease_duration_seconds: float = 15.0,
         heartbeat_interval_seconds: float = 5.0,
+        worker_supervision_policy: WorkerSupervisionPolicy | None = None,
+        adapter_timeout_seconds: float | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
@@ -835,6 +875,18 @@ class TaskOrchestrator:
         self.task_reviewer = task_reviewer
         self.independent_task_review = independent_task_review
         self.task_review_block_severities = block_severities
+        self.worker_supervision_policy = worker_supervision_policy or WorkerSupervisionPolicy(
+            rules=(
+                WorkerTimeoutRule(
+                    id="compatibility",
+                    recommended_timeout_seconds=600.0,
+                    minimum_timeout_seconds=0.001,
+                ),
+            )
+        )
+        if adapter_timeout_seconds is not None and adapter_timeout_seconds <= 0:
+            raise ValueError("adapter timeout must be positive")
+        self.adapter_timeout_seconds = adapter_timeout_seconds
 
     def run(
         self,
@@ -1451,6 +1503,10 @@ class TaskOrchestrator:
                 float,
             ],
         ] = {}
+        run_started_at = min(ensure_utc(item.created_at) for item in records.values())
+        timeout_profiles: dict[Future[NodeExecutionResult], WorkerTimeoutProfileRecord] = {}
+        attempt_supervisors: dict[Future[NodeExecutionResult], WorkerAttemptSupervisor] = {}
+        required_retry_strategies: dict[str, ExecutionStrategy] = {}
         watchdog_signals: dict[Future[NodeExecutionResult], float] = {}
         cancellation_signals: dict[Future[NodeExecutionResult], tuple[float, bool]] = {}
         cleanup_grace_seconds = 2.0
@@ -1582,6 +1638,7 @@ class TaskOrchestrator:
                             "attempt": record.attempt,
                         }
                     )
+                    child_run_id = _node_worker_run_id(run_id, node)
                     try:
                         route = self._route(
                             run_id,
@@ -1599,12 +1656,101 @@ class TaskOrchestrator:
                             failure_code="NO_ELIGIBLE_STRATEGY",
                         )
                         continue
+                    expected_retry_strategy = required_retry_strategies.get(node_id)
+                    if (
+                        expected_retry_strategy is not None
+                        and route.selected_strategy != expected_retry_strategy
+                    ):
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code="TIMEOUT_RETRY_STRATEGY_CHANGED",
+                        )
+                        continue
+                    required_retry_strategies.pop(node_id, None)
                     self.store.put("node_route_v2", route, run_id=run_id)
                     records[node_id] = self._advance(
                         records[node_id],
                         status="routed",
                         route_digest=route.content_digest,
                     )
+                    persisted_profile = route.assessment.semantic_profile
+                    scope = (
+                        SemanticScope.BOUNDED
+                        if persisted_profile is None
+                        else persisted_profile.scope
+                    )
+                    reasoning_class = (
+                        SemanticReasoningClass.MECHANICAL
+                        if persisted_profile is None
+                        else persisted_profile.reasoning_class
+                    )
+                    timeout_rule = self.worker_supervision_policy.select(
+                        scope, reasoning_class, route.assessment.scale
+                    )
+                    elapsed_run_seconds = max(
+                        0.0,
+                        (
+                            ensure_utc(self.clock()) - run_started_at
+                        ).total_seconds(),
+                    )
+                    remaining_wall_seconds = max(
+                        0.0, graph_run.max_wall_seconds - elapsed_run_seconds
+                    )
+                    timeout_profile = select_node_timeout(
+                        id=identifier("worker-timeout-profile"),
+                        run_id=run_id,
+                        created_at=self.clock(),
+                        graph_run_id=run_id,
+                        node_id=node.id,
+                        child_run_id=child_run_id,
+                        accepted_graph_revision_digest=graph_digest,
+                        generation=node.generation,
+                        attempt=node.attempt,
+                        operator_config_digest=(
+                            self.operator_config_digest
+                            or canonical_digest(self.worker_supervision_policy)
+                        ),
+                        rule=timeout_rule,
+                        profile=persisted_profile,
+                        scale=route.assessment.scale,
+                        accepted_node_timeout_seconds=node.resource_budget.wall_seconds,
+                        adapter_timeout_seconds=(
+                            self.adapter_timeout_seconds or graph_run.max_wall_seconds
+                        ),
+                        policy_timeout_seconds=graph_run.execution_policy.max_wall_seconds,
+                        remaining_run_timeout_seconds=remaining_wall_seconds,
+                    )
+                    self.store.put(
+                        "worker_timeout_profile_v2", timeout_profile, run_id=run_id
+                    )
+                    denied_authorities = inadequate_authorities(timeout_profile)
+                    if denied_authorities:
+                        self.store.put(
+                            "worker_budget_preflight_v2",
+                            WorkerBudgetPreflightRecord(
+                                id=identifier("worker-budget-preflight"),
+                                run_id=run_id,
+                                created_at=self.clock(),
+                                graph_run_id=run_id,
+                                node_id=node.id,
+                                child_run_id=child_run_id,
+                                accepted_graph_revision_digest=graph_digest,
+                                generation=node.generation,
+                                attempt=node.attempt,
+                                timeout_profile_digest=_required_digest(
+                                    timeout_profile.content_digest
+                                ),
+                                denied_authorities=denied_authorities,
+                            ),
+                            run_id=run_id,
+                        )
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code=StableFailureCode.WORKER_BUDGET_INADEQUATE.value,
+                        )
+                        continue
 
                     def create_reservation(
                         remaining: dict[str, int | float],
@@ -1757,6 +1903,19 @@ class TaskOrchestrator:
                         worker_request_digest=request.content_digest,
                     )
                     future = pool.submit(self.runner, node, request, route.selected_strategy)
+                    timeout_profiles[future] = timeout_profile
+                    attempt_supervisors[future] = WorkerAttemptSupervisor(
+                        timeout_profile,
+                        heartbeat_interval_seconds=(
+                            self.worker_supervision_policy.heartbeat_interval_seconds
+                        ),
+                        no_progress_threshold_seconds=(
+                            self.worker_supervision_policy.no_progress_threshold_seconds
+                        ),
+                        max_heartbeat_records=(
+                            self.worker_supervision_policy.max_heartbeat_records
+                        ),
+                    )
                     active[future] = (
                         node_id,
                         node,
@@ -1777,7 +1936,7 @@ class TaskOrchestrator:
                                 )
                     continue
                 pending_deadlines = tuple(
-                    active_item[5] + active_item[1].resource_budget.wall_seconds
+                    active_item[5] + timeout_profiles[future].effective_timeout_seconds
                     for future, active_item in active.items()
                     if future not in watchdog_signals
                 )
@@ -1790,6 +1949,18 @@ class TaskOrchestrator:
                     tuple(active), timeout=wait_timeout, return_when=FIRST_COMPLETED
                 )
                 observed_at = monotonic()
+                for future, active_item in tuple(active.items()):
+                    _node_id, _node, request, *_middle, started_at = active_item
+                    heartbeat = attempt_supervisors[future].sample(
+                        self._observe_worker_attempt(request),
+                        elapsed_seconds=max(0.0, observed_at - started_at),
+                        observed_at=self.clock(),
+                        force=future.done(),
+                    )
+                    if heartbeat is not None:
+                        self.store.put(
+                            "worker_attempt_heartbeat_v2", heartbeat, run_id=run_id
+                        )
                 if stop_action is None and self.store.control(run_id) == "cancel":
                     stop_action = "cancel"
                     self.store.put(
@@ -1832,7 +2003,9 @@ class TaskOrchestrator:
                     if future.done() or future in watchdog_signals:
                         continue
                     active_node_id, active_node, active_request, *_middle, started_at = active_item
-                    if observed_at < started_at + active_node.resource_budget.wall_seconds:
+                    if observed_at < (
+                        started_at + timeout_profiles[future].effective_timeout_seconds
+                    ):
                         continue
                     signal_outcome: Literal["signal_sent", "cleanup_failed"] = "signal_sent"
                     try:
@@ -1852,9 +2025,10 @@ class TaskOrchestrator:
                             accepted_graph_revision_digest=graph_digest,
                             generation=active_node.generation,
                             attempt=active_node.attempt,
-                            allowance_seconds=active_node.resource_budget.wall_seconds,
+                            allowance_seconds=timeout_profiles[future].effective_timeout_seconds,
                             cleanup_grace_seconds=cleanup_grace_seconds,
                             outcome=signal_outcome,
+                            timeout_profile_digest=timeout_profiles[future].content_digest,
                         ),
                         run_id=run_id,
                     )
@@ -1881,9 +2055,10 @@ class TaskOrchestrator:
                             accepted_graph_revision_digest=graph_digest,
                             generation=active_node.generation,
                             attempt=active_node.attempt,
-                            allowance_seconds=active_node.resource_budget.wall_seconds,
+                            allowance_seconds=timeout_profiles[future].effective_timeout_seconds,
                             cleanup_grace_seconds=cleanup_grace_seconds,
                             outcome="cleanup_failed",
+                            timeout_profile_digest=timeout_profiles[future].content_digest,
                         ),
                         run_id=run_id,
                     )
@@ -1910,8 +2085,9 @@ class TaskOrchestrator:
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
                                     attempt=node.attempt,
-                                    allowance_seconds=node.resource_budget.wall_seconds,
+                                    allowance_seconds=timeout_profiles[future].effective_timeout_seconds,
                                     cleanup_grace_seconds=cleanup_grace_seconds,
+                                    timeout_profile_digest=timeout_profiles[future].content_digest,
                                     outcome=(
                                         "cleanup_confirmed"
                                         if (
@@ -1928,11 +2104,110 @@ class TaskOrchestrator:
                                 ),
                                 run_id=run_id,
                             )
-                            records[node_id] = self._advance(
-                                records[node_id],
-                                status="failed",
-                                failure_code="WATCHDOG_TIMEOUT",
+                            remaining = cast(
+                                Mapping[str, int | float], reservation.remaining_budgets
                             )
+                            retry_cap = min(
+                                nodes[node_id].retry_limit,
+                                accepted.graph.budget.max_retries,
+                            )
+                            retry_count = loop_counts[(node_id, LoopAction.RETRY)]
+                            retry_within_policy = (
+                                strategy.id in graph_run.allowed_strategy_ids
+                                and strategy.backend in graph_run.allowed_backends
+                            )
+                            retry_within_counters = retry_count < retry_cap
+                            retry_within_resources = _node_resources_remain(node, remaining)
+                            recovery_action = timeout_recovery_action(
+                                retry_within_policy=retry_within_policy,
+                                retry_within_counters=retry_within_counters,
+                                retry_within_resource_budgets=retry_within_resources,
+                                replan_authorized=graph_run.replan_count < graph_run.max_replans,
+                            )
+                            self.store.put(
+                                "timeout_recovery_v2",
+                                TimeoutRecoveryRecord(
+                                    id=identifier("timeout-recovery"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    graph_run_id=run_id,
+                                    node_id=node_id,
+                                    child_run_id=request.run_id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    timeout_profile_digest=_required_digest(
+                                        timeout_profiles[future].content_digest
+                                    ),
+                                    source_generation=node.generation,
+                                    source_attempt=node.attempt,
+                                    action=recovery_action,
+                                    routing_mode=graph_run.routing_mode.value,
+                                    source_strategy_id=strategy.id,
+                                    source_model=strategy.model,
+                                    source_backend=strategy.backend,
+                                    retry_strategy_id=(
+                                        strategy.id
+                                        if recovery_action == "same_strategy_retry"
+                                        else None
+                                    ),
+                                    retry_model=(
+                                        strategy.model
+                                        if recovery_action == "same_strategy_retry"
+                                        else None
+                                    ),
+                                    retry_backend=(
+                                        strategy.backend
+                                        if recovery_action == "same_strategy_retry"
+                                        else None
+                                    ),
+                                    retry_within_policy=retry_within_policy,
+                                    retry_within_counters=retry_within_counters,
+                                    retry_within_resource_budgets=retry_within_resources,
+                                    normal_acceptance_required=(
+                                        recovery_action == "replan_required"
+                                    ),
+                                ),
+                                run_id=run_id,
+                            )
+                            if recovery_action == "same_strategy_retry":
+                                self._save_loop_transition(
+                                    LoopTransitionRecord(
+                                        id=identifier("loop-transition"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        action=LoopAction.RETRY,
+                                        reason_code="WATCHDOG_TIMEOUT",
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        node_id=node_id,
+                                        worker_request_digest=request.content_digest,
+                                        worker_result_digest=result.worker_result.content_digest,
+                                        consumed=retry_count + 1,
+                                        limit=retry_cap,
+                                    )
+                                )
+                                loop_counts[(node_id, LoopAction.RETRY)] += 1
+                                required_retry_strategies[node_id] = strategy
+                                records[node_id] = NodeExecutionRecord(
+                                    id=identifier("node-execution"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    transitioned_at=self.clock(),
+                                    node_id=node_id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=graph_run.generation,
+                                    attempt=records[node_id].attempt + 1,
+                                    sequence=0,
+                                    status="pending",
+                                    failure_code="RETRY_AFTER:WATCHDOG_TIMEOUT",
+                                )
+                                self._save_node(records[node_id])
+                            else:
+                                records[node_id] = self._advance(
+                                    records[node_id],
+                                    status="failed",
+                                    failure_code="WATCHDOG_TIMEOUT",
+                                )
                             continue
                         if future in cancellation_signals:
                             self.store.put(
@@ -4254,6 +4529,46 @@ class TaskOrchestrator:
             )
         )
         return repair if resumed else None
+
+    def _observe_worker_attempt(self, request: WorkerRequest) -> WorkerAttemptObservation:
+        actions = self.store.list_records(
+            "action_result_v2", ExecutionResult, run_id=request.run_id
+        )
+        artifacts = self.store.list_records(
+            "artifact_descriptor_v2", ArtifactDescriptor, run_id=request.run_id
+        )
+        latest_action = max(actions, key=lambda item: (item.created_at, item.id), default=None)
+        latest_artifact = max(
+            artifacts, key=lambda item: (item.created_at, item.id), default=None
+        )
+        diffs = tuple(
+            item
+            for item in artifacts
+            if "diff" in item.logical_kind or "patch" in item.logical_kind
+        )
+        latest_diff = max(diffs, key=lambda item: (item.created_at, item.id), default=None)
+        stdout_bytes = stderr_bytes = 0
+        for action in actions:
+            usage = action.resource_usage
+            if isinstance(usage, Mapping):
+                stdout = usage.get("stdout_bytes", 0)
+                stderr = usage.get("stderr_bytes", 0)
+                if isinstance(stdout, int) and not isinstance(stdout, bool):
+                    stdout_bytes += max(0, stdout)
+                if isinstance(stderr, int) and not isinstance(stderr, bool):
+                    stderr_bytes += max(0, stderr)
+        return WorkerAttemptObservation(
+            process_status="running" if latest_action is None else latest_action.status,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            last_mediated_action_digest=(
+                None if latest_action is None else latest_action.content_digest
+            ),
+            last_artifact_digest=(
+                None if latest_artifact is None else latest_artifact.artifact_digest
+            ),
+            last_diff_digest=None if latest_diff is None else latest_diff.artifact_digest,
+        )
 
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
         payload = record.model_dump(mode="python")
