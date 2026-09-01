@@ -31,6 +31,7 @@ def _bind_graph_child(store: SQLiteStore, work_run_id: str) -> None:
             id=f"execution-{work_run_id}",
             run_id="graph-parent",
             created_at=NOW,
+            transitioned_at=NOW,
             node_id="graph-node",
             accepted_graph_revision_digest="7" * 64,
             generation=0,
@@ -283,3 +284,74 @@ def test_graph_explanation_surfaces_terminal_promotion_approval(decision: str) -
         "obtain a fresh digest-bound promotion approval before promotion"
     )
     assert explanation["final_outcome"]["disposition"] == ("promotion_blocked_or_incomplete")
+
+
+def test_graph_explanation_projects_authoritative_node_operational_facts() -> None:
+    transition = "2026-01-01T00:00:05.000000Z"
+    record = {
+        "id": "execution-operational",
+        "content_digest": "b" * 64,
+        "node_id": "node-operational",
+        "accepted_graph_revision_digest": "a" * 64,
+        "generation": 0,
+        "attempt": 1,
+        "sequence": 1,
+        "status": "running",
+        "transitioned_at": transition,
+    }
+    view = {
+        "run_id": "operational-run",
+        "kind": "graph_run",
+        "state": "running",
+        "generation": 0,
+        "run": {
+            "goal_id": "goal",
+            "goal": {"id": "goal", "statement": "show operational facts"},
+        },
+        "graph_acceptance": {
+            "accepted_revision": {
+                "revision_number": 1,
+                "content_digest": "a" * 64,
+                "graph": {
+                    "id": "graph",
+                    "nodes": [{"id": "node-operational", "name": "Operational node"}],
+                    "edges": [],
+                    "entry_node_ids": ["node-operational"],
+                    "terminal_node_ids": ["node-operational"],
+                },
+            }
+        },
+        "nodes": [
+            {
+                **record,
+                "operational_status": "overdue",
+                "running_started_at": transition,
+                "last_persisted_activity_at": transition,
+                "finished_at": None,
+                "elapsed_seconds": 10.0,
+                "wall_time_budget_seconds": 10.0,
+                "deadline_at": "2026-01-01T00:00:15.000000Z",
+                "overdue": True,
+                "selected_strategy_id": "strategy-process",
+                "verification_count": 2,
+            }
+        ],
+        "node_history": [record],
+    }
+
+    explanation = _explain_graph_run(view)
+    story = explanation["task_stories"][0]
+
+    assert story["operational"] == {
+        "operational_status": "overdue",
+        "running_started_at": transition,
+        "last_persisted_activity_at": transition,
+        "finished_at": None,
+        "elapsed_seconds": 10.0,
+        "wall_time_budget_seconds": 10.0,
+        "deadline_at": "2026-01-01T00:00:15.000000Z",
+        "overdue": True,
+        "selected_strategy_id": "strategy-process",
+        "verification_count": 2,
+    }
+    assert story["execution_attempts"][0]["transitioned_at"] == transition

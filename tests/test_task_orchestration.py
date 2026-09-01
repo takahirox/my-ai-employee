@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -54,6 +54,7 @@ from ai_employee.serialization import canonical_digest
 from ai_employee.services_v2._common import identifier
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
+    NodeExecutionRecord,
     NodeExecutionResult,
     NodeReservationRecord,
     PreAcceptanceGoalRecord,
@@ -1626,3 +1627,42 @@ def test_evaluator_failure_and_exhausted_resources_do_not_retry(
         assert diagnostics[0].retryable is False
     else:
         assert diagnostics == ()
+
+
+def test_node_execution_advance_uses_injected_transition_clock(tmp_path: Path) -> None:
+    transitioned_at = NOW + timedelta(seconds=7)
+
+    def unused_runner(
+        _node: Node,
+        _request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        raise AssertionError("the transition test does not invoke a worker")
+
+    with SQLiteStore(tmp_path / "transition-clock.db") as store:
+        orchestrator = TaskOrchestrator(
+            store,
+            unused_runner,
+            (_strategy(),),
+            clock=lambda: transitioned_at,
+        )
+        initial = NodeExecutionRecord(
+            id="clocked-node",
+            run_id="clocked-run",
+            created_at=NOW,
+            transitioned_at=NOW,
+            node_id="a",
+            accepted_graph_revision_digest=ZERO,
+            generation=0,
+            attempt=0,
+            sequence=0,
+            status="pending",
+        )
+
+        running = orchestrator._advance(initial, status="running")
+
+        assert running.transitioned_at == transitioned_at
+        assert running.sequence == 1
+        assert store.list_records(
+            "node_execution_v2", NodeExecutionRecord, run_id="clocked-run"
+        ) == (running,)

@@ -1,8 +1,16 @@
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ai_employee.inspector import _INDEX, inspect_fleet_runs
+import pytest
+from pydantic import ValidationError
+
+from ai_employee.domain import Node, NodeKind, OutputContract
+from ai_employee.domain.models import NodeResourceBudget
+from ai_employee.inspector import _INDEX, _node_execution_projection, inspect_fleet_runs
+from ai_employee.serialization import canonical_json
+from ai_employee.task_orchestration import NodeExecutionRecord
 
 
 class _InspectorDocument(HTMLParser):
@@ -70,6 +78,7 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "waiting",
         "routed",
         "running",
+        "overdue",
         "passed",
         "failed",
         "blocked",
@@ -113,6 +122,101 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "['Active task',run.active_task]" not in _INDEX
     assert "['Phase',run.phase]" not in _INDEX
     assert "['Attention',run.attention.length?" not in _INDEX
+    for marker in (
+        "cardFacts",
+        "operational_status",
+        "selected_strategy_id",
+        "running_started_at",
+        "last_persisted_activity_at",
+        "finished_at",
+        "elapsed_seconds",
+        "wall_time_budget_seconds",
+        "deadline_at",
+        "verification_count",
+        "state-overdue",
+        "aria-label",
+        "@media(max-width:600px)",
+    ):
+        assert marker in _INDEX
+    card_source = _INDEX[_INDEX.index("function cardFacts"): _INDEX.index(
+        "function renderDetails"
+    )]
+    assert "task.objective" not in card_source
+    assert "content_digest" not in card_source
+    assert "routing_reasons" not in card_source
+
+
+def _execution_record(
+    *,
+    record_id: str,
+    sequence: int,
+    transitioned_at: datetime,
+    status: str,
+) -> NodeExecutionRecord:
+    return NodeExecutionRecord.model_validate(
+        {
+            "id": record_id,
+            "run_id": "timed-run",
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "transitioned_at": transitioned_at,
+            "node_id": "timed-node",
+            "accepted_graph_revision_digest": "a" * 64,
+            "generation": 0,
+            "attempt": 2,
+            "sequence": sequence,
+            "status": status,
+        },
+        strict=True,
+    )
+
+
+def test_node_transition_timestamp_serializes_and_drives_overdue_projection() -> None:
+    started_at = datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC)
+    pending = _execution_record(
+        record_id="execution-pending",
+        sequence=0,
+        transitioned_at=started_at - timedelta(seconds=5),
+        status="pending",
+    )
+    running = _execution_record(
+        record_id="execution-running",
+        sequence=1,
+        transitioned_at=started_at,
+        status="running",
+    )
+    node = Node(
+        id="timed-node",
+        kind=NodeKind.FUNCTION,
+        name="Timed node",
+        output_contract=OutputContract(id="timed-output"),
+        resource_budget=NodeResourceBudget(wall_seconds=10.0),
+    )
+
+    projection = _node_execution_projection(
+        running,
+        (pending, running),
+        node,
+        None,
+        None,
+        started_at + timedelta(seconds=10),
+    )
+
+    assert projection["operational_status"] == "overdue"
+    assert projection["running_started_at"] == "2026-01-01T00:00:05.000000Z"
+    assert projection["last_persisted_activity_at"] == "2026-01-01T00:00:05.000000Z"
+    assert projection["finished_at"] is None
+    assert projection["elapsed_seconds"] == 10.0
+    assert projection["deadline_at"] == "2026-01-01T00:00:15.000000Z"
+    assert projection["verification_count"] == 0
+    assert NodeExecutionRecord.model_validate_json(
+        canonical_json(running), strict=True
+    ) == running
+
+    payload = running.model_dump(mode="python")
+    payload.pop("transitioned_at")
+    payload["content_digest"] = None
+    with pytest.raises(ValidationError):
+        NodeExecutionRecord.model_validate(payload, strict=True)
 
 
 class _CatalogStore:
@@ -157,7 +261,7 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
     }
     with patch(
         "ai_employee.inspector.inspect_any_run",
-        side_effect=lambda _store, run_id: projections[run_id],
+        side_effect=lambda _store, run_id, **_kwargs: projections[run_id],
     ):
         result = inspect_fleet_runs(_CatalogStore(), "repo")  # type: ignore[arg-type]
 
@@ -207,7 +311,7 @@ def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> Non
     }
     with patch(
         "ai_employee.inspector.inspect_any_run",
-        side_effect=lambda _store, run_id: projections[run_id],
+        side_effect=lambda _store, run_id, **_kwargs: projections[run_id],
     ):
         result = inspect_fleet_runs(Store())  # type: ignore[arg-type]
 

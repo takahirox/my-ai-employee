@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from datetime import datetime
 from time import monotonic
 from typing import ClassVar, Literal, Protocol, Self, cast
 
@@ -28,7 +29,15 @@ from .domain import (
     SemanticTaskProfile,
     TaskAssessment,
 )
-from .domain.base import CanonicalData, Digest, Identifier, SchemaModel, StableStrEnum, freeze_json
+from .domain.base import (
+    CanonicalData,
+    Digest,
+    Identifier,
+    SchemaModel,
+    StableStrEnum,
+    UtcTimestamp,
+    freeze_json,
+)
 from .domain.v2 import (
     ArtifactDescriptor,
     ArtifactDescriptorReference,
@@ -338,6 +347,7 @@ class NodeExecutionRecord(DigestedRecordV2):
     generation: int = Field(ge=0)
     attempt: int = Field(ge=0)
     sequence: int = Field(ge=0)
+    transitioned_at: UtcTimestamp
     status: NodeExecutionStatus
     route_digest: Digest | None = None
     worker_request_digest: Digest | None = None
@@ -629,11 +639,13 @@ class TaskOrchestrator:
             TaskReviewSeverity.CRITICAL,
             TaskReviewSeverity.HIGH,
         ),
+        clock: Callable[[], datetime] = now,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
         self.store = store
         self.runner = runner
+        self.clock = clock
         self.strategies = tuple(sorted(strategies, key=lambda item: item.id))
         if not self.strategies:
             raise ValueError("at least one explicitly configured strategy is required")
@@ -1090,6 +1102,7 @@ class TaskOrchestrator:
                         update={
                             "id": identifier("node-execution"),
                             "created_at": now(),
+                            "transitioned_at": self.clock(),
                             "accepted_graph_revision_digest": graph_digest,
                             "generation": graph_run.generation,
                             "sequence": 0,
@@ -1120,6 +1133,7 @@ class TaskOrchestrator:
                         id=identifier("node-execution"),
                         run_id=run_id,
                         created_at=now(),
+                        transitioned_at=self.clock(),
                         node_id=node_id,
                         accepted_graph_revision_digest=graph_digest,
                         generation=graph_run.generation,
@@ -1134,6 +1148,7 @@ class TaskOrchestrator:
                     update={
                         "id": identifier("node-execution"),
                         "created_at": now(),
+                        "transitioned_at": self.clock(),
                         "generation": graph_run.generation,
                         "sequence": 0,
                         "status": "pending" if resumable else prior.status,
@@ -1151,6 +1166,7 @@ class TaskOrchestrator:
                     id=identifier("node-execution"),
                     run_id=run_id,
                     created_at=now(),
+                    transitioned_at=self.clock(),
                     node_id=node.id,
                     accepted_graph_revision_digest=graph_digest,
                     generation=graph_run.generation,
@@ -1646,6 +1662,7 @@ class TaskOrchestrator:
                                         id=identifier("node-execution"),
                                         run_id=run_id,
                                         created_at=now(),
+                                        transitioned_at=self.clock(),
                                         node_id=node_id,
                                         accepted_graph_revision_digest=graph_digest,
                                         generation=graph_run.generation,
@@ -1759,6 +1776,7 @@ class TaskOrchestrator:
                                     id=identifier("node-execution"),
                                     run_id=run_id,
                                     created_at=now(),
+                                    transitioned_at=self.clock(),
                                     node_id=node_id,
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=graph_run.generation,
@@ -1926,6 +1944,7 @@ class TaskOrchestrator:
                                 id=identifier("node-execution"),
                                 run_id=run_id,
                                 created_at=now(),
+                                transitioned_at=self.clock(),
                                 node_id=node_id,
                                 accepted_graph_revision_digest=graph_digest,
                                 generation=graph_run.generation,
@@ -2537,6 +2556,7 @@ class TaskOrchestrator:
                 id=identifier("node-execution"),
                 run_id=run_id,
                 created_at=now(),
+                transitioned_at=self.clock(),
                 node_id=node.id,
                 accepted_graph_revision_digest=run.accepted_graph_revision_digest,
                 generation=run.generation,
@@ -3764,7 +3784,13 @@ class TaskOrchestrator:
     def _advance(self, record: NodeExecutionRecord, **changes: object) -> NodeExecutionRecord:
         payload = record.model_dump(mode="python")
         payload.update(changes)
-        payload.update({"sequence": record.sequence + 1, "content_digest": None})
+        payload.update(
+            {
+                "sequence": record.sequence + 1,
+                "transitioned_at": self.clock(),
+                "content_digest": None,
+            }
+        )
         updated = NodeExecutionRecord.model_validate(payload, strict=True)
         self._save_node(updated)
         return updated

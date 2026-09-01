@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from .storage import SQLiteStore
 
 
-def explain_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def explain_any_run(
+    store: SQLiteStore,
+    run_id: str,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> dict[str, Any]:
     """Explain a running or historical run without invoking workers or reading bodies."""
 
     # Keep the raw Inspector projection as the only storage reconstruction path.  This
@@ -16,7 +27,7 @@ def explain_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     # telemetry store or a second source of runtime authority.
     from .inspector import inspect_any_run
 
-    inspected = inspect_any_run(store, run_id)
+    inspected = inspect_any_run(store, run_id, clock=clock)
     kind = inspected.get("kind")
     if kind == "graph_run":
         explanation = _explain_graph_run(inspected)
@@ -104,6 +115,14 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
         item for item in history if item.get("accepted_graph_revision_digest") == revision_digest
     ]
     latest_nodes = _latest_by_node(current_history)
+    latest_nodes.update(
+        {
+            str(item["node_id"]): item
+            for item in _mappings(view.get("nodes"))
+            if item.get("accepted_graph_revision_digest") == revision_digest
+            and item.get("node_id") is not None
+        }
+    )
     durable_status = {
         str(node["id"]): str(latest_nodes.get(str(node["id"]), {}).get("status", "pending"))
         for node in graph_nodes
@@ -282,6 +301,21 @@ def _graph_task_story(
         "state": status,
         "position": position,
         "why_this_state": _why_task_state(status, position, latest, evaluator, review, loops),
+        "operational": {
+            key: (latest or {}).get(key)
+            for key in (
+                "operational_status",
+                "running_started_at",
+                "last_persisted_activity_at",
+                "finished_at",
+                "elapsed_seconds",
+                "wall_time_budget_seconds",
+                "deadline_at",
+                "overdue",
+                "selected_strategy_id",
+                "verification_count",
+            )
+        },
         "routing": _route_story(route),
         "information_flow": _context_story(node, context),
         "execution_attempts": [
@@ -290,6 +324,7 @@ def _graph_task_story(
                 "attempt": item.get("attempt"),
                 "sequence": item.get("sequence"),
                 "status": item.get("status"),
+                "transitioned_at": item.get("transitioned_at"),
                 "authoritative_for_current_state": latest is not None
                 and item.get("content_digest") == latest.get("content_digest"),
                 "generation_matches_run": item.get("generation") == authoritative_generation,

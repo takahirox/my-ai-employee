@@ -197,16 +197,43 @@ marker-end:url(#arrow)}
 .node{
 position:absolute;
 width:210px;
-min-height:94px;
+min-height:150px;
 text-align:left;
 border-width:2px;
-box-shadow:0 6px 20px #0005}
-.node strong,
-.node small{
-display:block}
-.node small{
+padding:.5rem .6rem;
+box-shadow:0 6px 20px #0005;
+overflow:hidden}
+.node strong{
+display:block;
+margin:.25rem 0;
+line-height:1.2;
+max-height:2.4em;
+overflow:hidden;
+overflow-wrap:anywhere}
+.node-status{
+display:inline-block;
+font-size:.65rem;
+font-weight:700;
+letter-spacing:.04em}
+.node-facts{
+display:grid;
+grid-template-columns:repeat(2,minmax(0,1fr));
+gap:.2rem .4rem;
+margin-top:.35rem}
+.node-fact{
+display:block;
+min-width:0;
+font-size:.68rem;
 color:#c5d0df;
-margin-top:.25rem}
+overflow:hidden;
+text-overflow:ellipsis;
+white-space:nowrap}
+.node-fact b{
+display:block;
+font-size:.58rem;
+font-weight:600;
+color:var(--muted);
+text-transform:uppercase}
 .node.current{
 outline:3px solid #fff8;
 outline-offset:3px}
@@ -227,6 +254,10 @@ border-color:#f59e0b}
 .state-running{
 border-color:#22d3ee;
 background:#10364a}
+.state-overdue{
+border-color:#fbbf24;
+background:#4a3010;
+box-shadow:0 0 0 2px #fbbf2455,0 6px 20px #0005}
 .state-passed{
 border-color:#34d399;
 background:#113a31}
@@ -293,6 +324,20 @@ grid-template-columns:1fr}
 input{
 width:45vw}
 }
+@media(max-width:600px){
+header{
+position:static;
+flex-wrap:wrap}
+header label,
+header select,
+#refresh{
+width:100%}
+main,
+.panel{
+padding:.65rem}
+.changes{
+grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 
 </style>
 </head>
@@ -346,6 +391,7 @@ or evaluators.</div>
 <span>waiting</span>
 <span>routed</span>
 <span>running</span>
+<span>overdue</span>
 <span>passed</span>
 <span>failed</span>
 <span>blocked</span>
@@ -396,6 +442,23 @@ null,
 const maps=v=>Array.isArray(v)?
 v.filter(x=>x&&
 typeof x==='object'):[];
+const shortTime=v=>{
+if(!v)return'Not recorded';
+const date=new Date(v);
+return Number.isNaN(date.getTime())?'Not recorded':date.toLocaleString()};
+const duration=v=>{
+const seconds=Number(v);
+if(v===null||
+v===undefined||
+!Number.isFinite(seconds)||
+seconds<0)return'Not recorded';
+const whole=Math.floor(seconds),
+hours=Math.floor(whole/3600),
+minutes=Math.floor((whole%3600)/60),
+remainder=whole%60;
+return hours?
+hours+'h '+minutes+'m':minutes?
+minutes+'m '+remainder+'s':whole+'s'};
 
 async function getJSON(url){
 const response=await fetch(url,
@@ -702,7 +765,8 @@ cancelled:'cancelled'}
 'waiting'}
 function style(task){
 if(selectedRevision?.retained_task_ids?.includes(task.id))return'retained';
-const status=task.execution_state||
+const status=task.operational_status||
+task.execution_state||
 task.historical_state||
 task.state||
 'pending';
@@ -710,6 +774,7 @@ if(['succeeded',
 'completed'].includes(status))return'passed';
 return ['routed',
 'running',
+'overdue',
 'passed',
 'failed',
 'blocked',
@@ -741,10 +806,27 @@ maps(story.task_stories).find(x=>x.task_id===id)||
 records=name=>maps(raw[name]).filter(x=>x.node_id===id&&
 x.accepted_graph_revision_digest===digest),
 attempts=records('node_history'),
+latest=maps(raw.nodes).find(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest)||
+attempts.at(-1)||
+{
+}
+,
+routeRecords=records('routes'),
+selectedStrategy=latest.selected_strategy_id||
+nodeStory.routing?.selected_strategy?.id||
+routeRecords.at(-1)?.selected_strategy?.id,
+operationalStatus=latest.operational_status||
+latest.status||
+task.execution_state||
+task.historical_state||
+task.state||
+'pending',
 stateReasons=Array.isArray(nodeStory.why_this_state)&&
 nodeStory.why_this_state.length?
 nodeStory.why_this_state:attempts.map(x=>({
 status:x.status,
+transitioned_at:x.transitioned_at,
 failure_code:x.failure_code,
 generation:x.generation,
 attempt:x.attempt,
@@ -767,17 +849,46 @@ completion_criteria:definition.completion_criteria||
 nodeStory.completion_criteria||
 [],
 dependencies,
-recorded_state:task.execution_state||
+recorded_state:latest.status||
+task.execution_state||
 task.historical_state||
 task.state||
 definition.state||
 'pending',
+operational_status:operationalStatus,
+attempt:latest.attempt,
+selected_strategy_id:selectedStrategy,
+operational:{
+status:operationalStatus,
+running_started_at:latest.running_started_at,
+last_persisted_activity_at:latest.last_persisted_activity_at,
+finished_at:latest.finished_at,
+elapsed_seconds:latest.elapsed_seconds,
+wall_time_budget_seconds:latest.wall_time_budget_seconds,
+deadline_at:latest.deadline_at,
+overdue:Boolean(latest.overdue),
+failure_code:latest.failure_code,
+verification_count:Number(latest.verification_count)||0},
 position:position(task),
-style_state:style(task),
+style_state:style({...task,
+operational_status:operationalStatus}),
 details:{
 state_reason:stateReasons,
-routing:records('routes').length?
-records('routes'):nodeStory.routing,
+operational_facts:{
+status:operationalStatus,
+attempt:latest.attempt,
+selected_strategy_id:selectedStrategy,
+running_started_at:latest.running_started_at,
+last_persisted_activity_at:latest.last_persisted_activity_at,
+finished_at:latest.finished_at,
+elapsed_seconds:latest.elapsed_seconds,
+wall_time_budget_seconds:latest.wall_time_budget_seconds,
+deadline_at:latest.deadline_at,
+overdue:Boolean(latest.overdue),
+failure_code:latest.failure_code,
+verification_count:Number(latest.verification_count)||0},
+routing:routeRecords.length?
+routeRecords:nodeStory.routing,
 predecessor_context:records('worker_context_manifests').length?
 records('worker_context_manifests'):nodeStory.information_flow,
 attempts:attempts.length?
@@ -810,6 +921,29 @@ triggered_by_task_ids:selectedRevision?.triggered_by_task_ids||
 }
 }
 }
+
+function cardFacts(task){
+const facts=[['Attempt',text(task.attempt)],
+['Strategy',text(task.selected_strategy_id)]],
+state=task.operational_status;
+if(state==='running'||state==='overdue')facts.push(
+['Started',shortTime(task.operational.running_started_at)],
+['Activity',shortTime(task.operational.last_persisted_activity_at)],
+['Elapsed / budget',duration(task.operational.elapsed_seconds)+' / '+
+duration(task.operational.wall_time_budget_seconds)],
+['Deadline',shortTime(task.operational.deadline_at)]);
+else if(state==='failed')facts.push(
+['Failed',shortTime(task.operational.finished_at)],
+['Elapsed',duration(task.operational.elapsed_seconds)],
+['Failure',text(task.operational.failure_code)]);
+else if(state==='blocked')facts.push(
+['Blocked',shortTime(task.operational.finished_at)],
+['Reason',text(task.operational.failure_code)]);
+else if(state==='passed')facts.push(
+['Finished',shortTime(task.operational.finished_at)],
+['Elapsed',duration(task.operational.elapsed_seconds)],
+['Verification',String(task.operational.verification_count)]);
+return facts}
 
 function renderGraph(){
 const root=$('#graph'),
@@ -863,7 +997,7 @@ row)=>points[x.id]={
 x:30+
 Number(column)*260,
 y:35+
-row*130}
+row*180}
 )}
 const width=Math.max(760,
 80+
@@ -872,7 +1006,7 @@ const width=Math.max(760,
 1)*260),
 height=Math.max(420,
 80+
-rows*130);
+rows*180);
 root.replaceChildren();
 root.style.width=width+
 'px';
@@ -917,21 +1051,27 @@ button.style.left=points[task.id].x+
 'px';
 button.style.top=points[task.id].y+
 'px';
-for(const [tag,
-value] of [['strong',
-task.label],
-['small',
-task.recorded_state+
-' · '+
-task.position],
-['small',
-style(task)==='retained'?
-'retained after replan':selectedRevision?.redone_task_ids?.includes(task.id)?
-'replaced or rerun':selectedRevision?.added_task_ids?.includes(task.id)?
-'added':'']]){
-const element=document.createElement(tag);
-element.textContent=value;
-button.append(element)}
+const status=document.createElement('span');
+status.className='node-status';
+status.textContent=task.operational_status.toUpperCase();
+const name=document.createElement('strong');
+name.textContent=task.label;
+name.title=task.label;
+const facts=document.createElement('span');
+facts.className='node-facts';
+const factValues=cardFacts(task);
+for(const [label,value] of factValues){
+const fact=document.createElement('span'),
+key=document.createElement('b');
+fact.className='node-fact';
+key.textContent=label;
+fact.append(key,document.createTextNode(value));
+fact.title=label+': '+value;
+facts.append(fact)}
+button.setAttribute('aria-label',
+task.operational_status+' task '+task.label+'; '+
+factValues.map(x=>x[0]+': '+x[1]).join('; '));
+button.append(status,name,facts);
 button.addEventListener('click',
 ()=>{
 selectedTask=task.id;
@@ -955,6 +1095,10 @@ p.textContent='Select a task. Facts not persisted are shown as Not recorded.';
 root.append(p);
 return}
 add(root,
+'Operational facts',
+task.details.operational_facts,
+true);
+add(root,
 'Objective, criteria, and state',
 {
 objective:task.objective,
@@ -963,8 +1107,7 @@ recorded_state:task.recorded_state,
 position:task.position,
 state_reason:task.details.state_reason,
 dependencies:task.dependencies}
-,
-true);
+);
 for(const [label,
 key] of [['Strategy and routing reasons',
 'routing'],

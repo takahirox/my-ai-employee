@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +25,7 @@ from .domain import (
     Run,
     VerificationEvidence,
 )
-from .domain.base import FrozenDict
+from .domain.base import FrozenDict, ensure_utc
 from .domain.browser import BrowserObservation
 from .domain.evaluation import EvaluationEvidenceLedger, EvaluationResult, ObservationManifest
 from .domain.policy_v2 import PolicyLayer
@@ -270,7 +272,99 @@ def inspect_work_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     }
 
 
-def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+_TERMINAL_NODE_STATES = frozenset({"passed", "failed", "blocked", "cancelled"})
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _node_execution_projection(
+    record: NodeExecutionRecord,
+    history: tuple[NodeExecutionRecord, ...],
+    node: Node | None,
+    route: NodeRouteRecord | None,
+    reservation: NodeReservationRecord | None,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    # Running duration is reconstructed only from authoritative persisted transitions.
+    attempt_history = sorted(
+        (
+            item
+            for item in history
+            if item.node_id == record.node_id
+            and item.accepted_graph_revision_digest == record.accepted_graph_revision_digest
+            and item.generation == record.generation
+            and item.attempt == record.attempt
+        ),
+        key=lambda item: (item.sequence, item.transitioned_at, item.id),
+    )
+    running = next((item for item in attempt_history if item.status == "running"), None)
+    terminal = next(
+        (item for item in attempt_history if item.status in _TERMINAL_NODE_STATES),
+        None,
+    )
+    running_started_at = None if running is None else running.transitioned_at
+    finished_at = (
+        None
+        if record.status not in _TERMINAL_NODE_STATES or terminal is None
+        else terminal.transitioned_at
+    )
+    wall_seconds: float | None = None
+    if reservation is not None and isinstance(reservation.requested, Mapping):
+        persisted_wall_seconds = reservation.requested.get("wall_seconds")
+        if isinstance(persisted_wall_seconds, (int, float)) and not isinstance(
+            persisted_wall_seconds, bool
+        ):
+            wall_seconds = float(persisted_wall_seconds)
+    if wall_seconds is None and node is not None:
+        wall_seconds = node.resource_budget.wall_seconds
+    deadline_at = (
+        None
+        if running_started_at is None or wall_seconds is None
+        else running_started_at + timedelta(seconds=wall_seconds)
+    )
+    elapsed_end = finished_at or observed_at
+    elapsed_seconds = (
+        None
+        if running_started_at is None
+        else max(0.0, (elapsed_end - running_started_at).total_seconds())
+    )
+    overdue = (
+        record.status == "running"
+        and deadline_at is not None
+        and observed_at >= deadline_at
+    )
+    projection = _json_model(record)
+    projection.update(
+        {
+            "operational_status": "overdue" if overdue else record.status,
+            "running_started_at": _timestamp(running_started_at),
+            "last_persisted_activity_at": _timestamp(record.transitioned_at),
+            "finished_at": _timestamp(finished_at),
+            "elapsed_seconds": elapsed_seconds,
+            "wall_time_budget_seconds": wall_seconds,
+            "deadline_at": _timestamp(deadline_at),
+            "overdue": overdue,
+            "selected_strategy_id": None if route is None else route.selected_strategy.id,
+            "verification_count": len(record.verification_result_digests),
+        }
+    )
+    return projection
+
+
+def inspect_graph_run(
+    store: SQLiteStore,
+    run_id: str,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> dict[str, Any]:
     """Project exact graph handoff records without opening artifact bodies."""
 
     run = store.get("graph_run_v2", run_id, GraphRunRecord)
@@ -337,6 +431,52 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         ):
             latest_nodes[node_record.node_id] = node_record
     routes = store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
+    reservations = store.list_records(
+        "node_reservation_v2", NodeReservationRecord, run_id=run_id
+    )
+    observed_at = ensure_utc(clock())
+    graph_nodes = (
+        {}
+        if acceptance is None
+        else {item.id: item for item in acceptance.accepted_revision.graph.nodes}
+    )
+    route_by_attempt = {
+        (
+            item.node_id,
+            item.accepted_graph_revision_digest,
+            item.generation,
+            item.attempt,
+        ): item
+        for item in sorted(routes, key=lambda item: (item.created_at, item.id))
+    }
+    reservation_by_attempt = {
+        (
+            item.node_id,
+            item.accepted_graph_revision_digest,
+            item.generation,
+            item.attempt,
+        ): item
+        for item in sorted(reservations, key=lambda item: (item.created_at, item.id))
+    }
+    node_projections: list[dict[str, Any]] = []
+    for node_id in sorted(latest_nodes):
+        record = latest_nodes[node_id]
+        binding = (
+            record.node_id,
+            record.accepted_graph_revision_digest,
+            record.generation,
+            record.attempt,
+        )
+        node_projections.append(
+            _node_execution_projection(
+                record,
+                node_records,
+                graph_nodes.get(node_id),
+                route_by_attempt.get(binding),
+                reservation_by_attempt.get(binding),
+                observed_at,
+            )
+        )
     composition = (
         None
         if run.composition_id is None
@@ -394,15 +534,10 @@ def inspect_graph_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
             for record in latest_nodes.values()
             for item in record.artifact_descriptors
         ],
-        "nodes": [_json_model(latest_nodes[node_id]) for node_id in sorted(latest_nodes)],
+        "nodes": node_projections,
         "node_history": [_json_model(item) for item in node_records],
         "claims": list(store.graph_claims(run_id)),
-        "reservations": [
-            _json_model(item)
-            for item in store.list_records(
-                "node_reservation_v2", NodeReservationRecord, run_id=run_id
-            )
-        ],
+        "reservations": [_json_model(item) for item in reservations],
         "node_semantic_assessments": [
             _json_model(item)
             for item in store.list_records(
@@ -691,7 +826,12 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
     }
 
 
-def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+def inspect_any_run(
+    store: SQLiteStore,
+    run_id: str,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> dict[str, Any]:
     """Read any runtime generation without mutating or migrating state."""
 
     if store.is_standalone_work_run(run_id):
@@ -704,7 +844,13 @@ def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
         pass
     else:
         return _attach_repository_context(store, run_id, projection)
-    for inspector in (inspect_graph_run, inspect_failed_plan_review, inspect_work_run, inspect_run):
+    try:
+        projection = inspect_graph_run(store, run_id, clock=clock)
+    except KeyError:
+        pass
+    else:
+        return _attach_repository_context(store, run_id, projection)
+    for inspector in (inspect_failed_plan_review, inspect_work_run, inspect_run):
         try:
             projection = inspector(store, run_id)
         except KeyError:
@@ -723,7 +869,7 @@ _TERMINAL_RUN_STATES = frozenset(
     }
 )
 _ACTIVE_TASK_STATES = frozenset({"active", "claimed", "routed", "running"})
-_ATTENTION_TASK_STATES = frozenset({"blocked", "failed"})
+_ATTENTION_TASK_STATES = frozenset({"blocked", "failed", "overdue"})
 _ATTENTION_RUN_STATES = frozenset(
     {"failed", "paused", "planned", "ready_to_promote", "waiting_approval"}
 )
@@ -773,7 +919,9 @@ def _attention_facts(
 ) -> list[dict[str, Any]]:
     attention: list[dict[str, Any]] = []
     for record in latest_nodes:
-        task_status = record.get("status", record.get("state"))
+        task_status = record.get("operational_status") or record.get(
+            "status", record.get("state")
+        )
         if task_status in _ATTENTION_TASK_STATES:
             attention.append(
                 {
@@ -815,7 +963,12 @@ def _attention_facts(
     return unique
 
 
-def inspect_fleet_runs(store: SQLiteStore, repository_id: str | None = None) -> dict[str, Any]:
+def inspect_fleet_runs(
+    store: SQLiteStore,
+    repository_id: str | None = None,
+    *,
+    clock: Callable[[], datetime] = _utc_now,
+) -> dict[str, Any]:
     """Project a live, read-only summary of top-level persisted Fleet runs."""
 
     active: list[dict[str, Any]] = []
@@ -832,7 +985,7 @@ def inspect_fleet_runs(store: SQLiteStore, repository_id: str | None = None) -> 
         if run_id in child_work_run_ids:
             continue
         try:
-            projection = inspect_any_run(store, run_id)
+            projection = inspect_any_run(store, run_id, clock=clock)
         except KeyError:
             # Old event/checkpoint-only IDs remain discoverable without inventing facts.
             item: dict[str, Any] = {
