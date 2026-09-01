@@ -18,6 +18,7 @@ from ai_employee.domain.v2 import (
     InstallRequest,
     PolicyDecision,
     ProcessRequest,
+    StableFailureCode,
     WorkspaceRequest,
 )
 from ai_employee.services_v2 import (
@@ -509,6 +510,19 @@ def test_git_workspace_applies_only_exact_declared_edit_patch(tmp_path: Path) ->
     assert result.status == "succeeded"
     assert Path(snapshot.isolated_worktree, "file.txt").read_text() == "after\n"
     assert (repository / "file.txt").read_text() == "before\n"
+
+    drifted = EditIntentRequest(
+        **{
+            **request.model_dump(exclude={"id", "content_digest"}),
+            "id": "edit-drifted",
+        }
+    )
+    drifted_result = manager.apply_edit(
+        snapshot, drifted, allow(drifted.content_digest or ""), NeverCancelled()
+    )
+    assert drifted_result.failure is not None
+    assert drifted_result.failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+    assert Path(snapshot.isolated_worktree, "file.txt").read_text() == "after\n"
 
 
 def test_git_workspace_recounts_worker_hunk_lengths(tmp_path: Path) -> None:

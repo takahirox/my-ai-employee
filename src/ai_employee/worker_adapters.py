@@ -765,6 +765,8 @@ def _bounded_prompt(
         "protocol": "fleet-worker-proposal/2",
         "run_id": request.run_id,
         "goal": request.goal,
+        "task_kind": request.task_kind,
+        "processes_authorized": request.processes_authorized,
         "completion_criteria": request.completion_criteria,
         "required_capabilities": request.required_capabilities,
         "accepted_plan_digest": request.accepted_plan_digest,

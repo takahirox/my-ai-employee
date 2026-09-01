@@ -473,6 +473,12 @@ class WorkCoordinator:
                 )
             assert result_acceptance.artifact is not None
             run = self._update(run, output_artifact_ids=(result_acceptance.artifact.id,))
+        elif worker_request.task_kind.value == "non_mutating":
+            return self._update(
+                run,
+                status="failed",
+                failure_code=StableFailureCode.TYPED_RESULT_MALFORMED.value,
+            )
         elif (
             result.run_id != worker_request.run_id
             or result.request_digest != worker_request.content_digest
@@ -590,7 +596,15 @@ class WorkCoordinator:
             or typed_result.attempt != request.attempt
         ):
             failure_code = StableFailureCode.TYPED_RESULT_STALE
-        elif worker_result.proposals or submitted_action_count:
+        elif request.task_kind.value != "non_mutating":
+            failure_code = StableFailureCode.TYPED_RESULT_MALFORMED
+        elif (
+            any(
+                proposal.kind is not ActionKind.PROCESS
+                for proposal in worker_result.proposals
+            )
+            or (submitted_action_count and not request.processes_authorized)
+        ):
             failure_code = StableFailureCode.TYPED_RESULT_ACTIONS_FORBIDDEN
 
         artifact: ArtifactDescriptor | None = None
@@ -771,8 +785,37 @@ class WorkCoordinator:
                 completed_action_digests=tuple(completed),
                 output_artifact_ids=tuple(output_artifact_ids),
             )
+        patch: ArtifactDescriptor | None = None
+        if run.capture_patch:
+            patch = self.workspace.capture_diff(snapshot)
+            self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
+            retain((patch,))
+            patch_bytes = self.artifact_reader(patch)
+            if not patch_bytes.strip():
+                return self._update(run, status="failed", failure_code="EMPTY_PATCH")
+            patch_text = patch_bytes.decode("utf-8", "replace")
+            changed_paths = tuple(
+                line[6:]
+                for line in patch_text.splitlines()
+                if (line.startswith("+++ b/") or line.startswith("--- a/"))
+                and line[6:] != "/dev/null"
+            )
+            if any(
+                fnmatch(path, pattern)
+                for path in changed_paths
+                for pattern in self.protected_paths
+            ):
+                return self._update(run, status="failed", failure_code="REVIEW_BLOCKED")
+            run = self._update(
+                run,
+                patch_artifact_id=patch.id,
+                output_artifact_ids=tuple(output_artifact_ids),
+            )
+
         run = self._update(run, status="verifying")
         verification_digests: list[str] = []
+        criterion_verification_digests: list[str] = []
+        verification_failed = False
         for request in self.verification_requests:
             if self.store.control(run.id) == "pause":
                 return self._update(run, status="paused")
@@ -798,9 +841,18 @@ class WorkCoordinator:
             )
             self.store.put("verification_result_v2", result, run_id=run.id)
             retain(_mediated_result_artifacts(result, executor))
-            if result.status != "succeeded":
-                return self._update(run, status="failed", failure_code="VERIFICATION_FAILED")
             verification_digests.append(result.content_digest or "")
+            if result.status != "succeeded":
+                criterion_verification_digests.append("")
+                verification_failed = True
+                break
+            criterion_verification_digests.append(result.content_digest or "")
+
+        # Keep criterion/result cardinality deterministic when execution stops on the
+        # first failed verifier. Unexecuted requirements remain explicitly uncovered.
+        criterion_verification_digests.extend(
+            "" for _ in range(len(self.verification_requests) - len(criterion_verification_digests))
+        )
 
         if not run.capture_patch:
             artifacts = tuple(
@@ -810,7 +862,7 @@ class WorkCoordinator:
             criteria = _declared_criterion_evidence(
                 run.completion_criteria,
                 self.verification_requests,
-                tuple(verification_digests),
+                tuple(criterion_verification_digests),
                 artifacts,
             )
             ledger = AcceptanceLedger(
@@ -822,28 +874,45 @@ class WorkCoordinator:
             self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
             return self._update(
                 run,
-                status="completed",
+                status="failed" if verification_failed else "completed",
+                failure_code="VERIFICATION_FAILED" if verification_failed else None,
                 verification_result_digests=tuple(verification_digests),
                 acceptance_ledger_id=ledger.id,
                 output_artifact_ids=tuple(output_artifact_ids),
             )
 
-        patch = self.workspace.capture_diff(snapshot)
-        self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
-        retain((patch,))
-        patch_bytes = self.artifact_reader(patch)
-        if not patch_bytes.strip():
-            return self._update(run, status="failed", failure_code="EMPTY_PATCH")
-        patch_text = patch_bytes.decode("utf-8", "replace")
-        changed_paths = tuple(
-            line[6:]
-            for line in patch_text.splitlines()
-            if (line.startswith("+++ b/") or line.startswith("--- a/")) and line[6:] != "/dev/null"
+        assert patch is not None
+        review_digest = canonical_digest(
+            {
+                "patch": patch.artifact_digest,
+                "verification_results": tuple(verification_digests),
+                "blocked": verification_failed,
+            }
         )
-        if any(
-            fnmatch(path, pattern) for path in changed_paths for pattern in self.protected_paths
-        ):
-            return self._update(run, status="failed", failure_code="REVIEW_BLOCKED")
+        criteria = _declared_criterion_evidence(
+            run.completion_criteria,
+            self.verification_requests,
+            tuple(criterion_verification_digests),
+            (patch,),
+        )
+        ledger = AcceptanceLedger(
+            id=identifier("acceptance-ledger"),
+            run_id=run.id,
+            created_at=now(),
+            criteria=criteria,
+        )
+        self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
+        if verification_failed:
+            return self._update(
+                run,
+                status="failed",
+                failure_code="VERIFICATION_FAILED",
+                verification_result_digests=tuple(verification_digests),
+                review_digest=review_digest,
+                acceptance_ledger_id=ledger.id,
+                output_artifact_ids=tuple(output_artifact_ids),
+            )
+
         promotion_approval_id: str | None = None
         if self.request_promotion_approval and self.approval_service is not None:
             promotion_decision = PolicyDecision(
@@ -871,16 +940,8 @@ class WorkCoordinator:
             promotion_approval_id = promotion_approval.id
         # The exact patch digest is the deterministic review input. Required Harness
         # commands are submitted as ordinary process proposals by the coordinator caller.
-        review_digest = canonical_digest({"patch": patch.artifact_digest, "blocked": False})
-        criteria = (
-            _declared_criterion_evidence(
-                run.completion_criteria,
-                self.verification_requests,
-                tuple(verification_digests),
-                (patch,),
-            )
-            if run.completion_criteria
-            else (
+        if not run.completion_criteria:
+            criteria = (
                 *(
                     CriterionEvidence(
                         criterion_id=f"verification-{index}",
@@ -900,14 +961,8 @@ class WorkCoordinator:
                     evidence_refs=(patch.artifact_digest, review_digest),
                 ),
             )
-        )
-        ledger = AcceptanceLedger(
-            id=identifier("acceptance-ledger"),
-            run_id=run.id,
-            created_at=now(),
-            criteria=criteria,
-        )
-        self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
+            ledger = ledger.model_copy(update={"criteria": criteria, "content_digest": None})
+            self.store.put("acceptance_ledger_v2", ledger, run_id=run.id)
         self._event(
             run.id,
             "review_finished",
@@ -1070,7 +1125,7 @@ def _declared_criterion_evidence(
         missing = False
         for requirement_id in criterion.verification_requirement_ids:
             digest = verification_by_id.get(requirement_id)
-            if digest is None:
+            if not digest:
                 missing = True
             else:
                 refs.append(digest)

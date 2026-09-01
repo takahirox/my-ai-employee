@@ -27,6 +27,7 @@ from .domain import (
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
+    GoalTaskKind,
     Graph,
     Node,
     ProjectHarnessV2,
@@ -259,6 +260,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     work.add_argument("--plan-only", action="store_true")
+    work.add_argument(
+        "--task-kind",
+        choices=("mutating", "non_mutating"),
+        default="mutating",
+        help="persisted side-effect contract for the Goal (default: mutating)",
+    )
+    work.add_argument(
+        "--allow-processes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="authorize declared Harness processes (defaults on only for mutating Goals)",
+    )
     work.add_argument(
         "--max-concurrency",
         type=int,
@@ -658,13 +671,41 @@ def _work(args: argparse.Namespace) -> int:
     harness = discover_project_harness(repository)
     if harness.verification.review.independent_task_review and not routing_enabled:
         raise ValueError("independent task review requires configured routing")
-    goal = _work_goal(run_id, args.goal, harness) if resume_run is None else resume_run.goal
+    try:
+        goal = (
+            _work_goal(
+                run_id,
+                args.goal,
+                harness,
+                task_kind=GoalTaskKind(getattr(args, "task_kind", "mutating")),
+                processes_authorized=getattr(args, "allow_processes", None),
+            )
+            if resume_run is None
+            else resume_run.goal
+        )
+    except ValueError:
+        print(
+            canonical_json(
+                {
+                    "schema_version": "2",
+                    "run_id": run_id,
+                    "status": "failed",
+                    "stable_code": "GOAL_CONTRADICTION",
+                    "next_actions": (),
+                }
+            )
+        )
+        return 2
     if resume_run is not None and project_harness_digest(harness) != resume_run.harness_digest:
         raise ValueError("Project Harness changed since the graph was accepted")
-    capabilities = ["edit_intent", "process"]
-    if harness.network.mode.value != "disabled":
+    capabilities: list[str] = []
+    if goal.task_kind is GoalTaskKind.MUTATING:
+        capabilities.append("edit_intent")
+    if goal.processes_authorized:
+        capabilities.append("process")
+    if goal.task_kind is GoalTaskKind.MUTATING and harness.network.mode.value != "disabled":
         capabilities.append("download")
-    if harness.install.ecosystems:
+    if goal.task_kind is GoalTaskKind.MUTATING and harness.install.ecosystems:
         capabilities.append("install")
     operator_config_path = (
         resume_run.operator_config_path
@@ -1293,6 +1334,35 @@ def _work(args: argparse.Namespace) -> int:
             ) -> WorkCoordinator:
                 inner_store = SQLiteStore(db_path)
                 node_worker_name = cast(WorkerName, strategy.backend)
+                node_verification_names = tuple(
+                    name
+                    for name in harness.verification.required
+                    if any(
+                        name in criterion.verification_requirement_ids
+                        for criterion in node.completion_criteria
+                    )
+                )
+                node_verification_requests = (
+                    tuple(
+                        ProcessRequest(
+                            id=identifier("node-verification-request"),
+                            run_id=request.run_id,
+                            created_at=now(),
+                            argv=harness.commands[name].argv,
+                            cwd=harness.commands[name].cwd,
+                            inherit_environment=harness.commands[name].inherit_environment,
+                            timeout_seconds=min(300.0, harness.budgets.wall_seconds),
+                            budget_class="verification",
+                            purpose=f"node candidate Harness verification: {name}",
+                        )
+                        for name in node_verification_names
+                    )
+                    if (
+                        goal.task_kind is GoalTaskKind.MUTATING
+                        and "edit_intent" in node.required_capabilities
+                    )
+                    else ()
+                )
                 node_assessment = assess_task(
                     node.objective or node.name,
                     run_id=request.run_id,
@@ -1340,6 +1410,8 @@ def _work(args: argparse.Namespace) -> int:
                         artifacts,
                         network_mediated=harness.network.mode.value != "disabled",
                     ),
+                    max_worker_turns=max(1, node.resource_budget.worker_turns),
+                    verification_requests=node_verification_requests,
                     protected_paths=harness.paths.protected,
                     allowed_processes=tuple(command.argv for command in harness.commands.values()),
                     artifact_store=artifacts,
@@ -1458,7 +1530,7 @@ def _work(args: argparse.Namespace) -> int:
                         if resume_run is not None
                         else ExecutionPolicy(
                             max_nodes=16,
-                            max_attempts=16,
+                            max_attempts=32,
                             max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
                         )
                     ),
@@ -2187,11 +2259,48 @@ def _next_actions(run: object) -> tuple[str, ...]:
         return (f"fleet approvals list --run {run_id}", f"fleet resume {run_id}")
     if status == "ready_to_promote":
         return (f"fleet diff {run_id}", f"fleet promote {run_id} --patch-digest <digest>")
-    return ()
+    if status in {"planned", "paused"}:
+        return (f"fleet inspect {run_id}", f"fleet resume {run_id}")
+    if status in {"failed", "cancelled"}:
+        actions = [
+            f"fleet inspect {run_id}",
+            f"fleet explain {run_id}",
+            f"fleet logs {run_id}",
+        ]
+        if getattr(run, "patch_artifact_id", None) is not None or getattr(
+            run, "parent_candidate_artifact_id", None
+        ) is not None:
+            actions.insert(1, f"fleet diff {run_id}")
+        return tuple(actions)
+    return (f"fleet inspect {run_id}",) if run_id else ()
 
 
-def _work_goal(run_id: str, statement: str, harness: ProjectHarnessV2) -> Goal:
+def _work_goal(
+    run_id: str,
+    statement: str,
+    harness: ProjectHarnessV2,
+    *,
+    task_kind: GoalTaskKind = GoalTaskKind.MUTATING,
+    processes_authorized: bool | None = None,
+) -> Goal:
     """Bind the original Goal to exact declared parent verification evidence."""
+
+    processes_allowed = (
+        task_kind is GoalTaskKind.MUTATING
+        if processes_authorized is None
+        else processes_authorized
+    )
+    if task_kind is GoalTaskKind.NON_MUTATING:
+        return Goal(
+            id=f"goal-{run_id}",
+            statement=statement,
+            task_kind=task_kind,
+            processes_authorized=processes_allowed,
+        )
+    if not processes_allowed and (
+        harness.verification.required or harness.verification.required_evaluators
+    ):
+        raise ValueError("mutating Goal requires Harness verification processes")
 
     evaluators = {item.id: item for item in harness.evaluators}
     criteria: list[CompletionCriterion] = []
@@ -2225,6 +2334,8 @@ def _work_goal(run_id: str, statement: str, harness: ProjectHarnessV2) -> Goal:
     return Goal(
         id=f"goal-{run_id}",
         statement=statement,
+        task_kind=task_kind,
+        processes_authorized=processes_allowed,
         completion_criteria=tuple(criteria),
     )
 

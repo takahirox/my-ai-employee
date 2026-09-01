@@ -129,11 +129,36 @@ class CompletionCriterion(EntityModel):
     required_artifact_ids: tuple[Identifier, ...] = ()
 
 
+class GoalTaskKind(StableStrEnum):
+    """The persisted side-effect contract for an accepted Goal."""
+
+    MUTATING = "mutating"
+    NON_MUTATING = "non_mutating"
+
+
 class Goal(EntityModel):
     statement: str = Field(min_length=1, max_length=10_000)
+    task_kind: GoalTaskKind = GoalTaskKind.MUTATING
+    processes_authorized: bool = True
     completion_criteria: tuple[CompletionCriterion, ...] = ()
     constraints: tuple[Constraint, ...] = ()
     budget: Budget = Field(default_factory=Budget)
+
+    @model_validator(mode="after")
+    def _task_kind_matches_declared_evidence(self) -> Self:
+        required_artifacts = {
+            artifact
+            for criterion in self.completion_criteria
+            for artifact in criterion.required_artifact_ids
+        }
+        verification_required = any(
+            criterion.verification_requirement_ids for criterion in self.completion_criteria
+        )
+        if self.task_kind is GoalTaskKind.NON_MUTATING and "workspace_patch" in required_artifacts:
+            raise ValueError("non-mutating Goal cannot require a workspace_patch")
+        if not self.processes_authorized and verification_required:
+            raise ValueError("Goal verification requires processes but processes are unauthorized")
+        return self
 
 
 class OutputContract(EntityModel):

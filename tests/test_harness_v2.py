@@ -11,6 +11,9 @@ from ai_employee.domain import (
     BrowserAction,
     BrowserCapture,
     BrowserScenario,
+    CompletionCriterion,
+    Goal,
+    GoalTaskKind,
     ProjectHarnessV2,
     ProvenancedValue,
     ProvenanceKind,
@@ -281,6 +284,58 @@ def test_required_evaluator_defines_parent_goal_criteria() -> None:
     assert tuple(item.id for item in goal.completion_criteria) == ("tests-pass",)
     assert goal.completion_criteria[0].verification_requirement_ids == ("test",)
     assert goal.completion_criteria[0].required_artifact_ids == ("workspace_patch",)
+
+
+def test_non_mutating_goal_is_persistently_typed_before_criteria() -> None:
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(valid_harness()), strict=True)
+    goal = cli._work_goal(
+        "read-only-run",
+        "diagnose without changing files",
+        harness,
+        task_kind=GoalTaskKind.NON_MUTATING,
+    )
+
+    assert goal.task_kind is GoalTaskKind.NON_MUTATING
+    assert not goal.processes_authorized
+    assert goal.completion_criteria == ()
+    with pytest.raises(ValidationError, match="cannot require a workspace_patch"):
+        Goal(
+            id="contradictory-goal",
+            statement="do not mutate but return a patch",
+            task_kind=GoalTaskKind.NON_MUTATING,
+            processes_authorized=False,
+            completion_criteria=(
+                CompletionCriterion(
+                    id="patch",
+                    description="a patch exists",
+                    required_artifact_ids=("workspace_patch",),
+                ),
+            ),
+        )
+
+
+def test_goal_contradiction_fails_before_external_configuration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fleet = tmp_path / ".fleet"
+    fleet.mkdir()
+    (fleet / "project.json").write_text(json.dumps(valid_harness()), encoding="utf-8")
+
+    result = cli.main(
+        [
+            "work",
+            "change code without authorizing required verification",
+            "--repo",
+            str(tmp_path),
+            "--no-allow-processes",
+            "--db",
+            str(tmp_path / "fleet.db"),
+        ]
+    )
+
+    assert result == 2
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["stable_code"] == "GOAL_CONTRADICTION"
 
 
 def test_required_browser_evaluator_defines_scenario_bound_goal_criteria() -> None:

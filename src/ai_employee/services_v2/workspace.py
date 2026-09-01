@@ -184,7 +184,7 @@ class GitWorkspaceManager:
         if check.returncode:
             return self._edit_failure(
                 request,
-                StableFailureCode.INVALID_REQUEST,
+                StableFailureCode.PATCH_PREFLIGHT_FAILED,
                 check.stderr.decode("utf-8", "replace")[:2_000] or "patch preflight failed",
             )
         applied = subprocess.run(

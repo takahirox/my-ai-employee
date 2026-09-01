@@ -22,6 +22,7 @@ from .domain.v2 import (
     ExecutionResult,
     NonMutatingResultAcceptance,
     PolicyDecision,
+    StableFailureCode,
     WorkerRequest,
     WorkerResult,
     WorkspaceSnapshot,
@@ -214,6 +215,7 @@ class GraphExecutionService:
         resume: bool = False,
         replan: bool = False,
     ) -> GraphRunRecord:
+        capabilities = tuple(available_capabilities)
         session = _ExecutionSession(self.coordinator_factory, self.repository, self.base_commit)
         orchestrator = self._orchestrator(session.run_node)
         graph_run = orchestrator.run(
@@ -223,7 +225,7 @@ class GraphExecutionService:
             harness_digest=harness_digest,
             effective_policy_digest=effective_policy_digest,
             run_id=run_id,
-            available_capabilities=available_capabilities,
+            available_capabilities=capabilities,
             plan_only=plan_only,
             resume=resume,
             replan=replan,
@@ -323,11 +325,26 @@ class GraphExecutionService:
             "goal_evaluator_digest": evaluation.goal_evaluator_digest,
         }
         if evaluation.status != "ready_to_promote":
-            return self._update_run(
+            failed_run = self._update_run(
                 graph_run,
                 failure_code=evaluation.failure_code or "PARENT_EVALUATION_FAILED",
                 **evaluation_fields,
             )
+            evaluation_digest = evaluation.content_digest
+            if evaluation_digest is not None and orchestrator.prepare_parent_repair(
+                run_id, evaluation_digest
+            ):
+                return self.run(
+                    goal,
+                    acceptance.accepted_revision.graph,
+                    policy,
+                    harness_digest=harness_digest,
+                    effective_policy_digest=effective_policy_digest,
+                    run_id=run_id,
+                    available_capabilities=capabilities,
+                    resume=True,
+                )
+            return self.store.get("graph_run_v2", failed_run.id, GraphRunRecord)
         approval_created_at = now()
         approval_decision = PolicyDecision(
             id=identifier("graph-promotion-policy"),
@@ -745,7 +762,37 @@ def _authoritative_node_result(
             or typed_result.attempt != request.attempt
         ):
             raise ValueError("accepted worker typed result is stale")
-    if run.status != expected_status or worker_result.status != "succeeded":
+    repairable_patch_failure = (
+        writing
+        and run.status == "failed"
+        and run.failure_code == StableFailureCode.PATCH_PREFLIGHT_FAILED.value
+    )
+    if repairable_patch_failure:
+        failed_actions = tuple(
+            item
+            for item in store.list_records("action_result_v2", ExecutionResult, run_id=run.id)
+            if item.status == "failed"
+            and item.failure is not None
+            and item.failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+        )
+        if len(failed_actions) != 1 or run.workspace_id is None:
+            raise ValueError("post-result patch preflight failure is absent or ambiguous")
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=run.workspace_id,
+            result_acceptance=result_acceptance,
+            failure_code=StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
+        )
+    repairable_verification_failure = (
+        writing
+        and run.status == "failed"
+        and run.failure_code == "VERIFICATION_FAILED"
+    )
+    if (
+        run.status != expected_status
+        and not repairable_verification_failure
+    ) or worker_result.status != "succeeded":
         raise ValueError("inner work run did not reach its authoritative terminal state")
     descriptors = tuple(
         store.get("artifact_descriptor_v2", artifact_id, ArtifactDescriptor)
@@ -839,19 +886,24 @@ def _authoritative_node_result(
     result_by_request = {item.request_digest: item for item in results}
     verification_digests: list[str] = []
     for verification_request in coordinator.verification_requests:
+        result = result_by_request.get(verification_request.content_digest or "")
+        if result is None and repairable_verification_failure:
+            break
         persisted_request = store.get(
             "verification_request_v2", verification_request.id, type(verification_request)
         )
-        result = result_by_request.get(verification_request.content_digest or "")
         if (
             persisted_request != verification_request
             or result is None
-            or result.status != "succeeded"
             or result.run_id != run.id
             or result.content_digest is None
         ):
             raise ValueError("required Harness verification is absent or stale")
         verification_digests.append(result.content_digest)
+        if result.status != "succeeded":
+            if not repairable_verification_failure:
+                raise ValueError("required Harness verification failed unexpectedly")
+            break
     if tuple(verification_digests) != run.verification_result_digests:
         raise ValueError("WorkRun verification ledger does not match persisted results")
     if run.acceptance_ledger_id is None:
@@ -899,6 +951,7 @@ def _authoritative_node_result(
         artifact_descriptors=descriptors,
         result_acceptance=result_acceptance,
         acceptance_ledger_digest=_required(ledger.content_digest),
+        failure_code=(run.failure_code if repairable_verification_failure else None),
     )
 
 

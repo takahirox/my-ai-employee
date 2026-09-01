@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 
+from ai_employee.cli import _next_actions
 from ai_employee.domain import (
     Budget,
     CompletionCriterion,
     Edge,
+    EvaluationDecision,
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
@@ -18,7 +20,15 @@ from ai_employee.domain import (
     OutputContract,
     RoutingMode,
 )
-from ai_employee.domain.v2 import CriterionEvidence, WorkerRequest, WorkerResult
+from ai_employee.domain.v2 import (
+    CriterionEvidence,
+    StableFailure,
+    StableFailureCode,
+    WorkerBoundaryDiagnostic,
+    WorkerRequest,
+    WorkerResult,
+)
+from ai_employee.graph_evaluation import ParentCandidateEvaluationRecord
 from ai_employee.inspector import inspect_graph_run
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
@@ -288,6 +298,188 @@ def test_failed_evaluation_repairs_with_fresh_bound_feedback(tmp_path: Path) -> 
         )
 
 
+def test_malformed_patch_protocol_failure_gets_one_bound_correction_turn(
+    tmp_path: Path,
+) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+    requests: list[WorkerRequest] = []
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        if request.attempt:
+            return _result(request, "satisfied")
+        diagnostic = WorkerBoundaryDiagnostic(
+            id="malformed-patch-diagnostic",
+            run_id=request.run_id,
+            created_at=NOW,
+            adapter="scripted",
+            stage="envelope",
+            code="WORKER_ENVELOPE_MALFORMED",
+            retryable=False,
+            graph_run_id=request.graph_run_id,
+            node_id=request.node_id,
+            accepted_graph_revision_digest=request.accepted_graph_revision_digest,
+            generation=request.generation,
+            attempt=request.attempt,
+            worker_request_id=request.id,
+            worker_request_digest=request.content_digest,
+            exception_type="PatchValidationError",
+            exception_message="existing-file hunk has inconsistent line counts",
+            duration_seconds=0.01,
+        )
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="malformed-worker-result",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="failed",
+                failure=StableFailure(
+                    code=StableFailureCode.WORKER_PROTOCOL_ERROR,
+                    message="proposal normalization failed",
+                ),
+                duration_seconds=0.01,
+                boundary_diagnostic=diagnostic,
+            ),
+            criterion_evidence=(),
+        )
+
+    with SQLiteStore(tmp_path / "protocol-repair.db") as store:
+        orchestrator, run = _run(
+            store, graph, goal, runner, run_id="closed-loop-protocol-repair"
+        )
+        replay = orchestrator.replay("closed-loop-protocol-repair")
+
+    assert run.status == "completed"
+    assert [request.attempt for request in requests] == [0, 1]
+    assert "inconsistent line counts" in requests[1].goal
+    repair = next(item for item in replay.loop_transitions if item.action is LoopAction.REPAIR)
+    failed_result = next(item for item in replay.results if item.status == "failed")
+    assert repair.worker_result_digest == failed_result.content_digest
+    assert requests[1].accepted_feedback_digests == repair.evidence_digests
+
+
+def test_failed_parent_evaluation_resumes_one_writing_node_with_exact_feedback(
+    tmp_path: Path,
+) -> None:
+    criterion = CompletionCriterion(
+        id="criterion-patch",
+        description="the bounded patch is accepted",
+    )
+    node = Node(
+        id="fix",
+        kind=NodeKind.FUNCTION,
+        name="fix",
+        objective="fix the bounded defect",
+        output_contract=OutputContract(id="contract-fix"),
+        required_capabilities=("edit_intent",),
+        completion_criteria=(criterion,),
+    )
+    graph = Graph(
+        id="parent-repair-graph",
+        nodes=(node,),
+        entry_node_ids=(node.id,),
+        terminal_node_ids=(node.id,),
+        budget=Budget(
+            max_attempts=2,
+            max_repairs=1,
+            max_loop_iterations=2,
+            max_nodes=1,
+            max_worker_turns=2,
+            max_processes=2,
+            max_wall_seconds=2.0,
+            max_artifact_bytes=2_000_000,
+        ),
+    )
+    goal = Goal(id="parent-repair-goal", statement="fix one bounded defect")
+    strategy = _strategy().model_copy(update={"capabilities": ("edit_intent",)})
+    requests: list[WorkerRequest] = []
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        requests.append(request)
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id=f"worker-result-{request.attempt}",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id=criterion.id,
+                    disposition="satisfied",
+                    evidence_refs=(ZERO,),
+                ),
+            ),
+        )
+
+    with SQLiteStore(tmp_path / "parent-repair.db") as store:
+        orchestrator = TaskOrchestrator(store, runner, (strategy,))
+        first = orchestrator.run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=2, max_wall_seconds=2.0),
+            harness_digest=HARNESS,
+            effective_policy_digest=POLICY,
+            run_id="parent-repair",
+            available_capabilities=("edit_intent",),
+        )
+        failed = first.model_copy(
+            update={"status": "failed", "failure_code": "PARENT_VERIFICATION_FAILED"}
+        )
+        store.put("graph_run_v2", failed, run_id=failed.id, revision=1)
+        evaluation = ParentCandidateEvaluationRecord(
+            id="parent-evaluation",
+            run_id=failed.id,
+            created_at=NOW,
+            request_digest=ZERO,
+            accepted_graph_revision_digest=failed.accepted_graph_revision_digest,
+            composition_record_digest=ZERO,
+            composition_workspace_digest=ZERO,
+            candidate_digest=ZERO,
+            candidate_descriptor_digest=ZERO,
+            candidate_artifact_digest=ZERO,
+            effective_policy_digest=POLICY,
+            goal_evaluator_digest=ZERO,
+            decision=EvaluationDecision.FAIL,
+            status="failed",
+            failure_code="PARENT_VERIFICATION_FAILED",
+        )
+        store.put("parent_candidate_evaluation_v2", evaluation, run_id=failed.id)
+
+        assert orchestrator.prepare_parent_repair(
+            failed.id, evaluation.content_digest or ZERO
+        )
+        resumed = orchestrator.run(
+            goal,
+            graph,
+            failed.execution_policy,
+            harness_digest=HARNESS,
+            effective_policy_digest=POLICY,
+            run_id=failed.id,
+            available_capabilities=("edit_intent",),
+            resume=True,
+        )
+        replay = orchestrator.replay(failed.id)
+
+    assert resumed.status == "completed"
+    assert [request.attempt for request in requests] == [0, 1]
+    assert "Accepted parent-candidate repair evidence" in requests[1].goal
+    repair = next(item for item in replay.loop_transitions if item.action is LoopAction.REPAIR)
+    assert repair.reason_code == "ACCEPTED_PARENT_EVALUATION_FEEDBACK"
+    assert requests[1].accepted_feedback_digests == repair.evidence_digests
+
+
 def test_repair_bound_exhaustion_escalates_and_fails_closed(tmp_path: Path) -> None:
     goal, graph, _node = _inputs(max_repairs=1)
 
@@ -354,6 +546,31 @@ def test_non_repairable_evaluation_selects_terminal_fail(tmp_path: Path) -> None
     assert run.status == "failed"
     assert [item.action for item in replay.loop_transitions] == [LoopAction.FAIL]
     assert replay.loop_transitions[0].reason_code == "NODE_EVALUATION_NOT_PASS"
+
+
+def test_correctable_verification_with_zero_repair_budget_reports_exhaustion(
+    tmp_path: Path,
+) -> None:
+    goal, graph, _node = _inputs(max_repairs=0)
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        return _result(request, "blocked").model_copy(
+            update={"failure_code": StableFailureCode.VERIFICATION_FAILED.value}
+        )
+
+    with SQLiteStore(tmp_path / "zero-repair.db") as store:
+        orchestrator, run = _run(
+            store, graph, goal, runner, run_id="closed-loop-zero-repair"
+        )
+        replay = orchestrator.replay("closed-loop-zero-repair")
+
+    assert run.failure_code == "LOOP_ESCALATED:REPAIR_BUDGET_EXHAUSTED"
+    assert replay.loop_transitions[-1].reason_code == "REPAIR_BUDGET_EXHAUSTED"
+    assert _next_actions(run)
 
 
 def test_pending_repair_feedback_survives_pause_and_resume(tmp_path: Path) -> None:
