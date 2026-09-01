@@ -34,6 +34,11 @@ CLI worker (read-only proposal generation)
   -> explicit digest-bound promotion
 ```
 
+Every `fleet work` invocation enters this slice through `GraphExecutionService` and is
+persisted as a `GraphRunRecord`. Fixed routing constructs a one-node authoritative Graph;
+adaptive routing accepts a Planner-proposed child DAG. Inspector drill-down reads those
+Graph-owned node, route, execution, evidence, and review records.
+
 The worker never writes authoritative state and free-form prose is never executable.
 General commands use `LocalProcessExecutor`. Git worktree lifecycle, diff construction,
 exact patch application, and promotion are deterministic system operations encapsulated
@@ -57,8 +62,8 @@ logic alone maps those facts to `PASS`, `REPAIR`, `ESCALATE`, or `FAIL`.
 `process.harness` adapts an exact predeclared
 Harness command to the existing `ProcessExecutor`, policy decision, cancellation, and artifact
 paths. Process stdout and stderr remain ordinary `ArtifactDescriptor` records; evaluators do
-not write observation files into the candidate worktree. Legacy required commands are derived
-into required process evaluators in memory, preserving existing Project Harness intent.
+not write observation files into the candidate worktree. Established required commands are
+derived into required process evaluators in memory, preserving existing Project Harness intent.
 
 `browser.playwright` is the second available provider. The Playwright dependency is optional
 and loaded only for a declared browser evaluation. Its service maps an exact loopback origin to

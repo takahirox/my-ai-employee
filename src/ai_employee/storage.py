@@ -369,7 +369,7 @@ class SQLiteStore:
     def list_run_repositories(
         self, repository_id: str | None = None
     ) -> tuple[dict[str, str | None], ...]:
-        """List registered and legacy run IDs, optionally filtered by repository."""
+        """List registered and persisted run IDs, optionally filtered by repository."""
 
         run_sources = ["SELECT run_id FROM run_repositories"]
         run_sources.extend(
@@ -394,6 +394,7 @@ class SQLiteStore:
                 "repository": None if row[2] is None else str(row[2]),
             }
             for row in rows
+            if not self.is_standalone_work_run(str(row[0]))
         )
 
     def save_graph(self, run_id: str, revision: AcceptedGraphRevision) -> None:
@@ -546,6 +547,21 @@ class SQLiteStore:
         if self._schema_version() < 2:
             raise KeyError(run_id)
         return self.get("work_run_v2", run_id, WorkRun)
+
+    def is_standalone_work_run(self, run_id: str) -> bool:
+        """Return whether an ID belongs only to a historical pre-Graph WorkRun."""
+
+        try:
+            self.get_work_run(run_id)
+        except KeyError:
+            return False
+        owner = self._connection.execute(
+            "SELECT 1 FROM records "
+            "WHERE kind='node_execution_v2' "
+            "AND json_extract(payload, '$.work_run_id')=? LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return owner is None
 
     def append_work_event(self, event: Any) -> int:
         self.migrate_v2()

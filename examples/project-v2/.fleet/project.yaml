@@ -49,7 +49,6 @@ approvals:
   new_registry_domain: "required"
   promotion: "required"
 worker:
-  preferred: "codex_cli"
   allowed: ["codex_cli", "claude_code_cli", "ollama_cli"]
   allowed_strategy_ids: [codex-luna-max, codex-sol-high, claude-opus-high, claude-fable-high, ollama-local]
   adaptive_routing: true

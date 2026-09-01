@@ -74,7 +74,7 @@ projects those records without opening artifact bodies, and replay reads the sto
 without re-running a worker, process, composition, or promotion action.
 
 For backward compatibility, discovery derives one required `process.harness` evaluator for
-each legacy entry in `verification.required` when no explicit `required_evaluators` are
+each established entry in `verification.required` when no explicit `required_evaluators` are
 declared. Projects that use only the established command list therefore keep the same
 verification intent while gaining exact-candidate evidence binding.
 

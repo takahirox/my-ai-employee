@@ -33,8 +33,8 @@ persisted proposed graph, so that failure is also explainable historically.
 - a dashboard, UI framework, live tracing service, or second telemetry database;
 - cross-run analytics, cost optimization, or automatic diagnosis;
 - model-generated explanations or access to private chain-of-thought;
-- redesigning legacy runtime persistence.
+- redesigning historical Graph runtime persistence.
 
-The existing `fleet inspect` raw projection remains available for deeper forensics and
-backward compatibility. Future analytics can consume the stable persisted evidence and
+The existing `fleet inspect` raw projection remains available for deeper Graph forensics.
+Future analytics can consume the stable persisted evidence and
 the explanation projection without changing runtime authority.

@@ -61,6 +61,31 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert args.routing_mode == "adaptive"
     assert args.strategy_set is None
     assert args.max_concurrency == 1
+    assert not hasattr(args, "worker")
+    assert not hasattr(args, "model")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--worker", "codex_cli"),
+        ("--model", "gpt-5.6-sol"),
+        ("--routing-mode", "legacy"),
+    ),
+)
+def test_removed_work_routes_fail_in_parser_before_work_starts(
+    arguments: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_work",
+        lambda _args: (_ for _ in ()).throw(AssertionError("work must not start")),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["work", "route this task", *arguments])
+
+    assert error.value.code == 2
 
 
 def test_claude_graph_planner_disables_tools_without_empty_argv() -> None:
@@ -484,20 +509,8 @@ def test_fixed_routing_uses_the_degenerate_authoritative_graph(
     ("arguments", "message"),
     (
         (
-            ("--routing-mode", "adaptive", "--model", "gpt-5.6-sol"),
-            "--routing-mode cannot be combined with --model",
-        ),
-        (
             ("--routing-mode", "adaptive", "--strategy", "sol"),
             "--routing-mode adaptive rejects --strategy",
-        ),
-        (
-            ("--routing-mode", "adaptive", "--worker", "ollama_cli"),
-            "--routing-mode cannot be combined with --worker",
-        ),
-        (
-            ("--routing-mode", "legacy", "--strategy-set", "codex-all"),
-            "--strategy-set requires fixed or adaptive routing",
         ),
         (
             (

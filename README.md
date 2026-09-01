@@ -97,9 +97,12 @@ print(f'Migrated {source_path} to {destination_path}')
 PY
 ```
 
-Keep the old database until `fleet inspect RUN_ID` succeeds with the new default. Runs from
-older databases remain directly inspectable but appear as `legacy/unassigned` in the new
-repository filter because their repository identity was not previously persisted.
+Keep the old database as a rollback copy until current Graph runs inspect successfully. Older
+declarative v0.1 Graph runs remain inspectable and may appear as `v0.1/unassigned` because their
+repository identity was not previously persisted. Historical standalone v0.2 `WorkRun` rows stay
+in SQLite for audit and migration safety, but they are not top-level runs and cannot be inspected,
+explained, resumed, diffed, logged, promoted, or controlled. Graph-owned child `WorkRun` evidence
+remains available through its parent task drill-down.
 
 The Inspector binds to `127.0.0.1:8765` by default. `AUTO_MERGE_ELIGIBLE` is an
 advisory structured decision; Fleet never invokes Git merge or bypasses required
@@ -120,7 +123,7 @@ mkdir -p /path/to/project/.fleet
 cp examples/project-v2/.fleet/project.yaml /path/to/project/.fleet/project.yaml
 fleet project /path/to/project
 fleet work "Make one small objectively verifiable improvement" \
-  --repo /path/to/project --worker codex_cli --json
+  --repo /path/to/project --json
 ```
 
 The selected CLI must already be installed and authenticated by its own official
@@ -128,16 +131,18 @@ login flow. Fleet does not read or store its credential. Codex is invoked in a
 read-only proposal sandbox; edits are returned as typed unified diffs and applied
 by Fleet only after path and policy checks.
 
-To keep repository context on the local machine, Fleet can use an already-installed
-Ollama model directly. For example:
+To keep repository context on the local machine, Fleet can select an already-installed
+Ollama model through a configured strategy. Define the model on an `ollama_cli` strategy in
+machine-local operator configuration and set `worker.local_backend: true` in the Project
+Harness. The example operator configuration defines `ollama-local`; select it explicitly:
 
 ```bash
 fleet work "Create a reviewed design note" --repo /path/to/project \
-  --worker ollama_cli --model qwen3-coder:30b --json
+  --routing-mode fixed --strategy ollama-local --json
 ```
 
-The named model must already be available in local Ollama; Fleet
-does not implicitly download it.
+The strategy's model must already be available in local Ollama; Fleet does not implicitly
+download it.
 
 Worker executable locations are machine-specific operator configuration, not
 version-controlled Project Harness policy. By default Fleet optionally loads
@@ -150,8 +155,8 @@ used. Operator configuration can replace each exact strategy ID, backend, model,
 effort, capability, and complexity/scale/risk bound. The Project Harness can only
 narrow allowed IDs/backends and must opt into adaptive or local routing. Named
 strategy sets provide reproducible evaluation profiles without duplicating model
-definitions. Explicit worker/model selection remains available through
-`--routing-mode legacy`.
+definitions. Worker, backend, model, and effort selection are strategy-owned; `fleet work`
+exposes no standalone worker/model route.
 
 ```bash
 fleet work "Fix the bug" --repo /path/to/project --routing-mode fixed --strategy codex-luna-max
@@ -162,7 +167,6 @@ fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strat
 fleet work "Fix the bug" --repo /path/to/project --routing-mode adaptive --strategy-set local-only
 fleet work "Fix the bug" --repo /path/to/project --assessment-strategy codex-sol-high
 fleet work "Fix the bug" --repo /path/to/project --planner-strategy codex-sol-high
-fleet work "Fix the bug" --repo /path/to/project --routing-mode legacy --worker codex_cli --model MODEL
 ```
 
 Adaptive routing first obtains a repository-isolated strict-JSON semantic assessment. The
