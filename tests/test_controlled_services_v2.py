@@ -320,6 +320,25 @@ def test_process_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
 
 
+def test_process_timeout_terminates_descendant_after_leader_exit(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.1)
+    request = ProcessRequest(
+        id="process-tree-leader-exited",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", "trap '' TERM; sleep 10 &"),
+        timeout_seconds=0.1,
+        purpose="verify leader-exited process group cleanup",
+    )
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+    assert result.failure is not None
+    assert result.failure.code.value == "TIMEOUT"
+    assert result.exit_code == 0
+    assert result.duration_seconds < 2.0
+    assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
+
+
 def test_process_rejects_policy_budget_before_spawn(tmp_path: Path) -> None:
     store = AtomicArtifactStore(tmp_path / "artifacts")
     executor = LocalProcessExecutor((tmp_path,), store)

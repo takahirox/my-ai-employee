@@ -276,10 +276,11 @@ class LocalProcessExecutor:
         )
 
     def _terminate_group(self, process: subprocess.Popen[bytes]) -> str:
-        if process.poll() is not None:
-            return "already_exited"
+        leader_exited = process.poll() is not None
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGKILL if leader_exited else signal.SIGTERM)
+            if leader_exited:
+                return "sigkill_confirmed"
             process.wait(timeout=self.terminate_grace_seconds)
             return "sigterm_confirmed"
         except subprocess.TimeoutExpired:
@@ -289,11 +290,9 @@ class LocalProcessExecutor:
         except ProcessLookupError:
             return "already_exited"
         except PermissionError:
-            if process.poll() is None:
-                raise _ProcessGroupCleanupError(
-                    "process group cleanup could not be confirmed"
-                ) from None
-            return "already_exited"
+            raise _ProcessGroupCleanupError(
+                "process group cleanup could not be confirmed"
+            ) from None
 
     def _resolve_cwd(self, relative: str) -> Path:
         candidates = tuple((root / relative).resolve() for root in self.roots)
