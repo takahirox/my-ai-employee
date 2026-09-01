@@ -166,8 +166,8 @@ Compatibility is explicit:
 - Old graph runs and direct callers with no review records replay and inspect as
   plan_review.status=not_configured; absence is not retroactively treated as corruption and never
   invokes a reviewer.
-- Legacy CLI and fixed routing continue to build the existing one-node plain Graph and do not run a
-  plan reviewer because no probabilistic ProposedGraph exists.
+- Fixed routing builds the existing one-node plain Graph and does not run a plan reviewer because
+  no probabilistic ProposedGraph exists.
 - Policy routing and hand-authored plain Graph callers retain current deterministic acceptance.
 - Existing direct ProposedGraph callers that omit the optional gate retain current behavior. If
   they opt in, both reviewer and one-revision Planner are required and failures are closed.
@@ -216,7 +216,7 @@ Production implementation is acceptable when deterministic tests prove:
 7. plan-only completes the gate without Workers; resume uses the persisted binding without new AI
    calls; the existing post-execution replan tests keep their revision numbers, evidence fences,
    replan_count, and aggregate budgets.
-8. Legacy and fixed CLI, policy-routed and hand-authored Graph inputs, old databases with no review
+8. Fixed CLI, policy-routed and hand-authored Graph inputs, old graph databases with no review
    records, and direct TaskOrchestrator ProposedGraph callers without the optional gate retain
    current acceptance, replay, and Inspector behavior.
 9. Reviewer output cannot change policy, approvals, routing eligibility, capabilities, budgets,

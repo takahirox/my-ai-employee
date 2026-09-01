@@ -1317,7 +1317,7 @@ def test_coordinator_persists_and_projects_worker_boundary_diagnostic(
     assert view["worker"]["boundary_diagnostics"] == [diagnostics[0].model_dump(mode="json")]
 
 
-def test_legacy_coordinator_accepts_bound_typed_result_with_authoritative_budget(
+def test_work_coordinator_accepts_bound_typed_result_with_authoritative_budget(
     tmp_path: Path,
 ) -> None:
     store = SQLiteStore(tmp_path / "typed.db")
