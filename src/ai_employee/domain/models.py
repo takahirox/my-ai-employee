@@ -123,6 +123,7 @@ class Constraint(EntityModel):
 
 
 class CompletionCriterion(EntityModel):
+    source: Literal["custom", "accepted_non_mutating_result"] = "custom"
     description: str = Field(min_length=1, max_length=2_000)
     mandatory: bool = True
     verification_requirement_ids: tuple[Identifier, ...] = ()

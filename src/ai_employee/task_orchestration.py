@@ -24,6 +24,7 @@ from .domain import (
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
+    GoalTaskKind,
     Graph,
     Node,
     NodeKind,
@@ -691,6 +692,11 @@ def one_node_graph(
     criteria = goal.completion_criteria or (
         CompletionCriterion(
             id=f"criterion-{node_id}",
+            source=(
+                "accepted_non_mutating_result"
+                if goal.task_kind is GoalTaskKind.NON_MUTATING
+                else "custom"
+            ),
             description="the node-bound worker result is accepted",
         ),
     )

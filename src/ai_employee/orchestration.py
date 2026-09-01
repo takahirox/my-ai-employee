@@ -6,6 +6,7 @@ import io
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
+from hashlib import sha256
 from typing import Literal
 
 from pydantic import ConfigDict, Field
@@ -81,6 +82,13 @@ WorkStatus = Literal[
     "failed",
 ]
 WorkActor = Literal["runtime", "worker", "operator", "service"]
+_AcceptedNonMutatingResultSource = tuple[
+    WorkerRequest,
+    WorkerResult,
+    NonMutatingResultAcceptance,
+    ArtifactDescriptor,
+    bytes,
+]
 
 
 def bind_service_decision(
@@ -728,6 +736,9 @@ class WorkCoordinator:
                         "accepted_graph_revision_digest": (request.accepted_graph_revision_digest),
                         "generation": request.generation,
                         "attempt": request.attempt,
+                        "worker_result_id": worker_result.id,
+                        "worker_result_digest": worker_result.content_digest,
+                        "result_id": typed_result.id,
                         "result_digest": typed_result.content_digest,
                     }
                 ),
@@ -1034,10 +1045,12 @@ class WorkCoordinator:
                 self.store.get("artifact_descriptor_v2", artifact_id, ArtifactDescriptor)
                 for artifact_id in output_artifact_ids
             )
+            accepted_non_mutating_result = self._accepted_non_mutating_result_source(run)
             criteria = _declared_criterion_evidence(
                 run.completion_criteria,
                 verification_by_requirement,
                 artifacts,
+                accepted_non_mutating_result=accepted_non_mutating_result,
             )
             ledger = AcceptanceLedger(
                 id=identifier("acceptance-ledger"),
@@ -1051,6 +1064,7 @@ class WorkCoordinator:
                 ledger.criteria,
                 verification_by_requirement,
                 artifacts,
+                accepted_non_mutating_result=accepted_non_mutating_result,
             )
             acceptance_satisfied = _mandatory_acceptance_is_satisfied(
                 run.completion_criteria, ledger.criteria
@@ -1229,6 +1243,50 @@ class WorkCoordinator:
             output_artifact_ids=tuple(output_artifact_ids),
         )
 
+    def _accepted_non_mutating_result_source(
+        self, run: WorkRun
+    ) -> _AcceptedNonMutatingResultSource | None:
+        if run.worker_request_digest is None or run.worker_result_id is None:
+            return None
+        requests = tuple(
+            item
+            for item in self.store.list_records(
+                "worker_request_v2", WorkerRequest, run_id=run.id
+            )
+            if item.content_digest == run.worker_request_digest
+        )
+        results = tuple(
+            item
+            for item in self.store.list_records(
+                "worker_result_v2", WorkerResult, run_id=run.id
+            )
+            if item.id == run.worker_result_id
+        )
+        acceptances = self.store.list_records(
+            "non_mutating_result_acceptance_v2",
+            NonMutatingResultAcceptance,
+            run_id=run.id,
+        )
+        if len(requests) != 1 or len(results) != 1 or len(acceptances) != 1:
+            return None
+        acceptance = acceptances[0]
+        if acceptance.status != "accepted" or acceptance.artifact is None:
+            return None
+        descriptors = tuple(
+            item
+            for item in self.store.list_records(
+                "artifact_descriptor_v2", ArtifactDescriptor, run_id=run.id
+            )
+            if item.id == acceptance.artifact.id
+        )
+        if len(descriptors) != 1 or descriptors[0] != acceptance.artifact:
+            return None
+        try:
+            body = self.artifact_reader(descriptors[0])
+        except (KeyError, OSError, RuntimeError, ValueError):
+            return None
+        return requests[0], results[0], acceptance, descriptors[0], body
+
     def _graph_run_id(self, run: WorkRun) -> str | None:
         requests = tuple(
             item
@@ -1349,6 +1407,8 @@ def _declared_criterion_evidence(
     criteria: tuple[CompletionCriterion, ...],
     verification_by_requirement: Mapping[str, str],
     artifacts: tuple[ArtifactDescriptor, ...],
+    *,
+    accepted_non_mutating_result: _AcceptedNonMutatingResultSource | None = None,
 ) -> tuple[CriterionEvidence, ...]:
     """Map declared criteria only to exact first-party results and artifacts."""
 
@@ -1369,6 +1429,13 @@ def _declared_criterion_evidence(
             )
     result: list[CriterionEvidence] = []
     for criterion in criteria:
+        if criterion.source == "accepted_non_mutating_result":
+            result.append(
+                _accepted_non_mutating_result_criterion_evidence(
+                    criterion, accepted_non_mutating_result
+                )
+            )
+            continue
         refs: list[str] = []
         missing = False
         for requirement_id in criterion.verification_requirement_ids:
@@ -1395,6 +1462,106 @@ def _declared_criterion_evidence(
             )
         )
     return tuple(result)
+
+
+def _accepted_non_mutating_result_criterion_evidence(
+    criterion: CompletionCriterion,
+    accepted: _AcceptedNonMutatingResultSource | None,
+) -> CriterionEvidence:
+    """Resolve only the exact reserved fallback from one canonical accepted result."""
+
+    uncovered = CriterionEvidence(criterion_id=criterion.id, disposition="uncovered")
+    if accepted is None:
+        return uncovered
+    request, worker_result, acceptance, descriptor, body = accepted
+    typed_result = worker_result.non_mutating_result
+    source = descriptor.source
+    request_digest = request.content_digest
+    worker_result_digest = worker_result.content_digest
+    typed_result_digest = None if typed_result is None else typed_result.content_digest
+    acceptance_digest = acceptance.content_digest
+    descriptor_digest = descriptor.content_digest
+    if (
+        request.node_id is None
+        or request.graph_run_id is None
+        or request.accepted_graph_revision_digest is None
+        or criterion.source != "accepted_non_mutating_result"
+        or criterion.id != f"criterion-{request.node_id}"
+        or criterion.description != "the node-bound worker result is accepted"
+        or not criterion.mandatory
+        or criterion.verification_requirement_ids
+        or criterion.required_artifact_ids
+        or request.task_kind.value != "non_mutating"
+        or request_digest is None
+        or worker_result_digest is None
+        or typed_result is None
+        or typed_result_digest is None
+        or acceptance_digest is None
+        or descriptor_digest is None
+        or worker_result.status != "succeeded"
+        or worker_result.run_id != request.run_id
+        or worker_result.request_digest != request_digest
+        or typed_result.run_id != request.run_id
+        or typed_result.graph_run_id != request.graph_run_id
+        or typed_result.worker_request_digest != request_digest
+        or typed_result.node_id != request.node_id
+        or typed_result.accepted_graph_revision_digest
+        != request.accepted_graph_revision_digest
+        or typed_result.generation != request.generation
+        or typed_result.attempt != request.attempt
+        or acceptance.status != "accepted"
+        or acceptance.run_id != request.run_id
+        or acceptance.graph_run_id != request.graph_run_id
+        or acceptance.node_id != request.node_id
+        or acceptance.accepted_graph_revision_digest
+        != request.accepted_graph_revision_digest
+        or acceptance.generation != request.generation
+        or acceptance.attempt != request.attempt
+        or acceptance.worker_request_digest != request_digest
+        or acceptance.worker_result_id != worker_result.id
+        or acceptance.worker_result_digest != worker_result_digest
+        or acceptance.result_id != typed_result.id
+        or acceptance.result_digest != typed_result_digest
+        or acceptance.artifact != descriptor
+        or descriptor.run_id != request.run_id
+        or descriptor.producer_action_id != worker_result.id
+        or descriptor.logical_kind != typed_result.logical_kind
+        or descriptor.media_type != typed_result.media_type
+        or descriptor.redaction_state != "none"
+        or descriptor.size_bytes != len(body)
+        or sha256(body).hexdigest() != descriptor.artifact_digest
+        or body != canonical_json(typed_result).encode("utf-8")
+        or not isinstance(source, Mapping)
+        or set(source) != {
+            "graph_run_id",
+            "worker_request_digest",
+            "node_id",
+            "accepted_graph_revision_digest",
+            "generation",
+            "attempt",
+            "worker_result_id",
+            "worker_result_digest",
+            "result_id",
+            "result_digest",
+        }
+        or source.get("graph_run_id") != request.graph_run_id
+        or source.get("worker_request_digest") != request_digest
+        or source.get("node_id") != request.node_id
+        or source.get("accepted_graph_revision_digest")
+        != request.accepted_graph_revision_digest
+        or source.get("generation") != request.generation
+        or source.get("attempt") != request.attempt
+        or source.get("worker_result_id") != worker_result.id
+        or source.get("worker_result_digest") != worker_result_digest
+        or source.get("result_id") != typed_result.id
+        or source.get("result_digest") != typed_result_digest
+    ):
+        return uncovered
+    return CriterionEvidence(
+        criterion_id=criterion.id,
+        disposition="satisfied",
+        evidence_refs=(acceptance_digest, descriptor_digest, descriptor.artifact_digest),
+    )
 
 
 def _uncovered_criterion_evidence(
@@ -1538,53 +1705,15 @@ def _acceptance_evidence_is_authoritative(
     evidence: tuple[CriterionEvidence, ...],
     verification_by_requirement: Mapping[str, str],
     artifacts: tuple[ArtifactDescriptor, ...],
+    *,
+    accepted_non_mutating_result: _AcceptedNonMutatingResultSource | None = None,
 ) -> bool:
-    if tuple(item.criterion_id for item in evidence) != tuple(item.id for item in criteria):
-        return False
-    if len({item.criterion_id for item in evidence}) != len(evidence):
-        return False
-    artifact_by_id = {item.id: item for item in artifacts}
-    artifact_by_kind: dict[str, list[ArtifactDescriptor]] = {}
-    for artifact in artifacts:
-        artifact_by_kind.setdefault(artifact.logical_kind, []).append(artifact)
-    authoritative_refs = {
-        *(digest for digest in verification_by_requirement.values() if digest),
-        *(item.content_digest for item in artifacts if item.content_digest is not None),
-        *(item.artifact_digest for item in artifacts),
-    }
-    criteria_by_id = {item.id: item for item in criteria}
-    for item in evidence:
-        refs = set(item.evidence_refs)
-        if not refs <= authoritative_refs:
-            return False
-        if item.disposition != "satisfied":
-            continue
-        criterion = criteria_by_id[item.criterion_id]
-        if not item.evidence_refs:
-            return False
-        for requirement_id in criterion.verification_requirement_ids:
-            digest = verification_by_requirement.get(requirement_id)
-            if not digest or digest not in refs:
-                return False
-        for required in criterion.required_artifact_ids:
-            matches = (
-                (artifact_by_id[required],)
-                if required in artifact_by_id
-                else tuple(artifact_by_kind.get(required, ()))
-            )
-            if len(matches) != 1:
-                return False
-            descriptor = matches[0]
-            if (
-                descriptor.content_digest is None
-                or not {
-                    descriptor.content_digest,
-                    descriptor.artifact_digest,
-                }
-                <= refs
-            ):
-                return False
-    return True
+    return evidence == _declared_criterion_evidence(
+        criteria,
+        verification_by_requirement,
+        artifacts,
+        accepted_non_mutating_result=accepted_non_mutating_result,
+    )
 
 
 def _mandatory_acceptance_is_satisfied(

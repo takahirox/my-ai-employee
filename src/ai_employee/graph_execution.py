@@ -38,6 +38,7 @@ from .orchestration import (
     WorkCoordinator,
     WorkRun,
     _acceptance_evidence_is_authoritative,
+    _AcceptedNonMutatingResultSource,
     _authoritative_node_verification_results,
     _mandatory_acceptance_is_satisfied,
     _node_verification_configuration_is_valid,
@@ -876,11 +877,18 @@ def _authoritative_node_result(
         for digest in (result.stdout_artifact_digest, result.stderr_artifact_digest)
         if digest is not None
     }
+    accepted_non_mutating_result: _AcceptedNonMutatingResultSource | None = None
     if result_acceptance is not None:
         assert typed_result is not None
-        accepted_artifact = result_acceptance.artifact
-        if accepted_artifact is None or accepted_artifact not in descriptors:
-            raise ValueError("accepted typed-result artifact is absent or stale")
+        acceptance_artifact = result_acceptance.artifact
+        matches = tuple(
+            item
+            for item in descriptors
+            if acceptance_artifact is not None and item.id == acceptance_artifact.id
+        )
+        if len(matches) != 1 or matches[0] != acceptance_artifact:
+            raise ValueError("accepted typed-result artifact is absent, duplicate, or stale")
+        accepted_artifact = matches[0]
         body = coordinator.artifact_reader(accepted_artifact)
         expected_body = canonical_json(typed_result).encode("utf-8")
         source = accepted_artifact.source
@@ -892,7 +900,20 @@ def _authoritative_node_result(
             or accepted_artifact.producer_action_id != worker_result.id
             or accepted_artifact.logical_kind != typed_result.logical_kind
             or accepted_artifact.media_type != typed_result.media_type
+            or accepted_artifact.redaction_state != "none"
             or not isinstance(source, Mapping)
+            or set(source) != {
+                "graph_run_id",
+                "worker_request_digest",
+                "node_id",
+                "accepted_graph_revision_digest",
+                "generation",
+                "attempt",
+                "worker_result_id",
+                "worker_result_digest",
+                "result_id",
+                "result_digest",
+            }
             or source.get("graph_run_id") != request.graph_run_id
             or source.get("worker_request_digest") != request.content_digest
             or source.get("node_id") != node.id
@@ -900,9 +921,19 @@ def _authoritative_node_result(
             != request.accepted_graph_revision_digest
             or source.get("generation") != request.generation
             or source.get("attempt") != request.attempt
+            or source.get("worker_result_id") != worker_result.id
+            or source.get("worker_result_digest") != worker_result.content_digest
+            or source.get("result_id") != typed_result.id
             or source.get("result_digest") != typed_result.content_digest
         ):
             raise ValueError("accepted typed-result artifact is not canonical")
+        accepted_non_mutating_result = (
+            request,
+            worker_result,
+            result_acceptance,
+            accepted_artifact,
+            body,
+        )
         produced_digests.add(accepted_artifact.artifact_digest)
     if not writing:
         if run.patch_artifact_id is not None or not descriptors:
@@ -974,6 +1005,7 @@ def _authoritative_node_result(
     authoritative_refs = {
         *verification_digests,
         run.review_digest,
+        None if result_acceptance is None else result_acceptance.content_digest,
         *(item.content_digest for item in descriptors),
         *(item.artifact_digest for item in descriptors),
     }
@@ -988,6 +1020,7 @@ def _authoritative_node_result(
         ledger.criteria,
         verification_by_requirement,
         descriptors,
+        accepted_non_mutating_result=accepted_non_mutating_result,
     ):
         return NodeExecutionResult(
             worker_result=worker_result,

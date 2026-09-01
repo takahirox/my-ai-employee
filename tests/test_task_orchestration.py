@@ -153,6 +153,16 @@ def test_fixed_compatibility_graph_preserves_non_mutating_contract_and_budget() 
         for item in graph.nodes[0].completion_criteria
     )
 
+    fallback_graph = one_node_graph(
+        goal.model_copy(update={"completion_criteria": ()}),
+        graph_id="fallback-non-mutating-graph",
+        node_id="fallback-diagnosis-node",
+    )
+    fallback = fallback_graph.nodes[0].completion_criteria[0]
+    assert fallback.id == "criterion-fallback-diagnosis-node"
+    assert fallback.source == "accepted_non_mutating_result"
+    assert fallback.description == "the node-bound worker result is accepted"
+
 
 def _criterion(name: str) -> CompletionCriterion:
     return CompletionCriterion(id=f"criterion-{name}", description=f"{name} is complete")

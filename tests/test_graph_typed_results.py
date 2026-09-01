@@ -34,7 +34,10 @@ from ai_employee.domain.v2 import (
 )
 from ai_employee.graph_execution import GraphExecutionService
 from ai_employee.inspector import inspect_graph_run
-from ai_employee.orchestration import WorkCoordinator
+from ai_employee.orchestration import (
+    WorkCoordinator,
+    _accepted_non_mutating_result_criterion_evidence,
+)
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
@@ -146,6 +149,7 @@ def _execute(
     mode: str = "accepted",
     artifact_bytes: int = 100_000,
     external_evidence_required: bool = False,
+    fallback_criterion: bool = True,
 ):
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -215,11 +219,13 @@ def _execute(
             completion_criteria=(
                 CompletionCriterion(
                     id=f"criterion-{node_id}",
-                    description=f"accept the exact {kind}",
+                    source=(
+                        "accepted_non_mutating_result" if fallback_criterion else "custom"
+                    ),
+                    description="the node-bound worker result is accepted",
                     verification_requirement_ids=(
                         ("external-evidence",) if external_evidence_required else ()
                     ),
-                    required_artifact_ids=(kind,),
                 ),
             ),
         )
@@ -345,8 +351,16 @@ def test_two_node_typed_result_flow_is_authoritative_non_mutating_and_replayable
         subprocess.check_output(("git", "-C", str(repository), "status", "--porcelain"), text=True)
         == ""
     )
+    evidence_by_node = {item.node_id: item for item in replay.evidence}
+    acceptance_by_node = {item.node_id: item for item in replay.result_acceptances}
     for record in replay.nodes:
         descriptor = record.artifact_descriptors[0]
+        acceptance = acceptance_by_node[record.node_id]
+        assert evidence_by_node[record.node_id].criteria[0].evidence_refs == (
+            acceptance.content_digest,
+            descriptor.content_digest,
+            descriptor.artifact_digest,
+        )
         body = artifacts.open_verified(descriptor).read().decode("utf-8")
         assert (
             canonical_json(
@@ -400,11 +414,19 @@ def test_typed_result_binding_and_security_fail_closed(
     )
 
 
-def test_external_evidence_criterion_remains_uncovered_without_authority(
+@pytest.mark.parametrize(
+    ("fallback_criterion", "external_evidence_required"),
+    [(False, False), (True, True)],
+)
+def test_custom_and_external_criteria_remain_uncovered_without_authority(
     tmp_path: Path,
+    fallback_criterion: bool,
+    external_evidence_required: bool,
 ) -> None:
     _repository, _artifacts, run, replay, _second, inspected, *_rest = _execute(
-        tmp_path, external_evidence_required=True
+        tmp_path,
+        fallback_criterion=fallback_criterion,
+        external_evidence_required=external_evidence_required,
     )
 
     assert run.status == "failed"
@@ -414,6 +436,67 @@ def test_external_evidence_criterion_remains_uncovered_without_authority(
     assert inspected["worker_results"][0]["status"] == "succeeded"
     assert inspected["typed_result_acceptances"][0]["status"] == "accepted"
     assert inspected["nodes"][0]["status"] == "failed"
+
+
+def test_reserved_fallback_rejects_noncanonical_accepted_result_metadata(
+    tmp_path: Path,
+) -> None:
+    _repository, artifacts, _run, replay, _second, _inspected, requests, *_rest = (
+        _execute(tmp_path)
+    )
+    request = requests["diagnose"]
+    worker_result = next(
+        item for item in replay.results if item.id == replay.nodes[0].worker_result_id
+    )
+    acceptance = next(
+        item for item in replay.result_acceptances if item.node_id == "diagnose"
+    )
+    descriptor = replay.nodes[0].artifact_descriptors[0]
+    body = artifacts.open_verified(descriptor).read()
+    criterion = CompletionCriterion(
+        id="criterion-diagnose",
+        source="accepted_non_mutating_result",
+        description="the node-bound worker result is accepted",
+    )
+
+    accepted = (request, worker_result, acceptance, descriptor, body)
+    evidence = _accepted_non_mutating_result_criterion_evidence(criterion, accepted)
+    assert evidence.disposition == "satisfied"
+    assert evidence.evidence_refs == (
+        acceptance.content_digest,
+        descriptor.content_digest,
+        descriptor.artifact_digest,
+    )
+
+    extra_source = descriptor.model_copy(
+        update={"source": {**descriptor.source, "unexpected": "not-canonical"}}
+    )
+    redacted = descriptor.model_copy(update={"redaction_state": "redacted"})
+    stale_acceptance = acceptance.model_copy(update={"generation": 1})
+    rejected_acceptance = acceptance.model_copy(update={"status": "rejected"})
+    tampered_sources = (
+        (
+            request,
+            worker_result,
+            acceptance.model_copy(update={"artifact": extra_source}),
+            extra_source,
+            body,
+        ),
+        (
+            request,
+            worker_result,
+            acceptance.model_copy(update={"artifact": redacted}),
+            redacted,
+            body,
+        ),
+        (request, worker_result, stale_acceptance, descriptor, body),
+        (request, worker_result, rejected_acceptance, descriptor, body),
+        (request, worker_result, acceptance, descriptor, body + b"tampered"),
+    )
+    for source in tampered_sources:
+        rejected = _accepted_non_mutating_result_criterion_evidence(criterion, source)
+        assert rejected.disposition == "uncovered"
+        assert rejected.evidence_refs == ()
 
 
 def test_typed_result_oversize_and_malformed_have_specific_codes(tmp_path: Path) -> None:
