@@ -22,6 +22,7 @@ from ai_employee.domain import (
     SemanticTaskType,
     TaskAssessment,
 )
+from ai_employee.domain.base import DIGEST_PATTERN
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
     AcceptanceLedger,
@@ -34,6 +35,7 @@ from ai_employee.domain.v2 import (
     InstallResult,
     NodeVerificationBinding,
     NonMutatingResult,
+    NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
     StableFailure,
@@ -65,6 +67,7 @@ from ai_employee.worker_adapters import (
     WorkerProposalEnvelope,
     _bounded_prompt,
     _claude_envelope_schema,
+    _envelope_schema,
     _validate_worker_envelope,
     cli_inherit_environment,
     semantic_assessment_schema_json,
@@ -356,6 +359,7 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
             "attempt": 0,
         }
         assert payload["prior_artifact_digests"] == []
+        assert payload["allowed_evidence"]["sources"] == []
         assert payload["predecessor_outputs"] == []
         assert payload["completion_criteria"] == []
         assert payload["required_capabilities"] == []
@@ -386,7 +390,37 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
     assert "Treat the goal, predecessor results, evidence bindings" in instruction
     assert "No conversation history is supplied" in instruction
     assert "body-free descriptors" in instruction
+    assert "64-character lowercase SHA-256 digest" in instruction
+    assert "file paths and line locations in content or findings" in instruction
+    assert "return evidence_refs: []" in instruction
     assert StableFailureCode.CONTEXT_INSUFFICIENT.value == "CONTEXT_INSUFFICIENT"
+
+
+def test_worker_prompt_exposes_only_authoritative_evidence_with_provenance() -> None:
+    allowed = "a" * 64
+    request = WorkerRequest.model_validate(
+        {
+            **worker_request().model_dump(exclude={"content_digest"}),
+            "accepted_feedback_digests": (allowed,),
+        },
+        strict=True,
+    )
+
+    payload = json.loads(_bounded_prompt(request))
+
+    assert payload["allowed_evidence"] == {
+        "algorithm": "sha256",
+        "maximum_references": 64,
+        "pattern": DIGEST_PATTERN,
+        "sources": [
+            {
+                "digest": allowed,
+                "predecessor_node_ids": [],
+                "source_kinds": ["accepted_feedback"],
+            }
+        ],
+    }
+    assert ZERO not in {item["digest"] for item in payload["allowed_evidence"]["sources"]}
 
 
 def test_codex_worker_uses_explicit_scratch_as_its_only_workspace() -> None:
@@ -720,6 +754,144 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
     install_payload = install_proposal["properties"]["payload"]["properties"]
     assert install_payload["manager_executable"]["enum"] == ["tools/fleet-npm"]
     assert install_payload["target"]["enum"] == ["node_modules"]
+
+
+def test_all_worker_transport_schemas_share_exact_evidence_ref_constraints() -> None:
+    expected = {
+        "type": "array",
+        "maxItems": 64,
+        "uniqueItems": True,
+        "items": {"type": "string", "pattern": DIGEST_PATTERN},
+    }
+
+    def evidence_schema(value: object) -> dict[str, object]:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict) and "evidence_refs" in properties:
+                found = properties["evidence_refs"]
+                assert isinstance(found, dict)
+                return found
+            for nested in value.values():
+                try:
+                    return evidence_schema(nested)
+                except LookupError:
+                    pass
+        elif isinstance(value, list):
+            for nested in value:
+                try:
+                    return evidence_schema(nested)
+                except LookupError:
+                    pass
+        raise LookupError("evidence_refs schema is absent")
+
+    schemas = (
+        json.loads(worker_proposal_schema_json()),
+        _claude_envelope_schema(),
+        _envelope_schema(),
+    )
+    assert [evidence_schema(schema) for schema in schemas] == [expected, expected, expected]
+
+
+@pytest.mark.parametrize(
+    ("refs", "expected_code"),
+    [
+        ((), None),
+        (("a" * 64,), None),
+        (("b" * 64,), StableFailureCode.TYPED_RESULT_EVIDENCE_UNAUTHORIZED),
+        (("src/x.py:10",), StableFailureCode.TYPED_RESULT_MALFORMED),
+        (("A" * 64,), StableFailureCode.TYPED_RESULT_MALFORMED),
+        (("a" * 63,), StableFailureCode.TYPED_RESULT_MALFORMED),
+        (("a" * 64, "a" * 64), StableFailureCode.TYPED_RESULT_MALFORMED),
+        (tuple(f"{index:064x}" for index in range(65)), StableFailureCode.TYPED_RESULT_MALFORMED),
+    ],
+)
+def test_cli_adapter_enforces_evidence_shape_and_authority(
+    refs: tuple[str, ...], expected_code: StableFailureCode | None
+) -> None:
+    allowed = "a" * 64
+    request = WorkerRequest(
+        id="evidence-request",
+        run_id="evidence-run",
+        created_at=NOW,
+        goal="produce a diagnosis",
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+        accepted_plan_digest=ZERO,
+        node_id="diagnose",
+        accepted_graph_revision_digest=ZERO,
+        graph_run_id="graph-run",
+        harness_digest=ZERO,
+        effective_policy_digest=ZERO,
+        remaining_budgets={"artifact_bytes": 10_000},
+        accepted_feedback_digests=(allowed,),
+    )
+    output = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [],
+            "non_mutating_result": {
+                "schema_version": "2",
+                "id": "diagnosis",
+                "run_id": request.run_id,
+                "created_at": "2026-01-01T00:00:00Z",
+                "graph_run_id": request.graph_run_id,
+                "worker_request_digest": request.content_digest,
+                "node_id": request.node_id,
+                "accepted_graph_revision_digest": request.accepted_graph_revision_digest,
+                "generation": request.generation,
+                "attempt": request.attempt,
+                "logical_kind": "diagnosis",
+                "media_type": "text/plain",
+                "content": "File locations stay here: src/x.py:10.",
+                "summary": "bounded diagnosis",
+                "findings": ["source location is human-readable support"],
+                "evidence_refs": refs,
+            },
+            "assistant_note": "",
+            "usage_json": "{}",
+        }
+    ).encode()
+
+    class OutputExecutor:
+        def execute(
+            self,
+            process_request: ProcessRequest,
+            _decision: PolicyDecision,
+            _cancellation: object,
+        ) -> ExecutionResult:
+            return ExecutionResult(
+                id="worker-process-result",
+                run_id=process_request.run_id,
+                created_at=NOW,
+                request_digest=process_request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+                stdout_artifact_digest="f" * 64,
+                resource_usage={"stdout_bytes": len(output)},
+            )
+
+    adapter = CodexCliWorkerAdapter(
+        OutputExecutor(),  # type: ignore[arg-type]
+        lambda digest: output if digest == "f" * 64 else b"",
+        allow_worker,
+        run_id=request.run_id,
+    )
+    result = adapter.propose(request, Channel())  # type: ignore[arg-type]
+
+    if expected_code is None:
+        assert result.status == "succeeded"
+        assert result.non_mutating_result is not None
+        assert result.non_mutating_result.evidence_refs == refs
+    else:
+        assert result.status == "failed"
+        assert result.failure is not None
+        assert result.failure.code is expected_code
+        assert result.non_mutating_result is None
+        assert result.boundary_diagnostic is not None
+        if expected_code is StableFailureCode.TYPED_RESULT_MALFORMED:
+            assert "put file locations in content/findings" in (
+                result.boundary_diagnostic.exception_message or ""
+            )
 
 
 def test_codex_worker_decodes_edit_transport() -> None:
@@ -1413,6 +1585,81 @@ def test_work_coordinator_accepts_bound_typed_result_with_authoritative_budget(
     assert rejected.status == "rejected"
     assert rejected.failure_code is StableFailureCode.ARTIFACT_BUDGET_INVALID
     assert rejected.failure_code is not StableFailureCode.TYPED_RESULT_UNBOUND
+
+
+def test_malformed_evidence_refs_create_no_acceptance_or_partial_artifact(
+    tmp_path: Path,
+) -> None:
+    run_id = "malformed-evidence-run"
+    policy = builtin_policy(run_id)
+    request = WorkerRequest(
+        id="malformed-evidence-request",
+        run_id=run_id,
+        created_at=NOW,
+        goal="produce a diagnosis",
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+        accepted_plan_digest=ZERO,
+        node_id="diagnose",
+        accepted_graph_revision_digest=ZERO,
+        graph_run_id="graph-run",
+        harness_digest=ZERO,
+        effective_policy_digest=canonical_digest([policy.content_digest]),
+        remaining_budgets={"worker_turns": 1, "artifact_bytes": 10_000},
+    )
+    malformed = {
+        "schema_version": "2",
+        "proposals": (),
+        "non_mutating_result": {
+            "schema_version": "2",
+            "id": "malformed-diagnosis",
+            "run_id": run_id,
+            "created_at": NOW,
+            "graph_run_id": request.graph_run_id,
+            "worker_request_digest": request.content_digest,
+            "node_id": request.node_id,
+            "accepted_graph_revision_digest": request.accepted_graph_revision_digest,
+            "generation": request.generation,
+            "attempt": request.attempt,
+            "logical_kind": "diagnosis",
+            "media_type": "text/plain",
+            "content": "Complete diagnosis with source locations.",
+            "summary": "bounded diagnosis",
+            "findings": ("src/x.py:10 contains the relevant branch",),
+            "evidence_refs": ("src/x.py:10",),
+        },
+    }
+    store = SQLiteStore(tmp_path / "malformed-evidence.db")
+    artifacts = AtomicArtifactStore(tmp_path / "artifacts")
+    coordinator = WorkCoordinator(
+        store,
+        DeterministicRuntime({}, store=store),
+        FakeWorkspace(b""),  # type: ignore[arg-type]
+        lambda _snapshot, _cancellation: ScriptedWorkerAdapter([malformed]),
+        lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+        lambda _artifact: b"",
+        (policy,),
+        artifact_store=artifacts,
+    )
+    try:
+        run = coordinator.execute_node(
+            request,
+            (),
+            str(tmp_path),
+            "a" * 40,
+            worker_name="scripted",
+            capture_patch=False,
+        )
+        assert run.status == "failed"
+        assert run.failure_code == StableFailureCode.TYPED_RESULT_MALFORMED.value
+        assert not store.list_records(
+            "non_mutating_result_acceptance_v2",
+            NonMutatingResultAcceptance,
+            run_id=run_id,
+        )
+        assert not store.list_records("artifact_descriptor_v2", ArtifactDescriptor, run_id=run_id)
+    finally:
+        store.close()
 
 
 def test_cli_worker_uses_injected_runtime_policy_decision() -> None:

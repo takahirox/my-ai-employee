@@ -12,7 +12,7 @@ from typing import ClassVar, Literal
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
-from .domain.base import Digest, freeze_json
+from .domain.base import DIGEST_PATTERN, Digest, freeze_json
 from .domain.models import ExecutionStrategy, SemanticTaskProfile, TaskAssessment
 from .domain.services_v2 import Cancellation, MediatedActionChannel, ProcessExecutor
 from .domain.v2 import (
@@ -28,6 +28,7 @@ from .domain.v2 import (
     WorkerBoundaryDiagnostic,
     WorkerRequest,
     WorkerResult,
+    authoritative_worker_evidence_digests,
 )
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_json
@@ -341,6 +342,7 @@ class CliWorkerAdapter:
                 error=ValueError("worker output is empty"),
             )
         typed_result_supplied = False
+        decoded_payload: object = None
         try:
             payload = self._extract_payload(output)
             decoded_payload = json.loads(payload)
@@ -362,6 +364,7 @@ class CliWorkerAdapter:
                 error=error,
             )
         except (KeyError, TypeError, ValueError) as error:
+            evidence_error = _evidence_ref_shape_error(decoded_payload)
             return _worker_failure(
                 request,
                 started,
@@ -383,8 +386,26 @@ class CliWorkerAdapter:
                     else "WORKER_ENVELOPE_MALFORMED"
                 ),
                 invocation=invocation,
-                error=error,
+                error=evidence_error or error,
             )
+        typed_result = envelope.non_mutating_result
+        if typed_result is not None:
+            allowed = set(authoritative_worker_evidence_digests(request))
+            unauthorized = tuple(
+                digest for digest in typed_result.evidence_refs if digest not in allowed
+            )
+            if unauthorized:
+                return _worker_failure(
+                    request,
+                    started,
+                    StableFailureCode.TYPED_RESULT_EVIDENCE_UNAUTHORIZED,
+                    "non-mutating result cites evidence outside the supplied authority set",
+                    adapter=self.adapter,
+                    stage="typed_result",
+                    diagnostic_code=(StableFailureCode.TYPED_RESULT_EVIDENCE_UNAUTHORIZED.value),
+                    invocation=invocation,
+                    error=_unauthorized_evidence_error(unauthorized),
+                )
         for proposal in envelope.proposals:
             mediated_channel.submit(proposal)
         return WorkerResult(
@@ -761,6 +782,7 @@ def _bounded_prompt(
     include_response_schema: bool = False,
     codex_edit_transport: bool = False,
 ) -> bytes:
+    evidence_sources = _worker_evidence_sources(request)
     payload: dict[str, object] = {
         "protocol": "fleet-worker-proposal/2",
         "run_id": request.run_id,
@@ -783,6 +805,12 @@ def _bounded_prompt(
         "prior_artifact_digests": request.prior_artifact_digests,
         "predecessor_outputs": request.predecessor_outputs,
         "accepted_feedback_digests": request.accepted_feedback_digests,
+        "allowed_evidence": {
+            "algorithm": "sha256",
+            "pattern": DIGEST_PATTERN,
+            "maximum_references": 64,
+            "sources": evidence_sources,
+        },
         "non_mutating_result_binding": {
             "run_id": request.run_id,
             "graph_run_id": request.graph_run_id,
@@ -826,7 +854,13 @@ def _bounded_prompt(
             "read-only paths and remain within the supplied budgets. Every proposal and nested "
             "request must use the supplied run_id. For a "
             "non-mutating diagnosis or research task, return non_mutating_result with the exact "
-            "supplied non_mutating_result_binding values and keep proposals empty; assistant_note "
+            "supplied non_mutating_result_binding values and keep proposals empty. The "
+            "non_mutating_result.evidence_refs array may contain only digest values listed in "
+            "allowed_evidence.sources; each value is a 64-character lowercase SHA-256 digest. "
+            "Put human-readable file paths and line locations in content or findings, never in "
+            "evidence_refs. If allowed_evidence.sources is empty, return evidence_refs: []. Do "
+            "not use request, graph, Harness, or policy binding digests as factual evidence. "
+            "assistant_note "
             "is commentary and never authoritative task evidence."
         ),
     }
@@ -859,6 +893,53 @@ def _bounded_prompt(
     return value
 
 
+def _worker_evidence_sources(request: WorkerRequest) -> tuple[dict[str, object], ...]:
+    provenance: dict[str, set[str]] = {}
+    predecessor_nodes: dict[str, set[str]] = {}
+
+    def add(digest: str | None, kind: str, node_id: str | None = None) -> None:
+        if digest is None:
+            return
+        provenance.setdefault(digest, set()).add(kind)
+        if node_id is not None:
+            predecessor_nodes.setdefault(digest, set()).add(node_id)
+
+    for digest in request.prior_result_digests:
+        add(digest, "predecessor_worker_result")
+    for digest in request.prior_artifact_digests:
+        add(digest, "predecessor_artifact")
+    for digest in request.accepted_feedback_digests:
+        add(digest, "accepted_feedback")
+    for predecessor in request.predecessor_outputs:
+        node_id = predecessor.node_id
+        add(predecessor.worker_result_digest, "predecessor_worker_result", node_id)
+        add(predecessor.evaluator_digest, "predecessor_evaluation", node_id)
+        add(predecessor.result_acceptance_digest, "predecessor_result_acceptance", node_id)
+        typed_result = predecessor.non_mutating_result
+        add(
+            None if typed_result is None else typed_result.content_digest,
+            "predecessor_typed_result",
+            node_id,
+        )
+        if typed_result is not None:
+            for digest in typed_result.evidence_refs:
+                add(digest, "predecessor_cited_evidence", node_id)
+        for artifact in predecessor.artifact_descriptors:
+            add(artifact.descriptor_digest, "predecessor_artifact_descriptor", node_id)
+            add(artifact.artifact_digest, "predecessor_artifact", node_id)
+    allowed = authoritative_worker_evidence_digests(request)
+    if set(provenance) != set(allowed):
+        raise ValueError("worker evidence provenance is incomplete")
+    return tuple(
+        {
+            "digest": digest,
+            "source_kinds": tuple(sorted(provenance[digest])),
+            "predecessor_node_ids": tuple(sorted(predecessor_nodes.get(digest, ()))),
+        }
+        for digest in allowed
+    )
+
+
 def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
     """Validate proposals after replacing worker-claimed digests with local computation."""
 
@@ -883,8 +964,60 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
     return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
 
 
+def _evidence_ref_shape_error(payload: object) -> ValueError | None:
+    if not isinstance(payload, dict):
+        return None
+    typed_result = payload.get("non_mutating_result")
+    if not isinstance(typed_result, dict):
+        return None
+    refs = typed_result.get("evidence_refs")
+    if not isinstance(refs, list):
+        return None
+    invalid = tuple(
+        str(item)[:80]
+        for item in refs
+        if not isinstance(item, str) or re.fullmatch(DIGEST_PATTERN, item) is None
+    )
+    duplicate_count = len(refs) - len({json.dumps(item, sort_keys=True) for item in refs})
+    excess_count = max(0, len(refs) - 64)
+    if not invalid and not duplicate_count and not excess_count:
+        return None
+    return ValueError(
+        "evidence_refs requires supplied SHA-256 digests; put file locations in "
+        f"content/findings; invalid_count={len(invalid)}; duplicate_count={duplicate_count}; "
+        f"excess_count={excess_count}; sample={invalid[:3]!r}"
+    )
+
+
+def _unauthorized_evidence_error(unauthorized: tuple[str, ...]) -> ValueError:
+    return ValueError(
+        "evidence_refs requires supplied SHA-256 digests; put file locations in "
+        f"content/findings; unauthorized_count={len(unauthorized)}; "
+        f"sample={unauthorized[:3]!r}"
+    )
+
+
 def _envelope_schema() -> dict[str, object]:
-    return WorkerProposalEnvelope.model_json_schema()
+    schema = WorkerProposalEnvelope.model_json_schema()
+    _constrain_evidence_ref_schemas(schema)
+    return schema
+
+
+def _constrain_evidence_ref_schemas(value: object) -> None:
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict) and "evidence_refs" in properties:
+            properties["evidence_refs"] = {
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": True,
+                "items": {"type": "string", "pattern": DIGEST_PATTERN},
+            }
+        for nested in value.values():
+            _constrain_evidence_ref_schemas(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _constrain_evidence_ref_schemas(nested)
 
 
 def _claude_envelope_schema() -> dict[str, object]:
@@ -1148,7 +1281,8 @@ def worker_proposal_schema_json() -> bytes:
             "evidence_refs": {
                 "type": "array",
                 "maxItems": 64,
-                "items": {"type": "string"},
+                "uniqueItems": True,
+                "items": {"type": "string", "pattern": DIGEST_PATTERN},
             },
         },
         "required": [

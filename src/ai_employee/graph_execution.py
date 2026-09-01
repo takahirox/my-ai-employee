@@ -20,6 +20,7 @@ from .domain.v2 import (
     ArtifactDescriptor,
     DecisionOutcome,
     ExecutionResult,
+    NodeVerificationBinding,
     NonMutatingResultAcceptance,
     PolicyDecision,
     StableFailureCode,
@@ -792,43 +793,66 @@ def _authoritative_node_result(
             result_acceptance=result_acceptance,
             failure_code=StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
         )
-    binding_configuration_valid = _node_verification_configuration_is_valid(
-        run.id,
-        node.completion_criteria,
-        coordinator.verification_requests,
-        coordinator.verification_bindings,
-    ) and _persisted_node_verification_configuration_is_valid(
-        store,
-        run.id,
-        node.completion_criteria,
-        coordinator.verification_requests,
-        coordinator.verification_bindings,
-    )
-    if not binding_configuration_valid:
-        return NodeExecutionResult(
-            worker_result=worker_result,
-            criterion_evidence=(),
-            workspace_id=run.workspace_id,
-            result_acceptance=result_acceptance,
-            failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+    if writing:
+        binding_configuration_valid = _node_verification_configuration_is_valid(
+            run.id,
+            node.completion_criteria,
+            coordinator.verification_requests,
+            coordinator.verification_bindings,
+        ) and _persisted_node_verification_configuration_is_valid(
+            store,
+            run.id,
+            node.completion_criteria,
+            coordinator.verification_requests,
+            coordinator.verification_bindings,
         )
-    if run.failure_code == StableFailureCode.VERIFICATION_BINDING_INVALID.value:
-        raise ValueError("valid node verification was classified as an invalid binding")
-    authoritative_verification_results = _authoritative_node_verification_results(
-        store,
-        run,
-        node.completion_criteria,
-        coordinator.verification_requests,
-        coordinator.verification_bindings,
-    )
-    if authoritative_verification_results is None:
-        return NodeExecutionResult(
-            worker_result=worker_result,
-            criterion_evidence=(),
-            workspace_id=run.workspace_id,
-            result_acceptance=result_acceptance,
-            failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+        if not binding_configuration_valid:
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=run.workspace_id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+            )
+        if run.failure_code == StableFailureCode.VERIFICATION_BINDING_INVALID.value:
+            raise ValueError("valid node verification was classified as an invalid binding")
+        authoritative_verification_results = _authoritative_node_verification_results(
+            store,
+            run,
+            node.completion_criteria,
+            coordinator.verification_requests,
+            coordinator.verification_bindings,
         )
+        if authoritative_verification_results is None:
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=run.workspace_id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+            )
+    else:
+        persisted_verification = store.list_records(
+            "verification_result_v2", ExecutionResult, run_id=run.id
+        )
+        persisted_bindings = store.list_records(
+            "node_verification_binding_v2", NodeVerificationBinding, run_id=run.id
+        )
+        if (
+            coordinator.verification_requests
+            or coordinator.verification_bindings
+            or persisted_verification
+            or persisted_bindings
+            or run.verification_result_digests
+        ):
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=run.workspace_id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+            )
+        authoritative_verification_results = ()
     repairable_verification_failure = (
         writing
         and run.status == "failed"

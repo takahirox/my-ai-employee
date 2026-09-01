@@ -104,6 +104,7 @@ class _Adapter:
             ),
             summary="Bounded read-only result",
             findings=("No repository mutation is required.",),
+            evidence_refs=(("b" * 64,) if self.mode == "unauthorized" else ()),
         )
         proposals: tuple[ActionProposal, ...] = ()
         if self.mode == "action":
@@ -139,7 +140,13 @@ class _Adapter:
         )
 
 
-def _execute(tmp_path: Path, *, mode: str = "accepted", artifact_bytes: int = 100_000):
+def _execute(
+    tmp_path: Path,
+    *,
+    mode: str = "accepted",
+    artifact_bytes: int = 100_000,
+    external_evidence_required: bool = False,
+):
     repository = tmp_path / "repo"
     repository.mkdir()
     subprocess.run(("git", "init", "-q", str(repository)), check=True)
@@ -209,6 +216,9 @@ def _execute(tmp_path: Path, *, mode: str = "accepted", artifact_bytes: int = 10
                 CompletionCriterion(
                     id=f"criterion-{node_id}",
                     description=f"accept the exact {kind}",
+                    verification_requirement_ids=(
+                        ("external-evidence",) if external_evidence_required else ()
+                    ),
                     required_artifact_ids=(kind,),
                 ),
             ),
@@ -357,6 +367,10 @@ def test_two_node_typed_result_flow_is_authoritative_non_mutating_and_replayable
         ("unbound", StableFailureCode.TYPED_RESULT_UNBOUND.value),
         ("stale", StableFailureCode.TYPED_RESULT_STALE.value),
         ("action", StableFailureCode.TYPED_RESULT_ACTIONS_FORBIDDEN.value),
+        (
+            "unauthorized",
+            StableFailureCode.TYPED_RESULT_EVIDENCE_UNAUTHORIZED.value,
+        ),
     ],
 )
 def test_typed_result_binding_and_security_fail_closed(
@@ -384,6 +398,22 @@ def test_typed_result_binding_and_security_fail_closed(
         subprocess.check_output(("git", "-C", str(repository), "status", "--porcelain"), text=True)
         == ""
     )
+
+
+def test_external_evidence_criterion_remains_uncovered_without_authority(
+    tmp_path: Path,
+) -> None:
+    _repository, _artifacts, run, replay, _second, inspected, *_rest = _execute(
+        tmp_path, external_evidence_required=True
+    )
+
+    assert run.status == "failed"
+    assert replay.evidence[0].criteria[0].disposition == "uncovered"
+    assert replay.nodes[0].artifact_descriptors
+    assert replay.nodes[0].result_acceptance_id is not None
+    assert inspected["worker_results"][0]["status"] == "succeeded"
+    assert inspected["typed_result_acceptances"][0]["status"] == "accepted"
+    assert inspected["nodes"][0]["status"] == "failed"
 
 
 def test_typed_result_oversize_and_malformed_have_specific_codes(tmp_path: Path) -> None:

@@ -56,6 +56,7 @@ from .domain.v2 import (
     WorkerResult,
     WorkspaceRequest,
     WorkspaceSnapshot,
+    authoritative_worker_evidence_digests,
 )
 from .graph import accept_task_graph
 from .runtime import DeterministicRuntime
@@ -628,6 +629,10 @@ class WorkCoordinator:
         if typed_result is None:
             return None
         failure_code: StableFailureCode | None = None
+        allowed_evidence = set(authoritative_worker_evidence_digests(request))
+        unauthorized_evidence = tuple(
+            digest for digest in typed_result.evidence_refs if digest not in allowed_evidence
+        )
         bindings = (
             typed_result.graph_run_id,
             typed_result.worker_request_digest,
@@ -652,6 +657,8 @@ class WorkCoordinator:
             failure_code = StableFailureCode.TYPED_RESULT_STALE
         elif request.task_kind.value != "non_mutating":
             failure_code = StableFailureCode.TYPED_RESULT_MALFORMED
+        elif unauthorized_evidence:
+            failure_code = StableFailureCode.TYPED_RESULT_EVIDENCE_UNAUTHORIZED
         elif any(
             proposal.kind is not ActionKind.PROCESS for proposal in worker_result.proposals
         ) or (submitted_action_count and not request.processes_authorized):
@@ -746,6 +753,18 @@ class WorkCoordinator:
                 "status": acceptance.status,
                 "failure_code": (
                     None if acceptance.failure_code is None else acceptance.failure_code.value
+                ),
+                "evidence_contract": (
+                    None
+                    if not unauthorized_evidence
+                    else {
+                        "message": (
+                            "evidence_refs requires supplied SHA-256 digests; put file "
+                            "locations in content/findings"
+                        ),
+                        "invalid_count": len(unauthorized_evidence),
+                        "sample": unauthorized_evidence[:3],
+                    }
                 ),
             },
         )
@@ -866,7 +885,8 @@ class WorkCoordinator:
         verification_failed = False
         binding_failed = False
         node_bound = run.worker_request_digest is not None
-        if node_bound and not _node_verification_configuration_is_valid(
+        writing_node_bound = node_bound and run.capture_patch
+        if writing_node_bound and not _node_verification_configuration_is_valid(
             run.id,
             run.completion_criteria,
             self.verification_requests,
@@ -899,7 +919,7 @@ class WorkCoordinator:
                 acceptance_ledger_id=ledger.id,
                 output_artifact_ids=tuple(output_artifact_ids),
             )
-        if node_bound:
+        if writing_node_bound:
             for binding in self.verification_bindings:
                 self.store.put("node_verification_binding_v2", binding, run_id=run.id)
             for request in self.verification_requests:
@@ -929,7 +949,7 @@ class WorkCoordinator:
                 payload=request,
                 reason="required Harness verification",
             )
-            if not node_bound:
+            if not writing_node_bound:
                 self.store.put("verification_request_v2", request, run_id=run.id)
             proposal_decision = self._decide(verification_proposal)
             if proposal_decision.outcome is not DecisionOutcome.ALLOW:
@@ -971,7 +991,7 @@ class WorkCoordinator:
             if item.status == "succeeded" and item.content_digest is not None
         }
 
-        if node_bound:
+        if writing_node_bound:
             verification_by_requirement = {
                 binding.requirement_id: successful_result_digest_by_request.get(
                     binding.process_request_digest, ""
@@ -1016,14 +1036,11 @@ class WorkCoordinator:
             failed = (
                 binding_failed
                 or verification_failed
-                or (
-                    (node_bound or run.capture_patch)
-                    and (not evidence_authoritative or not acceptance_satisfied)
-                )
+                or (writing_node_bound and (not evidence_authoritative or not acceptance_satisfied))
             )
             failure_code = (
                 StableFailureCode.VERIFICATION_BINDING_INVALID
-                if binding_failed or (node_bound and not evidence_authoritative)
+                if binding_failed or (writing_node_bound and not evidence_authoritative)
                 else StableFailureCode.VERIFICATION_FAILED
             )
             if failed:
@@ -1086,14 +1103,11 @@ class WorkCoordinator:
         if (
             binding_failed
             or verification_failed
-            or (
-                (node_bound or run.capture_patch)
-                and (not evidence_authoritative or not acceptance_satisfied)
-            )
+            or (writing_node_bound and (not evidence_authoritative or not acceptance_satisfied))
         ):
             failure_code = (
                 StableFailureCode.VERIFICATION_BINDING_INVALID
-                if binding_failed or (node_bound and not evidence_authoritative)
+                if binding_failed or (writing_node_bound and not evidence_authoritative)
                 else StableFailureCode.VERIFICATION_FAILED
             )
             self._event(

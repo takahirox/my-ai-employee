@@ -65,6 +65,7 @@ class StableFailureCode(StableStrEnum):
     TYPED_RESULT_STALE = "TYPED_RESULT_STALE"
     TYPED_RESULT_OVERSIZED = "TYPED_RESULT_OVERSIZED"
     TYPED_RESULT_ACTIONS_FORBIDDEN = "TYPED_RESULT_ACTIONS_FORBIDDEN"
+    TYPED_RESULT_EVIDENCE_UNAUTHORIZED = "TYPED_RESULT_EVIDENCE_UNAUTHORIZED"
     EVALUATOR_EXECUTION_UNAVAILABLE = "EVALUATOR_EXECUTION_UNAVAILABLE"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     VERIFICATION_BINDING_INVALID = "VERIFICATION_BINDING_INVALID"
@@ -450,6 +451,40 @@ class WorkerRequest(DigestedRecordV2):
         if len(self.accepted_feedback_digests) != len(set(self.accepted_feedback_digests)):
             raise ValueError("accepted feedback digests must be unique")
         return self
+
+
+def authoritative_worker_evidence_digests(request: WorkerRequest) -> tuple[Digest, ...]:
+    """Derive factual evidence authority without treating binding digests as evidence."""
+
+    values: list[Digest] = [
+        *request.prior_result_digests,
+        *request.prior_artifact_digests,
+        *request.accepted_feedback_digests,
+    ]
+    for predecessor in request.predecessor_outputs:
+        values.extend(
+            digest
+            for digest in (
+                predecessor.worker_result_digest,
+                predecessor.evaluator_digest,
+                predecessor.result_acceptance_digest,
+                (
+                    None
+                    if predecessor.non_mutating_result is None
+                    else predecessor.non_mutating_result.content_digest
+                ),
+            )
+            if digest is not None
+        )
+        for artifact in predecessor.artifact_descriptors:
+            values.extend((artifact.descriptor_digest, artifact.artifact_digest))
+        result = predecessor.non_mutating_result
+        if result is not None:
+            values.extend(result.evidence_refs)
+    unique = tuple(dict.fromkeys(values))
+    if len(unique) > 256:
+        raise ValueError("authoritative worker evidence set exceeds 256 digests")
+    return unique
 
 
 class WorkerContextManifest(DigestedRecordV2):
