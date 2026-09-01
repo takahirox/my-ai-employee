@@ -1647,12 +1647,9 @@ def test_v2_inspector_projects_evidence_without_artifact_bodies(tmp_path: Path) 
         assert view["patch"]["artifact_digest"] == sha256(patch).hexdigest()
         assert "body" not in view["patch"]
         assert view["events"]
-        explanation = explain_any_run(store, "work-1")
-        assert explanation["goal"]["statement"] == run.goal
-        assert explanation["current_state"]["status"] == "ready_to_promote"
-        assert explanation["final_outcome"]["disposition"] == ("accepted_awaiting_promotion")
-        assert explanation["observation"]["artifact_bodies_read"] is False
-        assert explanation["timeline"]
+        with pytest.raises(KeyError, match=run.id):
+            explain_any_run(store, run.id)
+        assert store.get_work_run(run.id) == run
     finally:
         store.close()
 

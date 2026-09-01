@@ -694,6 +694,8 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
 def inspect_any_run(store: SQLiteStore, run_id: str) -> dict[str, Any]:
     """Read any runtime generation without mutating or migrating state."""
 
+    if store.is_standalone_work_run(run_id):
+        raise KeyError(run_id)
     try:
         from .eval_framework import inspect_experiment
 

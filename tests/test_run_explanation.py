@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_employee.cli import build_parser
+from ai_employee.cli import build_parser, main
 from ai_employee.domain.v2 import (
     DecisionOutcome,
     ExecutionResult,
@@ -13,6 +13,7 @@ from ai_employee.domain.v2 import (
     StableFailure,
     StableFailureCode,
 )
+from ai_employee.inspector import inspect_any_run, inspect_fleet_runs
 from ai_employee.orchestration import WorkRun
 from ai_employee.run_explanation import _explain_graph_run, explain_any_run
 from ai_employee.serialization import canonical_json
@@ -41,6 +42,7 @@ def test_work_explanation_includes_policy_denial_as_a_failure_cause(tmp_path: Pa
         effective_policy_digest=ZERO,
         node_id="node-denied",
         failure_code="POLICY_DENIED",
+        worker_request_digest="9" * 64,
     )
     decision = PolicyDecision(
         id="decision-denied",
@@ -83,6 +85,66 @@ def test_unknown_run_is_not_reconstructed_or_created(tmp_path: Path) -> None:
         assert store.list_records("graph_run_v2", WorkRun) == ()
 
 
+def test_historical_standalone_work_run_is_hidden_without_deleting_its_row(
+    tmp_path: Path,
+) -> None:
+    run = WorkRun(
+        id="historical-work",
+        goal="legacy standalone work",
+        repository=str(tmp_path),
+        base_commit="base",
+        worker="scripted",
+        status="failed",
+        effective_policy_digest=ZERO,
+    )
+    with SQLiteStore(tmp_path / "historical.db") as store:
+        store.save_work_run(run)
+
+        assert store.list_run_repositories() == ()
+        assert inspect_fleet_runs(store) == {"active": [], "history": []}
+        for reader in (inspect_any_run, explain_any_run):
+            with pytest.raises(KeyError, match=run.id):
+                reader(store, run.id)
+        assert store.get_work_run(run.id) == run
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ("inspect", "historical-work"),
+        ("explain", "historical-work"),
+        ("resume", "historical-work"),
+        ("diff", "historical-work"),
+        ("logs", "historical-work"),
+        ("promote", "historical-work", "--patch-digest", ZERO),
+        ("pause", "historical-work"),
+        ("cancel", "historical-work"),
+    ),
+)
+def test_historical_standalone_work_run_is_hidden_from_operational_commands(
+    tmp_path: Path, command: tuple[str, ...]
+) -> None:
+    database = tmp_path / "historical.db"
+    run = WorkRun(
+        id="historical-work",
+        goal="legacy standalone work",
+        repository=str(tmp_path),
+        base_commit="base",
+        worker="scripted",
+        status="failed",
+        effective_policy_digest=ZERO,
+    )
+    with SQLiteStore(database) as store:
+        store.save_work_run(run)
+
+    with pytest.raises(KeyError, match=run.id):
+        main((*command, "--db", str(database)))
+
+    with SQLiteStore(database) as store:
+        assert store.get_work_run(run.id) == run
+        assert store.control(run.id) is None
+
+
 def test_work_verification_explanation_does_not_expose_failure_text(tmp_path: Path) -> None:
     canary = "TOP-SECRET-FAILURE-CANARY"
     run = WorkRun(
@@ -95,6 +157,7 @@ def test_work_verification_explanation_does_not_expose_failure_text(tmp_path: Pa
         effective_policy_digest=ZERO,
         node_id="node-verification",
         failure_code="VERIFICATION_FAILED",
+        worker_request_digest="8" * 64,
     )
     result = ExecutionResult(
         id="verification-failed",
