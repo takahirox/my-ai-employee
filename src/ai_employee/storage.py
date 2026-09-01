@@ -369,7 +369,7 @@ class SQLiteStore:
     def list_run_repositories(
         self, repository_id: str | None = None
     ) -> tuple[dict[str, str | None], ...]:
-        """List registered and legacy run IDs, optionally filtered by repository."""
+        """List registered and persisted run IDs, optionally filtered by repository."""
 
         run_sources = ["SELECT run_id FROM run_repositories"]
         run_sources.extend(
@@ -552,9 +552,16 @@ class SQLiteStore:
         """Return whether an ID belongs only to a historical pre-Graph WorkRun."""
 
         try:
-            return self.get_work_run(run_id).worker_request_digest is None
+            self.get_work_run(run_id)
         except KeyError:
             return False
+        owner = self._connection.execute(
+            "SELECT 1 FROM records "
+            "WHERE kind='node_execution_v2' "
+            "AND json_extract(payload, '$.work_run_id')=? LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return owner is None
 
     def append_work_event(self, event: Any) -> int:
         self.migrate_v2()

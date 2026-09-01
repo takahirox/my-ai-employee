@@ -347,20 +347,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "work":
         return _work(args)
     with SQLiteStore(args.db) as store:
-        if (
-            args.command
-            in {
-                "cancel",
-                "diff",
-                "explain",
-                "inspect",
-                "logs",
-                "pause",
-                "promote",
-                "resume",
-            }
-            and store.is_standalone_work_run(args.run_id)
-        ):
+        if args.command in {
+            "cancel",
+            "diff",
+            "explain",
+            "inspect",
+            "logs",
+            "pause",
+            "promote",
+            "resume",
+        } and store.is_standalone_work_run(args.run_id):
             raise KeyError(args.run_id)
         if args.command == "approvals":
             return _approvals(store, args)
@@ -1389,7 +1385,7 @@ def _work(args: argparse.Namespace) -> int:
                 repository=str(repository),
                 base_commit=head,
                 max_concurrency=args.max_concurrency,
-                routing_mode=cast(RoutingMode, routing_mode),
+                routing_mode=routing_mode,
                 fixed_strategy_id=fixed_strategy_id,
                 allowed_strategy_ids=harness.worker.allowed_strategy_ids,
                 allowed_backends=harness.worker.allowed,

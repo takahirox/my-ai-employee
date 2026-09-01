@@ -97,9 +97,12 @@ print(f'Migrated {source_path} to {destination_path}')
 PY
 ```
 
-Keep the old database until `fleet inspect RUN_ID` succeeds with the new default. Runs from
-older databases remain directly inspectable but appear as `legacy/unassigned` in the new
-repository filter because their repository identity was not previously persisted.
+Keep the old database as a rollback copy until current Graph runs inspect successfully. Older
+declarative v0.1 Graph runs remain inspectable and may appear as `v0.1/unassigned` because their
+repository identity was not previously persisted. Historical standalone v0.2 `WorkRun` rows stay
+in SQLite for audit and migration safety, but they are not top-level runs and cannot be inspected,
+explained, resumed, diffed, logged, promoted, or controlled. Graph-owned child `WorkRun` evidence
+remains available through its parent task drill-down.
 
 The Inspector binds to `127.0.0.1:8765` by default. `AUTO_MERGE_ELIGIBLE` is an
 advisory structured decision; Fleet never invokes Git merge or bypasses required

@@ -45,7 +45,7 @@ class RoutingError(ValueError):
 
 
 def profile_compatibility_bands(profile: SemanticTaskProfile) -> tuple[int, int]:
-    """Map categorical semantic facts to exhaustive legacy compatibility bands."""
+    """Map categorical semantic facts to compatibility bands for older records."""
 
     task_complexity = {
         SemanticTaskType.MECHANICAL: 1,

@@ -843,7 +843,7 @@ def inspect_fleet_runs(store: SQLiteStore, repository_id: str | None = None) -> 
                 "progress": {"completed": 0, "total": 0},
                 "active_task": None,
                 "active_tasks": [],
-                "phase": "Persisted legacy records",
+                "phase": "Persisted v0.1 records",
                 "requires_attention": False,
                 "attention": [],
             }

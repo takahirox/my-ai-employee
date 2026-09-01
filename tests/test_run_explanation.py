@@ -18,9 +18,29 @@ from ai_employee.orchestration import WorkRun
 from ai_employee.run_explanation import _explain_graph_run, explain_any_run
 from ai_employee.serialization import canonical_json
 from ai_employee.storage import SQLiteStore
+from ai_employee.task_orchestration import NodeExecutionRecord
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
+
+
+def _bind_graph_child(store: SQLiteStore, work_run_id: str) -> None:
+    store.put(
+        "node_execution_v2",
+        NodeExecutionRecord(
+            id=f"execution-{work_run_id}",
+            run_id="graph-parent",
+            created_at=NOW,
+            node_id="graph-node",
+            accepted_graph_revision_digest="7" * 64,
+            generation=0,
+            attempt=0,
+            sequence=1,
+            status="running",
+            work_run_id=work_run_id,
+        ),
+        run_id="graph-parent",
+    )
 
 
 def test_explain_cli_is_a_distinct_read_only_command() -> None:
@@ -55,6 +75,7 @@ def test_work_explanation_includes_policy_denial_as_a_failure_cause(tmp_path: Pa
     )
     with SQLiteStore(tmp_path / "fleet.db") as store:
         store.save_work_run(run)
+        _bind_graph_child(store, run.id)
         store.put("policy_decision_v2", decision, run_id=run.id)
 
         explanation = explain_any_run(store, run.id)
@@ -96,6 +117,7 @@ def test_historical_standalone_work_run_is_hidden_without_deleting_its_row(
         worker="scripted",
         status="failed",
         effective_policy_digest=ZERO,
+        worker_request_digest="6" * 64,
     )
     with SQLiteStore(tmp_path / "historical.db") as store:
         store.save_work_run(run)
@@ -106,6 +128,27 @@ def test_historical_standalone_work_run_is_hidden_without_deleting_its_row(
             with pytest.raises(KeyError, match=run.id):
                 reader(store, run.id)
         assert store.get_work_run(run.id) == run
+
+
+def test_graph_owned_child_work_run_remains_visible_by_persisted_node_binding(
+    tmp_path: Path,
+) -> None:
+    run = WorkRun(
+        id="graph-child",
+        goal="bounded graph node",
+        repository=str(tmp_path),
+        base_commit="base",
+        worker="scripted",
+        status="failed",
+        effective_policy_digest=ZERO,
+    )
+    with SQLiteStore(tmp_path / "child.db") as store:
+        store.save_work_run(run)
+        _bind_graph_child(store, run.id)
+
+        assert store.is_standalone_work_run(run.id) is False
+        assert run.id in {item["run_id"] for item in store.list_run_repositories()}
+        assert inspect_any_run(store, run.id)["kind"] == "work_run"
 
 
 @pytest.mark.parametrize(
@@ -133,6 +176,7 @@ def test_historical_standalone_work_run_is_hidden_from_operational_commands(
         worker="scripted",
         status="failed",
         effective_policy_digest=ZERO,
+        worker_request_digest="6" * 64,
     )
     with SQLiteStore(database) as store:
         store.save_work_run(run)
@@ -175,6 +219,7 @@ def test_work_verification_explanation_does_not_expose_failure_text(tmp_path: Pa
     )
     with SQLiteStore(tmp_path / "redacted.db") as store:
         store.save_work_run(run)
+        _bind_graph_child(store, run.id)
         store.put("verification_result_v2", result, run_id=run.id)
 
         explanation = explain_any_run(store, run.id)
