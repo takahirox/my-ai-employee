@@ -143,7 +143,9 @@ def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, P
                         "entry_node_ids": ["a", "b"],
                         "terminal_node_ids": ["c"],
                         "budget": {
-                            "max_attempts": 3,
+                            "max_attempts": 4,
+                            "max_repairs": 1,
+                            "max_loop_iterations": 2,
                             "max_nodes": 3,
                             "max_wall_seconds": 30.0,
                         },
@@ -232,7 +234,9 @@ def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, P
                     "entry_node_ids": ["a", "b"],
                     "terminal_node_ids": ["c"],
                     "budget": {
-                        "max_attempts": 3,
+                        "max_attempts": 4,
+                        "max_repairs": 1,
+                        "max_loop_iterations": 2,
                         "max_nodes": 3,
                         "max_wall_seconds": 30.0,
                     },

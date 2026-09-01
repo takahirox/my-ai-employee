@@ -34,6 +34,7 @@ from .domain.v2 import (
     ArtifactDescriptorReference,
     CriterionEvidence,
     DigestedRecordV2,
+    ExecutionResult,
     NonMutatingResultAcceptance,
     PredecessorOutputReference,
     StableFailureCode,
@@ -428,6 +429,7 @@ class NodeExecutionResult(BaseModel):
     artifact_descriptors: tuple[ArtifactDescriptor, ...] = ()
     result_acceptance: NonMutatingResultAcceptance | None = None
     acceptance_ledger_digest: Digest | None = None
+    failure_code: str | None = None
 
     @model_validator(mode="after")
     def _criterion_evidence_is_unique(self) -> Self:
@@ -1223,6 +1225,14 @@ class TaskOrchestrator:
                     repair_goal_by_node[node_id] = self._task_review_repair_goal(
                         nodes[node_id], repair.evidence_digests
                     )
+                elif repair.reason_code == "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+                    repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
+                        nodes[node_id], repair.evidence_digests
+                    )
+                elif repair.reason_code == "ACCEPTED_PARENT_EVALUATION_FEEDBACK":
+                    repair_goal_by_node[node_id] = self._parent_evaluation_repair_goal(
+                        nodes[node_id], repair.evidence_digests
+                    )
         active: dict[
             Future[NodeExecutionResult],
             tuple[
@@ -1428,6 +1438,8 @@ class TaskOrchestrator:
                         run_id=_node_worker_run_id(run_id, node),
                         created_at=now(),
                         goal=repair_goal_by_node.get(node_id, node.objective or node.name),
+                        task_kind=graph_run.goal.task_kind,
+                        processes_authorized=graph_run.goal.processes_authorized,
                         completion_criteria=tuple(
                             item.description for item in node.completion_criteria
                         ),
@@ -1455,6 +1467,8 @@ class TaskOrchestrator:
                         worker_run_id=request.run_id,
                         node_id=node.id,
                         objective_digest=canonical_digest(request.goal),
+                        task_kind=request.task_kind,
+                        processes_authorized=request.processes_authorized,
                         completion_criteria_digest=canonical_digest(request.completion_criteria),
                         required_capabilities=request.required_capabilities,
                         accepted_graph_revision_digest=graph_digest,
@@ -1535,9 +1549,31 @@ class TaskOrchestrator:
                             )
                             continue
                         current = records[node_id]
+                        post_result_feedback = tuple(
+                            item.content_digest
+                            for item in self.store.list_records(
+                                "action_result_v2", ExecutionResult, run_id=request.run_id
+                            )
+                            if item.status != "succeeded" and item.content_digest is not None
+                        )
+                        boundary_feedback = (
+                            ()
+                            if result.worker_result.boundary_diagnostic is None
+                            else (
+                                _required_digest(
+                                    result.worker_result.boundary_diagnostic.content_digest
+                                ),
+                            )
+                        )
                         feedback = tuple(
                             item
-                            for item in (current.evidence_digest, current.evaluator_digest)
+                            for item in (
+                                current.evidence_digest,
+                                current.evaluator_digest,
+                                *current.verification_result_digests,
+                                *post_result_feedback,
+                                *boundary_feedback,
+                            )
                             if item is not None
                         )
                         if current.status == "passed":
@@ -1681,9 +1717,14 @@ class TaskOrchestrator:
                                         else review_decision.reason_code
                                     ),
                                 )
-                        elif (
-                            current.evaluator_decision is EvaluationDecision.FAIL
-                            and result.worker_result.status == "succeeded"
+                        elif current.evaluator_decision is EvaluationDecision.FAIL and (
+                            result.worker_result.status == "succeeded"
+                            or current.failure_code
+                            in {
+                                StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+                                StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                                StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+                            }
                         ):
                             repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
                             repair_limit = graph_run.max_repairs
@@ -1711,6 +1752,9 @@ class TaskOrchestrator:
                                 self._save_loop_transition(transition)
                                 loop_counts[(node_id, LoopAction.REPAIR)] += 1
                                 repair_feedback_by_node[node_id] = feedback
+                                repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
+                                    node, feedback
+                                )
                                 records[node_id] = NodeExecutionRecord(
                                     id=identifier("node-execution"),
                                     run_id=run_id,
@@ -1726,7 +1770,18 @@ class TaskOrchestrator:
                                 self._save_node(records[node_id])
                             else:
                                 enabled = repair_limit > 0
-                                action = LoopAction.ESCALATE if enabled else LoopAction.FAIL
+                                correctable_failure = current.failure_code in {
+                                    StableFailureCode.VERIFICATION_FAILED.value,
+                                    StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
+                                    StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+                                    StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+                                    StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+                                }
+                                action = (
+                                    LoopAction.ESCALATE
+                                    if enabled or correctable_failure
+                                    else LoopAction.FAIL
+                                )
                                 reason = (
                                     "REPAIR_RESOURCE_BUDGET_EXHAUSTED"
                                     if repair_count < repair_limit
@@ -1739,7 +1794,9 @@ class TaskOrchestrator:
                                         created_at=now(),
                                         action=action,
                                         reason_code=(
-                                            reason if enabled else "NODE_EVALUATION_NOT_PASS"
+                                            reason
+                                            if enabled or correctable_failure
+                                            else "NODE_EVALUATION_NOT_PASS"
                                         ),
                                         accepted_graph_revision_digest=graph_digest,
                                         generation=node.generation,
@@ -1752,7 +1809,7 @@ class TaskOrchestrator:
                                         limit=repair_limit,
                                     )
                                 )
-                                if enabled:
+                                if enabled or correctable_failure:
                                     records[node_id] = self._advance(
                                         current,
                                         failure_code=f"LOOP_ESCALATED:{reason}",
@@ -1784,6 +1841,28 @@ class TaskOrchestrator:
                                 failure_code="GRAPH_CANCELLED",
                             )
                             continue
+                        persisted_results = tuple(
+                            item
+                            for item in self.store.list_records(
+                                "worker_result_v2", WorkerResult, run_id=request.run_id
+                            )
+                            if item.request_digest == request.content_digest
+                        )
+                        boundary_result = (
+                            persisted_results[0] if len(persisted_results) == 1 else None
+                        )
+                        if boundary_result is not None:
+                            # A post-result runtime failure must not erase or replace the
+                            # exact worker identity that crossed the boundary successfully.
+                            self.store.put("worker_result_v2", boundary_result, run_id=run_id)
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="failed",
+                                output_generation=node.generation,
+                                worker_result_id=boundary_result.id,
+                                worker_result_digest=boundary_result.content_digest,
+                                failure_code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
+                            )
                         remaining = cast(Mapping[str, int | float], reservation.remaining_budgets)
                         retry_cap = min(
                             nodes[node_id].retry_limit,
@@ -1833,6 +1912,11 @@ class TaskOrchestrator:
                                     attempt=node.attempt,
                                     node_id=node_id,
                                     worker_request_digest=request.content_digest,
+                                    worker_result_digest=(
+                                        None
+                                        if boundary_result is None
+                                        else boundary_result.content_digest
+                                    ),
                                     consumed=retry_count + 1,
                                     limit=retry_cap,
                                 )
@@ -1876,6 +1960,11 @@ class TaskOrchestrator:
                                     attempt=node.attempt,
                                     node_id=node_id,
                                     worker_request_digest=request.content_digest,
+                                    worker_result_digest=(
+                                        None
+                                        if boundary_result is None
+                                        else boundary_result.content_digest
+                                    ),
                                     consumed=retry_count,
                                     limit=retry_cap,
                                 )
@@ -1953,7 +2042,10 @@ class TaskOrchestrator:
         completed_ok = node_pass and terminal_pass and goal_decision is EvaluationDecision.PASS
         stable_codes = {item.value for item in StableFailureCode}
         exact_failures = {
-            item.failure_code for item in records.values() if item.failure_code in stable_codes
+            item.failure_code
+            for item in records.values()
+            if item.failure_code in stable_codes
+            or (item.failure_code is not None and item.failure_code.startswith("LOOP_ESCALATED:"))
         }
         graph_run = graph_run.model_copy(
             update={
@@ -2325,6 +2417,140 @@ class TaskOrchestrator:
             review_acceptance_binding=review_binding,
         )
 
+    def prepare_parent_repair(
+        self,
+        run_id: Identifier,
+        evaluation_digest: Digest,
+    ) -> bool:
+        """Durably schedule one exact single-node repair from failed parent evidence."""
+
+        from .graph_evaluation import ParentCandidateEvaluationRecord
+
+        run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+        acceptance = self.store.list_records(
+            "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+        )[-1]
+        graph = acceptance.accepted_revision.graph
+        writing_nodes = tuple(
+            node for node in graph.nodes if "edit_intent" in node.required_capabilities
+        )
+        evaluations = tuple(
+            item
+            for item in self.store.list_records(
+                "parent_candidate_evaluation_v2",
+                ParentCandidateEvaluationRecord,
+                run_id=run_id,
+            )
+            if item.content_digest == evaluation_digest
+        )
+        if (
+            run.status != "failed"
+            or run.failure_code is None
+            or len(writing_nodes) != 1
+            or len(evaluations) != 1
+            or evaluations[0].status != "failed"
+            or evaluations[0].accepted_graph_revision_digest != run.accepted_graph_revision_digest
+        ):
+            return False
+        node = writing_nodes[0]
+        repairs = tuple(
+            item
+            for item in self.store.list_records(
+                "loop_transition_v2", LoopTransitionRecord, run_id=run_id
+            )
+            if item.action is LoopAction.REPAIR and item.node_id == node.id
+        )
+        replay = self.replay(run_id)
+        prior = next((item for item in replay.nodes if item.node_id == node.id), None)
+        if (
+            prior is None
+            or prior.status != "passed"
+            or prior.worker_request_digest is None
+            or prior.worker_result_digest is None
+        ):
+            return False
+        evaluation = evaluations[0]
+        feedback = tuple(
+            dict.fromkeys(
+                (
+                    evaluation_digest,
+                    evaluation.request_digest,
+                    *evaluation.verification_result_digests,
+                    *evaluation.evaluation_ledger_digests,
+                )
+            )
+        )
+        reservations = tuple(
+            item
+            for item in replay.reservations
+            if item.node_id == node.id and item.attempt == prior.attempt
+        )
+        resources_available = bool(reservations) and _node_resources_remain(
+            node, cast(Mapping[str, int | float], reservations[-1].remaining_budgets)
+        )
+        if len(repairs) >= run.max_repairs or not resources_available:
+            reason = (
+                "REPAIR_BUDGET_EXHAUSTED"
+                if len(repairs) >= run.max_repairs
+                else "REPAIR_RESOURCE_BUDGET_EXHAUSTED"
+            )
+            self._save_loop_transition(
+                LoopTransitionRecord(
+                    id=identifier("loop-transition"),
+                    run_id=run_id,
+                    created_at=now(),
+                    action=LoopAction.ESCALATE,
+                    reason_code=reason,
+                    accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                    generation=run.generation,
+                    attempt=prior.attempt,
+                    node_id=node.id,
+                    worker_request_digest=prior.worker_request_digest,
+                    worker_result_digest=prior.worker_result_digest,
+                    evidence_digests=feedback,
+                    consumed=len(repairs),
+                    limit=run.max_repairs,
+                )
+            )
+            self._save_run(run.model_copy(update={"failure_code": f"LOOP_ESCALATED:{reason}"}))
+            return False
+        self._save_loop_transition(
+            LoopTransitionRecord(
+                id=identifier("loop-transition"),
+                run_id=run_id,
+                created_at=now(),
+                action=LoopAction.REPAIR,
+                reason_code="ACCEPTED_PARENT_EVALUATION_FEEDBACK",
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=run.generation,
+                attempt=prior.attempt,
+                node_id=node.id,
+                worker_request_digest=prior.worker_request_digest,
+                worker_result_digest=prior.worker_result_digest,
+                evidence_digests=feedback,
+                consumed=len(repairs) + 1,
+                limit=run.max_repairs,
+            )
+        )
+        self._save_node(
+            NodeExecutionRecord(
+                id=identifier("node-execution"),
+                run_id=run_id,
+                created_at=now(),
+                node_id=node.id,
+                accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                generation=run.generation,
+                attempt=prior.attempt + 1,
+                sequence=0,
+                status="pending",
+                failure_code="REPAIR_AFTER:PARENT_EVALUATION_FAILED",
+            )
+        )
+        self._save_run(
+            run.model_copy(update={"status": "paused", "failure_code": "PARENT_REPAIR_PENDING"})
+        )
+        return True
+
     def _validate_planner_routing(
         self,
         goal: Goal,
@@ -2636,6 +2862,91 @@ class TaskOrchestrator:
             raise ValueError("accepted task-review repair context exceeds the worker bound")
         return value
 
+    def _node_evaluation_repair_goal(self, node: Node, feedback: tuple[Digest, ...]) -> str:
+        """Render compact exact verifier feedback without exposing artifact bodies."""
+
+        lines = [node.objective or node.name, "", "Accepted deterministic repair evidence:"]
+        verification_digests = set(feedback[2:])
+        execution_results = (
+            *self.store.list_records("verification_result_v2", ExecutionResult),
+            *self.store.list_records("action_result_v2", ExecutionResult),
+        )
+        matched = tuple(
+            result for result in execution_results if result.content_digest in verification_digests
+        )
+        for result in matched:
+            failure = result.failure
+            code = "VERIFICATION_FAILED" if failure is None else failure.code.value
+            message = "required Harness command failed" if failure is None else failure.message
+            artifact_refs = tuple(
+                digest
+                for digest in (result.stdout_artifact_digest, result.stderr_artifact_digest)
+                if digest is not None
+            )
+            lines.append(
+                f"- {code}: {message} (result: {result.content_digest}; "
+                f"output artifacts: {','.join(artifact_refs) or 'none'})"
+            )
+        diagnostics = tuple(
+            item
+            for item in self.store.list_records(
+                "worker_boundary_diagnostic_v2", WorkerBoundaryDiagnostic
+            )
+            if item.content_digest in verification_digests
+        )
+        for diagnostic in diagnostics:
+            lines.append(
+                f"- {diagnostic.code}: {diagnostic.exception_message} "
+                f"(stage: {diagnostic.stage}; diagnostic: {diagnostic.content_digest})"
+            )
+        if not matched and not diagnostics:
+            lines.append(f"- NODE_EVALUATION_NOT_PASS (evidence: {','.join(feedback)})")
+        lines.append(
+            "Repair only this node's bounded objective, then return a complete replacement patch."
+        )
+        value = "\n".join(lines)
+        if len(value) > 20_000:
+            raise ValueError("accepted node repair context exceeds the worker bound")
+        return value
+
+    def _parent_evaluation_repair_goal(self, node: Node, feedback: tuple[Digest, ...]) -> str:
+        from .graph_evaluation import ParentCandidateEvaluationRecord
+
+        evaluations = self.store.list_records(
+            "parent_candidate_evaluation_v2", ParentCandidateEvaluationRecord
+        )
+        evaluation = next(
+            (item for item in evaluations if item.content_digest == feedback[0]), None
+        )
+        if evaluation is None or evaluation.status != "failed":
+            raise ValueError("parent repair feedback is stale or non-failing")
+        result_digests = set(evaluation.verification_result_digests)
+        results = tuple(
+            item
+            for item in self.store.list_records("verification_result_v2", ExecutionResult)
+            if item.content_digest in result_digests
+        )
+        lines = [node.objective or node.name, "", "Accepted parent-candidate repair evidence:"]
+        for result in results:
+            if result.status == "succeeded":
+                continue
+            failure = result.failure
+            code = "VERIFICATION_FAILED" if failure is None else failure.code.value
+            message = "parent Harness verification failed" if failure is None else failure.message
+            lines.append(f"- {code}: {message} (result: {result.content_digest})")
+        if len(lines) == 3:
+            lines.append(
+                f"- {evaluation.failure_code or 'PARENT_EVALUATION_FAILED'} "
+                f"(evaluation: {evaluation.content_digest})"
+            )
+        lines.append(
+            "Repair the complete single-node candidate against this accepted parent evidence."
+        )
+        value = "\n".join(lines)
+        if len(value) > 20_000:
+            raise ValueError("accepted parent repair context exceeds the worker bound")
+        return value
+
     def _task_review_pass_is_authoritative(self, record: NodeExecutionRecord) -> bool:
         result_generation = (
             record.generation if record.output_generation is None else record.output_generation
@@ -2906,7 +3217,11 @@ class TaskOrchestrator:
                 raise ValueError("accepted typed-result binding is stale")
             if result_acceptance.artifact not in result.artifact_descriptors:
                 raise ValueError("accepted typed-result artifact is absent or stale")
-        if self.bounded_graph_execution and worker_result.status == "succeeded":
+        if (
+            self.bounded_graph_execution
+            and worker_result.status == "succeeded"
+            and result.failure_code is None
+        ):
             if not result.artifact_descriptors:
                 raise ValueError("bounded node result has no authoritative artifact descriptor")
             for descriptor in result.artifact_descriptors:
@@ -2989,9 +3304,12 @@ class TaskOrchestrator:
                 None
                 if decision is EvaluationDecision.PASS
                 else (
-                    worker_result.failure.code.value
-                    if worker_result.failure is not None
-                    else "NODE_EVALUATION_NOT_PASS"
+                    result.failure_code
+                    or (
+                        worker_result.failure.code.value
+                        if worker_result.failure is not None
+                        else "NODE_EVALUATION_NOT_PASS"
+                    )
                 )
             ),
             workspace_id=result.workspace_id,
@@ -3179,6 +3497,8 @@ class TaskOrchestrator:
             and request.graph_run_id == graph_run_id == manifest.run_id
             and request.node_id == node.id == manifest.node_id
             and canonical_digest(request.goal) == manifest.objective_digest
+            and request.task_kind == manifest.task_kind
+            and request.processes_authorized == manifest.processes_authorized
             and canonical_digest(request.completion_criteria) == manifest.completion_criteria_digest
             and request.completion_criteria
             == tuple(item.description for item in node.completion_criteria)
@@ -3277,7 +3597,35 @@ class TaskOrchestrator:
             except ValueError:
                 return False
             return True
-        if len(feedback) != 2 or repair.reason_code != "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+        if repair.reason_code == "ACCEPTED_PARENT_EVALUATION_FEEDBACK":
+            from .graph_evaluation import ParentCandidateEvaluationRecord
+
+            evaluations = self.store.list_records(
+                "parent_candidate_evaluation_v2",
+                ParentCandidateEvaluationRecord,
+                run_id=request.graph_run_id,
+            )
+            evaluation = next(
+                (item for item in evaluations if item.content_digest == feedback[0]), None
+            )
+            if evaluation is None or evaluation.status != "failed":
+                return False
+            expected = tuple(
+                dict.fromkeys(
+                    (
+                        evaluation.content_digest,
+                        evaluation.request_digest,
+                        *evaluation.verification_result_digests,
+                        *evaluation.evaluation_ledger_digests,
+                    )
+                )
+            )
+            return bool(
+                feedback == expected
+                and evaluation.accepted_graph_revision_digest
+                == repair.accepted_graph_revision_digest
+            )
+        if len(feedback) < 2 or repair.reason_code != "ACCEPTED_NODE_EVALUATION_FEEDBACK":
             return False
         history = self.store.list_records(
             "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id
@@ -3305,7 +3653,6 @@ class TaskOrchestrator:
         if (
             repair.worker_request_digest != prior.worker_request_digest
             or repair.worker_result_digest != prior.worker_result_digest
-            or repair.evidence_digests != (prior.evidence_digest, prior.evaluator_digest)
         ):
             return False
         assert prior.worker_result_id is not None
@@ -3316,6 +3663,38 @@ class TaskOrchestrator:
             evidence = self.store.get("node_evidence_v2", prior.evidence_id, NodeEvidenceRecord)
             evaluator = self.store.get("node_evaluator_v2", prior.evaluator_id, NodeEvaluatorRecord)
         except KeyError:
+            return False
+        failed_actions = tuple(
+            item.content_digest
+            for item in self.store.list_records(
+                "action_result_v2", ExecutionResult, run_id=worker_result.run_id
+            )
+            if item.status != "succeeded" and item.content_digest is not None
+        )
+        boundary_feedback = (
+            ()
+            if worker_result.boundary_diagnostic is None
+            else (_required_digest(worker_result.boundary_diagnostic.content_digest),)
+        )
+        if repair.evidence_digests != (
+            prior.evidence_digest,
+            prior.evaluator_digest,
+            *prior.verification_result_digests,
+            *failed_actions,
+            *boundary_feedback,
+        ):
+            return False
+        verification_results = self.store.list_records(
+            "verification_result_v2", ExecutionResult, run_id=worker_result.run_id
+        )
+        if (
+            tuple(
+                item.content_digest
+                for item in verification_results
+                if item.content_digest in prior.verification_result_digests
+            )
+            != prior.verification_result_digests
+        ):
             return False
         return bool(
             worker_result.content_digest == prior.worker_result_digest

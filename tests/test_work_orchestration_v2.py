@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from ai_employee.domain import (
+    CompletionCriterion,
     ExecutionStrategy,
+    GoalTaskKind,
     RoutingMode,
     SemanticAmbiguity,
     SemanticReasoningClass,
@@ -21,6 +23,7 @@ from ai_employee.domain import (
 )
 from ai_employee.domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind
 from ai_employee.domain.v2 import (
+    AcceptanceLedger,
     ActionKind,
     ActionProposal,
     ArtifactDescriptor,
@@ -167,6 +170,25 @@ class SuccessfulExecutor:
             request_digest=request.content_digest or "",
             status="succeeded",
             exit_code=0,
+            duration_seconds=0.01,
+        )
+
+
+class FailingVerificationExecutor:
+    def execute(
+        self, request: ProcessRequest, _decision: PolicyDecision, _cancellation: object
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            id=f"result-{request.id}",
+            run_id=request.run_id,
+            created_at=NOW,
+            request_digest=request.content_digest or "",
+            status="failed",
+            failure=StableFailure(
+                code=StableFailureCode.PROCESS_FAILED,
+                message="ruff found an unused import",
+            ),
+            exit_code=1,
             duration_seconds=0.01,
         )
 
@@ -1316,6 +1338,8 @@ def test_legacy_coordinator_accepts_bound_typed_result_with_authoritative_budget
             run_id="worker-run",
             created_at=NOW,
             goal="return a diagnosis",
+            task_kind=GoalTaskKind.NON_MUTATING,
+            processes_authorized=False,
             accepted_plan_digest=ZERO,
             node_id="diagnose",
             accepted_graph_revision_digest=ZERO,
@@ -1533,6 +1557,63 @@ def test_empty_patch_is_not_ready_to_promote(tmp_path: Path) -> None:
     try:
         assert run.status == "failed"
         assert run.failure_code == "EMPTY_PATCH"
+    finally:
+        store.close()
+
+
+def test_verification_failure_preserves_worker_identity_and_candidate_patch(
+    tmp_path: Path,
+) -> None:
+    patch = (
+        b"diff --git a/file.txt b/file.txt\n"
+        b"--- a/file.txt\n"
+        b"+++ b/file.txt\n"
+        b"@@ -1 +1 @@\n-before\n+after\n"
+    )
+    store = SQLiteStore(tmp_path / "fleet.db")
+    workspace = FakeWorkspace(patch)
+    verification = ProcessRequest(
+        id="verify-1",
+        run_id="work-1",
+        created_at=NOW,
+        argv=("ruff", "check"),
+        purpose="offline verification",
+    )
+    coordinator = WorkCoordinator(
+        store,
+        DeterministicRuntime({}, store=store),
+        workspace,  # type: ignore[arg-type]
+        lambda _snapshot, _cancellation: ScriptedWorkerAdapter([WorkerProposalEnvelope()]),
+        lambda _snapshot: FailingVerificationExecutor(),  # type: ignore[return-value]
+        lambda _descriptor: patch,
+        (builtin_policy("work-1"),),
+        verification_requests=(verification,),
+        allowed_processes=(verification.argv,),
+    )
+    try:
+        run = coordinator.start(
+            "make a verified change",
+            str(tmp_path),
+            "a" * 40,
+            worker_name="scripted",
+            run_id="work-1",
+            _completion_criteria=(
+                CompletionCriterion(
+                    id="verified-patch",
+                    description="candidate passes ruff",
+                    verification_requirement_ids=("verify-1",),
+                    required_artifact_ids=("workspace_patch",),
+                ),
+            ),
+        )
+        assert run.status == "failed"
+        assert run.failure_code == "VERIFICATION_FAILED"
+        assert run.worker_result_id is not None
+        assert run.patch_artifact_id == "patch-1"
+        assert run.acceptance_ledger_id is not None
+        ledger = store.get("acceptance_ledger_v2", run.acceptance_ledger_id, AcceptanceLedger)
+        assert ledger.criteria[0].disposition == "uncovered"
+        assert len(run.verification_result_digests) == 1
     finally:
         store.close()
 

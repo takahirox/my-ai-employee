@@ -148,6 +148,56 @@ def _canonicalize_graph_payload(
     }
     if unknown:
         raise ValueError(f"ProposedGraph returned unsupported capabilities: {sorted(unknown)}")
+    writing_nodes = tuple(
+        node for node in graph.nodes if "edit_intent" in node.required_capabilities
+    )
+    if goal.task_kind.value == "non_mutating" and writing_nodes:
+        raise ValueError("non-mutating ProposedGraph cannot contain a writing node")
+    for node in writing_nodes:
+        required_processes = len(
+            {
+                requirement
+                for criterion in node.completion_criteria
+                for requirement in criterion.verification_requirement_ids
+            }
+        )
+        if required_processes > node.resource_budget.processes:
+            raise ValueError(
+                f"ProposedGraph node {node.id!r} omits resources for declared verification"
+            )
+    if writing_nodes:
+        budget = graph.budget
+        if budget.max_repairs < 1 or budget.max_loop_iterations < 2:
+            raise ValueError("mutating ProposedGraph must reserve one bounded repair")
+        if budget.max_attempts < len(graph.nodes) + 1:
+            raise ValueError("mutating ProposedGraph attempt budget omits its repair reserve")
+        totals = {
+            "worker_turns": sum(node.resource_budget.worker_turns for node in graph.nodes),
+            "processes": sum(node.resource_budget.processes for node in graph.nodes),
+            "wall_seconds": sum(node.resource_budget.wall_seconds for node in graph.nodes),
+            "artifact_bytes": sum(node.resource_budget.artifact_bytes for node in graph.nodes),
+        }
+        repair = {
+            "worker_turns": max(node.resource_budget.worker_turns for node in writing_nodes),
+            "processes": max(node.resource_budget.processes for node in writing_nodes),
+            "wall_seconds": max(node.resource_budget.wall_seconds for node in writing_nodes),
+            "artifact_bytes": max(node.resource_budget.artifact_bytes for node in writing_nodes),
+        }
+        limits = {
+            "worker_turns": budget.max_worker_turns,
+            "processes": budget.max_processes,
+            "wall_seconds": budget.max_wall_seconds,
+            "artifact_bytes": budget.max_artifact_bytes,
+        }
+        missing = tuple(
+            resource
+            for resource in totals
+            if totals[resource] + repair[resource] > limits[resource]
+        )
+        if missing:
+            raise ValueError(
+                "mutating ProposedGraph resource budget omits repair reserve: " + ", ".join(missing)
+            )
     return graph
 
 
@@ -225,16 +275,21 @@ class CliProposedGraphPlanner:
                     "semantic_profile are planner hints only. The runtime persists them as "
                     "provenance and independently derives authoritative routing facts after graph "
                     "acceptance; do not select an execution strategy. "
-                    "Set graph max_attempts to at least the node count, and make every aggregate "
-                    "graph resource budget cover the sum of its node reservations without "
-                    "exceeding the supplied bounds. Edges mean required dependencies only: do "
+                    "For a mutating graph set max_repairs to 1, max_loop_iterations to 2, and "
+                    "max_attempts to at least the node count plus one. Its aggregate worker-turn, "
+                    "process, wall-time, and artifact budgets must cover the initial sum plus one "
+                    "largest writing-node reservation for repair, without exceeding the supplied "
+                    "bounds. For a non-mutating graph do not invent edit_intent or patch evidence. "
+                    "Edges mean required dependencies only: do "
                     "not emit "
                     "conditions, loops, retries, re-planning, or generalized control flow. "
                     "The runtime evaluates declared Harness commands against the composed parent "
-                    "candidate, so do not add a verification-only node or copy those goal-level "
-                    "criteria into individual node completion criteria. For "
-                    "editing nodes, bind completion evidence to the workspace_patch artifact; do "
-                    "not invent verification command IDs. "
+                    "candidate, so do not add a verification-only node. When the graph has one "
+                    "writing node, copy applicable accepted Goal verification requirement IDs "
+                    "into that node so deterministic failure can drive its bounded repair. In a "
+                    "multi-node graph keep composition-only checks at parent scope. For editing "
+                    "nodes, bind completion evidence to the workspace_patch artifact and use only "
+                    "the exact Goal verification IDs; do not invent command IDs. "
                     "Return only the supplied strict JSON schema."
                 ),
                 "categorical_rubric": SEMANTIC_PROFILE_RUBRIC,
@@ -242,11 +297,12 @@ class CliProposedGraphPlanner:
                 "available_capabilities": allowed,
                 "bounds": {
                     "max_nodes": max_nodes,
-                    "max_attempts": max_nodes,
+                    "max_attempts": max_nodes * 2,
                     "max_wall_seconds": max_wall_seconds,
                     "max_replans": 0,
                     "max_retries": 0,
-                    "max_loop_iterations": 1,
+                    "max_repairs": 1,
+                    "max_loop_iterations": 2,
                 },
                 "response_schema": json.loads(proposed_graph_schema_json()),
             }
@@ -360,11 +416,12 @@ class CliProposedGraphPlanner:
                     "effective_policy_digest": original.effective_policy_digest,
                     "harness_digest": original.harness_digest,
                     "max_nodes": max_nodes,
-                    "max_attempts": max_nodes,
+                    "max_attempts": max_nodes * 2,
                     "max_wall_seconds": max_wall_seconds,
                     "max_replans": 0,
                     "max_retries": 0,
-                    "max_loop_iterations": 1,
+                    "max_repairs": 1,
+                    "max_loop_iterations": 2,
                 },
                 "response_schema": json.loads(proposed_graph_schema_json()),
             }
@@ -417,11 +474,12 @@ class CliProposedGraphPlanner:
         if (
             len(graph.nodes) > max_nodes
             or budget.max_nodes > max_nodes
-            or budget.max_attempts > max_nodes
+            or budget.max_attempts > max_nodes * 2
             or budget.max_wall_seconds > max_wall_seconds
             or budget.max_replans != 0
             or budget.max_retries != 0
-            or budget.max_loop_iterations != 1
+            or budget.max_repairs != 1
+            or budget.max_loop_iterations != 2
         ):
             raise ValueError("revised ProposedGraph exceeds the original bounded constraints")
         return ProposedGraph(

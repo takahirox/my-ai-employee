@@ -13,6 +13,7 @@ from pydantic.main import BaseModel
 from ai_employee.serialization import versioned_digest
 
 from .base import CanonicalData, Digest, Identifier, StableStrEnum, UtcTimestamp
+from .models import GoalTaskKind
 
 
 class SchemaModelV2(BaseModel):
@@ -40,6 +41,7 @@ class StableFailureCode(StableStrEnum):
     APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
     APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     INVALID_REQUEST = "INVALID_REQUEST"
+    PATCH_PREFLIGHT_FAILED = "PATCH_PREFLIGHT_FAILED"
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
     ARTIFACT_BUDGET_INVALID = "ARTIFACT_BUDGET_INVALID"
     TIMEOUT = "TIMEOUT"
@@ -380,6 +382,8 @@ class PredecessorOutputReference(SchemaModelV2):
 class WorkerRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_request"
     goal: str = Field(min_length=1, max_length=20_000)
+    task_kind: GoalTaskKind = GoalTaskKind.MUTATING
+    processes_authorized: bool = True
     completion_criteria: tuple[str, ...] = ()
     required_capabilities: tuple[Identifier, ...] = ()
     accepted_plan_digest: Digest
@@ -447,6 +451,8 @@ class WorkerContextManifest(DigestedRecordV2):
     worker_run_id: Identifier
     node_id: Identifier
     objective_digest: Digest
+    task_kind: GoalTaskKind = GoalTaskKind.MUTATING
+    processes_authorized: bool = True
     completion_criteria_digest: Digest
     required_capabilities: tuple[Identifier, ...] = ()
     accepted_graph_revision_digest: Digest

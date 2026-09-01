@@ -13,6 +13,7 @@ from ai_employee.domain import (
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
+    GoalTaskKind,
     Graph,
     Node,
     NodeKind,
@@ -226,7 +227,12 @@ def _execute(tmp_path: Path, *, mode: str = "accepted", artifact_bytes: int = 10
             max_artifact_bytes=artifact_bytes,
         ),
     )
-    goal = Goal(id="typed-result-goal", statement="diagnose and report without mutation")
+    goal = Goal(
+        id="typed-result-goal",
+        statement="diagnose and report without mutation",
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+    )
     proposed = ProposedGraph(
         id="typed-result-proposal",
         run_id=run_id,
