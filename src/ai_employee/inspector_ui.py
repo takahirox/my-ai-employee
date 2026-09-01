@@ -1075,6 +1075,16 @@ x.node_id===id&&
 diagnostic,'Worker boundary event: '+text(diagnostic.stage),diagnostic.code);
 for(const transition of loopTransitions)push(
 transition,'Loop decision: '+text(transition.action),transition.reason_code);
+for(const authority of maps(raw.worker_timeout_authorities).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest))push(
+authority,'Worker deadline applied: '+duration(authority.effective_timeout_seconds));
+for(const watchdog of maps(raw.node_watchdogs).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest))push(
+watchdog,'Scheduler watchdog: '+text(watchdog.outcome));
+for(const control of maps(raw.node_control_propagations).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest))push(
+control,'Parent cancellation propagated',
+control.cleanup_confirmed?'cleanup confirmed':'cleanup not confirmed');
 for(const decision of maps(reviews.decisions).filter(x=>
 x.node_id===id&&
 (!digest||x.accepted_graph_revision_digest===digest)))push(
@@ -1148,6 +1158,8 @@ loopTransitions=maps(raw.loop_transitions).filter(x=>(x.node_id===id||
 Array.isArray(selectedRevision?.triggered_by_task_ids)&&
 selectedRevision.triggered_by_task_ids.includes(id)))&&
 x.accepted_graph_revision_digest===digest),
+childRunIds=new Set(maps(raw.worker_timeout_authorities).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest).map(x=>x.child_run_id)),
 activity=taskActivities(id,digest,attempts,resultDigests,records,reviews,loopTransitions)
 ;
 return{
@@ -1173,6 +1185,8 @@ attempt:latest.attempt,
 selected_strategy_id:selectedStrategy,
 activity,
 latest_loop_transition:loopTransitions.at(-1),
+latest_watchdog:maps(raw.node_watchdogs).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest).at(-1),
 operational:{
 status:operationalStatus,
 running_started_at:latest.running_started_at,
@@ -1227,6 +1241,16 @@ retry_repair_replan_decisions:maps(raw.loop_transitions).filter(x=>(x.node_id===
 x.node_id===null)&&
 x.accepted_graph_revision_digest===digest),
 retention:records('retained_node_bindings'),
+deadline_and_containment:{
+timeout_authority:maps(raw.worker_timeout_authorities).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest),
+watchdogs:maps(raw.node_watchdogs).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest),
+control_propagation:maps(raw.node_control_propagations).filter(x=>x.node_id===id&&
+x.accepted_graph_revision_digest===digest),
+child_worker_outcomes:Object.fromEntries(Object.entries(raw.child_worker_outcomes||{}).map(
+([key,items])=>[key,maps(items).filter(x=>childRunIds.has(x.run_id))])),
+doctor_incidents:maps(raw.doctor?.incidents).filter(x=>x.node_id===id)},
 revision_decision:{
 reason:selectedRevision?.trigger,
 evidence_digests:selectedRevision?.evidence_digests||
@@ -1426,6 +1450,7 @@ else stage='The task is '+text(status)+'.';
 const loop=task.latest_loop_transition;
 if(loop)stage+=' Latest loop decision: '+text(loop.action)+
 (loop.reason_code?' ('+loop.reason_code+')':'')+'.';
+if(task.latest_watchdog)stage+=' Watchdog: '+text(task.latest_watchdog.outcome)+'.';
 return stage}
 
 function renderTaskSummary(root,task){
@@ -1537,6 +1562,8 @@ key] of [['Strategy and routing reasons',
 'retry_repair_replan_decisions'],
 ['Retained-after-replan binding',
 'retention'],
+['Deadline, cancellation, and Fleet Doctor',
+'deadline_and_containment'],
 ['Revision decision',
 'revision_decision']])add(root,
 label,

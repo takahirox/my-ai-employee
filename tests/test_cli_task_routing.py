@@ -65,6 +65,14 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert not hasattr(args, "model")
 
 
+def test_doctor_cli_is_an_explicit_read_only_run_command() -> None:
+    args = cli.build_parser().parse_args(["doctor", "parent-run", "--db", "fleet.db"])
+
+    assert args.command == "doctor"
+    assert args.run_id == "parent-run"
+    assert args.db == "fleet.db"
+
+
 @pytest.mark.parametrize(
     "arguments",
     (

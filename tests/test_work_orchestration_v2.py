@@ -1269,6 +1269,70 @@ def test_cli_worker_rejects_ambiguous_or_count_inconsistent_existing_hunks(
         _validate_worker_envelope(raw)
 
 
+def test_successful_process_with_ambiguous_hunk_records_exact_protocol_classification() -> None:
+    output = json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-ambiguous",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-ambiguous",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": ["example.css"],
+                        "summary": "Replace one style.",
+                        "unified_diff": (
+                            "diff --git a/example.css b/example.css\n"
+                            "--- a/example.css\n"
+                            "+++ b/example.css\n"
+                            "@@ -1,2 +1,2 @@\n"
+                            " body{margin:0}\n"
+                        ),
+                    },
+                    "reason": "Implement the requested style.",
+                }
+            ],
+            "assistant_note": "",
+            "usage_json": "{}",
+        }
+    ).encode()
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
+        id="ambiguous-process-success",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+
+    result = CodexCliWorkerAdapter(
+        executor,
+        lambda _digest: output,
+        allow_worker,
+        run_id="run-1",
+    ).propose(worker_request(), Channel())  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.process_status == "succeeded"
+    assert result.boundary_diagnostic.code == "DIFF_HUNK_AMBIGUOUS", (
+        result.boundary_diagnostic.code,
+        result.boundary_diagnostic.exception_type,
+        result.boundary_diagnostic.exception_message,
+    )
+
+
 def test_cli_worker_recounts_incorrect_new_file_hunk_length() -> None:
     raw = json.dumps(
         {
@@ -1691,6 +1755,58 @@ def test_cli_worker_uses_injected_runtime_policy_decision() -> None:
     assert executor.decision is not None
     assert executor.decision.outcome is DecisionOutcome.DENY
     assert executor.decision.reason_code == "operator_policy_denied"
+
+
+def test_bound_probe_failure_persists_an_exact_failed_worker_result(tmp_path: Path) -> None:
+    run_id = "probe-failure-child"
+    policy = builtin_policy(run_id)
+    request = WorkerRequest(
+        id="probe-failure-request",
+        run_id=run_id,
+        created_at=NOW,
+        goal="diagnose without mutation",
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+        accepted_plan_digest=ZERO,
+        node_id="diagnosis-node",
+        graph_run_id="parent-run",
+        accepted_graph_revision_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=canonical_digest([policy.content_digest]),
+        remaining_budgets={"worker_turns": 1, "wall_seconds": 2.0},
+    )
+    with SQLiteStore(tmp_path / "probe-failure.db") as store:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            NoWorkspace(),  # type: ignore[arg-type]
+            lambda _snapshot, _cancellation: CodexCliWorkerAdapter(
+                CapturingExecutor(),
+                lambda _digest: b"",
+                allow_worker,
+                run_id=run_id,
+            ),
+            lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+            lambda _artifact: b"",
+            (policy,),
+        )
+
+        run = coordinator.execute_node(
+            request,
+            (),
+            str(tmp_path),
+            "a" * 40,
+            worker_name="codex_cli",
+            capture_patch=False,
+        )
+
+        assert run.status == "failed"
+        assert run.worker_result_id is not None
+        result = store.get("worker_result_v2", run.worker_result_id, WorkerResult)
+        assert result.request_digest == request.content_digest
+        assert result.status == "failed"
+        assert result.failure is not None
+        assert result.failure.code is StableFailureCode.POLICY_DENIED
 
 
 def test_plan_only_probes_without_workspace_or_action_mutation(tmp_path: Path) -> None:

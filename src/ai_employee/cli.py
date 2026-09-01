@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +21,7 @@ from . import __version__
 from .config import OperatorConfig, WorkerName, load_operator_config
 from .database import DATABASE_ENVIRONMENT_VARIABLE, resolve_database_path
 from .demo import run_demo
+from .doctor import doctor_from_projection
 from .domain import (
     CompletionCriterion,
     ContractKind,
@@ -134,6 +135,7 @@ from .task_orchestration import (
     GoalEvaluatorRecord,
     GraphRunRecord,
     TaskGraphAcceptance,
+    WorkerTimeoutAuthorityRecord,
     one_node_graph,
 )
 from .task_planning import (
@@ -197,6 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     explain.add_argument("run_id")
     explain.add_argument("--db")
+
+    doctor = commands.add_parser("doctor", help="classify persisted Fleet boundary incidents")
+    doctor.add_argument("run_id")
+    doctor.add_argument("--db")
 
     replay = commands.add_parser("replay", help="replay stored control flow without workers")
     replay.add_argument("run_id")
@@ -351,6 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {
             "cancel",
             "diff",
+            "doctor",
             "explain",
             "inspect",
             "logs",
@@ -408,6 +415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json(inspect_any_run(store, args.run_id)))
         elif args.command == "explain":
             print(canonical_json(explain_any_run(store, args.run_id)))
+        elif args.command == "doctor":
+            print(canonical_json(doctor_from_projection(inspect_any_run(store, args.run_id))))
         elif args.command == "replay":
             try:
                 graph_run = store.get("graph_run_v2", args.run_id, GraphRunRecord)
@@ -1185,6 +1194,7 @@ def _work(args: argparse.Namespace) -> int:
             bound_model: str | None,
             bound_effort: str | None,
             bound_store: SQLiteStore,
+            timeout_seconds: float,
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
             command = operator_config.worker_command(bound_worker_name)
@@ -1219,7 +1229,7 @@ def _work(args: argparse.Namespace) -> int:
                 inherit_environment=cli_inherit_environment(bound_worker_name),
                 include_response_schema=adapter_type is OllamaCliWorkerAdapter,
                 cancellation=cancellation,
-                timeout_seconds=harness.budgets.wall_seconds,
+                timeout_seconds=timeout_seconds,
             )
 
         if harness.provisional:
@@ -1263,6 +1273,33 @@ def _work(args: argparse.Namespace) -> int:
                 strategy: ExecutionStrategy,
             ) -> WorkCoordinator:
                 inner_store = SQLiteStore(db_path)
+                remaining = cast(Mapping[str, int | float], request.remaining_budgets)
+                node_timeout = float(
+                    remaining.get("wall_seconds", node.resource_budget.wall_seconds)
+                )
+                policy_timeout = float(policy.max_wall_seconds or harness.budgets.wall_seconds)
+                timeout_authority = WorkerTimeoutAuthorityRecord(
+                    id=identifier("worker-timeout-authority"),
+                    run_id=run_id,
+                    created_at=now(),
+                    graph_run_id=run_id,
+                    node_id=node.id,
+                    child_run_id=request.run_id,
+                    accepted_graph_revision_digest=cast(
+                        str, request.accepted_graph_revision_digest
+                    ),
+                    generation=node.generation,
+                    attempt=node.attempt,
+                    adapter_timeout_seconds=harness.budgets.wall_seconds,
+                    node_attempt_timeout_seconds=node_timeout,
+                    policy_timeout_seconds=min(policy_timeout, harness.budgets.wall_seconds),
+                    effective_timeout_seconds=min(
+                        harness.budgets.wall_seconds,
+                        node_timeout,
+                        policy_timeout,
+                    ),
+                )
+                inner_store.put("worker_timeout_authority_v2", timeout_authority, run_id=run_id)
                 node_worker_name = cast(WorkerName, strategy.backend)
                 node_verification_names = tuple(
                     name
@@ -1335,6 +1372,7 @@ def _work(args: argparse.Namespace) -> int:
                         bound_model=strategy.model,
                         bound_effort=strategy.effort,
                         bound_store=inner_store,
+                        timeout_seconds=timeout_authority.effective_timeout_seconds,
                     ),
                     lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
                     lambda descriptor: artifacts.open_verified(descriptor).read(),
@@ -1452,19 +1490,8 @@ def _work(args: argparse.Namespace) -> int:
                 harness_digest = proposed_graph.harness_digest
                 effective_policy_digest = proposed_graph.effective_policy_digest
             else:
-                node_goal = Goal(
-                    id=f"node-goal-{run_id}",
-                    statement=args.goal,
-                    completion_criteria=(
-                        CompletionCriterion(
-                            id=f"node-patch-{run_id}",
-                            description="the node produced an exact mediated workspace patch",
-                            required_artifact_ids=("workspace_patch",),
-                        ),
-                    ),
-                )
                 graph_input = one_node_graph(
-                    node_goal,
+                    goal,
                     graph_id=f"graph-{run_id}",
                     node_id=f"node-{run_id}",
                     required_capabilities=tuple(capabilities),

@@ -68,6 +68,7 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "Repository filter",
         "Task Summary",
         "Current / Recent Activity",
+        "Deadline, cancellation, and Fleet Doctor",
         "Typed result acceptances",
         "Live",
         "Reconnecting",
@@ -121,7 +122,7 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     assert "const taskOrPhase=run.active_task||run.phase||" in _INDEX
     assert "attention.title=attentionConditions.length?" in _INDEX
     assert "attentionCount+' warning'" in _INDEX
-    assert "id=\"warning-summary\"" in _INDEX
+    assert 'id="warning-summary"' in _INDEX
     assert "function renderWarningSummary(){" in _INDEX
     assert "const warnings=maps(raw.attention);" in _INDEX
     assert "button.dataset.taskId=task.id" in _INDEX
@@ -154,17 +155,18 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
         "taskActivities",
         "renderTaskSummary",
         "renderTaskActivity",
+        "worker_timeout_authorities",
+        "node_watchdogs",
+        "node_control_propagations",
         "@media(max-width:600px)",
     ):
         assert marker in _INDEX
-    card_source = _INDEX[
-        _INDEX.index("function cardFacts"): _INDEX.index("function renderGraph")
-    ]
+    card_source = _INDEX[_INDEX.index("function cardFacts") : _INDEX.index("function renderGraph")]
     assert "task.objective" not in card_source
     assert "content_digest" not in card_source
     assert "routing_reasons" not in card_source
     activity_source = _INDEX[
-        _INDEX.index("function taskActivities"): _INDEX.index("function taskView")
+        _INDEX.index("function taskActivities") : _INDEX.index("function taskView")
     ]
     for persisted_source in (
         "node_history",
@@ -178,15 +180,9 @@ def test_inspector_ui_exposes_read_only_dag_and_task_detail_contract() -> None:
     ):
         assert persisted_source in _INDEX
     assert "assistant_note" not in activity_source
-    details_source = _INDEX[
-        _INDEX.index("function renderDetails"): _INDEX.index("function add(")
-    ]
-    assert details_source.index("renderTaskSummary") < details_source.index(
-        "'Operational facts'"
-    )
-    assert details_source.index("renderTaskActivity") < details_source.index(
-        "'Operational facts'"
-    )
+    details_source = _INDEX[_INDEX.index("function renderDetails") : _INDEX.index("function add(")]
+    assert details_source.index("renderTaskSummary") < details_source.index("'Operational facts'")
+    assert details_source.index("renderTaskActivity") < details_source.index("'Operational facts'")
 
 
 def _execution_record(
@@ -251,9 +247,7 @@ def test_node_transition_timestamp_serializes_and_drives_overdue_projection() ->
     assert projection["elapsed_seconds"] == 10.0
     assert projection["deadline_at"] == "2026-01-01T00:00:15.000000Z"
     assert projection["verification_count"] == 0
-    assert NodeExecutionRecord.model_validate_json(
-        canonical_json(running), strict=True
-    ) == running
+    assert NodeExecutionRecord.model_validate_json(canonical_json(running), strict=True) == running
 
     payload = running.model_dump(mode="python")
     payload.pop("transitioned_at")
@@ -414,9 +408,7 @@ def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> Non
 
 def test_fleet_overview_does_not_invent_missing_update_timestamp() -> None:
     class Store(_CatalogStore):
-        def list_run_repositories(
-            self, repository_id: str | None = None
-        ) -> list[dict[str, str]]:
+        def list_run_repositories(self, repository_id: str | None = None) -> list[dict[str, str]]:
             return [{"run_id": "old", "repository_id": "repo", "repository": "/repo"}]
 
     projection = {

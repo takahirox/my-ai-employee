@@ -48,6 +48,7 @@ class StableFailureCode(StableStrEnum):
     CANCELLED = "CANCELLED"
     SPAWN_FAILED = "SPAWN_FAILED"
     PROCESS_FAILED = "PROCESS_FAILED"
+    PROCESS_GROUP_CLEANUP_FAILED = "PROCESS_GROUP_CLEANUP_FAILED"
     NETWORK_BLOCKED = "NETWORK_BLOCKED"
     DNS_REBIND_BLOCKED = "DNS_REBIND_BLOCKED"
     TLS_FAILED = "TLS_FAILED"
@@ -836,7 +837,7 @@ class WorkerBoundaryDiagnostic(DigestedRecordV2):
     exit_code: int | None = None
     duration_seconds: float = Field(ge=0)
     configured_timeout_seconds: float | None = Field(default=None, gt=0)
-    effective_timeout_seconds: float | None = Field(default=None, gt=0)
+    effective_timeout_seconds: float | None = Field(default=None, ge=0)
     stdout_bytes: int = Field(default=0, ge=0)
     stderr_bytes: int = Field(default=0, ge=0)
     stdout_artifact_digest: Digest | None = None

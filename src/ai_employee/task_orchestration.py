@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 from datetime import datetime
 from time import monotonic
 from typing import ClassVar, Literal, Protocol, Self, cast
@@ -24,6 +25,7 @@ from .domain import (
     Graph,
     Node,
     NodeKind,
+    NodeResourceBudget,
     OutputContract,
     RoutingMode,
     SemanticTaskProfile,
@@ -97,6 +99,13 @@ NodeExecutionStatus = Literal[
 GraphExecutionStatus = Literal[
     "planned", "running", "paused", "cancelled", "completed", "ready_to_promote", "failed"
 ]
+
+
+class _ContainmentThreadPoolExecutor(ThreadPoolExecutor):
+    """Do not let an uncooperative runner defeat the scheduler cleanup bound."""
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.shutdown(wait=False, cancel_futures=True)
 
 
 class LoopAction(StableStrEnum):
@@ -374,6 +383,77 @@ class NodeExecutionRecord(DigestedRecordV2):
     retained_from_revision_digest: Digest | None = None
 
 
+class WorkerTimeoutAuthorityRecord(DigestedRecordV2):
+    """Exact timeout sources bound to one parent node and child worker run."""
+
+    schema_name: ClassVar[str] = "worker_timeout_authority_record"
+    graph_run_id: Identifier
+    node_id: Identifier
+    child_run_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    adapter_timeout_seconds: float = Field(gt=0)
+    node_attempt_timeout_seconds: float = Field(gt=0)
+    policy_timeout_seconds: float = Field(gt=0)
+    effective_timeout_seconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _effective_timeout_is_the_strict_minimum(self) -> Self:
+        if self.effective_timeout_seconds != min(
+            self.adapter_timeout_seconds,
+            self.node_attempt_timeout_seconds,
+            self.policy_timeout_seconds,
+        ):
+            raise ValueError("effective worker timeout must equal every authority ceiling minimum")
+        return self
+
+
+class NodeWatchdogRecord(DigestedRecordV2):
+    """Scheduler containment fact for one expired accepted node attempt."""
+
+    schema_name: ClassVar[str] = "node_watchdog_record"
+    graph_run_id: Identifier
+    node_id: Identifier
+    child_run_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    allowance_seconds: float = Field(gt=0)
+    cleanup_grace_seconds: float = Field(ge=0)
+    outcome: Literal["signal_sent", "cleanup_confirmed", "cleanup_failed"]
+
+
+class NodeControlPropagationRecord(DigestedRecordV2):
+    """Parent-to-child cancellation and cleanup acknowledgement."""
+
+    schema_name: ClassVar[str] = "node_control_propagation_record"
+    graph_run_id: Identifier
+    node_id: Identifier
+    child_run_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    action: Literal["cancel"] = "cancel"
+    propagated: bool
+    cleanup_confirmed: bool
+
+
+class DiagnosticPersistenceFailureRecord(DigestedRecordV2):
+    """Minimal fail-safe fact when rich boundary diagnosis cannot be constructed."""
+
+    schema_name: ClassVar[str] = "diagnostic_persistence_failure_record"
+    graph_run_id: Identifier
+    node_id: Identifier
+    child_run_id: Identifier
+    accepted_graph_revision_digest: Digest
+    generation: int = Field(ge=0)
+    attempt: int = Field(ge=0)
+    original_exception_type: str
+    diagnostic_exception_type: str
+    effective_timeout_seconds: float = Field(ge=0)
+
+
 class GraphRunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     schema_version: Literal["2"] = "2"
@@ -592,6 +672,7 @@ def one_node_graph(
         output_contract=OutputContract(id=f"contract-{node_id}"),
         required_capabilities=required_capabilities,
         completion_criteria=criteria,
+        resource_budget=NodeResourceBudget(wall_seconds=max_wall_seconds),
     )
     return Graph(
         id=graph_id,
@@ -1260,6 +1341,9 @@ class TaskOrchestrator:
                 float,
             ],
         ] = {}
+        watchdog_signals: dict[Future[NodeExecutionResult], float] = {}
+        cancellation_signals: dict[Future[NodeExecutionResult], tuple[float, bool]] = {}
+        cleanup_grace_seconds = 2.0
         stop_action: Literal["pause", "cancel"] | None = None
         limits: dict[str, int | float] = {
             "worker_turns": graph_run.max_worker_turns,
@@ -1267,7 +1351,7 @@ class TaskOrchestrator:
             "wall_seconds": graph_run.max_wall_seconds,
             "artifact_bytes": graph_run.max_artifact_bytes,
         }
-        with ThreadPoolExecutor(
+        with _ContainmentThreadPoolExecutor(
             max_workers=self.max_concurrency,
             thread_name_prefix=f"fleet-{run_id[:24]}",
         ) as pool:
@@ -1289,6 +1373,34 @@ class TaskOrchestrator:
                             ),
                             run_id=run_id,
                         )
+                        if stop_action == "cancel":
+                            for future, active_item in tuple(active.items()):
+                                if future in cancellation_signals:
+                                    continue
+                                active_node_id, active_node, active_request, *_rest = active_item
+                                propagated = True
+                                try:
+                                    self.store.request_control(active_request.run_id, "cancel")
+                                except (OSError, RuntimeError, ValueError):
+                                    propagated = False
+                                cancellation_signals[future] = (monotonic(), propagated)
+                                self.store.put(
+                                    "node_control_propagation_v2",
+                                    NodeControlPropagationRecord(
+                                        id=identifier("node-control-propagation"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        graph_run_id=run_id,
+                                        node_id=active_node_id,
+                                        child_run_id=active_request.run_id,
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=active_node.generation,
+                                        attempt=active_node.attempt,
+                                        propagated=propagated,
+                                        cleanup_confirmed=False,
+                                    ),
+                                    run_id=run_id,
+                                )
                 for node_id in sorted(nodes):
                     record = records[node_id]
                     if record.status != "pending":
@@ -1544,11 +1656,162 @@ class TaskOrchestrator:
                                     failure_code="NO_READY_NODE",
                                 )
                     continue
-                completed, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
+                pending_deadlines = tuple(
+                    active_item[5] + active_item[1].resource_budget.wall_seconds
+                    for future, active_item in active.items()
+                    if future not in watchdog_signals
+                )
+                wait_timeout = (
+                    0.1
+                    if not pending_deadlines
+                    else max(0.0, min(0.1, min(pending_deadlines) - monotonic()))
+                )
+                completed, _pending = wait(
+                    tuple(active), timeout=wait_timeout, return_when=FIRST_COMPLETED
+                )
+                observed_at = monotonic()
+                for future, active_item in tuple(active.items()):
+                    if future.done() or future in watchdog_signals:
+                        continue
+                    active_node_id, active_node, active_request, *_middle, started_at = active_item
+                    if observed_at < started_at + active_node.resource_budget.wall_seconds:
+                        continue
+                    signal_outcome: Literal["signal_sent", "cleanup_failed"] = "signal_sent"
+                    try:
+                        self.store.request_control(active_request.run_id, "cancel")
+                    except (OSError, RuntimeError, ValueError):
+                        signal_outcome = "cleanup_failed"
+                    watchdog_signals[future] = observed_at
+                    self.store.put(
+                        "node_watchdog_v2",
+                        NodeWatchdogRecord(
+                            id=identifier("node-watchdog"),
+                            run_id=run_id,
+                            created_at=now(),
+                            graph_run_id=run_id,
+                            node_id=active_node_id,
+                            child_run_id=active_request.run_id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=active_node.generation,
+                            attempt=active_node.attempt,
+                            allowance_seconds=active_node.resource_budget.wall_seconds,
+                            cleanup_grace_seconds=cleanup_grace_seconds,
+                            outcome=signal_outcome,
+                        ),
+                        run_id=run_id,
+                    )
+                for future, active_item in tuple(active.items()):
+                    if future.done():
+                        continue
+                    signal_started = watchdog_signals.get(future)
+                    if (
+                        signal_started is None
+                        or observed_at - signal_started <= cleanup_grace_seconds
+                    ):
+                        continue
+                    active.pop(future)
+                    active_node_id, active_node, active_request, *_unused = active_item
+                    self.store.put(
+                        "node_watchdog_v2",
+                        NodeWatchdogRecord(
+                            id=identifier("node-watchdog"),
+                            run_id=run_id,
+                            created_at=now(),
+                            graph_run_id=run_id,
+                            node_id=active_node_id,
+                            child_run_id=active_request.run_id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=active_node.generation,
+                            attempt=active_node.attempt,
+                            allowance_seconds=active_node.resource_budget.wall_seconds,
+                            cleanup_grace_seconds=cleanup_grace_seconds,
+                            outcome="cleanup_failed",
+                        ),
+                        run_id=run_id,
+                    )
+                    records[active_node_id] = self._advance(
+                        records[active_node_id],
+                        status="failed",
+                        failure_code="WATCHDOG_TIMEOUT:CLEANUP_UNCONFIRMED",
+                    )
                 for future in sorted(completed, key=lambda item: active[item][0]):
                     node_id, node, request, reservation, strategy, started_at = active.pop(future)
                     try:
                         result = future.result()
+                        if future in watchdog_signals:
+                            self.store.put(
+                                "node_watchdog_v2",
+                                NodeWatchdogRecord(
+                                    id=identifier("node-watchdog"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    graph_run_id=run_id,
+                                    node_id=node_id,
+                                    child_run_id=request.run_id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    allowance_seconds=node.resource_budget.wall_seconds,
+                                    cleanup_grace_seconds=cleanup_grace_seconds,
+                                    outcome=(
+                                        "cleanup_confirmed"
+                                        if (
+                                            monotonic() - watchdog_signals[future]
+                                            <= cleanup_grace_seconds
+                                            and not (
+                                                result.worker_result.failure is not None
+                                                and result.worker_result.failure.code
+                                                is StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED
+                                            )
+                                        )
+                                        else "cleanup_failed"
+                                    ),
+                                ),
+                                run_id=run_id,
+                            )
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="failed",
+                                failure_code="WATCHDOG_TIMEOUT",
+                            )
+                            continue
+                        if future in cancellation_signals:
+                            self._persist_result(
+                                node,
+                                request,
+                                result,
+                                records,
+                                evidence_by_node,
+                                graph_digest,
+                            )
+                            cleanup_confirmed = not (
+                                result.worker_result.failure is not None
+                                and result.worker_result.failure.code
+                                is StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED
+                            )
+                            self.store.put(
+                                "node_control_propagation_v2",
+                                NodeControlPropagationRecord(
+                                    id=identifier("node-control-propagation"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    graph_run_id=run_id,
+                                    node_id=node_id,
+                                    child_run_id=request.run_id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    generation=node.generation,
+                                    attempt=node.attempt,
+                                    propagated=cancellation_signals[future][1],
+                                    cleanup_confirmed=cleanup_confirmed,
+                                ),
+                                run_id=run_id,
+                            )
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="cancelled",
+                                failure_code="GRAPH_CANCELLED",
+                            )
+                            continue
                         self._persist_result(
                             node,
                             request,
@@ -1557,13 +1820,6 @@ class TaskOrchestrator:
                             evidence_by_node,
                             graph_digest,
                         )
-                        if stop_action == "cancel":
-                            records[node_id] = self._advance(
-                                records[node_id],
-                                status="cancelled",
-                                failure_code="GRAPH_CANCELLED",
-                            )
-                            continue
                         current = records[node_id]
                         post_result_feedback = tuple(
                             item.content_digest
@@ -1895,33 +2151,60 @@ class TaskOrchestrator:
                         retry_resources_available = _node_resources_remain(node, remaining)
                         retryable = retry_count < retry_cap and retry_resources_available
                         exception_type, exception_message = _sanitized_boundary_exception(error)
-                        diagnostic = WorkerBoundaryDiagnostic(
-                            id=identifier("worker-boundary-diagnostic"),
-                            run_id=request.run_id,
-                            created_at=now(),
-                            adapter=strategy.backend,
-                            stage="runner",
-                            code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
-                            retryable=retryable,
-                            graph_run_id=run_id,
-                            node_id=node.id,
-                            accepted_graph_revision_digest=graph_digest,
-                            generation=node.generation,
-                            attempt=node.attempt,
-                            worker_request_id=request.id,
-                            worker_request_digest=_required_digest(request.content_digest),
-                            exception_type=exception_type,
-                            exception_message=exception_message,
-                            duration_seconds=max(0.0, monotonic() - started_at),
-                            configured_timeout_seconds=node.resource_budget.wall_seconds,
-                            effective_timeout_seconds=min(
+                        effective_timeout = max(
+                            0.0,
+                            min(
                                 node.resource_budget.wall_seconds,
                                 float(
                                     remaining.get("wall_seconds", node.resource_budget.wall_seconds)
                                 ),
                             ),
                         )
-                        self.store.put("worker_boundary_diagnostic_v2", diagnostic, run_id=run_id)
+                        try:
+                            diagnostic = WorkerBoundaryDiagnostic(
+                                id=identifier("worker-boundary-diagnostic"),
+                                run_id=request.run_id,
+                                created_at=now(),
+                                adapter=strategy.backend,
+                                stage="runner",
+                                code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
+                                retryable=retryable,
+                                graph_run_id=run_id,
+                                node_id=node.id,
+                                accepted_graph_revision_digest=graph_digest,
+                                generation=node.generation,
+                                attempt=node.attempt,
+                                worker_request_id=request.id,
+                                worker_request_digest=_required_digest(request.content_digest),
+                                exception_type=exception_type,
+                                exception_message=exception_message,
+                                duration_seconds=max(0.0, monotonic() - started_at),
+                                configured_timeout_seconds=node.resource_budget.wall_seconds,
+                                effective_timeout_seconds=effective_timeout,
+                            )
+                            self.store.put(
+                                "worker_boundary_diagnostic_v2", diagnostic, run_id=run_id
+                            )
+                        except Exception as diagnostic_error:
+                            with suppress(Exception):
+                                self.store.put(
+                                    "diagnostic_persistence_failure_v2",
+                                    DiagnosticPersistenceFailureRecord(
+                                        id=identifier("diagnostic-persistence-failure"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        graph_run_id=run_id,
+                                        node_id=node.id,
+                                        child_run_id=request.run_id,
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        original_exception_type=exception_type,
+                                        diagnostic_exception_type=type(diagnostic_error).__name__,
+                                        effective_timeout_seconds=effective_timeout,
+                                    ),
+                                    run_id=run_id,
+                                )
                         if retry_count < retry_cap and retry_resources_available:
                             self._save_loop_transition(
                                 LoopTransitionRecord(
@@ -1999,6 +2282,10 @@ class TaskOrchestrator:
                                 failure_code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
                             )
 
+        if stop_action == "cancel":
+            cancelled_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            if cancelled_run.status == "cancelled":
+                return cancelled_run
         authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
         if authoritative.generation != graph_run.generation:
             return authoritative

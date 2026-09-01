@@ -243,6 +243,7 @@ Inspect and control a run from another terminal:
 ```bash
 fleet inspect RUN_ID
 fleet explain RUN_ID
+fleet doctor RUN_ID
 fleet logs RUN_ID
 fleet approvals list --run RUN_ID
 fleet approvals approve APPROVAL_ID --request-digest REQUEST_DIGEST
@@ -283,6 +284,11 @@ failure path, and final disposition. It never invokes an AI worker, reads artifa
 bodies, or mutates/migrates the database. `fleet inspect` remains the detailed raw
 forensic projection. The local Inspector exposes the same summary at
 `/api/runs/RUN_ID/explanation`.
+
+`fleet doctor RUN_ID` deterministically classifies persisted deadline, watchdog,
+parent/child cancellation, process cleanup, worker-envelope, missing-result, diagnostic,
+and repair-exhaustion facts. It is read only: Doctor cannot transition a run, request a
+repair, apply a patch, or publish an incident.
 
 Start the browser Inspector with `fleet serve` (or `fleet serve --db PATH`). Its repository
 selector filters runs from the shared database by their persisted repository identity. The

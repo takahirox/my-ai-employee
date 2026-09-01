@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from pydantic import RootModel
 
+from .doctor import doctor_from_projection
 from .domain import (
     Artifact,
     ContextPackage,
@@ -73,20 +74,24 @@ from .promotion_approval import PromotionPolicyDecision
 from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
+    DiagnosticPersistenceFailureRecord,
     GoalEvaluatorRecord,
     GraphControlFact,
     GraphRunRecord,
     LoopTransitionRecord,
+    NodeControlPropagationRecord,
     NodeEvaluatorRecord,
     NodeEvidenceRecord,
     NodeExecutionRecord,
     NodeReservationRecord,
     NodeRouteRecord,
     NodeSemanticAssessmentRecord,
+    NodeWatchdogRecord,
     PreAcceptanceGoalRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
+    WorkerTimeoutAuthorityRecord,
     _load_plan_review_history,
 )
 from .task_planning import ProposedGraph
@@ -507,6 +512,37 @@ def inspect_graph_run(
             "artifact_descriptor_v2", run.parent_candidate_artifact_id, ArtifactDescriptor
         )
     )
+    timeout_authorities = store.list_records(
+        "worker_timeout_authority_v2", WorkerTimeoutAuthorityRecord, run_id=run_id
+    )
+    watchdogs = store.list_records("node_watchdog_v2", NodeWatchdogRecord, run_id=run_id)
+    control_propagations = store.list_records(
+        "node_control_propagation_v2", NodeControlPropagationRecord, run_id=run_id
+    )
+    child_run_ids = tuple(dict.fromkeys(item.child_run_id for item in timeout_authorities))
+    child_worker_outcomes = {
+        "results": [
+            _json_model(item)
+            for child_run_id in child_run_ids
+            for item in store.list_records("worker_result_v2", WorkerResult, run_id=child_run_id)
+        ],
+        "process_results": [
+            _json_model(item.root)
+            for child_run_id in child_run_ids
+            for item in store.list_records(
+                "action_result_v2", _ActionResultRecord, run_id=child_run_id
+            )
+        ],
+        "diagnostics": [
+            _json_model(item)
+            for child_run_id in child_run_ids
+            for item in store.list_records(
+                "worker_boundary_diagnostic_v2",
+                WorkerBoundaryDiagnostic,
+                run_id=child_run_id,
+            )
+        ],
+    }
     return {
         "schema_version": "2",
         "run_id": run.id,
@@ -545,6 +581,18 @@ def inspect_graph_run(
         "node_history": [_json_model(item) for item in node_records],
         "claims": list(store.graph_claims(run_id)),
         "reservations": [_json_model(item) for item in reservations],
+        "worker_timeout_authorities": [_json_model(item) for item in timeout_authorities],
+        "node_watchdogs": [_json_model(item) for item in watchdogs],
+        "node_control_propagations": [_json_model(item) for item in control_propagations],
+        "child_worker_outcomes": child_worker_outcomes,
+        "diagnostic_persistence_failures": [
+            _json_model(item)
+            for item in store.list_records(
+                "diagnostic_persistence_failure_v2",
+                DiagnosticPersistenceFailureRecord,
+                run_id=run_id,
+            )
+        ],
         "node_semantic_assessments": [
             _json_model(item)
             for item in store.list_records(
@@ -1124,6 +1172,7 @@ def _attach_repository_context(
     projection["attention"] = attention
     projection["attention_count"] = len(attention)
     projection["attention_available"] = True
+    projection["doctor"] = doctor_from_projection(projection)
     repository = store.repository_for_run(run_id)
     if repository is not None:
         projection["repository_context"] = repository

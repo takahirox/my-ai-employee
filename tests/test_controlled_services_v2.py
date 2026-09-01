@@ -269,7 +269,7 @@ def test_process_timeout_terminates_child_process_group(tmp_path: Path) -> None:
         id="process-tree-1",
         run_id="run-1",
         created_at=NOW,
-        argv=("/bin/sh", "-c", "sleep 10 & echo $! > child.pid; wait"),
+        argv=("/bin/sh", "-c", "trap '' TERM; sleep 10 & echo $! > child.pid; wait"),
         timeout_seconds=0.1,
         purpose="verify process group cleanup",
     )
@@ -280,6 +280,7 @@ def test_process_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     # The child inherits the captured pipes. Returning promptly therefore proves that
     # group cleanup closed the child's descriptors instead of leaving `sleep` running.
     assert result.duration_seconds < 2.0
+    assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
 
 
 def test_process_rejects_policy_budget_before_spawn(tmp_path: Path) -> None:

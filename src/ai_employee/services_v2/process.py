@@ -27,6 +27,11 @@ from ai_employee.domain.v2 import (
 
 from ._common import identifier, now
 
+
+class _ProcessGroupCleanupError(RuntimeError):
+    pass
+
+
 _SECRET_MARKERS = (
     "TOKEN",
     "SECRET",
@@ -122,7 +127,7 @@ class LocalProcessExecutor:
                     failure=self._failure(StableFailureCode.SPAWN_FAILED, str(error)),
                 )
             try:
-                stdout, stderr, exceeded, cancelled, timed_out = self._capture(
+                stdout, stderr, exceeded, cancelled, timed_out, cleanup = self._capture(
                     process, request, cancellation, started, timeout
                 )
             finally:
@@ -169,10 +174,19 @@ class LocalProcessExecutor:
                         "policy_digest": decision.effective_policy_digest,
                         "stdout_bytes": len(stdout),
                         "stderr_bytes": len(stderr),
+                        "process_group_cleanup": cleanup,
                     }
                 ),
                 stdout_artifact_digest=stdout_digest,
                 stderr_artifact_digest=stderr_digest,
+            )
+        except _ProcessGroupCleanupError as error:
+            return self._result(
+                request,
+                started,
+                failure=self._failure(StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED, str(error)),
+                status="indeterminate",
+                resource_usage={"process_group_cleanup": "failed"},
             )
         except (OSError, ValueError) as error:
             return self._result(
@@ -190,7 +204,7 @@ class LocalProcessExecutor:
         cancellation: Cancellation,
         started: float,
         timeout: float,
-    ) -> tuple[bytes, bytes, bool, bool, bool]:
+    ) -> tuple[bytes, bytes, bool, bool, bool, str]:
         assert process.stdout is not None and process.stderr is not None
         selector = selectors.DefaultSelector()
         stdout_buffer = bytearray()
@@ -202,6 +216,7 @@ class LocalProcessExecutor:
             process.stderr, selectors.EVENT_READ, (stderr_buffer, request.stderr_bytes)
         )
         exceeded = cancelled = timed_out = False
+        cleanup = "not_required"
         while selector.get_map():
             elapsed = time.monotonic() - started
             cancelled = cancellation.cancelled()
@@ -210,9 +225,13 @@ class LocalProcessExecutor:
                 try:
                     process.wait(timeout=0.05)
                 except subprocess.TimeoutExpired:
-                    self._terminate_group(process)
+                    outcome = self._terminate_group(process)
+                    if cleanup == "not_required" or outcome != "already_exited":
+                        cleanup = outcome
             elif cancelled or timed_out:
-                self._terminate_group(process)
+                outcome = self._terminate_group(process)
+                if cleanup == "not_required" or outcome != "already_exited":
+                    cleanup = outcome
             for key, _events in selector.select(timeout=0.05):
                 buffer, limit = key.data
                 chunk = os.read(key.fd, 64 * 1024)
@@ -226,22 +245,27 @@ class LocalProcessExecutor:
                 break
         process.wait()
         selector.close()
-        return bytes(stdout_buffer), bytes(stderr_buffer), exceeded, cancelled, timed_out
+        return bytes(stdout_buffer), bytes(stderr_buffer), exceeded, cancelled, timed_out, cleanup
 
-    def _terminate_group(self, process: subprocess.Popen[bytes]) -> None:
+    def _terminate_group(self, process: subprocess.Popen[bytes]) -> str:
         if process.poll() is not None:
-            return
+            return "already_exited"
         try:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=self.terminate_grace_seconds)
+            return "sigterm_confirmed"
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+            return "sigkill_confirmed"
         except ProcessLookupError:
-            pass
+            return "already_exited"
         except PermissionError:
             if process.poll() is None:
-                raise
+                raise _ProcessGroupCleanupError(
+                    "process group cleanup could not be confirmed"
+                ) from None
+            return "already_exited"
 
     def _resolve_cwd(self, relative: str) -> Path:
         candidates = tuple((root / relative).resolve() for root in self.roots)
@@ -378,7 +402,8 @@ class LocalProcessExecutor:
         started: float,
         *,
         failure: StableFailure,
-        status: Literal["failed", "cancelled"] = "failed",
+        status: Literal["failed", "cancelled", "indeterminate"] = "failed",
+        resource_usage: object = None,
     ) -> ExecutionResult:
         return ExecutionResult(
             id=identifier("execution"),
@@ -388,6 +413,7 @@ class LocalProcessExecutor:
             status=status,
             failure=failure,
             duration_seconds=time.monotonic() - started,
+            resource_usage=freeze_json(resource_usage),
         )
 
     @staticmethod

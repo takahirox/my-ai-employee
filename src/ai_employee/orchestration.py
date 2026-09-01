@@ -51,6 +51,7 @@ from .domain.v2 import (
     NonMutatingResultAcceptance,
     PolicyDecision,
     ProcessRequest,
+    StableFailure,
     StableFailureCode,
     WorkerRequest,
     WorkerResult,
@@ -432,7 +433,28 @@ class WorkCoordinator:
                 if availability.failure is None
                 else availability.failure.code
             )
-            return self._update(run, status="failed", failure_code=availability_code.value)
+            changes: dict[str, object] = {
+                "status": "failed",
+                "failure_code": availability_code.value,
+            }
+            if _accepted_request is not None:
+                failure = availability.failure or StableFailure(
+                    code=availability_code,
+                    message="configured worker probe reported unavailable",
+                    retryable=False,
+                )
+                result = WorkerResult(
+                    id=identifier("worker-result"),
+                    run_id=run.id,
+                    created_at=now(),
+                    request_digest=_accepted_request.content_digest or "",
+                    status="failed",
+                    failure=failure,
+                    duration_seconds=0.0,
+                )
+                self.store.put("worker_result_v2", result, run_id=run.id)
+                changes["worker_result_id"] = result.id
+            return self._update(run, **changes)
         if plan_only:
             return self._update(run, status="planned")
         request = WorkspaceRequest(

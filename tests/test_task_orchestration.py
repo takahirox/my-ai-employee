@@ -14,6 +14,7 @@ from ai_employee.domain import (
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
+    GoalTaskKind,
     Graph,
     Node,
     NodeKind,
@@ -28,6 +29,7 @@ from ai_employee.domain import (
 from ai_employee.domain.models import NodeResourceBudget
 from ai_employee.domain.v2 import (
     CriterionEvidence,
+    StableFailure,
     StableFailureCode,
     WorkerBoundaryDiagnostic,
     WorkerRequest,
@@ -54,9 +56,11 @@ from ai_employee.serialization import canonical_digest
 from ai_employee.services_v2._common import identifier
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
+    NodeControlPropagationRecord,
     NodeExecutionRecord,
     NodeExecutionResult,
     NodeReservationRecord,
+    NodeWatchdogRecord,
     PreAcceptanceGoalRecord,
     TaskGraphAcceptance,
     TaskOrchestrator,
@@ -66,6 +70,88 @@ from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
+
+
+def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(tmp_path: Path) -> None:
+    goal = Goal(
+        id="watchdog-goal",
+        statement="bound the worker",
+        completion_criteria=(_criterion("watchdog"),),
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="watchdog-graph",
+        node_id="watchdog-node",
+        required_capabilities=("process",),
+        max_wall_seconds=0.05,
+    )
+
+    def slow_runner(
+        _node_value: Node,
+        request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        threading.Event().wait(0.1)
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="late-watchdog-result",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.1,
+            ),
+            criterion_evidence=(),
+        )
+
+    with SQLiteStore(tmp_path / "watchdog.db") as store:
+        run = TaskOrchestrator(store, slow_runner, (_strategy(),)).run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=1.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="watchdog-run",
+            available_capabilities=("process",),
+        )
+        watchdogs = store.list_records("node_watchdog_v2", NodeWatchdogRecord, run_id=run.id)
+        replay = TaskOrchestrator(store, slow_runner, (_strategy(),)).replay(run.id)
+
+    assert run.status == "failed"
+    assert replay.nodes[0].failure_code == "WATCHDOG_TIMEOUT"
+    assert {item.outcome for item in watchdogs} == {"signal_sent", "cleanup_confirmed"}
+    assert len({item.child_run_id for item in watchdogs}) == 1
+    assert watchdogs[0].child_run_id.startswith("node-")
+
+
+def test_fixed_compatibility_graph_preserves_non_mutating_contract_and_budget() -> None:
+    criterion = CompletionCriterion(
+        id="typed-diagnosis",
+        description="a typed diagnosis is accepted",
+    )
+    goal = Goal(
+        id="non-mutating-goal",
+        statement="diagnose only",
+        completion_criteria=(criterion,),
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+    )
+
+    graph = one_node_graph(
+        goal,
+        graph_id="non-mutating-graph",
+        node_id="diagnosis-node",
+        required_capabilities=(),
+        max_wall_seconds=12.0,
+    )
+
+    assert graph.nodes[0].completion_criteria == (criterion,)
+    assert graph.nodes[0].required_capabilities == ()
+    assert graph.nodes[0].resource_budget.wall_seconds == 12.0
+    assert all(
+        "workspace_patch" not in item.required_artifact_ids
+        for item in graph.nodes[0].completion_criteria
+    )
 
 
 def _criterion(name: str) -> CompletionCriterion:
@@ -1422,6 +1508,11 @@ def test_cancel_fences_late_results_and_replays_only_stale_control_facts(
         controller.join(timeout=3)
         replay = orchestrator.replay(cancelled.id)
         explanation = explain_any_run(store, cancelled.id)
+        propagations = store.list_records(
+            "node_control_propagation_v2",
+            NodeControlPropagationRecord,
+            run_id=cancelled.id,
+        )
         assert store.list_records("goal_evaluator_v2", WorkerResult, run_id=cancelled.id) == ()
 
     assert not controller.is_alive()
@@ -1442,6 +1533,7 @@ def test_cancel_fences_late_results_and_replays_only_stale_control_facts(
     assert replay.results == ()
     assert replay.evidence == ()
     assert replay.evaluator_decisions == ()
+    assert {item.node_id for item in propagations} <= {"a", "b"}
     assert len(replay.stale_results) == 2
     assert {item.result_generation for item in replay.stale_results} == {0}
     assert {item.authoritative_generation for item in replay.stale_results} == {1}
@@ -1450,6 +1542,76 @@ def test_cancel_fences_late_results_and_replays_only_stale_control_facts(
     assert replay.verification_invocations == 0
     assert replay.composition_invocations == 0
     assert replay.promotion_invocations == 0
+
+
+def test_parent_cancel_is_propagated_to_each_blocked_child_run(tmp_path: Path) -> None:
+    database = tmp_path / "cancel-propagation.db"
+    started = {name: threading.Event() for name in ("a", "b")}
+
+    def runner(
+        node: Node,
+        request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        started[node.id].set()
+        with SQLiteStore(database) as observer:
+            for _index in range(300):
+                if observer.control(request.run_id) == "cancel":
+                    break
+                threading.Event().wait(0.01)
+            else:
+                raise AssertionError("parent cancellation did not reach child run")
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id=f"cancelled-result-{node.id}",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="cancelled",
+                failure=StableFailure(
+                    code=StableFailureCode.CANCELLED,
+                    message="child observed parent cancellation",
+                ),
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(),
+        )
+
+    def cancel_parent() -> None:
+        assert started["a"].wait(timeout=3)
+        assert started["b"].wait(timeout=3)
+        with SQLiteStore(database) as controller:
+            controller.request_control("propagation-run", "cancel")
+
+    controller = threading.Thread(target=cancel_parent)
+    with SQLiteStore(database) as store:
+        controller.start()
+        run = TaskOrchestrator(store, runner, (_strategy(),), max_concurrency=2).run(
+            Goal(id="propagation-goal", statement="cancel active children"),
+            _fork_join_graph(),
+            ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="propagation-run",
+            available_capabilities=("process",),
+        )
+        controller.join(timeout=3)
+        propagations = store.list_records(
+            "node_control_propagation_v2",
+            NodeControlPropagationRecord,
+            run_id=run.id,
+        )
+
+    assert run.status == "cancelled", (
+        run.status,
+        run.failure_code,
+        run.generation,
+        [(item.node_id, item.cleanup_confirmed) for item in propagations],
+    )
+    assert not controller.is_alive()
+    assert {item.node_id for item in propagations} == {"a", "b"}
+    assert all(item.propagated for item in propagations)
+    assert sum(item.cleanup_confirmed for item in propagations) == 2
 
 
 def test_worker_boundary_retries_once_with_new_attempt_authority(

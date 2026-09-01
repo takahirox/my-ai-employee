@@ -383,6 +383,8 @@ class CliWorkerAdapter:
                 diagnostic_code=(
                     "TYPED_RESULT_MALFORMED"
                     if typed_result_supplied
+                    else "DIFF_HUNK_AMBIGUOUS"
+                    if isinstance(error, _AmbiguousDiffHunk)
                     else "WORKER_ENVELOPE_MALFORMED"
                 ),
                 invocation=invocation,
@@ -940,6 +942,10 @@ def _worker_evidence_sources(request: WorkerRequest) -> tuple[dict[str, object],
     )
 
 
+class _AmbiguousDiffHunk(ValueError):
+    """Fail-closed marker for an existing-file hunk that cannot be recounted safely."""
+
+
 def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
     """Validate proposals after replacing worker-claimed digests with local computation."""
 
@@ -1086,7 +1092,7 @@ def _normalize_unified_diff(value: str) -> str:
             and not new_file
             and (observed_old != expected_old or observed_new != expected_new)
         ):
-            raise ValueError("existing-file hunk has ambiguous or inconsistent line counts")
+            raise _AmbiguousDiffHunk("existing-file hunk has ambiguous or inconsistent line counts")
 
     for line in lines:
         if line.startswith("diff --git "):
