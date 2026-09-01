@@ -668,6 +668,15 @@ const taskOrPhase=run.active_task||run.phase||
 'No active task or phase recorded';
 activity.textContent=taskOrPhase;
 activity.title=taskOrPhase;
+const ownership=document.createElement('p');
+ownership.className='run-activity muted';
+const ownershipFacts=[];
+if(run.diagnostic_code)ownershipFacts.push(run.diagnostic_code);
+if(run.owner_instance_id)ownershipFacts.push('Owner: '+run.owner_instance_id);
+if(run.last_heartbeat)ownershipFacts.push('Heartbeat: '+run.last_heartbeat);
+if(run.lease_expiry)ownershipFacts.push('Lease expiry: '+run.lease_expiry);
+ownership.textContent=ownershipFacts.join(' · ');
+ownership.title=ownership.textContent;
 const updated=document.createElement('span');
 updated.className='run-updated muted';
 if(run.last_updated_at){
@@ -688,7 +697,9 @@ meta.className='run-card-meta';
 meta.append(status,progressGroup,attention);
 const footer=document.createElement('div');
 footer.className='run-card-footer';
-footer.append(activity,updated);
+footer.append(activity);
+if(ownershipFacts.length)footer.append(ownership);
+footer.append(updated);
 card.append(title,repository,meta,footer);
 card.addEventListener('click',()=>openRun(run.run_id));
 root.append(card)}

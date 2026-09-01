@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
+import signal
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import monotonic
-from typing import ClassVar, Literal, Protocol, Self, cast
+from typing import Any, ClassVar, Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.main import BaseModel
@@ -38,6 +40,7 @@ from .domain.base import (
     SchemaModel,
     StableStrEnum,
     UtcTimestamp,
+    ensure_utc,
     freeze_json,
 )
 from .domain.v2 import (
@@ -78,6 +81,13 @@ from .routing import (
     profile_compatibility_bands,
     select_strategy,
 )
+from .run_ownership import (
+    OwnerFenceViolationRecord,
+    RunExecutionOwnerRecord,
+    RunLeaseClosureRecord,
+    RunLeaseHeartbeatRecord,
+    RunOwnerConflictRecord,
+)
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
@@ -97,8 +107,27 @@ NodeExecutionStatus = Literal[
     "pending", "routed", "running", "passed", "failed", "blocked", "cancelled"
 ]
 GraphExecutionStatus = Literal[
-    "planned", "running", "paused", "cancelled", "completed", "ready_to_promote", "failed"
+    "planned",
+    "running",
+    "paused",
+    "cancelled",
+    "completed",
+    "ready_to_promote",
+    "failed",
+    "interrupted",
 ]
+
+_OWNED_TERMINAL_GRAPH_STATES = frozenset(
+    {"paused", "cancelled", "completed", "failed", "interrupted"}
+)
+
+
+class RunOwnershipLost(RuntimeError):
+    """The caller no longer holds authority for the graph execution."""
+
+
+class _RunTerminationSignal(BaseException):
+    """Turn SIGTERM into bounded authoritative interruption handling."""
 
 
 class _ContainmentThreadPoolExecutor(ThreadPoolExecutor):
@@ -491,6 +520,7 @@ class GraphRunRecord(BaseModel):
     max_wall_seconds: float = Field(default=3600.0, gt=0)
     max_artifact_bytes: int = Field(default=100_000_000, ge=0)
     generation: int = Field(default=0, ge=0)
+    execution_attempt: int = Field(default=0, ge=0)
     repository: str | None = None
     base_commit: str | None = None
     operator_config_digest: Digest | None = None
@@ -721,12 +751,24 @@ class TaskOrchestrator:
             TaskReviewSeverity.HIGH,
         ),
         clock: Callable[[], datetime] = now,
+        owner_instance_id: Identifier | None = None,
+        lease_duration_seconds: float = 15.0,
+        heartbeat_interval_seconds: float = 5.0,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
         self.store = store
         self.runner = runner
         self.clock = clock
+        if lease_duration_seconds <= 0:
+            raise ValueError("run lease duration must be positive")
+        if heartbeat_interval_seconds <= 0 or heartbeat_interval_seconds >= lease_duration_seconds:
+            raise ValueError("run heartbeat interval must be positive and shorter than its lease")
+        self.owner_instance_id = owner_instance_id or identifier("fleet-owner")
+        self.lease_duration_seconds = lease_duration_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._run_owner: RunExecutionOwnerRecord | None = None
+        self._next_heartbeat_at: datetime | None = None
         self.strategies = tuple(sorted(strategies, key=lambda item: item.id))
         if not self.strategies:
             raise ValueError("at least one explicitly configured strategy is required")
@@ -789,6 +831,60 @@ class TaskOrchestrator:
         self.task_review_block_severities = block_severities
 
     def run(
+        self,
+        goal: Goal,
+        proposed_graph: Graph | ProposedGraph,
+        policy: ExecutionPolicy,
+        *,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+        run_id: Identifier,
+        available_capabilities: Iterable[str],
+        plan_only: bool = False,
+        resume: bool = False,
+        replan: bool = False,
+    ) -> GraphRunRecord:
+        """Execute with bounded signal/error terminalization once ownership is acquired."""
+
+        self._run_owner = None
+        self._next_heartbeat_at = None
+        previous_sigterm = None
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def interrupt_for_sigterm(_signum: int, _frame: object) -> None:
+                raise _RunTerminationSignal("SIGTERM")
+
+            signal.signal(signal.SIGTERM, interrupt_for_sigterm)
+        try:
+            return self._run_impl(
+                goal,
+                proposed_graph,
+                policy,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                run_id=run_id,
+                available_capabilities=available_capabilities,
+                plan_only=plan_only,
+                resume=resume,
+                replan=replan,
+            )
+        except BaseException as error:
+            if self._run_owner is not None:
+                status: GraphExecutionStatus = (
+                    "interrupted"
+                    if isinstance(error, (KeyboardInterrupt, _RunTerminationSignal))
+                    else "failed"
+                )
+                self._terminalize_after_exception(status, type(error).__name__)
+            raise
+        finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            self._run_owner = None
+            self._next_heartbeat_at = None
+
+    def _run_impl(
         self,
         goal: Goal,
         proposed_graph: Graph | ProposedGraph,
@@ -985,6 +1081,7 @@ class TaskOrchestrator:
                     "generation": (
                         graph_run.generation if starting_planned else graph_run.generation + 1
                     ),
+                    "execution_attempt": graph_run.execution_attempt + 1,
                     "failure_code": None,
                 }
             )
@@ -1001,6 +1098,7 @@ class TaskOrchestrator:
                     ),
                     run_id=run_id,
                 )
+            self._acquire_run_owner(graph_run)
             self._save_run(graph_run)
         elif replan:
             assert proposal is not None and previous_acceptance is not None
@@ -1027,6 +1125,10 @@ class TaskOrchestrator:
                     "status": "running",
                     "generation": self.store.get("graph_run_v2", run_id, GraphRunRecord).generation
                     + 1,
+                    "execution_attempt": self.store.get(
+                        "graph_run_v2", run_id, GraphRunRecord
+                    ).execution_attempt
+                    + 1,
                     "replan_count": self.store.get(
                         "graph_run_v2", run_id, GraphRunRecord
                     ).replan_count
@@ -1044,6 +1146,7 @@ class TaskOrchestrator:
                 }
             )
             self.store.clear_control(run_id)
+            self._acquire_run_owner(graph_run)
             self._save_run(graph_run)
             self._save_loop_transition(
                 LoopTransitionRecord(
@@ -1134,6 +1237,8 @@ class TaskOrchestrator:
                 operator_config_path=self.operator_config_path,
                 strategy_set=self.strategy_set,
             )
+            if not plan_only:
+                self._acquire_run_owner(graph_run)
             self._save_run(graph_run)
         max_claims = graph_run.max_claims
         nodes = {node.id: node for node in accepted.graph.nodes}
@@ -1284,7 +1389,6 @@ class TaskOrchestrator:
             graph_run = graph_run.model_copy(
                 update={
                     "status": "failed",
-                    "generation": graph_run.generation + 1,
                     "failure_code": "GRAPH_EXECUTION_UNAVAILABLE",
                 }
             )
@@ -1356,12 +1460,11 @@ class TaskOrchestrator:
             thread_name_prefix=f"fleet-{run_id[:24]}",
         ) as pool:
             while active or any(item.status == "pending" for item in records.values()):
+                self._heartbeat_run_owner_if_due()
                 if stop_action is None:
                     observed = self.store.control(run_id)
                     if observed == "pause" or observed == "cancel":
                         stop_action = cast(Literal["pause", "cancel"], observed)
-                        if stop_action == "cancel":
-                            graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
                         self.store.put(
                             "graph_control_fact_v2",
                             GraphControlFact(
@@ -1369,7 +1472,11 @@ class TaskOrchestrator:
                                 run_id=run_id,
                                 created_at=now(),
                                 action=stop_action,
-                                generation=graph_run.generation,
+                                generation=(
+                                    graph_run.generation + 1
+                                    if stop_action == "cancel"
+                                    else graph_run.generation
+                                ),
                             ),
                             run_id=run_id,
                         )
@@ -1438,7 +1545,14 @@ class TaskOrchestrator:
                         )
                         self._save_run(graph_run)
                     else:
-                        graph_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+                        graph_run = graph_run.model_copy(
+                            update={
+                                "status": "cancelled",
+                                "generation": graph_run.generation + 1,
+                                "failure_code": "GRAPH_CANCELLED",
+                            }
+                        )
+                        self._save_run(graph_run)
                     return graph_run
                 ready = (
                     []
@@ -1670,6 +1784,44 @@ class TaskOrchestrator:
                     tuple(active), timeout=wait_timeout, return_when=FIRST_COMPLETED
                 )
                 observed_at = monotonic()
+                if stop_action is None and self.store.control(run_id) == "cancel":
+                    stop_action = "cancel"
+                    self.store.put(
+                        "graph_control_fact_v2",
+                        GraphControlFact(
+                            id=identifier("graph-control"),
+                            run_id=run_id,
+                            created_at=now(),
+                            action="cancel",
+                            generation=graph_run.generation + 1,
+                        ),
+                        run_id=run_id,
+                    )
+                    for future, active_item in tuple(active.items()):
+                        active_node_id, active_node, active_request, *_rest = active_item
+                        propagated = True
+                        try:
+                            self.store.request_control(active_request.run_id, "cancel")
+                        except (OSError, RuntimeError, ValueError):
+                            propagated = False
+                        cancellation_signals[future] = (monotonic(), propagated)
+                        self.store.put(
+                            "node_control_propagation_v2",
+                            NodeControlPropagationRecord(
+                                id=identifier("node-control-propagation"),
+                                run_id=run_id,
+                                created_at=now(),
+                                graph_run_id=run_id,
+                                node_id=active_node_id,
+                                child_run_id=active_request.run_id,
+                                accepted_graph_revision_digest=graph_digest,
+                                generation=active_node.generation,
+                                attempt=active_node.attempt,
+                                propagated=propagated,
+                                cleanup_confirmed=False,
+                            ),
+                            run_id=run_id,
+                        )
                 for future, active_item in tuple(active.items()):
                     if future.done() or future in watchdog_signals:
                         continue
@@ -1735,6 +1887,7 @@ class TaskOrchestrator:
                         failure_code="WATCHDOG_TIMEOUT:CLEANUP_UNCONFIRMED",
                     )
                 for future in sorted(completed, key=lambda item: active[item][0]):
+                    self._assert_run_owner("consume_child_result")
                     node_id, node, request, reservation, strategy, started_at = active.pop(future)
                     try:
                         result = future.result()
@@ -1776,13 +1929,23 @@ class TaskOrchestrator:
                             )
                             continue
                         if future in cancellation_signals:
-                            self._persist_result(
-                                node,
-                                request,
-                                result,
-                                records,
-                                evidence_by_node,
-                                graph_digest,
+                            self.store.put(
+                                "stale_node_result_v2",
+                                StaleNodeResultRecord(
+                                    id=identifier("stale-node-result"),
+                                    run_id=run_id,
+                                    created_at=now(),
+                                    node_id=node.id,
+                                    accepted_graph_revision_digest=graph_digest,
+                                    result_generation=request.generation,
+                                    authoritative_generation=graph_run.generation + 1,
+                                    attempt=request.attempt,
+                                    worker_request_digest=_required_digest(request.content_digest),
+                                    worker_result_digest=_required_digest(
+                                        result.worker_result.content_digest
+                                    ),
+                                ),
+                                run_id=run_id,
                             )
                             cleanup_confirmed = not (
                                 result.worker_result.failure is not None
@@ -2283,9 +2446,22 @@ class TaskOrchestrator:
                             )
 
         if stop_action == "cancel":
-            cancelled_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
-            if cancelled_run.status == "cancelled":
-                return cancelled_run
+            for node_id in sorted(nodes):
+                if records[node_id].status in {"pending", "routed", "running", "blocked"}:
+                    records[node_id] = self._advance(
+                        records[node_id],
+                        status="cancelled",
+                        failure_code="GRAPH_CANCELLED",
+                    )
+            cancelled_run = graph_run.model_copy(
+                update={
+                    "status": "cancelled",
+                    "generation": graph_run.generation + 1,
+                    "failure_code": "GRAPH_CANCELLED",
+                }
+            )
+            self._save_run(cancelled_run)
+            return cancelled_run
         authoritative = self.store.get("graph_run_v2", run_id, GraphRunRecord)
         if authoritative.generation != graph_run.generation:
             return authoritative
@@ -4098,8 +4274,258 @@ class TaskOrchestrator:
     def _save_loop_transition(self, transition: LoopTransitionRecord) -> None:
         self.store.put("loop_transition_v2", transition, run_id=transition.run_id)
 
+    def _acquire_run_owner(self, run: GraphRunRecord) -> None:
+        acquired_at = ensure_utc(self.clock())
+        owner = RunExecutionOwnerRecord(
+            id=identifier("run-owner"),
+            run_id=run.id,
+            created_at=acquired_at,
+            graph_run_id=run.id,
+            accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+            generation=run.generation,
+            execution_attempt=run.execution_attempt,
+            owner_instance_id=self.owner_instance_id,
+            acquired_at=acquired_at,
+            last_heartbeat_at=acquired_at,
+            expires_at=acquired_at + timedelta(seconds=self.lease_duration_seconds),
+            lease_duration_seconds=self.lease_duration_seconds,
+        )
+        conflict = self.store.acquire_run_owner(owner)
+        if conflict is not None:
+            with suppress(Exception):
+                self.store.put(
+                    "run_owner_conflict_v2",
+                    RunOwnerConflictRecord(
+                        id=identifier("run-owner-conflict"),
+                        run_id=run.id,
+                        created_at=acquired_at,
+                        graph_run_id=run.id,
+                        accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                        generation=run.generation,
+                        execution_attempt=run.execution_attempt,
+                        rejected_owner_instance_id=self.owner_instance_id,
+                        current_owner_record_id=str(conflict["owner_record_id"]),
+                        current_owner_record_digest=str(conflict["owner_record_digest"]),
+                        current_owner_instance_id=str(conflict["owner_instance_id"]),
+                        current_generation=cast(int, conflict["generation"]),
+                        current_execution_attempt=cast(int, conflict["execution_attempt"]),
+                        last_heartbeat_at=ensure_utc(conflict["last_heartbeat_at"]),
+                        expires_at=ensure_utc(conflict["expires_at"]),
+                    ),
+                    run_id=run.id,
+                )
+            raise RunOwnershipLost("an authoritative owner already exists for this run")
+        self._run_owner = owner
+        self._next_heartbeat_at = acquired_at + timedelta(seconds=self.heartbeat_interval_seconds)
+
+    def _heartbeat_run_owner_if_due(self, *, force: bool = False) -> None:
+        owner = self._run_owner
+        if owner is None:
+            return
+        heartbeat_at = ensure_utc(self.clock())
+        if (
+            not force
+            and self._next_heartbeat_at is not None
+            and heartbeat_at < self._next_heartbeat_at
+        ):
+            return
+        current = self.store.current_run_owner(owner.run_id)
+        previous_digest = (
+            _required_digest(owner.content_digest)
+            if current is None
+            else str(current["heartbeat_digest"])
+        )
+        heartbeat = RunLeaseHeartbeatRecord(
+            id=identifier("run-heartbeat"),
+            run_id=owner.run_id,
+            created_at=heartbeat_at,
+            graph_run_id=owner.graph_run_id,
+            accepted_graph_revision_digest=owner.accepted_graph_revision_digest,
+            generation=owner.generation,
+            execution_attempt=owner.execution_attempt,
+            owner_instance_id=owner.owner_instance_id,
+            owner_record_id=owner.id,
+            owner_record_digest=_required_digest(owner.content_digest),
+            previous_heartbeat_digest=previous_digest,
+            heartbeat_at=heartbeat_at,
+            expires_at=heartbeat_at + timedelta(seconds=self.lease_duration_seconds),
+        )
+        if not self.store.heartbeat_run_owner(heartbeat):
+            self._record_owner_fence("heartbeat", heartbeat_at)
+            raise RunOwnershipLost("run owner lease is expired or superseded")
+        self._next_heartbeat_at = heartbeat_at + timedelta(seconds=self.heartbeat_interval_seconds)
+
+    def _assert_run_owner(
+        self,
+        operation: Literal["heartbeat", "terminalize", "write", "consume_child_result"],
+    ) -> None:
+        owner = self._run_owner
+        if owner is None:
+            return
+        observed_at = ensure_utc(self.clock())
+        current = self.store.current_run_owner(owner.run_id)
+        matches = bool(
+            current is not None
+            and current["status"] == "active"
+            and observed_at < ensure_utc(current["expires_at"])
+            and current["owner_record_id"] == owner.id
+            and current["owner_record_digest"] == owner.content_digest
+            and current["graph_revision_digest"] == owner.accepted_graph_revision_digest
+            and cast(int, current["generation"]) == owner.generation
+            and cast(int, current["execution_attempt"]) == owner.execution_attempt
+            and current["owner_instance_id"] == owner.owner_instance_id
+        )
+        if not matches:
+            self._record_owner_fence(operation, observed_at)
+            raise RunOwnershipLost("run owner lease is expired or superseded")
+
+    def _record_owner_fence(
+        self,
+        operation: Literal["heartbeat", "terminalize", "write", "consume_child_result"],
+        observed_at: datetime,
+    ) -> None:
+        owner = self._run_owner
+        if owner is None:
+            return
+        current = self.store.current_run_owner(owner.run_id)
+        if current is None:
+            reason: Literal["expired", "closed", "missing", "stale", "superseded"] = "missing"
+        elif current["status"] != "active":
+            reason = "closed"
+        elif current["owner_record_id"] != owner.id:
+            reason = "superseded"
+        elif observed_at >= ensure_utc(current["expires_at"]):
+            reason = "expired"
+        else:
+            reason = "stale"
+        with suppress(Exception):
+            self.store.put(
+                "owner_fence_violation_v2",
+                OwnerFenceViolationRecord(
+                    id=identifier("owner-fence"),
+                    run_id=owner.run_id,
+                    created_at=observed_at,
+                    graph_run_id=owner.graph_run_id,
+                    accepted_graph_revision_digest=owner.accepted_graph_revision_digest,
+                    generation=owner.generation,
+                    execution_attempt=owner.execution_attempt,
+                    owner_instance_id=owner.owner_instance_id,
+                    owner_record_id=owner.id,
+                    owner_record_digest=_required_digest(owner.content_digest),
+                    operation=operation,
+                    observed_at=observed_at,
+                    reason=reason,
+                ),
+                run_id=owner.run_id,
+            )
+
+    def _terminalize_after_exception(self, status: GraphExecutionStatus, reason: str) -> None:
+        owner = self._run_owner
+        if owner is None:
+            return
+        current = self.store.current_run_owner(owner.run_id)
+        if current is None or current["status"] != "active":
+            return
+        self._propagate_owner_interruption(owner)
+        with suppress(Exception):
+            run = self.store.get("graph_run_v2", owner.run_id, GraphRunRecord)
+            if run.status in _OWNED_TERMINAL_GRAPH_STATES:
+                return
+            terminal = run.model_copy(
+                update={
+                    "status": status,
+                    "failure_code": (
+                        "RUN_INTERRUPTED"
+                        if status == "interrupted"
+                        else f"ORCHESTRATOR_EXCEPTION:{reason}"
+                    ),
+                }
+            )
+            self._save_run(terminal)
+
+    def _propagate_owner_interruption(self, owner: RunExecutionOwnerRecord) -> None:
+        """Request bounded child cleanup without allowing diagnostics to block closure."""
+
+        requests = self.store.list_records("worker_request_v2", WorkerRequest, run_id=owner.run_id)
+        for request in requests:
+            if (
+                request.graph_run_id != owner.run_id
+                or request.accepted_graph_revision_digest != owner.accepted_graph_revision_digest
+                or request.generation != owner.generation
+            ):
+                continue
+            propagated = True
+            try:
+                self.store.request_control(request.run_id, "cancel")
+            except (OSError, RuntimeError, ValueError):
+                propagated = False
+            with suppress(Exception):
+                self.store.put(
+                    "node_control_propagation_v2",
+                    NodeControlPropagationRecord(
+                        id=identifier("node-control-propagation"),
+                        run_id=owner.run_id,
+                        created_at=now(),
+                        graph_run_id=owner.run_id,
+                        node_id=request.node_id or "unknown-node",
+                        child_run_id=request.run_id,
+                        accepted_graph_revision_digest=owner.accepted_graph_revision_digest,
+                        generation=owner.generation,
+                        attempt=request.attempt,
+                        propagated=propagated,
+                        cleanup_confirmed=False,
+                    ),
+                    run_id=owner.run_id,
+                )
+
     def _save_run(self, run: GraphRunRecord) -> None:
-        self.store.put("graph_run_v2", run, run_id=run.id, revision=run.generation + 1)
+        owner = self._run_owner
+        if owner is None:
+            self.store.put("graph_run_v2", run, run_id=run.id, revision=run.generation + 1)
+            return
+        if (
+            run.id != owner.run_id
+            or run.accepted_graph_revision_digest != owner.accepted_graph_revision_digest
+            or (
+                run.generation != owner.generation
+                and not (run.status == "cancelled" and run.generation == owner.generation + 1)
+            )
+            or run.execution_attempt != owner.execution_attempt
+        ):
+            observed_at = ensure_utc(self.clock())
+            self._record_owner_fence("write", observed_at)
+            raise RunOwnershipLost("graph state does not match the current owner binding")
+        self._heartbeat_run_owner_if_due()
+        observed_at = ensure_utc(self.clock())
+        if run.status in _OWNED_TERMINAL_GRAPH_STATES:
+            closure = self.store.terminalize_owned_graph_run(
+                owner,
+                run,
+                lambda heartbeat_digest: RunLeaseClosureRecord(
+                    id=identifier("run-closure"),
+                    run_id=run.id,
+                    created_at=observed_at,
+                    graph_run_id=run.id,
+                    accepted_graph_revision_digest=run.accepted_graph_revision_digest,
+                    generation=owner.generation,
+                    execution_attempt=run.execution_attempt,
+                    owner_instance_id=owner.owner_instance_id,
+                    owner_record_id=owner.id,
+                    owner_record_digest=_required_digest(owner.content_digest),
+                    final_heartbeat_digest=heartbeat_digest,
+                    closed_at=observed_at,
+                    terminal_graph_status=cast(Any, run.status),
+                    reason=run.failure_code or run.status,
+                ),
+                observed_at=observed_at,
+            )
+            if closure is None:
+                self._record_owner_fence("terminalize", observed_at)
+                raise RunOwnershipLost("only the authoritative owner can terminalize the run")
+            return
+        if not self.store.put_owned_graph_run(owner, run, observed_at=observed_at):
+            self._record_owner_fence("write", observed_at)
+            raise RunOwnershipLost("only the authoritative owner can update the run")
 
 
 def _evaluate_criteria(

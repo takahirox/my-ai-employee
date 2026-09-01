@@ -43,6 +43,38 @@ def doctor_from_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
             incidents.append(item)
 
     authorities = _records(projection.get("worker_timeout_authorities"))
+    ownership_value = projection.get("run_ownership")
+    ownership = dict(ownership_value) if isinstance(ownership_value, Mapping) else {}
+    owner_sources = _records(ownership.get("owners"))
+    owner_source_ids = [item.get("id") for item in owner_sources]
+    owner_source_digests = [item.get("content_digest") for item in owner_sources]
+    owner_facts = {
+        "run_id": run_id,
+        "graph_revision_digest": ownership.get("graph_revision_digest"),
+        "execution_attempt": ownership.get("execution_attempt"),
+        "owner_instance_id": ownership.get("owner_instance_id"),
+        "last_heartbeat": ownership.get("last_heartbeat"),
+        "lease_expiry": ownership.get("lease_expiry"),
+        "source_record_ids": owner_source_ids,
+        "source_record_digests": owner_source_digests,
+        "child_run_ids": ownership.get("terminal_child_run_ids", []),
+    }
+    diagnostic_code = ownership.get("diagnostic_code")
+    if diagnostic_code in {"RUN_OWNER_ABSENT", "RUN_LEASE_EXPIRED"}:
+        add(str(diagnostic_code), ownership, **owner_facts)
+    for item in _records(ownership.get("conflicts")):
+        add("RUN_OWNER_CONFLICT", item, **owner_facts)
+    for item in _records(ownership.get("fence_violations")):
+        add("OWNER_FENCE_VIOLATION", item, operation=item.get("operation"), **owner_facts)
+    child_run_ids = ownership.get("terminal_child_run_ids")
+    parent_nonterminal = projection.get("state") == "running"
+    if parent_nonterminal and isinstance(child_run_ids, list) and child_run_ids:
+        add("CHILD_TERMINAL_PARENT_NONTERMINAL", ownership, **owner_facts)
+    if parent_nonterminal and ownership.get("state") in {
+        "orphaned",
+        "parent_terminalization_missing",
+    }:
+        add("PARENT_TERMINALIZATION_MISSING", ownership, **owner_facts)
     for item in authorities:
         if float(item.get("effective_timeout_seconds") or 0) > float(
             item.get("node_attempt_timeout_seconds") or 0
@@ -121,4 +153,5 @@ def doctor_from_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
         "worker_boundary_diagnostics": diagnostics,
         "child_worker_outcomes": child_outcomes,
         "diagnostic_persistence_failures": diagnostic_failures,
+        "run_ownership": ownership,
     }

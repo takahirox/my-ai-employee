@@ -26,6 +26,13 @@ from .domain import (
     Task,
     VerificationEvidence,
 )
+from .domain.base import ensure_utc
+from .run_ownership import (
+    RunExecutionOwnerRecord,
+    RunLeaseClosureRecord,
+    RunLeaseHeartbeatRecord,
+    RunOrphanRecoveryRecord,
+)
 from .serialization import canonical_json
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -39,6 +46,7 @@ _RUN_ID_TABLES = (
     "work_checkpoints_v2",
     "graph_claims_v2",
     "graph_reservations_v2",
+    "run_execution_owners_v2",
 )
 
 
@@ -241,6 +249,16 @@ class SQLiteStore:
                 "PRIMARY KEY(run_id,node_id,generation,attempt))"
             )
             connection.execute(
+                "CREATE TABLE IF NOT EXISTS run_execution_owners_v2 ("
+                "run_id TEXT PRIMARY KEY,owner_record_id TEXT NOT NULL,"
+                "owner_record_digest TEXT NOT NULL,graph_revision_digest TEXT NOT NULL,"
+                "generation INTEGER NOT NULL,execution_attempt INTEGER NOT NULL,"
+                "owner_instance_id TEXT NOT NULL,last_heartbeat_at TEXT NOT NULL,"
+                "expires_at TEXT NOT NULL,heartbeat_digest TEXT NOT NULL,"
+                "status TEXT NOT NULL CHECK(status IN ('active','closed','recovered')),"
+                "closure_record_id TEXT,closure_record_digest TEXT)"
+            )
+            connection.execute(
                 "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
             )
             connection.execute(
@@ -286,6 +304,273 @@ class SQLiteStore:
                 (kind, record_id, run_id, revision, canonical_json(model)),
             )
         return cursor.rowcount == 1
+
+    def append_record(self, kind: str, model: BaseModel, *, run_id: str | None = None) -> int:
+        """Append a new immutable revision without replacing historical payloads."""
+
+        record_id = getattr(model, "id", None)
+        if record_id is None:
+            raise ValueError("stored model requires an id")
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(revision),0) FROM records WHERE kind=? AND record_id=?",
+                (kind, record_id),
+            ).fetchone()
+            revision = int(row[0]) + 1
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) VALUES(?,?,?,?,?)",
+                (kind, record_id, run_id, revision, canonical_json(model)),
+            )
+            connection.commit()
+            return revision
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def current_run_owner(self, run_id: str) -> dict[str, object] | None:
+        """Return the persisted owner index without interpreting wall-clock liveness."""
+
+        exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_execution_owners_v2'"
+        ).fetchone()
+        if exists is None:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def acquire_run_owner(self, owner: RunExecutionOwnerRecord) -> dict[str, object] | None:
+        """Atomically acquire one exact generation/attempt or return the conflicting owner."""
+
+        self.migrate_v2()
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (owner.run_id,)
+            ).fetchone()
+            current = None if row is None else dict(row)
+            if current is not None:
+                current_binding = (
+                    int(current["generation"]),
+                    int(current["execution_attempt"]),
+                )
+                requested_binding = (owner.generation, owner.execution_attempt)
+                current_live = current["status"] == "active" and owner.acquired_at < ensure_utc(
+                    current["expires_at"]
+                )
+                if current_live or requested_binding <= current_binding:
+                    connection.rollback()
+                    return current
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('run_execution_owner_v2',?,?,1,?)",
+                (owner.id, owner.run_id, canonical_json(owner)),
+            )
+            values = (
+                owner.run_id,
+                owner.id,
+                owner.content_digest,
+                owner.accepted_graph_revision_digest,
+                owner.generation,
+                owner.execution_attempt,
+                owner.owner_instance_id,
+                owner.last_heartbeat_at.isoformat(),
+                owner.expires_at.isoformat(),
+                owner.content_digest,
+                "active",
+                None,
+                None,
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO run_execution_owners_v2("
+                "run_id,owner_record_id,owner_record_digest,graph_revision_digest,"
+                "generation,execution_attempt,owner_instance_id,last_heartbeat_at,expires_at,"
+                "heartbeat_digest,status,closure_record_id,closure_record_digest) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+            connection.commit()
+            return None
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def heartbeat_run_owner(self, heartbeat: RunLeaseHeartbeatRecord) -> bool:
+        """Renew only the current, unexpired, exact owner binding."""
+
+        self.migrate_v2()
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (heartbeat.run_id,)
+            ).fetchone()
+            if row is None or not _owner_row_matches(
+                row,
+                heartbeat,
+                observed_at=heartbeat.heartbeat_at,
+                previous_heartbeat_digest=heartbeat.previous_heartbeat_digest,
+            ):
+                connection.rollback()
+                return False
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('run_lease_heartbeat_v2',?,?,1,?)",
+                (heartbeat.id, heartbeat.run_id, canonical_json(heartbeat)),
+            )
+            connection.execute(
+                "UPDATE run_execution_owners_v2 SET last_heartbeat_at=?,expires_at=?,"
+                "heartbeat_digest=? WHERE run_id=?",
+                (
+                    heartbeat.heartbeat_at.isoformat(),
+                    heartbeat.expires_at.isoformat(),
+                    heartbeat.content_digest,
+                    heartbeat.run_id,
+                ),
+            )
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def put_owned_graph_run(
+        self,
+        owner: RunExecutionOwnerRecord,
+        run: BaseModel,
+        *,
+        observed_at: object,
+    ) -> bool:
+        """Append a graph state only while the exact owner still holds a live lease."""
+
+        self.migrate_v2()
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (owner.run_id,)
+            ).fetchone()
+            if row is None or not _owner_row_matches(row, owner, observed_at=observed_at):
+                connection.rollback()
+                return False
+            _put_graph_run_in_transaction(connection, run, owner.run_id)
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def terminalize_owned_graph_run(
+        self,
+        owner: RunExecutionOwnerRecord,
+        run: BaseModel,
+        closure_factory: Callable[[str], RunLeaseClosureRecord],
+        *,
+        observed_at: object,
+    ) -> RunLeaseClosureRecord | None:
+        """Atomically append a terminal parent state and close its exact owner lease."""
+
+        self.migrate_v2()
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (owner.run_id,)
+            ).fetchone()
+            if row is None or not _owner_row_matches(row, owner, observed_at=observed_at):
+                connection.rollback()
+                return None
+            closure = closure_factory(str(row["heartbeat_digest"]))
+            _put_graph_run_in_transaction(connection, run, owner.run_id)
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('run_lease_closure_v2',?,?,1,?)",
+                (closure.id, owner.run_id, canonical_json(closure)),
+            )
+            connection.execute(
+                "UPDATE run_execution_owners_v2 SET status='closed',closure_record_id=?,"
+                "closure_record_digest=? WHERE run_id=?",
+                (
+                    closure.id,
+                    closure.content_digest,
+                    owner.run_id,
+                ),
+            )
+            connection.commit()
+            return closure
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def recover_expired_run_owner(
+        self,
+        run: BaseModel,
+        recovery: RunOrphanRecoveryRecord,
+        *,
+        observed_at: object,
+    ) -> str:
+        """Explicitly terminalize one exact expired owner; never touch live/newer authority."""
+
+        self.migrate_v2()
+        run_id = recovery.run_id
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return "owner_absent"
+            if row["status"] == "recovered":
+                outcome = (
+                    "already_recovered"
+                    if row["owner_record_id"] == recovery.expired_owner_record_id
+                    and row["owner_record_digest"] == recovery.expired_owner_record_digest
+                    and int(row["generation"]) == recovery.generation
+                    and int(row["execution_attempt"]) == recovery.execution_attempt
+                    else "stale"
+                )
+                connection.rollback()
+                return outcome
+            exact_binding = bool(
+                row["status"] == "active"
+                and row["owner_record_id"] == recovery.expired_owner_record_id
+                and row["owner_record_digest"] == recovery.expired_owner_record_digest
+                and row["graph_revision_digest"] == recovery.accepted_graph_revision_digest
+                and int(row["generation"]) == recovery.generation
+                and int(row["execution_attempt"]) == recovery.execution_attempt
+            )
+            if not exact_binding:
+                connection.rollback()
+                return "stale"
+            if ensure_utc(observed_at) < ensure_utc(row["expires_at"]):
+                connection.rollback()
+                return "live"
+            _append_record_in_transaction(connection, "graph_run_v2", run, run_id)
+            connection.execute(
+                "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('run_orphan_recovery_v2',?,?,1,?)",
+                (recovery.id, run_id, canonical_json(recovery)),
+            )
+            connection.execute(
+                "UPDATE run_execution_owners_v2 SET status='recovered',closure_record_id=?,"
+                "closure_record_digest=? WHERE run_id=?",
+                (
+                    recovery.id,
+                    recovery.content_digest,
+                    run_id,
+                ),
+            )
+            connection.commit()
+            return "recovered"
+        except BaseException:
+            connection.rollback()
+            raise
 
     def get(
         self, kind: str, record_id: str, model_type: type[ModelT], *, revision: int | None = None
@@ -486,42 +771,6 @@ class SQLiteStore:
             connection.execute(
                 "INSERT OR REPLACE INTO controls(run_id, action) VALUES(?,?)", (run_id, action)
             )
-            if action == "cancel":
-                row = connection.execute(
-                    "SELECT revision,payload FROM records "
-                    "WHERE kind='graph_run_v2' AND record_id=? "
-                    "ORDER BY revision DESC LIMIT 1",
-                    (run_id,),
-                ).fetchone()
-                if row is not None:
-                    payload = json.loads(row["payload"])
-                    if not isinstance(payload, dict):
-                        raise ValueError("graph run payload must be an object")
-                    if payload.get("status") not in {
-                        "cancelled",
-                        "completed",
-                        "ready_to_promote",
-                        "failed",
-                    }:
-                        generation = int(payload.get("generation", 0)) + 1
-                        payload.update(
-                            {
-                                "generation": generation,
-                                "status": "cancelled",
-                                "failure_code": "GRAPH_CANCELLED",
-                            }
-                        )
-                        connection.execute(
-                            "INSERT OR REPLACE INTO records"
-                            "(kind,record_id,run_id,revision,payload) VALUES(?,?,?,?,?)",
-                            (
-                                "graph_run_v2",
-                                run_id,
-                                run_id,
-                                generation + 1,
-                                canonical_json(payload),
-                            ),
-                        )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -721,6 +970,70 @@ class SQLiteStore:
         if not isinstance(payload, dict):
             raise ValueError("v2 checkpoint payload must be an object")
         return int(row["generation"]), payload
+
+
+def _append_record_in_transaction(
+    connection: sqlite3.Connection,
+    kind: str,
+    model: BaseModel,
+    run_id: str | None,
+) -> int:
+    record_id = getattr(model, "id", None)
+    if record_id is None:
+        raise ValueError("stored model requires an id")
+    row = connection.execute(
+        "SELECT COALESCE(MAX(revision),0) FROM records WHERE kind=? AND record_id=?",
+        (kind, record_id),
+    ).fetchone()
+    revision = int(row[0]) + 1
+    connection.execute(
+        "INSERT INTO records(kind,record_id,run_id,revision,payload) VALUES(?,?,?,?,?)",
+        (kind, record_id, run_id, revision, canonical_json(model)),
+    )
+    return revision
+
+
+def _put_graph_run_in_transaction(
+    connection: sqlite3.Connection,
+    run: BaseModel,
+    run_id: str,
+) -> None:
+    generation = int(getattr(run, "generation", 0))
+    connection.execute(
+        "INSERT OR REPLACE INTO records(kind,record_id,run_id,revision,payload) "
+        "VALUES('graph_run_v2',?,?,?,?)",
+        (run_id, run_id, generation + 1, canonical_json(run)),
+    )
+
+
+def _owner_row_matches(
+    row: sqlite3.Row,
+    authority: BaseModel,
+    *,
+    observed_at: object,
+    previous_heartbeat_digest: str | None = None,
+) -> bool:
+    owner_record_id = getattr(authority, "owner_record_id", getattr(authority, "id", None))
+    owner_record_digest = getattr(
+        authority,
+        "owner_record_digest",
+        getattr(authority, "content_digest", None),
+    )
+    return bool(
+        row["status"] == "active"
+        and ensure_utc(observed_at) < ensure_utc(row["expires_at"])
+        and row["owner_record_id"] == owner_record_id
+        and row["owner_record_digest"] == owner_record_digest
+        and row["graph_revision_digest"]
+        == getattr(authority, "accepted_graph_revision_digest", None)
+        and int(row["generation"]) == getattr(authority, "generation", None)
+        and int(row["execution_attempt"]) == getattr(authority, "execution_attempt", None)
+        and row["owner_instance_id"] == getattr(authority, "owner_instance_id", None)
+        and (
+            previous_heartbeat_digest is None
+            or row["heartbeat_digest"] == previous_heartbeat_digest
+        )
+    )
 
 
 class _TransitionRecord(BaseModel):

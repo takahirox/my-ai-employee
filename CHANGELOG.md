@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added generation-fenced top-level execution owners and expiring leases so Inspector Active
+  contains only live Fleet runs, plus read-only orphan/parent-terminalization diagnostics and
+  explicit idempotent `fleet recover` terminalization for expired runs.
 - Added deterministic single-run explanations through `fleet explain` and the local
   Inspector, including graph position, persisted decision reasons, information flow,
   failure paths, graph evolution, and final disposition without AI re-execution.

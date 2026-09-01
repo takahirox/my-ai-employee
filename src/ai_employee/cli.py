@@ -37,7 +37,7 @@ from .domain import (
     RoutingMode,
     Run,
 )
-from .domain.base import freeze_json
+from .domain.base import ensure_utc, freeze_json
 from .domain.browser import BrowserObservation
 from .domain.evaluation import (
     EvaluationDecision,
@@ -112,6 +112,7 @@ from .promotion_approval import (
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
 from .run_explanation import explain_any_run
+from .run_ownership import RunOrphanRecoveryRecord
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import (
     canonical_digest,
@@ -211,6 +212,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume = commands.add_parser("resume", help="start a planned run or resume a paused run")
     resume.add_argument("run_id")
     resume.add_argument("--db")
+
+    recover = commands.add_parser(
+        "recover", help="explicitly terminalize one exact expired orphan as interrupted"
+    )
+    recover.add_argument("run_id")
+    recover.add_argument("--db")
 
     for name in ("pause", "cancel"):
         control = commands.add_parser(name, help=f"request {name} at the next node boundary")
@@ -363,6 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "logs",
             "pause",
             "promote",
+            "recover",
             "resume",
         } and store.is_standalone_work_run(args.run_id):
             raise KeyError(args.run_id)
@@ -455,6 +463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return _resume_work(store, work_run)
             else:
                 return _resume_graph(store, graph_run)
+        elif args.command == "recover":
+            return _recover_orphan(store, args.run_id)
         elif args.command in {"pause", "cancel"}:
             store.request_control(args.run_id, args.command)
             print(canonical_json({"run_id": args.run_id, "requested": args.command}))
@@ -467,6 +477,59 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
             serve(store, args.host, args.port)
+    return 0
+
+
+def _recover_orphan(store: SQLiteStore, run_id: str) -> int:
+    """Perform the only authorized mutation for an expired top-level owner."""
+
+    run = store.get("graph_run_v2", run_id, GraphRunRecord)
+    current = store.current_run_owner(run_id)
+    if current is None:
+        raise ValueError("run has no durable execution owner to recover")
+    observed_at = now()
+    recovery = RunOrphanRecoveryRecord(
+        id=f"run-recovery-{str(current['owner_record_digest'])[:40]}",
+        run_id=run_id,
+        created_at=observed_at,
+        graph_run_id=run_id,
+        accepted_graph_revision_digest=str(current["graph_revision_digest"]),
+        generation=cast(int, current["generation"]),
+        execution_attempt=cast(int, current["execution_attempt"]),
+        expired_owner_record_id=str(current["owner_record_id"]),
+        expired_owner_record_digest=str(current["owner_record_digest"]),
+        last_heartbeat_at=ensure_utc(current["last_heartbeat_at"]),
+        expired_at=ensure_utc(current["expires_at"]),
+        recovered_at=observed_at,
+    )
+    interrupted = run.model_copy(
+        update={
+            "status": "interrupted",
+            "failure_code": "RUN_ORPHAN_RECOVERED",
+        }
+    )
+    outcome = store.recover_expired_run_owner(
+        interrupted,
+        recovery,
+        observed_at=observed_at,
+    )
+    if outcome in {"live", "stale", "owner_absent"}:
+        raise ValueError(f"orphan recovery refused: {outcome}")
+    print(
+        canonical_json(
+            {
+                "schema_version": "2",
+                "run_id": run_id,
+                "status": "interrupted",
+                "recovery": outcome,
+                "recovery_record_id": (
+                    str(current["closure_record_id"])
+                    if outcome == "already_recovered"
+                    else recovery.id
+                ),
+            }
+        )
+    )
     return 0
 
 

@@ -287,14 +287,23 @@ forensic projection. The local Inspector exposes the same summary at
 
 `fleet doctor RUN_ID` deterministically classifies persisted deadline, watchdog,
 parent/child cancellation, process cleanup, worker-envelope, missing-result, diagnostic,
-and repair-exhaustion facts. It is read only: Doctor cannot transition a run, request a
-repair, apply a patch, or publish an incident.
+repair-exhaustion, run-owner, lease-expiry, owner-conflict, and missing parent-terminalization
+facts. It is read only: Doctor cannot transition a run, request a repair, apply a patch, or
+publish an incident.
+
+Every executing top-level Graph run acquires an immutable, graph-digest/generation/attempt-bound
+owner record and renews a bounded lease. Inspector classifies a run as Active only while that
+exact owner is current and unexpired. Missing, expired, conflicting, or closed ownership fails
+closed into History without changing the authoritative Graph state. An operator may explicitly
+terminalize one exact expired orphan as `interrupted` with `fleet recover RUN_ID`; recovery is
+idempotent, refuses live or newer ownership, and retains the expired owner and prior Graph facts.
 
 Start the browser Inspector with `fleet serve` (or `fleet serve --db PATH`). Its repository
 selector filters runs from the shared database by their persisted repository identity. The
-default Fleet overview separates currently active runs from terminal History and shows each
-run's persisted goal, repository, authoritative status, completed/total graph progress, active
-task or phase, and attention conditions. The same read-only projection is available at
+default Fleet overview separates lease-proven active runs from terminal or interrupted History
+and shows each run's persisted goal, repository, authoritative status, completed/total graph
+progress, active task or phase, owner identity, last heartbeat, lease expiry, diagnostic code,
+and attention conditions. The same read-only projection is available at
 `/api/overview`, with an optional `repository_id` query parameter.
 
 Selecting a run drills into its dependency-free DAG view, which shows entry and terminal tasks,

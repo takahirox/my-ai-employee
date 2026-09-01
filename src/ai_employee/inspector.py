@@ -71,6 +71,14 @@ from .plan_review import (
     PlanRevisionAttempt,
 )
 from .promotion_approval import PromotionPolicyDecision
+from .run_ownership import (
+    OwnerFenceViolationRecord,
+    RunExecutionOwnerRecord,
+    RunLeaseClosureRecord,
+    RunLeaseHeartbeatRecord,
+    RunOrphanRecoveryRecord,
+    RunOwnerConflictRecord,
+)
 from .serialization import canonical_digest, canonical_json
 from .storage import SQLiteStore
 from .task_orchestration import (
@@ -373,6 +381,112 @@ def _node_execution_projection(
     return projection
 
 
+def _run_ownership_projection(
+    store: SQLiteStore,
+    run: GraphRunRecord,
+    latest_nodes: Mapping[str, NodeExecutionRecord],
+    observed_at: datetime,
+) -> dict[str, Any]:
+    owners = store.list_records("run_execution_owner_v2", RunExecutionOwnerRecord, run_id=run.id)
+    heartbeats = store.list_records(
+        "run_lease_heartbeat_v2", RunLeaseHeartbeatRecord, run_id=run.id
+    )
+    closures = store.list_records("run_lease_closure_v2", RunLeaseClosureRecord, run_id=run.id)
+    conflicts = store.list_records("run_owner_conflict_v2", RunOwnerConflictRecord, run_id=run.id)
+    fence_violations = store.list_records(
+        "owner_fence_violation_v2", OwnerFenceViolationRecord, run_id=run.id
+    )
+    recoveries = store.list_records(
+        "run_orphan_recovery_v2", RunOrphanRecoveryRecord, run_id=run.id
+    )
+    current = store.current_run_owner(run.id)
+    owner_by_id = {item.id: item for item in owners}
+    current_owner = None if current is None else owner_by_id.get(str(current["owner_record_id"]))
+    binding_matches = bool(
+        current is not None
+        and current_owner is not None
+        and current["owner_record_digest"] == current_owner.content_digest
+        and current["graph_revision_digest"] == run.accepted_graph_revision_digest
+        and cast(int, current["generation"]) == run.generation
+        and cast(int, current["execution_attempt"]) == run.execution_attempt
+        and current["owner_instance_id"] == current_owner.owner_instance_id
+    )
+    expired = bool(current is not None and observed_at >= ensure_utc(current["expires_at"]))
+    parent_nonterminal = run.status == "running"
+    live = bool(
+        parent_nonterminal
+        and current is not None
+        and current["status"] == "active"
+        and binding_matches
+        and not expired
+    )
+    terminal_child_ids = tuple(
+        sorted(
+            {
+                item.work_run_id
+                for item in latest_nodes.values()
+                if item.work_run_id is not None and item.status in _TERMINAL_NODE_STATES
+            }
+        )
+    )
+    child_parent_incident = bool(parent_nonterminal and terminal_child_ids)
+    liveness_state: str
+    diagnostic_code: str | None
+    if run.status in {"planned", "paused", "ready_to_promote"}:
+        liveness_state = run.status
+        diagnostic_code = None
+    elif not parent_nonterminal:
+        liveness_state = "terminal"
+        diagnostic_code = None
+    elif current is None:
+        liveness_state = "orphaned"
+        diagnostic_code = "RUN_OWNER_ABSENT"
+    elif current["status"] == "recovered":
+        liveness_state = "interrupted"
+        diagnostic_code = None
+    elif current["status"] != "active":
+        liveness_state = "interrupted"
+        diagnostic_code = "PARENT_TERMINALIZATION_MISSING" if child_parent_incident else None
+    elif not binding_matches:
+        liveness_state = "orphaned"
+        diagnostic_code = "RUN_OWNER_CONFLICT"
+    elif expired:
+        liveness_state = "orphaned"
+        diagnostic_code = "RUN_LEASE_EXPIRED"
+    elif child_parent_incident:
+        liveness_state = "parent_terminalization_missing"
+        diagnostic_code = "CHILD_TERMINAL_PARENT_NONTERMINAL"
+    else:
+        liveness_state = "live"
+        diagnostic_code = None
+    return {
+        "state": liveness_state,
+        "is_active": live and not child_parent_incident,
+        "diagnostic_code": diagnostic_code,
+        "last_authoritative_graph_state": run.status,
+        "graph_revision_digest": run.accepted_graph_revision_digest,
+        "generation": run.generation,
+        "execution_attempt": run.execution_attempt,
+        "owner_instance_id": None if current is None else current["owner_instance_id"],
+        "owner_record_id": None if current is None else current["owner_record_id"],
+        "owner_record_digest": None if current is None else current["owner_record_digest"],
+        "last_heartbeat": (
+            None if current is None else _timestamp(ensure_utc(current["last_heartbeat_at"]))
+        ),
+        "lease_expiry": (
+            None if current is None else _timestamp(ensure_utc(current["expires_at"]))
+        ),
+        "observed_at": _timestamp(observed_at) if parent_nonterminal else None,
+        "terminal_child_run_ids": list(terminal_child_ids),
+        "owners": [_json_model(item) for item in owners],
+        "heartbeats": [_json_model(item) for item in heartbeats],
+        "closures": [_json_model(item) for item in closures],
+        "conflicts": [_json_model(item) for item in conflicts],
+        "fence_violations": [_json_model(item) for item in fence_violations],
+        "recoveries": [_json_model(item) for item in recoveries],
+    }
+
+
 def inspect_graph_run(
     store: SQLiteStore,
     run_id: str,
@@ -447,6 +561,7 @@ def inspect_graph_run(
     routes = store.list_records("node_route_v2", NodeRouteRecord, run_id=run_id)
     reservations = store.list_records("node_reservation_v2", NodeReservationRecord, run_id=run_id)
     observed_at = ensure_utc(clock())
+    run_ownership = _run_ownership_projection(store, run, latest_nodes, observed_at)
     graph_nodes = (
         {}
         if acceptance is None
@@ -549,6 +664,8 @@ def inspect_graph_run(
         "kind": "graph_run",
         "state": run.status,
         "generation": run.generation,
+        "execution_attempt": run.execution_attempt,
+        "run_ownership": run_ownership,
         "replan_count": run.replan_count,
         "run": _json_model(run),
         "planner_routing": (
@@ -1088,6 +1205,13 @@ def inspect_fleet_runs(
             continue
 
         status = str(projection.get("state") or "not_recorded")
+        ownership = _as_dict(projection.get("run_ownership"))
+        graph_run_is_active = bool(ownership.get("is_active"))
+        displayed_status = (
+            str(ownership.get("state") or status)
+            if projection.get("kind") == "graph_run" and status not in _TERMINAL_RUN_STATES
+            else status
+        )
         run = _as_dict(projection.get("run"))
         goal_statement = _goal_statement(projection, run)
         graph = _accepted_graph(projection)
@@ -1139,7 +1263,7 @@ def inspect_fleet_runs(
         item = {
             **context,
             "goal": goal_statement,
-            "status": status,
+            "status": displayed_status,
             "generation": projection.get("generation"),
             "progress": {"completed": completed, "total": len(node_ids)},
             "active_task": active_task,
@@ -1157,7 +1281,39 @@ def inspect_fleet_runs(
             "attention_count": projection.get("attention_count", len(attention)),
             "attention_available": projection.get("attention_available", True),
         }
-        (history if status in _TERMINAL_RUN_STATES else active).append(item)
+        if projection.get("kind") == "graph_run":
+            ownership_summary = {
+                key: ownership.get(key)
+                for key in (
+                    "state",
+                    "is_active",
+                    "diagnostic_code",
+                    "last_authoritative_graph_state",
+                    "graph_revision_digest",
+                    "generation",
+                    "execution_attempt",
+                    "owner_instance_id",
+                    "owner_record_id",
+                    "owner_record_digest",
+                    "last_heartbeat",
+                    "lease_expiry",
+                    "terminal_child_run_ids",
+                )
+            }
+            item.update(
+                {
+                    "authoritative_status": status,
+                    "execution_attempt": projection.get("execution_attempt"),
+                    "liveness": ownership_summary,
+                    "last_heartbeat": ownership.get("last_heartbeat"),
+                    "lease_expiry": ownership.get("lease_expiry"),
+                    "owner_instance_id": ownership.get("owner_instance_id"),
+                    "diagnostic_code": ownership.get("diagnostic_code"),
+                }
+            )
+            (active if graph_run_is_active else history).append(item)
+        else:
+            (history if status in _TERMINAL_RUN_STATES else active).append(item)
     active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
     history.sort(key=lambda item: str(item["run_id"]), reverse=True)
     return {"active": active, "history": history}
