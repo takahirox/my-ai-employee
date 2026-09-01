@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import ClassVar, Literal
 
 from pydantic import ConfigDict, Field
@@ -1060,6 +1061,127 @@ def _claude_envelope_schema() -> dict[str, object]:
     }
 
 
+def _diff_header_value(line: str, prefix: str) -> str:
+    value = line[len(prefix) :]
+    if value.endswith("\n"):
+        value = value[:-1]
+    if value.endswith("\r"):
+        value = value[:-1]
+    return value
+
+
+def _safe_diff_path(value: str) -> bool:
+    path = PurePosixPath(value)
+    return (
+        0 < len(value) <= 1_000
+        and value != "."
+        and not value.startswith("/")
+        and "\\" not in value
+        and ".." not in path.parts
+        and path.as_posix() == value
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def _headerless_file_pair(old_line: str, new_line: str) -> tuple[str, bool]:
+    old = _diff_header_value(old_line, "--- ")
+    new = _diff_header_value(new_line, "+++ ")
+    old_path = old[2:] if old.startswith("a/") and _safe_diff_path(old[2:]) else None
+    new_path = new[2:] if new.startswith("b/") and _safe_diff_path(new[2:]) else None
+    if old == "/dev/null" and new_path is not None:
+        return new_path, True
+    if new == "/dev/null" and old_path is not None:
+        return old_path, False
+    if old_path is not None and new_path is not None:
+        if old_path != new_path:
+            raise ValueError("header-less unified diff renames are not supported")
+        return old_path, False
+    raise ValueError("header-less unified diff has unsafe or unsupported paths")
+
+
+def _normalize_headerless_diff_sections(value: str) -> str:
+    """Add missing Git file delimiters only at structurally completed boundaries."""
+
+    lines = value.splitlines(keepends=True)
+    normalized: list[str] = []
+    section_delimited = False
+    section_has_hunk = False
+    section_new_file = False
+    in_hunk = False
+    expected_old = 0
+    expected_new = 0
+    observed_old = 0
+    observed_new = 0
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        hunk_complete = (
+            in_hunk and observed_old == expected_old and observed_new == expected_new
+        )
+        at_boundary = not in_hunk or hunk_complete
+
+        if at_boundary and line.startswith("diff --git "):
+            section_delimited = True
+            section_has_hunk = False
+            section_new_file = False
+            in_hunk = False
+        elif at_boundary and line.startswith("--- "):
+            leading_delimited_headers = section_delimited and not section_has_hunk
+            if index + 1 >= len(lines) or not lines[index + 1].startswith("+++ "):
+                if not leading_delimited_headers:
+                    raise ValueError("header-less unified diff requires an adjacent file pair")
+            else:
+                next_line = lines[index + 1]
+                if leading_delimited_headers:
+                    try:
+                        _, section_new_file = _headerless_file_pair(line, next_line)
+                    except ValueError:
+                        section_new_file = False
+                else:
+                    path, section_new_file = _headerless_file_pair(line, next_line)
+                    normalized.append(f"diff --git a/{path} b/{path}\n")
+                    section_delimited = True
+                    section_has_hunk = False
+                    in_hunk = False
+                normalized.extend((line, next_line))
+                index += 2
+                continue
+        elif (
+            at_boundary
+            and line.startswith("+++ ")
+            and not (section_delimited and not section_has_hunk)
+        ):
+            raise ValueError("header-less unified diff requires an adjacent file pair")
+
+        if at_boundary and line.startswith("@@ "):
+            match = re.match(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+            section_has_hunk = True
+            in_hunk = True
+            observed_old = 0
+            observed_new = 0
+            if match is None:
+                expected_old = -1
+                expected_new = -1
+            else:
+                expected_old = int(match.group(1) or "1")
+                expected_new = int(match.group(2) or "1")
+        elif in_hunk and not line.startswith("\\"):
+            if section_new_file:
+                observed_new += 1
+            else:
+                marker = line[0] if line else ""
+                if marker != "+":
+                    observed_old += 1
+                if marker != "-":
+                    observed_new += 1
+
+        normalized.append(line)
+        index += 1
+
+    return "".join(normalized)
+
+
 def _normalize_new_file_diff(value: str) -> str:
     """Repair malformed new-file bodies without rewriting neighboring file patches."""
 
@@ -1077,7 +1199,8 @@ def _normalize_new_file_diff(value: str) -> str:
 def _normalize_unified_diff(value: str) -> str:
     """Repair only unambiguous omitted context markers in existing-file hunks."""
 
-    lines = _normalize_new_file_diff(value).splitlines(keepends=True)
+    normalized_headers = _normalize_headerless_diff_sections(value)
+    lines = _normalize_new_file_diff(normalized_headers).splitlines(keepends=True)
     normalized: list[str] = []
     in_hunk = False
     new_file = False

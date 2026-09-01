@@ -68,6 +68,7 @@ from ai_employee.worker_adapters import (
     _bounded_prompt,
     _claude_envelope_schema,
     _envelope_schema,
+    _normalize_unified_diff,
     _validate_worker_envelope,
     cli_inherit_environment,
     semantic_assessment_schema_json,
@@ -1039,6 +1040,218 @@ def test_scripted_adapter_rejects_unknown_envelope_fields() -> None:
     assert result.failure.code.value == "WORKER_PROTOCOL_ERROR"
 
 
+class _NotCancelled:
+    def cancelled(self) -> bool:
+        return False
+
+
+def _edit_envelope(unified_diff: str, paths: tuple[str, ...]) -> str:
+    return json.dumps(
+        {
+            "schema_version": "2",
+            "proposals": [
+                {
+                    "schema_version": "2",
+                    "id": "proposal-headerless",
+                    "run_id": "run-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "worker_id": "worker-1",
+                    "kind": "edit_intent",
+                    "payload": {
+                        "schema_version": "2",
+                        "id": "edit-headerless",
+                        "run_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "paths": paths,
+                        "summary": "Apply header-less file sections.",
+                        "unified_diff": unified_diff,
+                    },
+                    "reason": "Implement the requested bounded edits.",
+                }
+            ],
+        }
+    )
+
+
+def test_cli_worker_synthesizes_only_missing_file_delimiters_idempotently() -> None:
+    delimited = (
+        "diff --git a/kept.txt b/kept.txt\n"
+        "--- a/kept.txt\n"
+        "+++ b/kept.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    )
+    headerless = (
+        "--- a/existing.txt\n"
+        "+++ b/existing.txt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "--- /dev/null\n"
+        "+++ b/created.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+created\n"
+        "--- a/deleted.txt\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-deleted\n"
+    )
+
+    envelope = _validate_worker_envelope(
+        _edit_envelope(
+            delimited + headerless,
+            ("kept.txt", "existing.txt", "created.txt", "deleted.txt"),
+        )
+    )
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert payload.unified_diff.startswith(delimited)
+    assert payload.unified_diff.count("diff --git a/kept.txt b/kept.txt\n") == 1
+    assert (
+        "diff --git a/existing.txt b/existing.txt\n--- a/existing.txt\n"
+        in payload.unified_diff
+    )
+    assert "diff --git a/created.txt b/created.txt\n--- /dev/null\n" in payload.unified_diff
+    assert (
+        "diff --git a/deleted.txt b/deleted.txt\n--- a/deleted.txt\n"
+        in payload.unified_diff
+    )
+    assert _normalize_unified_diff(payload.unified_diff) == payload.unified_diff
+
+
+def test_cli_worker_does_not_split_header_shaped_hunk_content() -> None:
+    patch = (
+        "--- a/first.txt\n"
+        "+++ b/first.txt\n"
+        "@@ -1 +1 @@\n"
+        "--- a/literal.txt\n"
+        "+++ b/literal.txt\n"
+        "--- a/second.txt\n"
+        "+++ b/second.txt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    envelope = _validate_worker_envelope(_edit_envelope(patch, ("first.txt", "second.txt")))
+
+    payload = envelope.proposals[0].payload
+    assert isinstance(payload, EditIntentRequest)
+    assert payload.unified_diff.count("diff --git ") == 2
+    assert "--- a/literal.txt\n+++ b/literal.txt\n" in payload.unified_diff
+    assert "diff --git a/literal.txt b/literal.txt" not in payload.unified_diff
+
+
+@pytest.mark.parametrize(
+    "patch",
+    (
+        "--- a/../escape.txt\n+++ b/../escape.txt\n",
+        "--- /etc/passwd\n+++ b/etc/passwd\n",
+        "--- c/file.txt\n+++ b/file.txt\n",
+        "--- a/old.txt\n+++ b/new.txt\n",
+        "--- a/orphan.txt\n@@ -1 +1 @@\n",
+    ),
+)
+def test_cli_worker_rejects_unsafe_or_unrecognized_headerless_paths(patch: str) -> None:
+    with pytest.raises(ValueError, match="header-less unified diff"):
+        _validate_worker_envelope(_edit_envelope(patch, ("safe.txt",)))
+
+
+def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> None:
+    output = json.loads(
+        _edit_envelope("--- a/old.txt\n+++ b/new.txt\n", ("old.txt", "new.txt"))
+    )
+    output.update({"assistant_note": "", "usage_json": "{}"})
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
+        id="headerless-rename-process",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+
+    result = CodexCliWorkerAdapter(
+        executor,
+        lambda _digest: json.dumps(output).encode(),
+        allow_worker,
+        run_id="run-1",
+    ).propose(worker_request(), Channel())  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "WORKER_ENVELOPE_MALFORMED"
+
+
+def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> None:
+    repository = tmp_path / "headerless-repo"
+    repository.mkdir()
+    subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True
+    )
+    (repository / "existing.txt").write_text("before\n")
+    (repository / "deleted.txt").write_text("deleted\n")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    manager = GitWorkspaceManager(
+        tmp_path / "headerless-state",
+        AtomicArtifactStore(tmp_path / "headerless-artifacts"),
+    )
+    snapshot = manager.create(
+        WorkspaceRequest(
+            id="workspace-headerless",
+            run_id="run-1",
+            created_at=NOW,
+            repository=str(repository),
+            base_commit=head,
+        )
+    )
+    patch = (
+        "--- a/existing.txt\n"
+        "+++ b/existing.txt\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+        "--- /dev/null\n"
+        "+++ b/created.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+created\n"
+        "--- a/deleted.txt\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-deleted\n"
+    )
+    envelope = _validate_worker_envelope(
+        _edit_envelope(patch, ("existing.txt", "created.txt", "deleted.txt"))
+    )
+    request = envelope.proposals[0].payload
+    assert isinstance(request, EditIntentRequest)
+
+    result = manager.apply_edit(
+        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+    )
+
+    assert result.status == "succeeded"
+    isolated = Path(snapshot.isolated_worktree)
+    assert (isolated / "existing.txt").read_text() == "after\n"
+    assert (isolated / "created.txt").read_text() == "created\n"
+    assert not (isolated / "deleted.txt").exists()
+
+
 def test_cli_worker_recomputes_untrusted_proposal_and_request_digests() -> None:
     raw = json.dumps(
         {
@@ -1269,7 +1482,7 @@ def test_cli_worker_rejects_ambiguous_or_count_inconsistent_existing_hunks(
         _validate_worker_envelope(raw)
 
 
-def test_successful_process_with_ambiguous_hunk_records_exact_protocol_classification() -> None:
+def test_headerless_ambiguous_hunk_records_exact_protocol_classification() -> None:
     output = json.dumps(
         {
             "schema_version": "2",
@@ -1289,7 +1502,6 @@ def test_successful_process_with_ambiguous_hunk_records_exact_protocol_classific
                         "paths": ["example.css"],
                         "summary": "Replace one style.",
                         "unified_diff": (
-                            "diff --git a/example.css b/example.css\n"
                             "--- a/example.css\n"
                             "+++ b/example.css\n"
                             "@@ -1,2 +1,2 @@\n"
