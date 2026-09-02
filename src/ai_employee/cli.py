@@ -262,6 +262,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     work = commands.add_parser("work", help="create a mediated v0.2 work run")
     work.add_argument("goal")
+    work.add_argument("--run-id", help="explicit unique Graph Run ID")
+    work.add_argument(
+        "--job-id",
+        help="persist this new Graph Run under an existing or newly declared parent Job",
+    )
+    work.add_argument(
+        "--job-goal",
+        help=(
+            "original higher-level Job goal; required when --job-id is first used and "
+            "optional, but required to match, on later child runs"
+        ),
+    )
     work.add_argument("--repo", default=".")
     work.add_argument(
         "--routing-mode",
@@ -948,9 +960,11 @@ def _incident_reporting_projection(
 
 
 def _graph_run_cli_result(
-    graph_run: GraphRunRecord, incidents: Sequence[IncidentRunRecord]
+    graph_run: GraphRunRecord,
+    incidents: Sequence[IncidentRunRecord],
+    job_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "schema_version": "2",
         "run_id": graph_run.id,
         "status": graph_run.status,
@@ -958,6 +972,9 @@ def _graph_run_cli_result(
         "next_actions": (),
         "incident_reporting": _incident_reporting_projection(incidents),
     }
+    if job_context is not None:
+        result["job"] = job_context
+    return result
 
 
 def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
@@ -1195,7 +1212,12 @@ def _work(args: argparse.Namespace) -> int:
 
     with SQLiteStore(db_path) as store:
         if resume_run is None:
-            store.claim_run_id(run_id, repository)
+            store.claim_run_id(
+                run_id,
+                repository,
+                job_id=getattr(args, "job_id", None),
+                job_goal=getattr(args, "job_goal", None),
+            )
 
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(
@@ -1882,7 +1904,13 @@ def _work(args: argparse.Namespace) -> int:
                     )
                 )
                 return 7
-            print(canonical_json(_graph_run_cli_result(graph_run, incident_records)))
+            print(
+                canonical_json(
+                    _graph_run_cli_result(
+                        graph_run, incident_records, store.job_context_for_run(run_id)
+                    )
+                )
+            )
             return _graph_run_exit_code(graph_run)
 
 

@@ -136,6 +136,27 @@ border-color:#60a5fa}
 .run-card.attention-card{
 border-color:#f59e0b;
 background:#211d19}
+.job-children{
+display:grid;
+gap:.35rem;
+margin-top:.65rem;
+padding-top:.65rem;
+border-top:1px solid #293752}
+.job-child{
+display:flex;
+align-items:center;
+gap:.5rem;
+width:100%;
+padding:.45rem .55rem;
+text-align:left}
+.job-child-label{
+flex:1;
+min-width:0;
+overflow:hidden;
+text-overflow:ellipsis;
+white-space:nowrap}
+.job-child .badge{
+flex:none}
 .run-card h3{
 display:-webkit-box;
 margin:0 0 .3rem;
@@ -433,8 +454,8 @@ reviewers,
 or evaluators.</div>
 <section id="fleet-overview">
 <div class="overview-head">
-<h2>Fleet runs</h2>
-<span class="muted">Select a run to inspect its graph and tasks.</span>
+<h2>Fleet Jobs and standalone runs</h2>
+<span class="muted">Open a Job child to inspect its Run, revisions, and tasks.</span>
 </div>
 <h2>Active <span id="active-count" class="muted"></span></h2>
 <div id="active-runs" class="run-grid"></div>
@@ -603,7 +624,9 @@ empty.textContent=emptyLabel;
 root.append(empty);
 return}
 for(const run of runs){
-const card=document.createElement('button');
+const isJob=run.kind==='job',
+children=maps(run.child_graph_runs),
+card=document.createElement(isJob?'section':'button');
 card.className='run-card';
 card.classList.toggle('attention-card',Boolean(run.requires_attention));
 const title=document.createElement('h3');
@@ -666,8 +689,11 @@ const activity=document.createElement('p');
 activity.className='run-activity';
 const taskOrPhase=run.active_task||run.phase||
 'No active task or phase recorded';
-activity.textContent=taskOrPhase;
-activity.title=taskOrPhase;
+const displayedTaskOrPhase=isJob?
+'Current: '+text(run.current_status)+' · '+children.length+' child Graph Run(s)':
+taskOrPhase;
+activity.textContent=displayedTaskOrPhase;
+activity.title=displayedTaskOrPhase;
 const ownership=document.createElement('p');
 ownership.className='run-activity muted';
 const ownershipFacts=[];
@@ -701,7 +727,27 @@ footer.append(activity);
 if(ownershipFacts.length)footer.append(ownership);
 footer.append(updated);
 card.append(title,repository,meta,footer);
-card.addEventListener('click',()=>openRun(run.run_id));
+if(isJob){
+const childList=document.createElement('div');
+childList.className='job-children';
+for(const child of children){
+const childButton=document.createElement('button');
+childButton.className='job-child';
+const childLabel=document.createElement('span');
+childLabel.className='job-child-label';
+childLabel.textContent='#'+text(child.job_sequence)+' '+
+(child.goal||child.run_id);
+childLabel.title=child.goal||child.run_id;
+const childStatus=document.createElement('span');
+childStatus.className='badge';
+childStatus.textContent=text(child.status);
+childButton.append(childLabel,childStatus);
+childButton.setAttribute(
+'aria-label','Open child Graph Run '+child.run_id);
+childButton.addEventListener('click',()=>openRun(child.run_id));
+childList.append(childButton)}
+card.append(childList)}
+else card.addEventListener('click',()=>openRun(run.run_id));
 root.append(card)}
 }
 

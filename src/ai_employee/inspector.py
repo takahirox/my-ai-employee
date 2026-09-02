@@ -57,6 +57,7 @@ from .graph_evaluation import (
 )
 from .incident_runtime import INCIDENT_RUN_RECORD_KIND, IncidentRunRecord
 from .inspector_ui import INDEX as _INDEX
+from .jobs import JobGraphRunRecord, JobRecord
 from .parent_review import (
     ParentSemanticRepairRequest,
     ParentSemanticReviewDecision,
@@ -1220,6 +1221,131 @@ def _attention_facts(
     return unique
 
 
+def _group_parent_jobs(
+    store: SQLiteStore,
+    active: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collapse explicitly related Graph Runs into ordered parent Job summaries."""
+
+    jobs = {
+        item.id: item
+        for item in store.list_records("job_v2", JobRecord)
+        if isinstance(item, JobRecord)
+    }
+    bindings = tuple(
+        item
+        for item in store.list_records("job_graph_run_v2", JobGraphRunRecord)
+        if isinstance(item, JobGraphRunRecord)
+    )
+    if not jobs or not bindings:
+        return {"active": active, "history": history}
+
+    active_ids = {str(item["run_id"]) for item in active}
+    summaries = {
+        str(item["run_id"]): item
+        for item in (*active, *history)
+        if isinstance(item.get("run_id"), str)
+    }
+    grouped_run_ids: set[str] = set()
+    active_jobs: list[dict[str, Any]] = []
+    historical_jobs: list[dict[str, Any]] = []
+    for job_id, job in jobs.items():
+        ordered_bindings = sorted(
+            (item for item in bindings if item.job_id == job_id),
+            key=lambda item: (item.sequence, item.graph_run_id),
+        )
+        children: list[dict[str, Any]] = []
+        for binding in ordered_bindings:
+            summary = summaries.get(binding.graph_run_id)
+            if summary is None:
+                continue
+            grouped_run_ids.add(binding.graph_run_id)
+            children.append(
+                {
+                    **summary,
+                    "job_sequence": binding.sequence,
+                    "job_relationship_created_at": binding.created_at,
+                }
+            )
+        if not children:
+            continue
+        latest = children[-1]
+        has_active_child = any(str(item["run_id"]) in active_ids for item in children)
+        current_status = str(latest.get("status") or "not_recorded")
+        successful = {"completed", "ready_to_promote", "succeeded"}
+        overall_status = (
+            "running"
+            if has_active_child
+            else "completed"
+            if all(str(item.get("status")) in successful for item in children)
+            else current_status
+        )
+        attention = [
+            {**fact, "run_id": child["run_id"]}
+            for child in children
+            for fact in _as_dicts(child.get("attention"))
+        ]
+        repositories = {
+            str(item["repository"]) for item in children if isinstance(item.get("repository"), str)
+        }
+        repository_ids = {
+            str(item["repository_id"])
+            for item in children
+            if isinstance(item.get("repository_id"), str)
+        }
+        timestamps = [
+            str(item["last_updated_at"])
+            for item in children
+            if isinstance(item.get("last_updated_at"), str)
+        ]
+        terminal_count = sum(
+            str(item.get("status"))
+            in {"cancelled", "completed", "failed", "ready_to_promote", "succeeded"}
+            for item in children
+        )
+        job_summary: dict[str, Any] = {
+            "kind": "job",
+            "job_id": job.id,
+            "goal": job.goal,
+            "status": overall_status,
+            "overall_status": overall_status,
+            "current_status": current_status,
+            "current_run_id": latest["run_id"],
+            "child_graph_runs": children,
+            "progress": {"completed": terminal_count, "total": len(children)},
+            "phase": f"{len(children)} child Graph Run(s); current: {current_status}",
+            "last_updated_at": max(timestamps) if timestamps else None,
+            "requires_attention": any(bool(item.get("requires_attention")) for item in children),
+            "attention": attention,
+            "attention_count": sum(int(item.get("attention_count") or 0) for item in children),
+            "attention_available": all(
+                item.get("attention_available", True) is not False for item in children
+            ),
+            "repository": (
+                next(iter(repositories)) if len(repositories) == 1 else "Multiple repositories"
+            ),
+            "repository_id": (next(iter(repository_ids)) if len(repository_ids) == 1 else None),
+            "created_at": job.created_at,
+        }
+        (active_jobs if has_active_child else historical_jobs).append(job_summary)
+
+    grouped_active = [item for item in active if str(item["run_id"]) not in grouped_run_ids]
+    grouped_history = [item for item in history if str(item["run_id"]) not in grouped_run_ids]
+    grouped_active.extend(active_jobs)
+    grouped_history.extend(historical_jobs)
+    grouped_active.sort(
+        key=lambda item: (
+            not item["requires_attention"],
+            str(item.get("job_id") or item.get("run_id")),
+        )
+    )
+    grouped_history.sort(
+        key=lambda item: str(item.get("job_id") or item.get("run_id")), reverse=True
+    )
+    return {"active": grouped_active, "history": grouped_history}
+
+
 def inspect_fleet_runs(
     store: SQLiteStore,
     repository_id: str | None = None,
@@ -1385,7 +1511,7 @@ def inspect_fleet_runs(
         target.append(item)
     active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
     history.sort(key=lambda item: str(item["run_id"]), reverse=True)
-    return {"active": active, "history": history}
+    return _group_parent_jobs(store, active, history)
 
 
 def _attach_repository_context(
@@ -1401,6 +1527,9 @@ def _attach_repository_context(
     repository = store.repository_for_run(run_id)
     if repository is not None:
         projection["repository_context"] = repository
+    job_context = store.job_context_for_run(run_id)
+    if job_context is not None:
+        projection["job_context"] = job_context
     return projection
 
 
