@@ -186,6 +186,7 @@ class ArmIdentity(SchemaModelV2):
     arm_config_digest: Digest
     seed: int = Field(ge=0)
     repetition: int = Field(ge=1)
+    assignment_index: int = Field(ge=0)
     disabled_components: tuple[Identifier, ...] = ()
 
     @model_validator(mode="after")
@@ -194,6 +195,32 @@ class ArmIdentity(SchemaModelV2):
             raise ValueError("disabled components must be unique and sorted")
         if (self.kind is ArmKind.FLEET_ABLATION) != bool(self.disabled_components):
             raise ValueError("exactly Fleet ablation arms must disable components")
+        if self.assignment_index >= len(self.fairness_config.randomized_order) or (
+            self.fairness_config.randomized_order[self.assignment_index] != self.id
+        ):
+            raise ValueError("assignment index must bind this arm to the randomized order")
+        config = self.arm_config
+        if self.kind is ArmKind.DIRECT_AGENT and (
+            config.planning or config.review or config.repair or config.maximum_parallelism != 1
+        ):
+            raise ValueError("direct arms must disable every Fleet orchestration component")
+        if self.kind is ArmKind.FLEET and not (config.planning and config.review and config.repair):
+            raise ValueError("complete Fleet arms must enable planning, review, and repair")
+        if self.kind is ArmKind.FLEET_ABLATION:
+            component = self.disabled_components[0]
+            expected = {
+                "planning": not config.planning and config.review and config.repair,
+                "review": config.planning and not config.review and config.repair,
+                "repair": config.planning and config.review and not config.repair,
+                "parallelism": (
+                    config.planning
+                    and config.review
+                    and config.repair
+                    and config.maximum_parallelism == 1
+                ),
+            }.get(component)
+            if expected is not True:
+                raise ValueError("ablation arm configuration does not disable its named component")
         bindings = (
             ("environment", self.environment_digest, canonical_digest(self.environment)),
             (
@@ -299,7 +326,14 @@ class TrialResult(SchemaModelV2):
         ):
             raise ValueError("check failure requires exit zero and assertion classification")
         if self.terminal_outcome is TerminalOutcome.EXECUTION_FAILED and (
-            self.process_exit_code in (None, 0) or self.failure_classification is None
+            self.process_exit_code in (None, 0)
+            or self.failure_classification
+            not in {
+                FailureClassification.PROCESS,
+                FailureClassification.INFRASTRUCTURE,
+                FailureClassification.POLICY,
+                FailureClassification.PROTOCOL,
+            }
         ):
             raise ValueError("execution failure requires a nonzero exit and classification")
         expected = {
@@ -308,6 +342,29 @@ class TrialResult(SchemaModelV2):
         }.get(self.terminal_outcome)
         if expected is not None and self.failure_classification is not expected:
             raise ValueError("terminal outcome and failure classification are incoherent")
+        budgets = self.arm.fairness_config.budgets
+        stopping = self.arm.fairness_config.stopping
+        if self.metrics.wall_seconds > budgets.wall_seconds:
+            raise ValueError("observed wall time exceeds the retained budget")
+        if (
+            self.metrics.input_tokens is not None
+            and self.metrics.input_tokens > budgets.input_tokens
+        ):
+            raise ValueError("observed input tokens exceed the retained budget")
+        if (
+            self.metrics.output_tokens is not None
+            and self.metrics.output_tokens > budgets.output_tokens
+        ):
+            raise ValueError("observed output tokens exceed the retained budget")
+        observed_cost = (self.metrics.api_cost or 0) + (self.metrics.compute_cost or 0)
+        if budgets.cost_limit is not None and observed_cost > budgets.cost_limit:
+            raise ValueError("observed cost exceeds the retained budget")
+        if self.metrics.retries > stopping.maximum_retries:
+            raise ValueError("observed retries exceed the retained stopping rule")
+        if self.metrics.repairs > stopping.maximum_repairs:
+            raise ValueError("observed repairs exceed the retained stopping rule")
+        if self.metrics.maximum_parallelism > self.arm.arm_config.maximum_parallelism:
+            raise ValueError("observed parallelism exceeds the retained arm configuration")
         return self
 
     @staticmethod
@@ -772,6 +829,34 @@ def compare_history(
         new = current_index.get(key)
         if new is None:
             raise ValueError("mapped current trial is missing")
+        if (
+            old.task.repository != new.task.repository
+            or old.task.baseline_commit != new.task.baseline_commit
+            or old.task.task_class is not new.task.task_class
+            or old.task.acceptance_criteria != new.task.acceptance_criteria
+            or old.task.regression_checks != new.task.regression_checks
+        ):
+            raise ValueError("mapped historical tasks are not demonstrably equivalent")
+        if (
+            old.arm.kind is not new.arm.kind
+            or old.arm.adapter != new.arm.adapter
+            or old.arm.worker != new.arm.worker
+            or old.arm.environment != new.arm.environment
+            or old.arm.arm_config != new.arm.arm_config
+            or old.arm.disabled_components != new.arm.disabled_components
+        ):
+            raise ValueError("mapped historical arms are not capability-equivalent")
+        old_fairness = old.arm.fairness_config.model_dump(
+            mode="python", exclude={"randomized_order"}
+        )
+        new_fairness = new.arm.fairness_config.model_dump(
+            mode="python", exclude={"randomized_order"}
+        )
+        mapped_order = tuple(
+            arm_map.get(item, item) for item in old.arm.fairness_config.randomized_order
+        )
+        if old_fairness != new_fairness or mapped_order != new.arm.fairness_config.randomized_order:
+            raise ValueError("mapped historical fairness controls are not equivalent")
         compared += 1
         if old.accepted and not new.accepted:
             regressions.append(f"{old.task.task_id}:{old.arm.id}:accepted")

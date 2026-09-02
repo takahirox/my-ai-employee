@@ -123,6 +123,7 @@ def arm(kind: ArmKind, name: str, repetition: int = 1, machine: str = D1) -> Arm
         arm_config_digest=canonical_digest(arm_manifest),
         seed=7,
         repetition=repetition,
+        assignment_index=("direct", "fleet", "no-review").index(name),
         disabled_components=("review",) if kind is ArmKind.FLEET_ABLATION else (),
     )
 
@@ -151,7 +152,7 @@ def result(
         recoveries=1,
         decomposed_nodes=2,
         dependency_edges=1,
-        maximum_parallelism=2,
+        maximum_parallelism=bound_arm.arm_config.maximum_parallelism,
         critical_path_seconds=7,
         context_input_tokens=50,
         context_output_tokens=10,
@@ -308,7 +309,7 @@ def test_manifests_bind_digests_and_ablation_changes_exactly_one_component() -> 
             "arm_config_digest": canonical_digest(broken_config),
         }
     )
-    with pytest.raises(ValueError, match="one-component-only"):
+    with pytest.raises(ValueError, match="does not disable"):
         component_ablation_contribution((full,), (result(task(), broken_arm, accepted=False),))
 
 

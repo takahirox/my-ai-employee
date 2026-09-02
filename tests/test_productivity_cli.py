@@ -100,6 +100,7 @@ def _arm(kind: ArmKind, arm_id: str, environment: str = D1) -> ArmIdentity:
         arm_config_digest=canonical_digest(arm_manifest),
         seed=7,
         repetition=1,
+        assignment_index=("direct", "fleet").index(arm_id),
     )
 
 
@@ -123,7 +124,7 @@ def _result(bound_arm: ArmIdentity, *, accepted: bool, active: float) -> TrialRe
         recoveries=1,
         decomposed_nodes=2,
         dependency_edges=1,
-        maximum_parallelism=2,
+        maximum_parallelism=bound_arm.arm_config.maximum_parallelism,
         critical_path_seconds=7,
         context_input_tokens=50,
         context_output_tokens=10,
