@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar, Self
+from typing import ClassVar, Literal, Self, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from . import __version__
 from .doctor import doctor_from_projection
@@ -25,9 +25,11 @@ from .incident_reporting import (
     Category,
     Diagnosis,
     Failure,
+    IncidentError,
     Mode,
     Outbox,
     Policy,
+    PublicationReceipt,
     PublicExceptionClass,
     TerminalState,
 )
@@ -88,6 +90,9 @@ class IncidentRunRecord(DigestedRecordV2):
         ),
     )
     public_report_digest: Digest | None = None
+    authorization_mode: Literal["approval_required", "auto"] | None = None
+    authorization_digest: Digest | None = None
+    authorized_at: UtcTimestamp | None = None
     published_at: UtcTimestamp | None = None
 
     @model_validator(mode="after")
@@ -105,6 +110,9 @@ class IncidentRunRecord(DigestedRecordV2):
             self.issue_number,
             self.public_url,
             self.public_report_digest,
+            self.authorization_mode,
+            self.authorization_digest,
+            self.authorized_at,
             self.published_at,
         )
         has_receipt = all(value is not None for value in receipt)
@@ -129,8 +137,20 @@ class IncidentRunRecord(DigestedRecordV2):
         elif self.state is IncidentRunState.PREPARED:
             if not has_receipt or has_publication:
                 raise ValueError("prepared incident receipt has an invalid shape")
-        elif self.state is IncidentRunState.PUBLISHED and (not has_receipt or not has_publication):
-            raise ValueError("published incident receipt has an invalid shape")
+        elif self.state is IncidentRunState.PUBLISHED:
+            if not has_receipt or not has_publication:
+                raise ValueError("published incident receipt has an invalid shape")
+            issue_number = cast(int, self.issue_number)
+            public_url = cast(str, self.public_url)
+            public_report_digest = cast(str, self.public_report_digest)
+            authorized_at = cast(datetime, self.authorized_at)
+            published_at = cast(datetime, self.published_at)
+            if public_report_digest != self.report_digest:
+                raise ValueError("published report digest must match prepared report")
+            if not public_url.endswith(f"/issues/{issue_number}"):
+                raise ValueError("published incident URL must match its issue number")
+            if authorized_at > published_at:
+                raise ValueError("incident authorization must precede publication")
         return self
 
 
@@ -277,6 +297,141 @@ def _persist_all(
     records: tuple[IncidentRunRecord, ...],
 ) -> tuple[IncidentRunRecord, ...]:
     return tuple(_persist(store, record) for record in records)
+
+
+def _publication_record_id(prepared: IncidentRunRecord) -> str:
+    digest = canonical_digest(
+        {
+            "prepared_record_id": prepared.id,
+            "state": IncidentRunState.PUBLISHED.value,
+        }
+    )
+    return f"incident-{digest[:48]}"
+
+
+def _same_publication_record(
+    left: IncidentRunRecord,
+    right: IncidentRunRecord,
+) -> bool:
+    excluded = {"content_digest", "created_at"}
+    return left.model_dump(mode="json", exclude=excluded) == right.model_dump(
+        mode="json",
+        exclude=excluded,
+    )
+
+
+def record_incident_publication(
+    store: SQLiteStore,
+    graph_run_id: Identifier,
+    fingerprint: Digest,
+    receipt: PublicationReceipt,
+    *,
+    clock: Callable[[], datetime],
+) -> IncidentRunRecord:
+    """Record a validated publication without publishing or changing the graph run."""
+
+    try:
+        if not isinstance(store, SQLiteStore):
+            raise TypeError("store must be a SQLiteStore")
+        if not callable(clock) or not isinstance(receipt, PublicationReceipt):
+            raise TypeError("invalid publication dependencies")
+        validated_graph_run_id = TypeAdapter(Identifier).validate_python(
+            graph_run_id,
+            strict=True,
+        )
+        validated_fingerprint = TypeAdapter(Digest).validate_python(
+            fingerprint,
+            strict=True,
+        )
+        validated_receipt = PublicationReceipt.model_validate(
+            receipt.model_dump(mode="python", round_trip=True),
+            strict=True,
+        )
+        now = ensure_utc(clock())
+    except Exception:
+        raise IncidentError("INVALID_PUBLICATION_ARGUMENTS") from None
+
+    if validated_receipt.fingerprint != validated_fingerprint:
+        raise IncidentError("PUBLICATION_FINGERPRINT_MISMATCH")
+    if validated_receipt.published_at > now:
+        raise IncidentError("PUBLICATION_TIME_INVALID")
+
+    records = store.list_records(
+        INCIDENT_RUN_RECORD_KIND,
+        IncidentRunRecord,
+        run_id=validated_graph_run_id,
+    )
+    matching = tuple(
+        record
+        for record in records
+        if record.graph_run_id == validated_graph_run_id
+        and record.fingerprint == validated_fingerprint
+    )
+    prepared = tuple(record for record in matching if record.state is IncidentRunState.PREPARED)
+    if not prepared:
+        raise IncidentError("PREPARED_INCIDENT_MISSING")
+    if len(prepared) != 1:
+        raise IncidentError("PREPARED_INCIDENT_AMBIGUOUS")
+    prepared_record = prepared[0]
+    if validated_receipt.public_report_digest != prepared_record.report_digest:
+        raise IncidentError("PUBLICATION_REPORT_MISMATCH")
+
+    try:
+        candidate = IncidentRunRecord(
+            id=_publication_record_id(prepared_record),
+            run_id=prepared_record.run_id,
+            created_at=now,
+            graph_run_id=prepared_record.graph_run_id,
+            accepted_graph_revision_digest=(prepared_record.accepted_graph_revision_digest),
+            harness_digest=prepared_record.harness_digest,
+            effective_policy_digest=prepared_record.effective_policy_digest,
+            generation=prepared_record.generation,
+            execution_attempt=prepared_record.execution_attempt,
+            terminal_closure_digest=prepared_record.terminal_closure_digest,
+            internal_incident_code=prepared_record.internal_incident_code,
+            state=IncidentRunState.PUBLISHED,
+            fingerprint=prepared_record.fingerprint,
+            report_digest=prepared_record.report_digest,
+            preview_digest=prepared_record.preview_digest,
+            expiry=prepared_record.expiry,
+            issue_number=validated_receipt.issue_number,
+            public_url=validated_receipt.public_url,
+            public_report_digest=validated_receipt.public_report_digest,
+            authorization_mode=validated_receipt.authorization_mode,
+            authorization_digest=validated_receipt.authorization_digest,
+            authorized_at=validated_receipt.authorized_at,
+            published_at=validated_receipt.published_at,
+        )
+    except Exception:
+        raise IncidentError("PUBLICATION_RECEIPT_INVALID") from None
+
+    published = tuple(record for record in matching if record.state is IncidentRunState.PUBLISHED)
+    if len(published) > 1:
+        raise IncidentError("PUBLISHED_INCIDENT_AMBIGUOUS")
+    if published:
+        if _same_publication_record(published[0], candidate):
+            return published[0]
+        raise IncidentError("PUBLISHED_INCIDENT_CONFLICT")
+
+    if store.put_once(
+        INCIDENT_RUN_RECORD_KIND,
+        candidate,
+        run_id=candidate.run_id,
+    ):
+        return candidate
+
+    persisted = tuple(
+        record
+        for record in store.list_records(
+            INCIDENT_RUN_RECORD_KIND,
+            IncidentRunRecord,
+            run_id=candidate.run_id,
+        )
+        if record.id == candidate.id
+    )
+    if len(persisted) == 1 and _same_publication_record(persisted[0], candidate):
+        return persisted[0]
+    raise IncidentError("PUBLICATION_PERSISTENCE_CONFLICT")
 
 
 def _failed_closed(

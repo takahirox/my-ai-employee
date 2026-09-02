@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -16,13 +16,14 @@ import ai_employee.incident_runtime as runtime
 from ai_employee.domain import ExecutionPolicy, ExecutionStrategy, Goal, RoutingMode
 from ai_employee.domain.harness import HarnessIncidentReporting, ProjectHarnessV2
 from ai_employee.incident_preparation import InternalIncidentCode
-from ai_employee.incident_reporting import Outbox
+from ai_employee.incident_reporting import IncidentError, Outbox, PublicationReceipt
 from ai_employee.incident_runtime import (
     INCIDENT_RUN_RECORD_KIND,
     IncidentRunErrorCode,
     IncidentRunRecord,
     IncidentRunState,
     prepare_graph_run_incidents,
+    record_incident_publication,
 )
 from ai_employee.run_ownership import RunLeaseClosureRecord
 from ai_employee.serialization import project_harness_digest
@@ -135,6 +136,55 @@ def _doctor(codes: list[object], run_id: str) -> dict[str, object]:
 
 def _forbidden(*_args: object, **_kwargs: object) -> None:
     raise AssertionError("forbidden boundary was accessed")
+
+
+def _prepare_one(
+    store: SQLiteStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str = "publication-run",
+) -> tuple[GraphRunRecord, IncidentRunRecord]:
+    harness = _harness(tmp_path)
+    run = _run(harness, run_id)
+    monkeypatch.setattr(runtime, "inspect_graph_run", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        runtime,
+        "doctor_from_projection",
+        lambda _projection: _doctor(["ENVELOPE_INVALID"], run.id),
+    )
+    monkeypatch.setenv("ISSUE62_RUNTIME_KEY", KEY)
+    store.put("graph_run_v2", run, run_id=run.id)
+    _put_closure(store, _closure(run))
+    records = prepare_graph_run_incidents(
+        store,
+        run,
+        harness,
+        public_commit=PUBLIC_COMMIT,
+        clock=lambda: NOW,
+    )
+    assert len(records) == 1
+    assert records[0].state is IncidentRunState.PREPARED
+    return run, records[0]
+
+
+def _publication_receipt(
+    prepared: IncidentRunRecord,
+    **changes: object,
+) -> PublicationReceipt:
+    values: dict[str, object] = {
+        "repository": "owner/repository",
+        "fingerprint": prepared.fingerprint,
+        "issue_number": 7,
+        "public_url": "https://github.com/owner/repository/issues/7",
+        "public_report_digest": prepared.report_digest,
+        "authorization_mode": "approval_required",
+        "authorization_digest": "d" * 64,
+        "authorized_at": NOW,
+        "published_at": NOW,
+    }
+    values.update(changes)
+    return PublicationReceipt.model_validate(values)
 
 
 def test_off_and_nonfailed_return_before_inspector_outbox_or_environment(
@@ -483,3 +533,175 @@ def test_persistence_is_run_scoped_frozen_and_idempotently_bounded(
             first[0].state = IncidentRunState.PUBLISHED
         with pytest.raises(ValidationError):
             IncidentRunRecord.model_validate(first[0].model_dump() | {"private": CANARY})
+
+
+def test_publication_is_bounded_idempotent_and_does_not_mutate_graph_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SQLiteStore(tmp_path / "publication.db") as store:
+        run, prepared = _prepare_one(store, tmp_path, monkeypatch)
+        graph_before = store.get("graph_run_v2", run.id, GraphRunRecord)
+        receipt = _publication_receipt(prepared)
+
+        first = record_incident_publication(
+            store,
+            run.id,
+            receipt.fingerprint,
+            receipt,
+            clock=lambda: NOW,
+        )
+        second = record_incident_publication(
+            store,
+            run.id,
+            receipt.fingerprint,
+            receipt,
+            clock=lambda: NOW + timedelta(minutes=1),
+        )
+
+        assert second == first
+        assert first.state is IncidentRunState.PUBLISHED
+        assert first.issue_number == 7
+        assert first.public_url == "https://github.com/owner/repository/issues/7"
+        assert first.public_report_digest == prepared.report_digest
+        assert first.authorization_mode == "approval_required"
+        assert first.authorization_digest == "d" * 64
+        assert first.authorized_at == NOW
+        assert first.published_at == NOW
+        assert store.get("graph_run_v2", run.id, GraphRunRecord) == graph_before
+        records = store.list_records(
+            INCIDENT_RUN_RECORD_KIND,
+            IncidentRunRecord,
+            run_id=run.id,
+        )
+        assert tuple(record.state for record in records) == (
+            IncidentRunState.PREPARED,
+            IncidentRunState.PUBLISHED,
+        )
+        surface = json.dumps([record.model_dump(mode="json") for record in records])
+        assert CANARY not in surface
+        assert KEY not in surface
+        assert set(first.model_dump()) == set(IncidentRunRecord.model_fields)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("missing", "PREPARED_INCIDENT_MISSING"),
+        ("fingerprint", "PUBLICATION_FINGERPRINT_MISMATCH"),
+        ("report", "PUBLICATION_REPORT_MISMATCH"),
+        ("future", "PUBLICATION_TIME_INVALID"),
+    ],
+)
+def test_publication_mismatches_fail_closed_without_a_published_record(
+    case: str,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SQLiteStore(tmp_path / f"publication-{case}.db") as store:
+        run, prepared = _prepare_one(store, tmp_path, monkeypatch, run_id=f"run-{case}")
+        fingerprint = prepared.fingerprint
+        assert fingerprint is not None
+        receipt = _publication_receipt(prepared)
+        graph_run_id = run.id
+        if case == "missing":
+            graph_run_id = "missing-run"
+        elif case == "fingerprint":
+            fingerprint = "b" * 64
+        elif case == "report":
+            receipt = _publication_receipt(prepared, public_report_digest="c" * 64)
+        elif case == "future":
+            receipt = _publication_receipt(
+                prepared,
+                authorized_at=NOW + timedelta(seconds=1),
+                published_at=NOW + timedelta(seconds=1),
+            )
+
+        with pytest.raises(IncidentError, match=f"^{expected}$"):
+            record_incident_publication(
+                store,
+                graph_run_id,
+                fingerprint,
+                receipt,
+                clock=lambda: NOW,
+            )
+
+        assert all(
+            record.state is not IncidentRunState.PUBLISHED
+            for record in store.list_records(
+                INCIDENT_RUN_RECORD_KIND,
+                IncidentRunRecord,
+                run_id=run.id,
+            )
+        )
+
+
+def test_publication_revalidates_receipt_and_redacts_invalid_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SQLiteStore(tmp_path / "publication-invalid.db") as store:
+        run, prepared = _prepare_one(store, tmp_path, monkeypatch)
+        invalid = PublicationReceipt.model_construct(
+            **(_publication_receipt(prepared).model_dump() | {"public_url": CANARY})
+        )
+        assert prepared.fingerprint is not None
+        with pytest.raises(IncidentError, match=r"^INVALID_PUBLICATION_ARGUMENTS$") as caught:
+            record_incident_publication(
+                store,
+                run.id,
+                prepared.fingerprint,
+                invalid,
+                clock=lambda: NOW,
+            )
+        assert CANARY not in str(caught.value)
+
+
+def test_publication_conflict_and_ambiguous_preparation_are_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SQLiteStore(tmp_path / "publication-conflict.db") as store:
+        run, prepared = _prepare_one(store, tmp_path, monkeypatch)
+        assert prepared.fingerprint is not None
+        first = _publication_receipt(prepared)
+        record_incident_publication(
+            store,
+            run.id,
+            prepared.fingerprint,
+            first,
+            clock=lambda: NOW,
+        )
+        conflicting = _publication_receipt(
+            prepared,
+            issue_number=8,
+            public_url="https://github.com/owner/repository/issues/8",
+        )
+        with pytest.raises(IncidentError, match=r"^PUBLISHED_INCIDENT_CONFLICT$"):
+            record_incident_publication(
+                store,
+                run.id,
+                prepared.fingerprint,
+                conflicting,
+                clock=lambda: NOW,
+            )
+
+    with SQLiteStore(tmp_path / "publication-ambiguous.db") as store:
+        run, prepared = _prepare_one(
+            store,
+            tmp_path,
+            monkeypatch,
+            run_id="ambiguous-run",
+        )
+        duplicate = prepared.model_copy(update={"id": "duplicate-prepared-record"})
+        store.put(INCIDENT_RUN_RECORD_KIND, duplicate, run_id=run.id)
+        assert prepared.fingerprint is not None
+        with pytest.raises(IncidentError, match=r"^PREPARED_INCIDENT_AMBIGUOUS$"):
+            record_incident_publication(
+                store,
+                run.id,
+                prepared.fingerprint,
+                _publication_receipt(prepared),
+                clock=lambda: NOW,
+            )
