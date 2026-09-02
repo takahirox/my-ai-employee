@@ -411,7 +411,7 @@ def test_terminal_outcomes_and_durations_are_coherent() -> None:
 
 def test_offline_protocol_manifest_covers_required_scenarios() -> None:
     manifest = json.loads(Path("examples/productivity/protocols.json").read_text(encoding="utf-8"))
-    assert manifest["format"] == "fleet-productivity-protocols/1"
+    assert manifest["format"] == "fleet-productivity-protocols/2"
     required = {
         "codex-direct",
         "codex-fleet",
@@ -428,6 +428,11 @@ def test_offline_protocol_manifest_covers_required_scenarios() -> None:
     }
     assert {item["id"] for item in manifest["protocols"]} == required
     assert all(item["network"] == "disabled" for item in manifest["protocols"])
-    assert all(
-        item["command"] and item["artifacts"] and item["evidence"] for item in manifest["protocols"]
-    )
+    for item in manifest["protocols"]:
+        assert item["command"][:3] == ["python", "-m", "ai_employee.productivity_protocol"]
+        assert "pytest" not in item["command"]
+        assert item["artifacts"] and item["evidence"] and item["treatments"]
+        assert item["command"].count("{task}") == 1
+        assert item["command"].count("{repository}") == 1
+        assert item["command"].count("{output}") == 1
+        assert item["command"].count("{protocol}") == 1

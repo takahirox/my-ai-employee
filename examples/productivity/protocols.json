@@ -3,105 +3,321 @@
     "expensive": ["weekly-sunday-03:00-utc", "every-release-candidate", "material-control-change"],
     "per_pr": "every-pull-request"
   },
-  "format": "fleet-productivity-protocols/1",
+  "format": "fleet-productivity-protocols/2",
   "protocols": [
     {
       "artifacts": "artifacts/ablation-no-planning/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_manifests_bind_digests_and_ablation_changes_exactly_one_component"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-planning", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "planning",
       "evidence": ["artifacts/ablation-no-planning/acceptance.json", "artifacts/ablation-no-planning/regression.json", "artifacts/ablation-no-planning/result-bundle.json"],
       "id": "ablation-no-planning",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": false, "repair": true, "review": true, "schema_version": "2"},
+        "disabled_components": ["planning"],
+        "id": "ablation-no-planning",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/ablation-no-repair/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_manifests_bind_digests_and_ablation_changes_exactly_one_component"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-repair", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "repair",
       "evidence": ["artifacts/ablation-no-repair/acceptance.json", "artifacts/ablation-no-repair/regression.json", "artifacts/ablation-no-repair/result-bundle.json"],
       "id": "ablation-no-repair",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": false, "review": true, "schema_version": "2"},
+        "disabled_components": ["repair"],
+        "id": "ablation-no-repair",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/ablation-no-review/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_manifests_bind_digests_and_ablation_changes_exactly_one_component"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-review", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "review",
       "evidence": ["artifacts/ablation-no-review/acceptance.json", "artifacts/ablation-no-review/regression.json", "artifacts/ablation-no-review/result-bundle.json"],
       "id": "ablation-no-review",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": false, "schema_version": "2"},
+        "disabled_components": ["review"],
+        "id": "ablation-no-review",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/ablation-serial/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_manifests_bind_digests_and_ablation_changes_exactly_one_component"],
-      "controlled_delta": "maximum_parallelism",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-serial", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "maximum-parallelism",
       "evidence": ["artifacts/ablation-serial/acceptance.json", "artifacts/ablation-serial/regression.json", "artifacts/ablation-serial/result-bundle.json"],
       "id": "ablation-serial",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 1, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "disabled_components": ["parallelism"],
+        "id": "ablation-serial",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/claude-direct/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_outcomes_bind_ids_authorities_dispositions_and_evidence"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "claude-direct", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "direct-claude-adapter",
       "evidence": ["artifacts/claude-direct/acceptance.json", "artifacts/claude-direct/regression.json", "artifacts/claude-direct/result-bundle.json"],
       "id": "claude-direct",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "claude",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "claude-direct",
+        "kind": "direct_agent",
+        "schema_version": "2",
+        "worker": "claude"
+      }]
     },
     {
       "artifacts": "artifacts/claude-fleet/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_bundle_rejects_noncanonical_order_duplicate_ids_and_unstable_families"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "claude-fleet", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "fleet-orchestration",
       "evidence": ["artifacts/claude-fleet/acceptance.json", "artifacts/claude-fleet/regression.json", "artifacts/claude-fleet/result-bundle.json"],
       "id": "claude-fleet",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "claude-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "claude"
+      }]
     },
     {
       "artifacts": "artifacts/codex-direct/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_outcomes_bind_ids_authorities_dispositions_and_evidence"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "codex-direct", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "direct-codex-adapter",
       "evidence": ["artifacts/codex-direct/acceptance.json", "artifacts/codex-direct/regression.json", "artifacts/codex-direct/result-bundle.json"],
       "id": "codex-direct",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "codex",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "codex-direct",
+        "kind": "direct_agent",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/codex-fleet/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_bundle_rejects_noncanonical_order_duplicate_ids_and_unstable_families"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "codex-fleet", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "fleet-orchestration",
       "evidence": ["artifacts/codex-fleet/acceptance.json", "artifacts/codex-fleet/regression.json", "artifacts/codex-fleet/result-bundle.json"],
       "id": "codex-fleet",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "codex-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     },
     {
       "artifacts": "artifacts/native-swe-bench/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_swe_bench_native_records_fail_closed_without_network"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "native-swe-bench", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "native-record-projection",
       "evidence": ["artifacts/native-swe-bench/acceptance.json", "artifacts/native-swe-bench/regression.json", "artifacts/native-swe-bench/result-bundle.json"],
       "id": "native-swe-bench",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "swe-bench",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "native-swe-bench",
+        "kind": "oss_adapter",
+        "schema_version": "2",
+        "worker": "offline-import"
+      }]
     },
     {
       "artifacts": "artifacts/oss-comparator/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_adapters_bundles_tamper_and_history"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "oss-comparator", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "generic-oss-adapter",
       "evidence": ["artifacts/oss-comparator/acceptance.json", "artifacts/oss-comparator/regression.json", "artifacts/oss-comparator/result-bundle.json"],
       "id": "oss-comparator",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "generic-oss",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "oss-comparator",
+        "kind": "oss_adapter",
+        "schema_version": "2",
+        "worker": "operator-supplied"
+      }]
     },
     {
       "artifacts": "artifacts/randomized-real-ab/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q", "tests/test_productivity_evaluation.py::test_authority_fairness_aggregation_and_ablation"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "randomized-real-ab", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "predeclared-randomized-order",
       "evidence": ["artifacts/randomized-real-ab/acceptance.json", "artifacts/randomized-real-ab/regression.json", "artifacts/randomized-real-ab/result-bundle.json"],
       "id": "randomized-real-ab",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [
+        {
+          "adapter": "randomized-real",
+          "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+          "disabled_components": [],
+          "id": "real-direct",
+          "kind": "direct_agent",
+          "schema_version": "2",
+          "worker": "codex"
+        },
+        {
+          "adapter": "randomized-real",
+          "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+          "disabled_components": [],
+          "id": "real-fleet",
+          "kind": "fleet",
+          "schema_version": "2",
+          "worker": "codex"
+        }
+      ]
     },
     {
       "artifacts": "artifacts/release-regression/command.json",
-      "command": ["uv", "run", "--offline", "pytest", "-q"],
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "release-regression", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
       "controlled_delta": "compatible-release-candidate",
       "evidence": ["artifacts/release-regression/acceptance.json", "artifacts/release-regression/regression.json", "artifacts/release-regression/result-bundle.json"],
       "id": "release-regression",
-      "network": "disabled"
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "disabled_components": [],
+        "id": "release-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
     }
   ],
+  "schema_version": "2",
   "verification": {
     "diff_check": ["git", "diff", "--check"],
     "lint": ["uv", "run", "--offline", "ruff", "check", "."],

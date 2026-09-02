@@ -173,11 +173,54 @@ refresh a headline; publish versioned, reproducible runs.
 ## Version-controlled offline protocols
 
 [`examples/productivity/protocols.json`](../examples/productivity/protocols.json) is the canonical
-offline-safe protocol index. It covers direct Codex, Codex through Fleet, direct Claude, Claude
-through Fleet, each one-component ablation, an OSS comparator, native SWE-bench normalization,
-randomized real A/B dry-run assignment, and release regression. Each record declares exact argv,
-disabled network, artifact paths, and evidence paths. The commands are fixtures: replacing one
-with a credentialed external worker requires a separately reviewed manifest and opt-in authority.
+protocol index. It contains runner templates for direct Codex, Codex through full Fleet, direct
+Claude, Claude through full Fleet, every exact one-component ablation, a generic OSS producer,
+native SWE-bench import, randomized real A/B collection, and release regression. Angle-bracketed
+values are mandatory operator substitutions; none of the templates claims measured performance.
+
+The runner is deliberately separate from the `fleet` command and does not change Fleet execution
+or promotion authority. For example, after creating a canonical `TaskIdentity` JSON file and an
+offline producer wrapper, collect the direct-Codex protocol with:
+
+```bash
+python -m ai_employee.productivity_protocol \
+  --manifest examples/productivity/protocols.json \
+  --protocol codex-direct \
+  --task ./task.json \
+  --repository ./disposable-checkout \
+  --output-root . \
+  --timeout 3600 \
+  --network disabled \
+  -- ./operator-productivity-producer \
+  --task '{task}' --repository '{repository}' --output '{output}' --protocol '{protocol}'
+```
+
+The arm command is an argv array, never a shell string. Each of `{task}`, `{repository}`,
+`{output}`, and `{protocol}` must occur once as a complete argument. The runner resolves the task,
+checkout, output staging directory, protocol ID, and executable before launching the producer with
+the checkout as its explicit working directory. The task file must be the canonical JSON encoding
+of one `TaskIdentity`, followed by one newline. The selected manifest and caller must both declare
+the same network policy, and every result arm must retain that policy in its environment manifest.
+
+The producer must create exactly three regular files in `{output}`:
+
+- `acceptance.json`, a canonical `fleet-productivity-check-artifact/1` record with family
+  `acceptance`;
+- `regression.json`, the same record format with family `regression`;
+- `result-bundle.json`, a canonical `fleet-productivity-results/2` `ResultBundle`.
+
+Each check artifact lists canonical `(trial_id, check_id, authority, disposition)` records. Every
+matching `CheckOutcome.evidence_digest` must be the SHA-256 digest of the complete, exact bytes of
+its family artifact. The bundle run ID must equal the selected protocol ID, its task must equal the
+supplied task, and its exact arm IDs, kinds, adapters, workers, configurations, disabled components,
+and network modes must match the manifest treatments.
+
+Only after the command exits zero and every binding validates does the runner add canonical
+`command.json` metadata and atomically rename the staging directory to the declared destination.
+It records original and resolved argv, protocol and task configuration, explicit cwd, timeout,
+network policy, UTC start/end, exit code, stdout/stderr digests, and exact artifact digests. Existing
+destinations, path escapes, missing or extra files, stale task/check data, malformed JSON, and
+protocol or evidence mismatches fail without publishing the staged artifacts.
 
 Run the cheap per-PR gate against the exact candidate:
 
@@ -197,17 +240,9 @@ uv run --offline ruff check .
 uv run --offline mypy
 ```
 
-For every protocol command, the runner creates the declared artifact directory before execution,
-captures stdout and stderr as bytes, records argv, UTC start/end, exit code, candidate tree digest,
-manifest digest, and SHA-256 digests for every captured file in `command.json`, then writes the
-criterion and regression check records to `acceptance.json` and `regression.json`. It validates and
-stores the canonical `result-bundle.json` with:
+Inspect a successfully collected bundle without granting execution authority:
 
 ```bash
 fleet productivity validate artifacts/<protocol-id>/result-bundle.json
 fleet productivity report artifacts/<protocol-id>/result-bundle.json --format markdown
 ```
-
-No missing artifact, failed check, stale candidate binding, duplicate evidence record, or
-noncanonical bundle is counted. The protocol runner may copy results out of a disposable worktree,
-but the productivity CLI remains read-only and has no Fleet execution or promotion authority.
