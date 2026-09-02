@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NamedTuple, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .serialization import canonical_digest, canonical_json, canonical_json_bytes
 
@@ -269,7 +269,7 @@ def _scan_sink(value: str, limit: int) -> None:
 
 def _summary(report: Report) -> str:
     value = (
-        f"Occurrences: {report.occurrences}/999; category={report.category.value}; "
+        f"Occurrences: {report.occurrences} of 999; category={report.category.value}; "
         f"failure={report.failure.value}; stage={report.stage.value}"
     )
     _scan_sink(value, 256)
@@ -421,10 +421,16 @@ class Outbox:
         self.db.close()
 
     def _repository(self, policy: Policy, report: Report) -> str:
+        try:
+            policy = Policy.model_validate(policy.model_dump(), strict=True)
+        except ValidationError as error:
+            raise IncidentError("POLICY_INVALID") from error
         if policy.mode is Mode.OFF:
             raise IncidentError("POLICY_OFF")
         if policy.repository is None:
             raise IncidentError("REPOSITORY_REQUIRED")
+        for segment in policy.repository.split("/"):
+            _scan_sink(segment, 100)
         if policy.mode is Mode.AUTO and report.category not in policy.auto_categories:
             raise IncidentError("AUTO_CATEGORY_DENIED")
         return policy.repository
