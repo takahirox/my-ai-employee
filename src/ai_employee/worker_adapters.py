@@ -1215,7 +1215,7 @@ def _normalize_new_file_diff(value: str) -> str:
 
 
 def _normalize_existing_file_hunk_counts(value: str) -> str:
-    """Recount one structurally explicit existing-file hunk per file section."""
+    """Atomically recount safe explicit existing-file hunks per file section."""
 
     lines = value.splitlines(keepends=True)
     starts = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
@@ -1238,53 +1238,63 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
             normalized.extend(section)
             continue
 
-        hunks = [index for index, line in enumerate(section) if line.startswith("@@ ")]
-        if len(hunks) != 1:
+        hunks = [index for index, line in enumerate(section) if line.startswith("@@")]
+        if not hunks:
             normalized.extend(section)
             continue
-        hunk = hunks[0]
-        header_match = re.fullmatch(
-            r"(@@ -)(\d+)(?:,(\d+))?( \+)(\d+)(?:,(\d+))?"
-            r"( @@[^\r\n]*)(\r\n|\n)?",
-            section[hunk],
-        )
+        first_hunk = hunks[0]
         old_headers = [
-            index
-            for index, line in enumerate(section[:hunk])
-            if line.startswith("--- ")
+            index for index, line in enumerate(section) if line.startswith("--- ")
         ]
         new_headers = [
-            index
-            for index, line in enumerate(section[:hunk])
-            if line.startswith("+++ ")
+            index for index, line in enumerate(section) if line.startswith("+++ ")
         ]
         if (
-            header_match is None
-            or len(old_headers) != 1
+            len(old_headers) != 1
             or len(new_headers) != 1
+            or old_headers[0] >= first_hunk
             or new_headers[0] != old_headers[0] + 1
             or _diff_header_value(section[old_headers[0]], "--- ") != f"a/{old_path}"
             or _diff_header_value(section[new_headers[0]], "+++ ") != f"b/{old_path}"
             or any(
-                line.startswith(("rename from ", "rename to ")) for line in section[:hunk]
+                line.startswith(("rename from ", "rename to "))
+                for line in section[:first_hunk]
             )
         ):
             normalized.extend(section)
             continue
 
-        body = section[hunk + 1 :]
-        if not body or not all(line.startswith((" ", "+", "-", "\\")) for line in body):
-            normalized.extend(section)
-            continue
-        observed_old = sum(line.startswith((" ", "-")) for line in body)
-        observed_new = sum(line.startswith((" ", "+")) for line in body)
-        if observed_old == 0 and observed_new == 0:
-            normalized.extend(section)
-            continue
+        candidate = section.copy()
+        section_is_safe = True
+        for hunk_number, hunk in enumerate(hunks):
+            next_hunk = (
+                hunks[hunk_number + 1]
+                if hunk_number + 1 < len(hunks)
+                else len(section)
+            )
+            header_match = re.fullmatch(
+                r"(@@ -)(\d+)(?:,(\d+))?( \+)(\d+)(?:,(\d+))?"
+                r"( @@[^\r\n]*)(\r\n|\n)?",
+                section[hunk],
+            )
+            body = section[hunk + 1 : next_hunk]
+            if (
+                header_match is None
+                or not body
+                or not all(line.startswith((" ", "+", "-", "\\")) for line in body)
+            ):
+                section_is_safe = False
+                break
+            observed_old = sum(line.startswith((" ", "-")) for line in body)
+            observed_new = sum(line.startswith((" ", "+")) for line in body)
+            if observed_old == 0 and observed_new == 0:
+                section_is_safe = False
+                break
 
-        expected_old = int(header_match.group(3) or "1")
-        expected_new = int(header_match.group(6) or "1")
-        if observed_old != expected_old or observed_new != expected_new:
+            expected_old = int(header_match.group(3) or "1")
+            expected_new = int(header_match.group(6) or "1")
+            if observed_old == expected_old and observed_new == expected_new:
+                continue
             old_count = (
                 f",{observed_old}"
                 if header_match.group(3) is not None or observed_old != 1
@@ -1295,12 +1305,13 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
                 if header_match.group(6) is not None or observed_new != 1
                 else ""
             )
-            section[hunk] = (
+            candidate[hunk] = (
                 f"{header_match.group(1)}{header_match.group(2)}{old_count}"
                 f"{header_match.group(4)}{header_match.group(5)}{new_count}"
                 f"{header_match.group(7)}{header_match.group(8) or ''}"
             )
-        normalized.extend(section)
+
+        normalized.extend(candidate if section_is_safe else section)
     return "".join(normalized)
 
 

@@ -1680,9 +1680,9 @@ def test_cli_worker_rejects_unprefixed_count_inconsistent_existing_hunks(
             "@@ -1 +1 @@\n"
             "-one\n"
             "+one\n"
-            "@@ -3,2 +3,2 @@\n"
+            "@@malformed\n"
             " two\n",
-            id="multiple-hunks",
+            id="malformed-hunk-boundary",
         ),
         pytest.param(
             "diff --git a/../escape.txt b/../escape.txt\n"
