@@ -13,6 +13,7 @@ from ai_employee.productivity_evaluation import (
     RegressionCheck,
     TaskClass,
     TaskIdentity,
+    load_result_bundle,
 )
 from ai_employee.productivity_protocol import collect_protocol, load_protocol_manifest
 from ai_employee.serialization import canonical_digest, canonical_json
@@ -21,7 +22,31 @@ MANIFEST = Path("examples/productivity/protocols.json")
 PRODUCER = Path("tests/fixtures/productivity_protocol_producer.py").resolve()
 
 
-def _task(path: Path) -> Path:
+def _evaluator(check_id: str, mode: str) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(PRODUCER),
+        "evaluator",
+        "--task",
+        "{task}",
+        "--repository",
+        "{repository}",
+        "--trial",
+        "{trial}",
+        "--protocol",
+        "{protocol}",
+        "--check",
+        check_id,
+        "--mode",
+        mode,
+    )
+
+
+def _task(
+    path: Path,
+    evaluator_mode: str = "passed",
+    acceptance_evaluator: tuple[str, ...] | None = None,
+) -> Path:
     task = TaskIdentity(
         benchmark="fixture",
         benchmark_version="v1",
@@ -35,6 +60,11 @@ def _task(path: Path) -> Path:
                 id="acceptance",
                 description="fixture acceptance",
                 authority="fixture-pytest",
+                evaluator_argv=(
+                    _evaluator("acceptance", evaluator_mode)
+                    if acceptance_evaluator is None
+                    else acceptance_evaluator
+                ),
             ),
         ),
         regression_checks=(
@@ -42,6 +72,7 @@ def _task(path: Path) -> Path:
                 id="regression",
                 description="fixture regression",
                 authority="fixture-pytest",
+                evaluator_argv=_evaluator("regression", evaluator_mode),
             ),
         ),
     )
@@ -79,14 +110,20 @@ def _command(manifest: Path, mode: str = "valid") -> list[str]:
     ]
 
 
-def _collect(tmp_path: Path, mode: str = "valid") -> Path:
+def _collect(
+    tmp_path: Path,
+    mode: str = "valid",
+    *,
+    evaluator_mode: str = "passed",
+    acceptance_evaluator: tuple[str, ...] | None = None,
+) -> Path:
     repository = tmp_path / "repository"
     repository.mkdir(exist_ok=True)
     manifest = _manifest(tmp_path / "protocols.json")
     return collect_protocol(
         manifest_path=manifest,
         protocol_id="codex-direct",
-        task_path=_task(tmp_path / "task.json"),
+        task_path=_task(tmp_path / "task.json", evaluator_mode, acceptance_evaluator),
         repository=repository,
         output_root=tmp_path,
         timeout=10,
@@ -121,14 +158,37 @@ def test_collect_protocol_crosses_process_boundary_and_atomically_records(tmp_pa
             command["content_digests"][name]
             == hashlib.sha256((artifact_directory / name).read_bytes()).hexdigest()
         )
+    acceptance = json.loads((artifact_directory / "acceptance.json").read_bytes())
+    record = acceptance["outcomes"][0]
+    assert acceptance["format"] == "fleet-productivity-check-artifact/2"
+    assert record["exit_code"] == 0
+    assert record["disposition"] == "passed"
+    assert record["evaluator_executable"] == record["evaluator_argv"][0]
+    bundle = load_result_bundle((artifact_directory / "result-bundle.json").read_bytes())
+    assert (
+        bundle.results[0].acceptance_outcomes[0].evidence_digest
+        == hashlib.sha256((artifact_directory / "acceptance.json").read_bytes()).hexdigest()
+    )
+
+
+def test_collect_protocol_derives_failed_checks_from_evaluator_exit(tmp_path: Path) -> None:
+    artifact_directory = _collect(tmp_path, evaluator_mode="failed").parent
+    bundle = load_result_bundle((artifact_directory / "result-bundle.json").read_bytes())
+    assert not bundle.results[0].accepted
+    assert bundle.results[0].terminal_outcome.value == "checks_failed"
+    for name in ("acceptance.json", "regression.json"):
+        assert (
+            json.loads((artifact_directory / name).read_bytes())["outcomes"][0]["disposition"]
+            == "failed"
+        )
 
 
 @pytest.mark.parametrize(
     ("mode", "message"),
     (
-        ("bad-evidence", "evidence digest"),
-        ("extra", "exactly acceptance"),
-        ("missing", "exactly acceptance"),
+        ("claim-artifact", "exactly one canonical draft"),
+        ("extra", "exactly one canonical draft"),
+        ("missing", "exactly one canonical draft"),
         ("noncanonical-bundle", "not canonical"),
         ("wrong-arm", "protocol treatments"),
         ("wrong-task", "supplied task"),
@@ -139,6 +199,29 @@ def test_collect_protocol_rejects_untrusted_producer_outputs(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _collect(tmp_path, mode)
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+@pytest.mark.parametrize(
+    ("evaluator", "message"),
+    (
+        ((), "must not be empty"),
+        (
+            _evaluator("acceptance", "passed")[:7] + _evaluator("acceptance", "passed")[9:],
+            "{trial}",
+        ),
+    ),
+)
+def test_collect_protocol_rejects_invalid_evaluator_templates(
+    tmp_path: Path, evaluator: tuple[str, ...], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _collect(tmp_path, acceptance_evaluator=evaluator)
+
+
+def test_collect_protocol_rejects_oversized_evaluator_observation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="observation exceeds size limit"):
+        _collect(tmp_path, evaluator_mode="oversized")
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
 
 

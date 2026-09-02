@@ -11,10 +11,10 @@ import shutil
 import signal
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import ClassVar, Literal, Self
+from typing import ClassVar, Literal, Self, cast
 
 from pydantic import Field, field_validator, model_validator
 
@@ -24,17 +24,24 @@ from .productivity_evaluation import (
     ArmConfigManifest,
     ArmKind,
     CheckDisposition,
+    CheckOutcome,
     EnvironmentManifest,
+    FailureClassification,
     FairnessConfigManifest,
     ResultBundle,
     TaskIdentity,
+    TerminalOutcome,
+    TrialResult,
+    dump_result_bundle,
     load_result_bundle,
 )
 from .serialization import canonical_digest, canonical_json, loads_model
 
 _CHECK_FILENAMES = ("acceptance.json", "regression.json", "result-bundle.json")
-_PLACEHOLDERS = ("{task}", "{repository}", "{output}", "{protocol}")
+_PRODUCER_PLACEHOLDERS = ("{task}", "{repository}", "{output}", "{protocol}")
+_EVALUATOR_PLACEHOLDERS = ("{task}", "{repository}", "{trial}", "{protocol}")
 _MAX_ARTIFACT_BYTES = 10_000_000
+_MAX_OBSERVATION_BYTES = 1_000_000
 
 
 def _relative_artifact_path(value: str) -> str:
@@ -135,12 +142,16 @@ class ProtocolCheckRecord(SchemaModelV2):
     trial_id: Identifier
     check_id: Identifier
     authority: str = Field(min_length=1, max_length=1_000)
+    evaluator_argv: tuple[str, ...] = Field(min_length=1)
+    evaluator_executable: str = Field(min_length=1, max_length=4_096)
+    exit_code: int
+    observation_digest: Digest
     disposition: CheckDisposition
 
 
 class ProtocolCheckArtifact(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_protocol_check_artifact"
-    format: Literal["fleet-productivity-check-artifact/1"]
+    format: Literal["fleet-productivity-check-artifact/2"]
     family: Literal["acceptance", "regression"]
     outcomes: tuple[ProtocolCheckRecord, ...] = Field(min_length=1)
 
@@ -204,23 +215,34 @@ def _contained(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _resolve_argv(
-    command: Sequence[str], *, task: Path, repository: Path, output: Path, protocol: str
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _validate_argv_template(
+    command: Sequence[str], placeholders: Sequence[str], label: str
+) -> tuple[str, ...]:
     original = tuple(command)
     if not original:
-        raise ValueError("arm command must not be empty")
-    for placeholder in _PLACEHOLDERS:
+        raise ValueError(f"{label} command must not be empty")
+    if any(not item or "\x00" in item for item in original):
+        raise ValueError(f"{label} command arguments must be nonempty and contain no NUL")
+    for placeholder in placeholders:
         exact = sum(item == placeholder for item in original)
         embedded = any(placeholder in item and item != placeholder for item in original)
         if exact != 1 or embedded:
-            raise ValueError(f"arm command must contain exact placeholder once: {placeholder}")
-    replacements = {
-        "{task}": str(task),
-        "{repository}": str(repository),
-        "{output}": str(output),
-        "{protocol}": protocol,
-    }
+            raise ValueError(f"{label} command must contain exact placeholder once: {placeholder}")
+    known = set(placeholders)
+    if any("{" in item or "}" in item for item in original if item not in known):
+        raise ValueError(f"{label} command contains an unsupported placeholder")
+    return original
+
+
+def _resolve_argv(
+    command: Sequence[str],
+    *,
+    replacements: Mapping[str, str],
+    placeholders: Sequence[str],
+    repository: Path,
+    label: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    original = _validate_argv_template(command, placeholders, label)
     resolved = [replacements.get(item, item) for item in original]
     executable = resolved[0]
     if "/" in executable:
@@ -229,15 +251,15 @@ def _resolve_argv(
             executable_path = repository / executable_path
         executable_path = Path(os.path.abspath(executable_path))
         if not executable_path.is_file():
-            raise ValueError("arm executable is not a regular file")
+            raise ValueError(f"{label} executable is not a regular file")
         resolved[0] = str(executable_path)
     else:
         discovered = shutil.which(executable)
         if discovered is None:
-            raise ValueError(f"arm executable was not found: {executable}")
+            raise ValueError(f"{label} executable was not found: {executable}")
         discovered_path = Path(os.path.abspath(discovered))
         if not discovered_path.is_file():
-            raise ValueError("arm executable is not a regular file")
+            raise ValueError(f"{label} executable is not a regular file")
         resolved[0] = str(discovered_path)
     return original, tuple(resolved)
 
@@ -257,7 +279,12 @@ def _validate_execution_contract(
 
 
 def _run(
-    argv: tuple[str, ...], repository: Path, timeout: float, network: str
+    argv: tuple[str, ...],
+    repository: Path,
+    timeout: float,
+    network: str,
+    *,
+    observation_limit: int | None = None,
 ) -> tuple[bytes, bytes, str, str, int]:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number")
@@ -282,50 +309,41 @@ def _run(
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
         raise ValueError(f"arm command timed out after {timeout} seconds") from exc
+    if observation_limit is not None and len(stdout) + len(stderr) > observation_limit:
+        raise ValueError("evaluator observation exceeds size limit")
     ended_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     return stdout, stderr, started_at, ended_at, process.returncode
 
 
-def _read_outputs(stage: Path) -> dict[str, bytes]:
+def _read_draft(stage: Path) -> bytes:
     actual = {item.name for item in stage.iterdir()}
-    if actual != set(_CHECK_FILENAMES):
-        raise ValueError("producer must create exactly acceptance, regression, and result bundle")
-    outputs: dict[str, bytes] = {}
-    for name in _CHECK_FILENAMES:
-        path = stage / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"producer output must be a regular file: {name}")
-        if path.stat().st_size > _MAX_ARTIFACT_BYTES:
-            raise ValueError(f"producer output exceeds size limit: {name}")
-        outputs[name] = path.read_bytes()
-    return outputs
+    if actual != {"result-bundle.json"}:
+        raise ValueError("producer must create exactly one canonical draft result-bundle.json")
+    path = stage / "result-bundle.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("producer draft result bundle must be a regular file")
+    if path.stat().st_size > _MAX_ARTIFACT_BYTES:
+        raise ValueError("producer draft result bundle exceeds size limit")
+    return path.read_bytes()
 
 
-def _records(bundle: ResultBundle, family: str) -> tuple[ProtocolCheckRecord, ...]:
-    records: list[ProtocolCheckRecord] = []
-    for result in bundle.results:
-        outcomes = (
-            result.acceptance_outcomes if family == "acceptance" else result.regression_outcomes
-        )
-        records.extend(
-            ProtocolCheckRecord(
-                trial_id=result.id,
-                check_id=outcome.check_id,
-                authority=outcome.authority,
-                disposition=outcome.disposition,
+def _validate_evaluator_templates(task: TaskIdentity) -> None:
+    for family, checks in (
+        ("acceptance", task.acceptance_criteria),
+        ("regression", task.regression_checks),
+    ):
+        for check in checks:
+            _validate_argv_template(
+                check.evaluator_argv,
+                _EVALUATOR_PLACEHOLDERS,
+                f"{family} evaluator {check.id}",
             )
-            for outcome in outcomes
-        )
-    return tuple(sorted(records, key=lambda item: (item.trial_id, item.check_id)))
 
 
-def _validate_bundle(
+def _validate_draft_bundle(
     protocol: ProtocolDefinition,
     task: TaskIdentity,
     bundle: ResultBundle,
-    acceptance: ProtocolCheckArtifact,
-    regression: ProtocolCheckArtifact,
-    outputs: dict[str, bytes],
 ) -> None:
     if bundle.run_id != protocol.id:
         raise ValueError("result bundle run ID does not match the selected protocol")
@@ -351,16 +369,108 @@ def _validate_bundle(
             raise ValueError(f"result bundle treatment mismatch: {arm_id}")
         if arm.environment.network_mode != protocol.network:
             raise ValueError(f"result bundle network-policy mismatch: {arm_id}")
-    for family, artifact in (("acceptance", acceptance), ("regression", regression)):
-        if artifact.outcomes != _records(bundle, family):
-            raise ValueError(f"{family} artifact has missing, extra, or stale check records")
-        evidence_digest = _digest(outputs[f"{family}.json"])
-        for result in bundle.results:
-            outcomes = (
-                result.acceptance_outcomes if family == "acceptance" else result.regression_outcomes
+
+
+def _evaluate_checks(
+    *,
+    task_path: Path,
+    task: TaskIdentity,
+    repository: Path,
+    protocol: ProtocolDefinition,
+    draft: ResultBundle,
+    timeout: float,
+    network: str,
+) -> tuple[ResultBundle, dict[str, bytes]]:
+    records: dict[str, list[ProtocolCheckRecord]] = {"acceptance": [], "regression": []}
+    dispositions: dict[tuple[str, str, str], CheckDisposition] = {}
+    for result in draft.results:
+        for family, checks in (
+            ("acceptance", task.acceptance_criteria),
+            ("regression", task.regression_checks),
+        ):
+            for check in checks:
+                _, argv = _resolve_argv(
+                    check.evaluator_argv,
+                    replacements={
+                        "{task}": str(task_path),
+                        "{repository}": str(repository),
+                        "{trial}": result.id,
+                        "{protocol}": protocol.id,
+                    },
+                    placeholders=_EVALUATOR_PLACEHOLDERS,
+                    repository=repository,
+                    label=f"{family} evaluator {check.id}",
+                )
+                stdout, stderr, _, _, exit_code = _run(
+                    argv,
+                    repository,
+                    timeout,
+                    network,
+                    observation_limit=_MAX_OBSERVATION_BYTES,
+                )
+                disposition = CheckDisposition.PASSED if exit_code == 0 else CheckDisposition.FAILED
+                dispositions[(result.id, family, check.id)] = disposition
+                records[family].append(
+                    ProtocolCheckRecord(
+                        trial_id=result.id,
+                        check_id=check.id,
+                        authority=check.authority,
+                        evaluator_argv=argv,
+                        evaluator_executable=argv[0],
+                        exit_code=exit_code,
+                        observation_digest=_digest(stdout + stderr),
+                        disposition=disposition,
+                    )
+                )
+    artifacts = {
+        family: ProtocolCheckArtifact(
+            format="fleet-productivity-check-artifact/2",
+            family=cast(Literal["acceptance", "regression"], family),
+            outcomes=tuple(sorted(items, key=lambda item: (item.trial_id, item.check_id))),
+        )
+        for family, items in records.items()
+    }
+    outputs = {
+        f"{family}.json": (canonical_json(artifact) + "\n").encode("utf-8")
+        for family, artifact in artifacts.items()
+    }
+    digests = {family: _digest(outputs[f"{family}.json"]) for family in artifacts}
+    final_results: list[TrialResult] = []
+    for result in draft.results:
+        updates: dict[str, object] = {}
+        all_passed = True
+        for family, checks in (
+            ("acceptance", task.acceptance_criteria),
+            ("regression", task.regression_checks),
+        ):
+            outcomes = tuple(
+                CheckOutcome(
+                    check_id=check.id,
+                    authority=check.authority,
+                    disposition=dispositions[(result.id, family, check.id)],
+                    evidence_digest=digests[family],
+                )
+                for check in checks
             )
-            if any(item.evidence_digest != evidence_digest for item in outcomes):
-                raise ValueError(f"{family} evidence digest does not bind exact artifact bytes")
+            all_passed = all_passed and all(
+                item.disposition is CheckDisposition.PASSED for item in outcomes
+            )
+            updates[f"{family}_outcomes"] = outcomes
+        if not all_passed:
+            updates.update(
+                terminal_outcome=TerminalOutcome.CHECKS_FAILED,
+                failure_classification=FailureClassification.ASSERTION,
+                process_exit_code=0,
+                metrics=result.metrics.model_copy(update={"time_to_accepted_seconds": None}),
+            )
+        values = result.model_dump(mode="python")
+        values.update(updates)
+        final_results.append(TrialResult.model_validate(values))
+    bundle_values = draft.model_dump(mode="python", exclude={"bundle_digest"})
+    bundle_values["results"] = tuple(final_results)
+    bundle = ResultBundle.model_validate(bundle_values)
+    outputs["result-bundle.json"] = dump_result_bundle(bundle)
+    return bundle, outputs
 
 
 def collect_protocol(
@@ -386,6 +496,7 @@ def collect_protocol(
         raise ValueError("caller and protocol network policies do not match")
     task_path = task_path.resolve(strict=True)
     task, task_bytes = _load_task(task_path)
+    _validate_evaluator_templates(task)
     repository = repository.resolve(strict=True)
     if not repository.is_dir():
         raise ValueError("repository must be an existing directory")
@@ -402,20 +513,34 @@ def collect_protocol(
     try:
         original_argv, argv = _resolve_argv(
             arm_command,
-            task=task_path,
+            replacements={
+                "{task}": str(task_path),
+                "{repository}": str(repository),
+                "{output}": str(stage),
+                "{protocol}": protocol.id,
+            },
+            placeholders=_PRODUCER_PLACEHOLDERS,
             repository=repository,
-            output=stage,
-            protocol=protocol.id,
+            label="arm",
         )
         _validate_execution_contract(protocol, argv)
         stdout, stderr, started_at, ended_at, exit_code = _run(argv, repository, timeout, network)
         if exit_code != 0:
             raise ValueError(f"arm command exited with {exit_code}")
-        outputs = _read_outputs(stage)
-        acceptance = _load_check_artifact(outputs["acceptance.json"], "acceptance")
-        regression = _load_check_artifact(outputs["regression.json"], "regression")
-        bundle = load_result_bundle(outputs["result-bundle.json"])
-        _validate_bundle(protocol, task, bundle, acceptance, regression, outputs)
+        draft_bytes = _read_draft(stage)
+        draft = load_result_bundle(draft_bytes)
+        _validate_draft_bundle(protocol, task, draft)
+        bundle, outputs = _evaluate_checks(
+            task_path=task_path,
+            task=task,
+            repository=repository,
+            protocol=protocol,
+            draft=draft,
+            timeout=timeout,
+            network=network,
+        )
+        for name, data in outputs.items():
+            (stage / name).write_bytes(data)
         content_digests = {name: _digest(value) for name, value in sorted(outputs.items())}
         command_record = {
             "argv": argv,

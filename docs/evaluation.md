@@ -211,32 +211,46 @@ checkout, output staging directory, protocol ID, and executable before launching
 the checkout as its explicit working directory. Symlinks in the producer path are resolved, and the
 resulting executable must exactly equal every treatment environment executable before the process
 is started. The task file must be the canonical JSON encoding
-of one `TaskIdentity`, followed by one newline. The selected manifest and caller must both declare
-the same network policy, and every result arm must retain that policy in its environment manifest.
+of one `TaskIdentity`, followed by one newline. Every acceptance criterion and regression check in
+a collected task must declare one nonempty `evaluator_argv`, for example:
 
-The producer must create exactly three regular files in `{output}`:
+```json
+{"authority":"pytest","description":"focused tests pass","evaluator_argv":["python","-m","pytest","{repository}/tests/test_feature.py","--task-file","{task}","--trial","{trial}","--protocol","{protocol}"],"id":"focused-tests","schema_version":"2"}
+```
 
-- `acceptance.json`, a canonical `fleet-productivity-check-artifact/1` record with family
-  `acceptance`;
-- `regression.json`, the same record format with family `regression`;
-- `result-bundle.json`, a canonical `fleet-productivity-results/2` `ResultBundle`.
+Each evaluator argv must contain `{task}`, `{repository}`, `{trial}`, and `{protocol}` exactly once
+as complete arguments. Adapters may leave evaluator argv empty while normalizing external cases,
+but such tasks cannot be collected until the operator supplies the evaluator commands. The selected
+manifest and caller must both declare the same network policy, and every result arm must retain that
+policy in its environment manifest.
 
-Each check artifact lists canonical `(trial_id, check_id, authority, disposition)` records. Every
-matching `CheckOutcome.evidence_digest` must be the SHA-256 digest of the complete, exact bytes of
-its family artifact. The bundle run ID must equal the selected protocol ID and its task must equal
-the supplied task. Every arm's ID, kind, adapter, worker, complete environment and fairness
-manifests, canonical manifest digests, arm configuration, and disabled components must match its
-protocol treatment exactly. Each treatment digest is validated against its predeclared manifest
-while loading the protocol, and each result-arm digest is validated against its retained manifest
-while loading the bundle; a producer cannot make invented controls acceptable merely by digesting
-them consistently.
+The untrusted producer must create exactly one regular file in `{output}`:
 
-Only after the command exits zero and every binding validates does the runner add canonical
+- `result-bundle.json`, a canonical draft `fleet-productivity-results/2` `ResultBundle`.
+
+Producer-supplied claim artifacts are rejected. After the producer exits zero, the collector runs
+each predeclared evaluator directly without a shell and bounds its combined stdout and stderr to
+1,000,000 bytes. Exit zero alone derives `passed`; every other exit derives `failed`. The collector
+then creates canonical `fleet-productivity-check-artifact/2` acceptance and regression records with
+the trial and check identities, authority, resolved evaluator argv and executable, exit code,
+observation digest, and derived disposition. It rebuilds every final `CheckOutcome` so its evidence
+digest is the SHA-256 digest of the complete, exact family artifact bytes, then replaces the draft
+with the final canonical bundle.
+
+The bundle run ID must equal the selected protocol ID and its task must equal the supplied task.
+Every arm's ID, kind, adapter, worker, complete environment and fairness manifests, canonical
+manifest digests, arm configuration, and disabled components must match its protocol treatment
+exactly. Each treatment digest is validated against its predeclared manifest while loading the
+protocol, and each result-arm digest is validated against its retained manifest while loading the
+bundle.
+
+Only after every command and binding validates does the runner add canonical
 `command.json` metadata and atomically rename the staging directory to the declared destination.
 It records original and resolved argv, protocol and task configuration, explicit cwd, timeout,
 network policy, UTC start/end, exit code, stdout/stderr digests, and exact artifact digests. Existing
-destinations, path escapes, missing or extra files, stale task/check data, malformed JSON, and
-protocol or evidence mismatches fail without publishing the staged artifacts.
+destinations, path escapes, missing or extra checks, empty or malformed evaluator commands,
+noncanonical drafts, oversized observations, producer claim artifacts, and stale task or protocol
+data fail without publishing the staged artifacts.
 
 ### Combine separately collected arms
 

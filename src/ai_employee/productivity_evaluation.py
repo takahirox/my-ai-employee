@@ -76,6 +76,7 @@ class AcceptanceCriterion(SchemaModelV2):
     id: Identifier
     description: str = Field(min_length=1, max_length=4_000)
     authority: str = Field(min_length=1, max_length=1_000)
+    evaluator_argv: tuple[str, ...] = ()
 
 
 class RegressionCheck(SchemaModelV2):
@@ -83,6 +84,7 @@ class RegressionCheck(SchemaModelV2):
     id: Identifier
     description: str = Field(min_length=1, max_length=4_000)
     authority: str = Field(min_length=1, max_length=1_000)
+    evaluator_argv: tuple[str, ...] = ()
 
 
 class SWEBenchProvenance(SchemaModelV2):

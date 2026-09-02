@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,11 +20,7 @@ from ai_employee.productivity_evaluation import (
     dump_result_bundle,
     trial_id,
 )
-from ai_employee.productivity_protocol import (
-    ProtocolCheckArtifact,
-    ProtocolCheckRecord,
-    load_protocol_manifest,
-)
+from ai_employee.productivity_protocol import load_protocol_manifest
 from ai_employee.serialization import canonical_digest, canonical_json, loads_model
 
 
@@ -94,28 +90,29 @@ def _arm(manifest_path: Path, arm_id: str, mode: str) -> ArmIdentity:
     )
 
 
-def _artifact(
-    family: str,
-    bound_trial_id: str,
-    task: TaskIdentity,
-) -> ProtocolCheckArtifact:
-    definitions = task.acceptance_criteria if family == "acceptance" else task.regression_checks
-    return ProtocolCheckArtifact(
-        format="fleet-productivity-check-artifact/1",
-        family=family,
-        outcomes=tuple(
-            ProtocolCheckRecord(
-                trial_id=bound_trial_id,
-                check_id=item.id,
-                authority=item.authority,
-                disposition=CheckDisposition.PASSED,
-            )
-            for item in definitions
-        ),
-    )
+def _evaluate(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--trial", required=True)
+    parser.add_argument("--protocol", required=True)
+    parser.add_argument("--check", required=True)
+    parser.add_argument("--mode", choices=("passed", "failed", "oversized"), required=True)
+    args = parser.parse_args(argv)
+    if Path(args.repository).resolve() != Path.cwd().resolve() or not Path(args.task).is_file():
+        return 9
+    if not args.trial or args.protocol != "codex-direct":
+        return 8
+    if args.mode == "oversized":
+        sys.stdout.buffer.write(b"x" * 1_000_001)
+    else:
+        print(f"{args.trial}:{args.check}:{args.mode}")
+    return 1 if args.mode == "failed" else 0
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["evaluator"]:
+        return _evaluate(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True)
     parser.add_argument("--repository", required=True)
@@ -127,7 +124,7 @@ def main() -> int:
         default="valid",
         choices=(
             "valid",
-            "bad-evidence",
+            "claim-artifact",
             "extra",
             "missing",
             "noncanonical-bundle",
@@ -163,14 +160,6 @@ def main() -> int:
         args.mode,
     )
     bound_trial_id = trial_id(task, arm)
-    acceptance = _artifact("acceptance", bound_trial_id, task)
-    regression = _artifact("regression", bound_trial_id, task)
-    acceptance_bytes = _dump(acceptance)
-    regression_bytes = _dump(regression)
-    acceptance_digest = hashlib.sha256(acceptance_bytes).hexdigest()
-    regression_digest = hashlib.sha256(regression_bytes).hexdigest()
-    if args.mode == "bad-evidence":
-        acceptance_digest = "0" * 64
     result = TrialResult(
         id=bound_trial_id,
         task=task,
@@ -180,7 +169,7 @@ def main() -> int:
                 check_id=item.id,
                 authority=item.authority,
                 disposition=CheckDisposition.PASSED,
-                evidence_digest=acceptance_digest,
+                evidence_digest="0" * 64,
             )
             for item in task.acceptance_criteria
         ),
@@ -189,7 +178,7 @@ def main() -> int:
                 check_id=item.id,
                 authority=item.authority,
                 disposition=CheckDisposition.PASSED,
-                evidence_digest=regression_digest,
+                evidence_digest="0" * 64,
             )
             for item in task.regression_checks
         ),
@@ -232,10 +221,10 @@ def main() -> int:
     if args.mode == "noncanonical-bundle":
         bundle_bytes = bundle_bytes.replace(b":", b": ", 1)
     output = Path(args.output)
-    (output / "acceptance.json").write_bytes(acceptance_bytes)
     if args.mode != "missing":
-        (output / "regression.json").write_bytes(regression_bytes)
-    (output / "result-bundle.json").write_bytes(bundle_bytes)
+        (output / "result-bundle.json").write_bytes(bundle_bytes)
+    if args.mode == "claim-artifact":
+        (output / "acceptance.json").write_bytes(b"{}\n")
     if args.mode == "extra":
         (output / "extra.txt").write_text("unexpected", encoding="utf-8")
     return 0
