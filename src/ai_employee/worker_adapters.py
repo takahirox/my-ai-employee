@@ -1882,6 +1882,18 @@ def _worker_failure(
         status=status,
         failure=failure,
         duration_seconds=time.monotonic() - started,
+        resource_usage=(
+            None
+            if invocation is None
+            else freeze_json(
+                {
+                    "stdout_limit_bytes": invocation.request.stdout_bytes,
+                    "stderr_limit_bytes": invocation.request.stderr_bytes,
+                    "output_limit_stream": _output_limit_stream(invocation),
+                    "process_group_cleanup": _process_group_cleanup(invocation.result),
+                }
+            )
+        ),
         stdout_artifact_digest=None if process is None else process.stdout_artifact_digest,
         stderr_artifact_digest=None if process is None else process.stderr_artifact_digest,
     )
@@ -1917,19 +1929,8 @@ def _worker_failure(
             None if invocation is None else invocation.request.timeout_seconds
         ),
         effective_timeout_seconds=(None if invocation is None else _effective_timeout(invocation)),
-        stdout_limit_bytes=(None if invocation is None else invocation.request.stdout_bytes),
-        stderr_limit_bytes=(None if invocation is None else invocation.request.stderr_bytes),
         stdout_bytes=0 if process is None else _output_size(process, "stdout_bytes"),
         stderr_bytes=0 if process is None else _output_size(process, "stderr_bytes"),
-        output_limit_stream=(
-            _output_limit_stream(invocation)
-            if code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
-            and invocation is not None
-            else None
-        ),
-        process_group_cleanup=(
-            None if process is None else _process_group_cleanup(process)
-        ),
         stdout_artifact_digest=None if process is None else process.stdout_artifact_digest,
         stderr_artifact_digest=None if process is None else process.stderr_artifact_digest,
     )

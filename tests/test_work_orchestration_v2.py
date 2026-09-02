@@ -1991,15 +1991,11 @@ def test_cli_worker_preserves_process_failure_and_diagnostics(
     assert diagnostic.process_result_digest is not None
     assert diagnostic.configured_timeout_seconds == 30.0
     assert diagnostic.effective_timeout_seconds == 12.0
-    assert diagnostic.stdout_limit_bytes == 16
-    assert diagnostic.stderr_limit_bytes == 16
     assert (diagnostic.stdout_bytes, diagnostic.stderr_bytes) == (17, 23)
-    assert diagnostic.output_limit_stream == (
-        "stdout_and_stderr"
-        if code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
-        else None
-    )
-    assert diagnostic.process_group_cleanup == "sigterm_confirmed"
+    assert result.resource_usage["stdout_limit_bytes"] == 16
+    assert result.resource_usage["stderr_limit_bytes"] == 16
+    assert result.resource_usage["output_limit_stream"] == "stdout_and_stderr"
+    assert result.resource_usage["process_group_cleanup"] == "sigterm_confirmed"
     assert {"stdout_body", "stderr_body"}.isdisjoint(diagnostic.model_dump())
 
 
