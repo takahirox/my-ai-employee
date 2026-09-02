@@ -982,12 +982,8 @@ def compare_history(
             regressions.append(f"{old.task.task_id}:{old.arm.id}:accepted")
         for metric in ("human_active_seconds", "wall_seconds", "api_cost", "compute_cost"):
             old_value, new_value = _values(old)[metric], _values(new)[metric]
-            if (
-                metric in {"api_cost", "compute_cost"}
-                and old_value is not None
-                and new_value is None
-            ):
-                raise ValueError(f"current historical cost evidence is missing for {metric}")
+            if metric in {"api_cost", "compute_cost"} and (old_value is None or new_value is None):
+                raise ValueError(f"historical cost evidence is missing for {metric}")
             if old_value is not None and new_value is not None and new_value > old_value:
                 regressions.append(f"{old.task.task_id}:{old.arm.id}:{metric}")
     if compared != len(current.results):

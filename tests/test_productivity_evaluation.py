@@ -135,6 +135,8 @@ def result(
     accepted: bool = True,
     active: float = 2,
     wall: float = 10,
+    api_cost: float | None = 0.5,
+    compute_cost: float | None = 0.1,
 ) -> TrialResult:
     metrics = TrialMetrics(
         human_active_seconds=active,
@@ -143,9 +145,9 @@ def result(
         wall_seconds=wall,
         input_tokens=100,
         output_tokens=20,
-        api_cost=0.5,
+        api_cost=api_cost,
         compute_seconds=8,
-        compute_cost=0.1,
+        compute_cost=compute_cost,
         retries=1,
         repairs=1,
         replans=0,
@@ -367,6 +369,46 @@ def test_adapters_bundles_tamper_and_history() -> None:
         capabilities_equivalent=True,
     )
     assert "case-1:fleet:accepted" in compare_history(old, new, compatibility).regressions
+
+
+@pytest.mark.parametrize("metric", ("api_cost", "compute_cost"))
+@pytest.mark.parametrize(
+    ("old_value", "new_value"),
+    ((None, 0.5), (None, None), (0.5, None)),
+    ids=("old-missing", "both-missing", "current-missing"),
+)
+def test_compare_history_requires_both_costs_on_both_sides(
+    metric: str, old_value: float | None, new_value: float | None
+) -> None:
+    old_task, new_task = task("v1"), task("v2")
+    base_arm = arm(ArmKind.FLEET, "fleet")
+    budgets = base_arm.fairness_config.budgets.model_copy(update={"cost_limit": None})
+    fairness_config = base_arm.fairness_config.model_copy(update={"budgets": budgets})
+    uncapped_arm = base_arm.model_copy(
+        update={
+            "fairness_config": fairness_config,
+            "fairness_config_digest": canonical_digest(fairness_config),
+        }
+    )
+    old_costs = {"api_cost": 0.5, "compute_cost": 0.1}
+    new_costs = dict(old_costs)
+    old_costs[metric] = old_value
+    new_costs[metric] = new_value
+    old = bundle("v1", result(old_task, uncapped_arm, **old_costs))
+    new = bundle("v2", result(new_task, uncapped_arm, **new_costs))
+    compatibility = HistoryCompatibility(
+        benchmark="fixture",
+        previous_version="v1",
+        current_version="v2",
+        task_pairs=((canonical_digest(old_task), canonical_digest(new_task)),),
+        arm_pairs=(("fleet", "fleet"),),
+        baselines_equivalent=True,
+        criteria_equivalent=True,
+        capabilities_equivalent=True,
+    )
+
+    with pytest.raises(ValueError, match=rf"historical cost evidence is missing for {metric}"):
+        compare_history(old, new, compatibility)
 
 
 def test_outcomes_bind_ids_authorities_dispositions_and_evidence() -> None:

@@ -224,12 +224,14 @@ but such tasks cannot be collected until the operator supplies the evaluator com
 manifest and caller must both declare the same network policy, and every result arm must retain that
 policy in its environment manifest.
 
-The disabled network policy is OS-enforced; the environment variable passed to commands is only
-informational. On Darwin, the collector uses the fixed `/usr/bin/sandbox-exec` executable with a
-deterministic profile that permits local process and file operations while denying every network
-operation. On Linux, it requires a resolved `unshare` executable that can create a user-mapped
-network namespace. Other platforms, missing executables, and Linux hosts that prohibit the required
-namespace fail closed.
+Secure collection is Linux-only. The disabled network policy is OS-enforced; the environment
+variable passed to commands is only informational. The collector requires a resolved `unshare`
+executable that can create a user-mapped network namespace. Resolving a Darwin network sandbox
+alone is insufficient because secure procfs inspection, child-subreaper containment, and
+`renameat2` publication with `RENAME_NOREPLACE` are unavailable there. Other platforms, missing
+executables, and Linux hosts that prohibit the required namespace or containment primitives fail
+closed. Offline validation, reporting, and combination remain cross-platform; only collection has
+this Linux requirement.
 
 Before it creates a staging directory or launches a producer, the collector opens a private
 loopback listener and tries to connect to it from a Python probe launched through the exact
@@ -270,8 +272,8 @@ and staging directory is fsynced before publication; the parent directory is fsy
 The published directory identity and exact bytes are checked again after the atomic rename, with a
 no-replace rollback if concurrent mutation is detected. Missing primitives fail closed.
 It records original and resolved payload argv separately from the fully wrapped execution argv,
-plus the isolation backend, exact wrapper argv, Darwin profile digest (or null for the Linux
-namespace backend), and the successful probe's payload/execution argv, socket-denial result,
+plus the isolation backend, exact wrapper argv, a null profile digest for the Linux namespace
+backend, and the successful probe's payload/execution argv, socket-denial result,
 timestamps, exit code, and output digests. It also records protocol and task configuration,
 explicit cwd, timeout, network policy, UTC start/end, exit code, and exact artifact digests. Existing
 destinations, path escapes, missing or extra checks, empty or malformed evaluator commands,

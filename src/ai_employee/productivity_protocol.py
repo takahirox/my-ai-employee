@@ -51,7 +51,6 @@ _EVALUATOR_PLACEHOLDERS = ("{task}", "{repository}", "{trial}", "{protocol}")
 _MAX_ARTIFACT_BYTES = 10_000_000
 _MAX_OBSERVATION_BYTES = 1_000_000
 
-_DARWIN_SANDBOX_PROFILE = "(version 1)\n(allow default)\n(deny network*)\n"
 _NETWORK_PROBE_SCRIPT = """\
 import socket
 import sys
@@ -321,34 +320,25 @@ def _validate_execution_contract(
 
 
 def _resolve_isolation_backend() -> _IsolationBackend:
-    if sys.platform == "darwin":
-        executable = Path("/usr/bin/sandbox-exec")
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise ValueError("Darwin network isolation backend is unavailable")
-        return _IsolationBackend(
-            name="darwin-sandbox-exec",
-            wrapper_argv=(str(executable), "-p", _DARWIN_SANDBOX_PROFILE),
-            profile_digest=_digest(_DARWIN_SANDBOX_PROFILE.encode("utf-8")),
-        )
-    if sys.platform.startswith("linux"):
-        discovered = shutil.which("unshare")
-        if discovered is None:
-            raise ValueError("Linux network namespace backend is unavailable")
-        executable = Path(discovered).resolve(strict=True)
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise ValueError("Linux network namespace backend is unavailable")
-        return _IsolationBackend(
-            name="linux-unshare-user-net",
-            wrapper_argv=(
-                str(executable),
-                "--user",
-                "--map-root-user",
-                "--net",
-                "--",
-            ),
-            profile_digest=None,
-        )
-    raise ValueError(f"network isolation is unsupported on platform: {sys.platform}")
+    if not sys.platform.startswith("linux"):
+        raise ValueError("secure protocol collection requires Linux containment primitives")
+    discovered = shutil.which("unshare")
+    if discovered is None:
+        raise ValueError("Linux network namespace backend is unavailable")
+    executable = Path(discovered).resolve(strict=True)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError("Linux network namespace backend is unavailable")
+    return _IsolationBackend(
+        name="linux-unshare-user-net",
+        wrapper_argv=(
+            str(executable),
+            "--user",
+            "--map-root-user",
+            "--net",
+            "--",
+        ),
+        profile_digest=None,
+    )
 
 
 def _require_secure_runtime() -> None:
