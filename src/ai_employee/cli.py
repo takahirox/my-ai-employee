@@ -7,7 +7,7 @@ import getpass
 import io
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,6 +82,10 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRequest,
 )
 from .graph_execution import GraphExecutionService
+from .incident_runtime import (
+    IncidentRunRecord,
+    prepare_graph_run_incidents,
+)
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
 from .parent_review import (
     CliParentSemanticReviewer,
@@ -112,7 +116,7 @@ from .promotion_approval import (
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
 from .run_explanation import explain_any_run
-from .run_ownership import RunOrphanRecoveryRecord
+from .run_ownership import RunLeaseClosureRecord, RunOrphanRecoveryRecord
 from .runtime import DeterministicRuntime, NodeExecutionContext
 from .serialization import (
     canonical_digest,
@@ -688,6 +692,118 @@ def _print_eval_summary(report: EvalReport) -> None:
             f"{item.verified_successes}/{item.planned_trials} ({item.verified_success_rate:.0%})"
         )
         print(f"{item.strategy_id:<24} {verified:<13} {total:<11} {cost}")
+
+
+_INCIDENT_REPORTING_RESULT_LIMIT = 16
+# This build does not carry a verified public source revision. Never substitute the
+# target repository HEAD, which may identify private user source.
+_PUBLIC_BUILD_COMMIT_UNAVAILABLE = "0" * 40
+
+
+def _has_authoritative_failed_closure(store: SQLiteStore, graph_run: GraphRunRecord) -> bool:
+    closures = store.list_records(
+        "run_lease_closure_v2",
+        RunLeaseClosureRecord,
+        run_id=graph_run.id,
+    )
+    matching = tuple(
+        closure
+        for closure in closures
+        if closure.run_id == graph_run.id
+        and closure.graph_run_id == graph_run.id
+        and closure.accepted_graph_revision_digest == graph_run.accepted_graph_revision_digest
+        and closure.generation == graph_run.generation
+        and closure.execution_attempt == graph_run.execution_attempt
+        and closure.terminal_graph_status == "failed"
+        and closure.content_digest is not None
+    )
+    return len(matching) == 1
+
+
+def _prepare_failed_graph_run_incidents(
+    store: SQLiteStore,
+    graph_run: GraphRunRecord,
+    harness: ProjectHarnessV2,
+) -> tuple[IncidentRunRecord, ...]:
+    if graph_run.status != "failed" or harness.incident_reporting.mode == "off":
+        return ()
+    try:
+        return prepare_graph_run_incidents(
+            store,
+            graph_run,
+            harness,
+            public_commit=_PUBLIC_BUILD_COMMIT_UNAVAILABLE,
+            clock=now,
+        )
+    except Exception:
+        return ()
+
+
+def _execute_graph_run_with_incident_reporting(
+    store: SQLiteStore,
+    run_id: str,
+    harness: ProjectHarnessV2,
+    execute: Callable[[], GraphRunRecord],
+) -> tuple[GraphRunRecord, tuple[IncidentRunRecord, ...]]:
+    try:
+        graph_run = execute()
+    except (PlanReviewGateError, GraphValidationError):
+        raise
+    except Exception:
+        if harness.incident_reporting.mode != "off":
+            try:
+                terminal = store.get("graph_run_v2", run_id, GraphRunRecord)
+                if terminal.status == "failed" and _has_authoritative_failed_closure(
+                    store, terminal
+                ):
+                    _prepare_failed_graph_run_incidents(
+                        store,
+                        terminal,
+                        harness,
+                    )
+            except Exception:
+                pass
+        raise
+    incidents = _prepare_failed_graph_run_incidents(
+        store,
+        graph_run,
+        harness,
+    )
+    return graph_run, incidents
+
+
+def _incident_reporting_projection(
+    records: Sequence[IncidentRunRecord],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "state": record.state,
+            "internal_incident_code": record.internal_incident_code,
+            "error_code": record.error_code,
+            "fingerprint": record.fingerprint,
+            "report_digest": record.report_digest,
+            "preview_digest": record.preview_digest,
+            "expiry": record.expiry,
+        }
+        for record in records[:_INCIDENT_REPORTING_RESULT_LIMIT]
+    ]
+
+
+def _graph_run_cli_result(
+    graph_run: GraphRunRecord, incidents: Sequence[IncidentRunRecord]
+) -> dict[str, object]:
+    return {
+        "schema_version": "2",
+        "run_id": graph_run.id,
+        "status": graph_run.status,
+        "stable_code": graph_run.failure_code,
+        "next_actions": (),
+        "incident_reporting": _incident_reporting_projection(incidents),
+    }
+
+
+def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
+    return 0 if graph_run.status in {"planned", "completed", "ready_to_promote"} else 5
 
 
 def _work(args: argparse.Namespace) -> int:
@@ -1556,24 +1672,29 @@ def _work(args: argparse.Namespace) -> int:
                     max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
                 )
             try:
-                graph_run = service.run(
-                    goal,
-                    graph_input,
-                    (
-                        resume_run.execution_policy
-                        if resume_run is not None
-                        else ExecutionPolicy(
-                            max_nodes=16,
-                            max_attempts=32,
-                            max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
-                        )
+                graph_run, incident_records = _execute_graph_run_with_incident_reporting(
+                    store,
+                    run_id,
+                    harness,
+                    lambda: service.run(
+                        goal,
+                        graph_input,
+                        (
+                            resume_run.execution_policy
+                            if resume_run is not None
+                            else ExecutionPolicy(
+                                max_nodes=16,
+                                max_attempts=32,
+                                max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                            )
+                        ),
+                        harness_digest=harness_digest,
+                        effective_policy_digest=effective_policy_digest,
+                        run_id=run_id,
+                        available_capabilities=tuple(capabilities),
+                        plan_only=args.plan_only,
+                        resume=resume_run is not None,
                     ),
-                    harness_digest=harness_digest,
-                    effective_policy_digest=effective_policy_digest,
-                    run_id=run_id,
-                    available_capabilities=tuple(capabilities),
-                    plan_only=args.plan_only,
-                    resume=resume_run is not None,
                 )
             except PlanReviewGateError as error:
                 print(
@@ -1601,18 +1722,8 @@ def _work(args: argparse.Namespace) -> int:
                     )
                 )
                 return 7
-            print(
-                canonical_json(
-                    {
-                        "schema_version": "2",
-                        "run_id": graph_run.id,
-                        "status": graph_run.status,
-                        "stable_code": graph_run.failure_code,
-                        "next_actions": (),
-                    }
-                )
-            )
-            return 0 if graph_run.status in {"planned", "completed", "ready_to_promote"} else 5
+            print(canonical_json(_graph_run_cli_result(graph_run, incident_records)))
+            return _graph_run_exit_code(graph_run)
 
 
 def _approvals(store: SQLiteStore, args: argparse.Namespace) -> int:
