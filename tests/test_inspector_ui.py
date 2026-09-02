@@ -359,6 +359,59 @@ def test_fleet_overview_separates_active_history_and_projects_persisted_attentio
     assert result["history"][0]["last_updated_at"] == "2025-12-31T23:59:59.654321Z"
 
 
+def test_fleet_history_projects_deep_cause_ahead_of_node_wrapper() -> None:
+    class Store(_CatalogStore):
+        def list_run_repositories(self, repository_id: str | None = None) -> list[dict[str, str]]:
+            return [{"run_id": "done", "repository_id": "repo", "repository": "/repo"}]
+
+    projection = {
+        "kind": "graph_run",
+        "state": "failed",
+        "generation": 3,
+        "run": {"failure_code": "NODE_EXECUTION_FAILED"},
+        "run_ownership": {"is_active": False},
+        "nodes": [
+            {
+                "node_id": "failed-node",
+                "generation": 3,
+                "attempt": 2,
+                "status": "failed",
+                "failure_code": "NODE_EXECUTION_FAILED",
+            }
+        ],
+        "worker_boundary_diagnostics": [
+            {
+                "id": "output-limit",
+                "code": "PROCESS_OUTPUT_LIMIT_EXCEEDED",
+                "stage": "process",
+                "node_id": "failed-node",
+                "generation": 3,
+                "attempt": 2,
+                "stdout_bytes": 4097,
+                "stdout_limit_bytes": 4096,
+                "stderr_bytes": 0,
+                "stderr_limit_bytes": 4096,
+                "output_limit_stream": "stdout",
+            }
+        ],
+        "attention": [{"kind": "task", "task_id": "failed-node", "condition": "failed"}],
+        "attention_count": 1,
+        "attention_available": True,
+    }
+    with patch(
+        "ai_employee.inspector.inspect_any_run",
+        return_value=projection,
+    ):
+        result = inspect_fleet_runs(Store())  # type: ignore[arg-type]
+
+    cause = result["history"][0]["primary_root_cause"]
+    assert cause["code"] == "PROCESS_OUTPUT_LIMIT_EXCEEDED"
+    assert cause["stage"] == "process"
+    assert cause["stdout_bytes"] == 4097
+    assert cause["stdout_limit_bytes"] == 4096
+    assert cause["wrapper_context"]["code"] == "NODE_EXECUTION_FAILED"
+
+
 def test_fleet_overview_hides_child_work_runs_and_prioritizes_attention() -> None:
     class Store(_CatalogStore):
         def list_run_repositories(self, repository_id: str | None = None) -> list[dict[str, str]]:

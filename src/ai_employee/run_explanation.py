@@ -46,6 +46,9 @@ def _attach_child_work_runs(store: SQLiteStore, explanation: dict[str, Any]) -> 
     parent_failures = explanation.get("failure_path")
     if not isinstance(parent_failures, list):
         return
+    primary_causes = [
+        item for item in [_mapping(explanation.get("primary_root_cause"))] if item
+    ]
     for story in _mappings(explanation.get("task_stories")):
         child_ids = tuple(
             dict.fromkeys(
@@ -68,6 +71,7 @@ def _attach_child_work_runs(store: SQLiteStore, explanation: dict[str, Any]) -> 
                 )
                 continue
             child_tasks = _mappings(child.get("task_stories"))
+            child_cause = _mapping(child.get("primary_root_cause"))
             summary = {
                 "run_id": child_id,
                 "status": _mapping(child.get("current_state")).get("status"),
@@ -77,6 +81,25 @@ def _attach_child_work_runs(store: SQLiteStore, explanation: dict[str, Any]) -> 
                 "failure_path": child.get("failure_path", []),
                 "final_outcome": child.get("final_outcome"),
             }
+            if child_cause:
+                bound_attempts = [
+                    item
+                    for item in _mappings(story.get("execution_attempts"))
+                    if item.get("work_run_id") == child_id
+                ]
+                bound_attempt = max(bound_attempts, key=_attempt_key) if bound_attempts else {}
+                child_cause = {
+                    **child_cause,
+                    "node_id": bound_attempt.get("node_id") or story.get("task_id"),
+                    "generation": bound_attempt.get("generation"),
+                    "attempt": bound_attempt.get("attempt"),
+                    "wrapper_context": {
+                        "status": bound_attempt.get("status"),
+                        "code": bound_attempt.get("failure_code"),
+                    },
+                }
+                summary["primary_root_cause"] = child_cause
+                primary_causes.append(child_cause)
             child_summaries.append(summary)
             for cause in _mappings(child.get("failure_path")):
                 parent_failures.append(
@@ -88,6 +111,8 @@ def _attach_child_work_runs(store: SQLiteStore, explanation: dict[str, Any]) -> 
                     }
                 )
         story["child_work_runs"] = child_summaries
+    if primary_causes:
+        explanation["primary_root_cause"] = max(primary_causes, key=_root_cause_key)
 
 
 def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +269,7 @@ def _explain_graph_run(view: dict[str, Any]) -> dict[str, Any]:
             "plan_review": _plan_review_story(view.get("plan_review")),
         },
         "task_stories": task_stories,
+        "primary_root_cause": _primary_root_cause(view),
         "failure_path": _graph_failure_path(view, task_stories),
         "final_outcome": _graph_final_outcome(view, promotion_approval),
     }
@@ -571,6 +597,279 @@ def _revision_task_summaries(
         }
         for node in nodes
     ]
+
+
+_ROOT_CAUSE_HEARTBEAT_LIMIT = 3
+_DEEP_CAUSE_STAGES = {
+    "workspace_preflight": 5,
+    "pre_dispatch": 5,
+    "worker_budget_preflight": 5,
+    "process": 4,
+    "runner": 4,
+    "transport": 4,
+    "envelope": 4,
+    "typed_result": 4,
+    "watchdog": 3,
+    "task_execution": 1,
+}
+
+
+def _record_key(item: dict[str, Any]) -> tuple[int, int, int, str, str]:
+    return (
+        int(item.get("generation") or 0),
+        int(item.get("attempt") or 0),
+        int(item.get("sequence") or 0),
+        str(item.get("created_at") or item.get("observed_at") or ""),
+        str(item.get("id") or item.get("content_digest") or ""),
+    )
+
+
+def _root_cause_key(item: dict[str, Any]) -> tuple[int, int, int, str]:
+    return (
+        _DEEP_CAUSE_STAGES.get(str(item.get("stage")), 2),
+        int(item.get("generation") or 0),
+        int(item.get("attempt") or 0),
+        str(item.get("code") or ""),
+    )
+
+
+def _same_attempt(item: dict[str, Any], reference: dict[str, Any]) -> bool:
+    for key in ("node_id", "generation", "attempt"):
+        left = item.get(key)
+        right = reference.get(key)
+        if left is not None and right is not None and left != right:
+            return False
+    return True
+
+
+def _latest_causal_record(
+    records: list[dict[str, Any]], reference: dict[str, Any]
+) -> dict[str, Any]:
+    matches = [item for item in records if _same_attempt(item, reference)]
+    return max(matches, key=_record_key) if matches else {}
+
+
+def _remediation(code: str) -> str:
+    if code == "TIMEOUT":
+        return "raise the binding timeout ceiling or reduce/decompose the node before retrying"
+    if code == "CANCELLED":
+        return "confirm the cancellation authority and process cleanup outcome before retrying"
+    if code == "PROCESS_OUTPUT_LIMIT_EXCEEDED":
+        return "reduce emitted output or raise the affected stream limit within policy"
+    if code == "WORKER_BUDGET_INADEQUATE":
+        return "raise the denied timeout authority or reduce/decompose the node before dispatch"
+    if code == "WORKER_DISPATCH_CONTRACT_CONTRADICTION":
+        return "recreate the route and worker request from persisted accepted authority"
+    if code in {"PATCH_PREFLIGHT_FAILED", "SOURCE_WORKTREE_DIRTY", "WORKSPACE_CONFLICT"}:
+        return "resolve the workspace preflight contradiction and create a fresh workspace"
+    return "inspect the bounded causal record and retry only when its policy permits"
+
+
+def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
+    """Select one deepest safe causal record without changing the raw projection."""
+
+    worker = _mapping(view.get("worker"))
+    child_outcomes = _mapping(view.get("child_worker_outcomes"))
+    diagnostics = [
+        *_mappings(view.get("worker_boundary_diagnostics")),
+        *_mappings(worker.get("boundary_diagnostics")),
+        *_mappings(child_outcomes.get("diagnostics")),
+    ]
+    preflights = _mappings(view.get("worker_budget_preflights"))
+    watchdogs = _mappings(view.get("node_watchdogs"))
+    workspace_preflights = [
+        item
+        for item in _mappings(view.get("events"))
+        if item.get("kind") == "workspace_preflight_failed"
+    ]
+    wrappers = [
+        item
+        for item in [
+            *_mappings(view.get("node_history")),
+            *_mappings(view.get("nodes")),
+        ]
+        if item.get("failure_code") or item.get("status") in {"failed", "cancelled"}
+    ]
+    run = _mapping(view.get("run"))
+    run_failure_code = run.get("failure_code") or view.get("failure_code")
+    if run_failure_code:
+        wrappers.append(
+            {
+                "node_id": run.get("node_id"),
+                "generation": view.get("generation"),
+                "attempt": None,
+                "status": view.get("state"),
+                "failure_code": run_failure_code,
+            }
+        )
+
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    candidates.extend((5, "boundary", item) for item in diagnostics)
+    candidates.extend((5, "budget", item) for item in preflights)
+    candidates.extend((5, "workspace", item) for item in workspace_preflights)
+    candidates.extend((3, "watchdog", item) for item in watchdogs)
+    candidates.extend(
+        (1, "wrapper", item)
+        for item in wrappers
+        if item.get("failure_code") == "NODE_EXECUTION_FAILED"
+    )
+    if not candidates:
+        return None
+    _, source, selected = max(
+        candidates,
+        key=lambda candidate: (candidate[0], _record_key(candidate[2]), candidate[1]),
+    )
+    wrapper = _latest_causal_record(wrappers, selected)
+    node_id = selected.get("node_id") or wrapper.get("node_id") or run.get("node_id")
+    generation = selected.get("generation")
+    if generation is None:
+        generation = wrapper.get("generation", view.get("generation"))
+    attempt = selected.get("attempt")
+    if attempt is None:
+        attempt = wrapper.get("attempt")
+
+    if source == "workspace":
+        details = _mapping(selected.get("details"))
+        facts = _mapping(details.get("facts"))
+        code = str(details.get("stable_failure_code") or run_failure_code)
+        stage = "workspace_preflight"
+    elif source == "budget":
+        facts = {}
+        code = str(selected.get("failure_code") or "WORKER_BUDGET_INADEQUATE")
+        stage = "worker_budget_preflight"
+    elif source == "watchdog":
+        facts = {}
+        code = "TIMEOUT"
+        stage = "watchdog"
+    else:
+        facts = {}
+        code = str(selected.get("code") or selected.get("failure_code"))
+        stage = str(selected.get("stage") or "task_execution")
+
+    matching_heartbeats = [
+        item
+        for item in _mappings(view.get("worker_attempt_heartbeats"))
+        if _same_attempt(item, selected)
+    ]
+    if code == "CANCELLED" and any(
+        item.get("hard_timeout_reached") is True for item in matching_heartbeats
+    ):
+        code = "TIMEOUT"
+        stage = "watchdog"
+
+    root: dict[str, Any] = {
+        "code": code,
+        "stage": stage,
+        "node_id": node_id,
+        "generation": generation,
+        "attempt": attempt,
+        "remediation": _remediation(code),
+        "wrapper_context": {
+            "status": wrapper.get("status") or view.get("state"),
+            "code": wrapper.get("failure_code") or run_failure_code,
+        },
+    }
+    if selected.get("content_digest") is not None:
+        root["record_digest"] = selected["content_digest"]
+    if source == "workspace" and facts.get("cause") is not None:
+        root["cause"] = facts["cause"]
+    if source == "budget":
+        root["denied_authorities"] = selected.get("denied_authorities", [])
+
+    authority = _latest_causal_record(
+        _mappings(view.get("worker_timeout_authorities")), selected
+    )
+    profile = _latest_causal_record(
+        _mappings(view.get("worker_timeout_profiles")), selected
+    )
+    configured_timeout = selected.get("configured_timeout_seconds")
+    if configured_timeout is None:
+        configured_timeout = authority.get("node_attempt_timeout_seconds")
+    if configured_timeout is None:
+        configured_timeout = profile.get("accepted_node_timeout_seconds")
+    effective_timeout = selected.get("effective_timeout_seconds")
+    if effective_timeout is None:
+        effective_timeout = authority.get("effective_timeout_seconds")
+    if effective_timeout is None:
+        effective_timeout = profile.get("effective_timeout_seconds")
+    if configured_timeout is not None:
+        root["configured_timeout_seconds"] = configured_timeout
+    if effective_timeout is not None:
+        root["effective_timeout_seconds"] = effective_timeout
+
+    worker_results = [
+        *_mappings(worker.get("results")),
+        *_mappings(child_outcomes.get("results")),
+    ]
+    bound_worker_results = [
+        item
+        for item in worker_results
+        if (
+            selected.get("worker_result_id") is not None
+            and item.get("id") == selected.get("worker_result_id")
+        )
+        or (
+            selected.get("worker_result_digest") is not None
+            and item.get("content_digest") == selected.get("worker_result_digest")
+        )
+    ]
+    worker_result = (
+        max(bound_worker_results, key=_record_key) if bound_worker_results else {}
+    )
+    worker_usage = _mapping(worker_result.get("resource_usage"))
+    for key in (
+        "stdout_bytes",
+        "stdout_limit_bytes",
+        "stderr_bytes",
+        "stderr_limit_bytes",
+        "output_limit_stream",
+    ):
+        value = selected.get(key)
+        if value is None:
+            value = worker_usage.get(key)
+        if value is not None:
+            root[key] = value
+
+    watchdog = _latest_causal_record(watchdogs, selected)
+    if watchdog:
+        outcome = watchdog.get("outcome")
+        root["watchdog"] = {
+            "signal_sent": outcome in {"signal_sent", "cleanup_confirmed", "cleanup_failed"},
+            "cleanup_outcome": outcome,
+        }
+    elif worker_usage.get("process_group_cleanup") is not None:
+        root["watchdog"] = {
+            "signal_sent": None,
+            "cleanup_outcome": worker_usage["process_group_cleanup"],
+        }
+
+    no_progress = sorted(
+        (
+            item
+            for item in matching_heartbeats
+            if item.get("no_observable_progress")
+        ),
+        key=_record_key,
+    )
+    if no_progress:
+        recent = no_progress[-_ROOT_CAUSE_HEARTBEAT_LIMIT:]
+        root["no_progress_heartbeat_count"] = len(no_progress)
+        root["omitted_no_progress_heartbeat_count"] = len(no_progress) - len(recent)
+        root["recent_no_progress_heartbeats"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "sequence",
+                    "elapsed_seconds",
+                    "remaining_seconds",
+                    "stdout_bytes",
+                    "stderr_bytes",
+                    "hard_timeout_reached",
+                )
+            }
+            for item in recent
+        ]
+    return root
 
 
 def _graph_failure_path(
@@ -1005,6 +1304,7 @@ def _explain_work_run(view: dict[str, Any]) -> dict[str, Any]:
             }
             for item in events
         ],
+        "primary_root_cause": _primary_root_cause(view),
         "failure_path": failure_path,
         "final_outcome": {
             "status": status,
