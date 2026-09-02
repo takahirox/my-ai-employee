@@ -306,6 +306,8 @@ approval. Host-global installation remains denied.
   [example profile](examples/project/.fleet/project.yaml)
 - [OpenAI Agents SDK and TAKT influences](docs/influences.md)
 - [Security, permissions, sandboxing, and secrets](docs/security.md)
+- [Opt-in public operational incident reporting runbook](docs/incident-reporting.md) for the
+  approval, privacy, deduplication, token, and failure boundaries of GitHub Issue publishing
 - [Development and release checks](docs/development.md)
 - [v0.2/v0.3 roadmap](docs/roadmap.md)
 - [Normative v0.2 specification](docs/v0.2-spec.md)

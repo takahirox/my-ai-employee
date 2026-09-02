@@ -27,6 +27,15 @@ CLI worker authentication remains owned by the official Codex/Claude tool. Fleet
 not inspect auth files and filters credential-like environment variables from controlled
 commands. Artifact bodies are not returned by Inspector projections.
 
+## Public operational incidents are not vulnerability reports
+
+Fleet has a separate, opt-in public operational incident channel with a fixed sanitized
+schema, repository-scoped configuration, digest-bound approval, and an explicit publish
+command. Its complete operator and credential boundary is documented in the
+[incident-reporting runbook](incident-reporting.md). Suspected vulnerabilities, exploit
+information, security-sensitive diagnostics, secrets, and sensitive user data must never
+use incident publishing. Report them privately according to [`SECURITY.md`](../SECURITY.md).
+
 Machine-local worker executable overrides belong in Operator Config, not the repository's
 Project Harness. Overrides must be absolute paths, are resolved through the controlled
 `ProcessExecutor`, and do not grant additional process, filesystem, network, or project
