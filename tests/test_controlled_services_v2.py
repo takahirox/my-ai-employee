@@ -190,6 +190,7 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     assert failed.resource_usage["output_limit_stream"] == "stdout"
     assert failed.resource_usage["process_group_cleanup"] in {
         "already_exited",
+        "sigterm_confirmed",
         "sigkill_confirmed",
     }
 
