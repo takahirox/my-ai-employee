@@ -216,6 +216,13 @@ def _validate_source(
         raise ValueError(f"legacy database schema version {version} is unsupported")
     if version == 1 and tables.intersection(_V2_TABLES):
         raise ValueError("legacy database schema version does not match its v2 tables")
+    if version == 2:
+        missing_v2 = set(_V2_TABLES) - tables
+        if missing_v2:
+            raise ValueError(
+                "legacy database is missing required schema-v2 tables: "
+                + ", ".join(sorted(missing_v2))
+            )
 
     ordered_tables = tuple(
         table for table in (*_BASE_TABLES, *_V2_TABLES) if table in tables
@@ -360,13 +367,13 @@ def import_legacy_database(
         from .storage import SQLiteStore
 
         with SQLiteStore(destination_path) as store:
-            if schema_version == 2:
-                store.migrate_v2()
             connection = store._connection
             imported_rows = 0
             skipped_rows = 0
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                if schema_version == 2:
+                    store._migrate_v2_in_transaction(connection)
                 for table in tables:
                     imported, skipped = _copy_table(source_connection, connection, table)
                     imported_rows += imported

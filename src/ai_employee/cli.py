@@ -5,11 +5,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import io
-import shlex
 import shutil
 import subprocess
-import sys
-import tempfile
 from collections.abc import Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -310,21 +307,6 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("run_id")
     promote.add_argument("--patch-digest", required=True)
     return parser
-
-
-def _warn_for_explicit_temporary_database(command: str, database_path: str) -> None:
-    if command not in {"run", "work"}:
-        return
-    resolved_path = Path(database_path).resolve()
-    temporary_directory = Path(tempfile.gettempdir()).resolve()
-    if not resolved_path.is_relative_to(temporary_directory):
-        return
-    serve_command = shlex.join(("fleet", "serve", "--db", str(resolved_path)))
-    print(
-        f"warning: temporary database {resolved_path} is absent from the default Inspector; "
-        f"run `{serve_command}` to inspect it.",
-        file=sys.stderr,
-    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

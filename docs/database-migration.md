@@ -22,8 +22,9 @@ The importer:
   every known column before touching the destination;
 - refuses symlinks, an active WAL source, unknown schema objects, and newer schemas;
 - creates a private SQLite backup beside an existing destination before importing;
-- merges rows in one immediate transaction, accepting exact duplicates but rejecting any
-  primary-key or uniqueness collision with different content;
+- performs any required destination schema upgrade and merges rows in one immediate transaction,
+  accepting exact duplicates but rejecting any primary-key or uniqueness collision with different
+  content;
 - copies repository registrations and parent/child run relationships with the records they
   describe;
 - verifies that the source file did not change, checks destination foreign keys, commits an
@@ -37,9 +38,10 @@ A changed source is a new import and receives full validation.
 
 ## Failures and rollback
 
-Unknown schemas, broken relationships, and collisions fail before commit. The source is never
-modified. A backup created before a failed transaction is intentionally retained so an
-operator always has a recovery point.
+Unknown schemas, broken relationships, and collisions fail before commit. Schema upgrades and
+row imports share the same rollback boundary, so failure leaves neither partial data nor a partial
+upgrade. The source is never modified. A backup created before a failed transaction is
+intentionally retained so an operator always has a recovery point.
 
 If a successful import must be rolled back, stop Fleet, retain the current database for audit,
 and replace it with the reported backup using normal filesystem administration. Ensure the

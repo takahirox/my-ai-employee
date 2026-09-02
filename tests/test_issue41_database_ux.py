@@ -60,7 +60,6 @@ def test_work_rejects_database_environment_before_dispatch(
     temporary_directory = tmp_path / "platform-temporary-directory"
     temporary_directory.mkdir()
     database = temporary_directory / "work.db"
-    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: str(temporary_directory))
     monkeypatch.setenv("FLEET_DB", str(database))
     called = False
 
@@ -80,22 +79,15 @@ def test_work_rejects_database_environment_before_dispatch(
     assert not database.exists()
 
 
-def test_default_and_unrelated_commands_do_not_warn_for_temporary_paths(
+def test_default_operational_command_does_not_warn_for_canonical_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    temporary_directory = tmp_path / "platform-temporary-directory"
-    temporary_directory.mkdir()
-    home = temporary_directory / "home"
+    home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: str(temporary_directory))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("FLEET_DB", raising=False)
 
     assert cli.main(["run", _graph(), "--run-id", "shared-default-run"]) == 0
-    assert capsys.readouterr().err == ""
-
-    cli._warn_for_explicit_temporary_database("run", str(tmp_path / "tmp-sibling" / "db.sqlite"))
-    cli._warn_for_explicit_temporary_database("inspect", str(temporary_directory / "other.db"))
     assert capsys.readouterr().err == ""
 
 

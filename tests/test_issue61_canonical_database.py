@@ -137,6 +137,83 @@ def test_import_collision_rolls_back_every_source_row_and_journal(
         assert source_id is None
 
 
+def test_cross_version_collision_rolls_back_destination_schema_upgrade(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-v2.db"
+    destination = tmp_path / "fleet-v1.db"
+    source_repository = tmp_path / "source-repository"
+    destination_repository = tmp_path / "destination-repository"
+    source_repository.mkdir()
+    destination_repository.mkdir()
+    with SQLiteStore(source) as store:
+        store.claim_run_id("collision", source_repository)
+        store.migrate_v2()
+    with SQLiteStore(destination) as store:
+        store.claim_run_id("collision", destination_repository)
+        original_repositories = store.list_run_repositories()
+        original_tables = {
+            str(row[0])
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert store._schema_version() == 1
+
+    with pytest.raises(ValueError, match="collision"):
+        import_legacy_database(source, destination=destination)
+
+    with SQLiteStore(destination) as store:
+        current_tables = {
+            str(row[0])
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert current_tables == original_tables
+        assert store._schema_version() == 1
+        assert store.list_run_repositories() == original_repositories
+        assert store._connection.execute("SELECT COUNT(*) FROM legacy_imports").fetchone()[0] == 0
+
+
+def test_version_two_source_requires_every_v2_table(tmp_path: Path) -> None:
+    source = tmp_path / "incomplete-v2.db"
+    destination = tmp_path / "fleet.db"
+    with SQLiteStore(source) as store:
+        store.migrate_v2()
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("DROP TABLE graph_claims_v2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="missing required schema-v2 tables: graph_claims_v2"):
+        import_legacy_database(source, destination=destination)
+
+    assert not destination.exists()
+
+
+def test_version_two_source_rejects_malformed_v2_columns(tmp_path: Path) -> None:
+    source = tmp_path / "malformed-v2.db"
+    destination = tmp_path / "fleet.db"
+    with SQLiteStore(source) as store:
+        store.migrate_v2()
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute(
+            "ALTER TABLE graph_claims_v2 RENAME COLUMN node_id TO unexpected_node_id"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="unknown graph_claims_v2 schema"):
+        import_legacy_database(source, destination=destination)
+
+    assert not destination.exists()
+
+
 def test_unknown_source_schema_fails_without_creating_destination(tmp_path: Path) -> None:
     source = tmp_path / "legacy.db"
     destination = tmp_path / "fleet.db"

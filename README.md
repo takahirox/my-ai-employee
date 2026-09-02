@@ -51,8 +51,8 @@ schemas atomically, records an idempotency journal, and prints a verification su
 the [database migration guide](docs/database-migration.md) for rollback and failure handling.
 
 Keep the old database as a rollback copy until current Graph runs inspect successfully. Older
-declarative v0.1 Graph runs remain inspectable and may appear as `v0.1/unassigned` because their
-repository identity was not previously persisted. Historical standalone v0.2 `WorkRun` rows stay
+declarative v0.1 Graph runs without repository identity remain visible as
+`Legacy / unassigned repository`. Historical standalone v0.2 `WorkRun` rows stay
 in SQLite for audit and migration safety, but they are not top-level runs and cannot be inspected,
 explained, resumed, diffed, logged, promoted, or controlled. Graph-owned child `WorkRun` evidence
 remains available through its parent task drill-down.
@@ -251,7 +251,7 @@ closed into History without changing the authoritative Graph state. An operator 
 terminalize one exact expired orphan as `interrupted` with `fleet recover RUN_ID`; recovery is
 idempotent, refuses live or newer ownership, and retains the expired owner and prior Graph facts.
 
-Start the browser Inspector with `fleet serve` (or `fleet serve --db PATH`). Its repository
+Start the browser Inspector with `fleet serve`. Its repository
 selector filters runs from the shared database by their persisted repository identity. The
 default Fleet overview separates lease-proven active runs from terminal or interrupted History
 and shows each run's persisted goal, repository, authoritative status, completed/total graph
