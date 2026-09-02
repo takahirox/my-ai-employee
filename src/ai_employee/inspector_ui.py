@@ -643,6 +643,11 @@ status.className='badge run-status state-'+
 ({
 completed:'passed',
 succeeded:'passed',
+ready_to_promote:'ready',
+planned:'waiting',
+paused:'blocked',
+interrupted:'failed',
+unknown:'waiting',
 waiting_approval:'routed'}
 [run.status]||
 (['ready',
@@ -659,6 +664,7 @@ status.textContent=text(run.status);
 status.title='Run status: '+text(run.status);
 const progressData=run.progress||{},
 completed=Number(progressData.completed)||0,
+terminal=Number(progressData.terminal)||completed,
 total=Number(progressData.total)||0;
 const progressGroup=document.createElement('span');
 progressGroup.className='run-progress';
@@ -667,9 +673,13 @@ progress.max=Math.max(total,1);
 progress.value=Math.min(completed,progress.max);
 progress.setAttribute(
 'aria-label',
+isJob?
+completed+' of '+total+' child Graph Runs completed successfully; '+
+terminal+' terminal':
 completed+' of '+total+' tasks completed');
 const progressText=document.createElement('span');
-progressText.textContent=completed+'/'+total;
+progressText.textContent=isJob?
+completed+'/'+total+' successful':completed+'/'+total;
 progressGroup.append(progress,progressText);
 const attention=document.createElement('span');
 attention.className='attention';
@@ -739,7 +749,9 @@ childLabel.textContent='#'+text(child.job_sequence)+' '+
 (child.goal||child.run_id);
 childLabel.title=child.goal||child.run_id;
 const childStatus=document.createElement('span');
-childStatus.className='badge';
+childStatus.className='badge state-'+
+({completed:'passed',succeeded:'passed',ready_to_promote:'ready',
+interrupted:'failed'}[child.status]||child.status||'waiting');
 childStatus.textContent=text(child.status);
 childButton.append(childLabel,childStatus);
 childButton.setAttribute(

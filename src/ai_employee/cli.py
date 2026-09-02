@@ -146,6 +146,7 @@ from .storage import SQLiteStore
 from .task_orchestration import (
     GoalEvaluatorRecord,
     GraphRunRecord,
+    PreAcceptanceGraphRunOutcomeRecord,
     TaskGraphAcceptance,
     WorkerTimeoutAuthorityRecord,
     one_node_graph,
@@ -977,6 +978,78 @@ def _graph_run_cli_result(
     return result
 
 
+class _PreAcceptanceOutcomeGuard:
+    """Close a newly claimed run unless authoritative GraphRun state supersedes it."""
+
+    def __init__(self, store: SQLiteStore, run_id: str, goal: Goal) -> None:
+        self._store = store
+        self._run_id = run_id
+        self._goal = goal
+        self._claimed = False
+        self._stable_code: str | None = None
+
+    def __enter__(self) -> _PreAcceptanceOutcomeGuard:
+        return self
+
+    def mark_claimed(self) -> None:
+        self._claimed = True
+
+    def fail(self, stable_code: str) -> None:
+        self._stable_code = stable_code
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object,
+    ) -> Literal[False]:
+        if not self._claimed:
+            return False
+        try:
+            self._store.get("graph_run_v2", self._run_id, GraphRunRecord)
+        except KeyError:
+            pass
+        else:
+            return False
+        status: Literal["failed", "interrupted"] = (
+            "interrupted"
+            if exc_type is not None and not issubclass(exc_type, Exception)
+            else "failed"
+        )
+        stable_code = self._stable_code or (
+            "PRE_ACCEPTANCE_INTERRUPTED" if status == "interrupted" else "PRE_ACCEPTANCE_FAILED"
+        )
+        outcome = PreAcceptanceGraphRunOutcomeRecord(
+            id=self._run_id,
+            run_id=self._run_id,
+            created_at=now(),
+            goal=self._goal,
+            status=status,
+            stable_code=stable_code,
+        )
+        if not self._store.put_once(
+            "pre_acceptance_graph_run_outcome_v2", outcome, run_id=self._run_id
+        ):
+            raise ValueError("pre-acceptance run already has a terminal outcome")
+        return False
+
+
+def _pre_acceptance_cli_result(
+    store: SQLiteStore, run_id: str, stable_code: str
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema_version": "2",
+        "run_id": run_id,
+        "status": "failed",
+        "stable_code": stable_code,
+        "next_actions": (),
+    }
+    job_context = store.job_context_for_run(run_id)
+    if job_context is not None:
+        result["job"] = job_context
+    return result
+
+
 def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
     return 0 if graph_run.status in {"planned", "completed", "ready_to_promote"} else 5
 
@@ -1210,7 +1283,10 @@ def _work(args: argparse.Namespace) -> int:
     for command in harness.commands.values():
         add_executable_path(command.argv[0])
 
-    with SQLiteStore(db_path) as store:
+    with (
+        SQLiteStore(db_path) as store,
+        _PreAcceptanceOutcomeGuard(store, run_id, goal) as pre_acceptance,
+    ):
         if resume_run is None:
             store.claim_run_id(
                 run_id,
@@ -1218,6 +1294,7 @@ def _work(args: argparse.Namespace) -> int:
                 job_id=getattr(args, "job_id", None),
                 job_goal=getattr(args, "job_goal", None),
             )
+            pre_acceptance.mark_claimed()
 
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(
@@ -1504,17 +1581,9 @@ def _work(args: argparse.Namespace) -> int:
                     max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
                 )
             except ValueError:
-                print(
-                    canonical_json(
-                        {
-                            "schema_version": "2",
-                            "run_id": run_id,
-                            "status": "failed",
-                            "stable_code": "GRAPH_PLANNER_FAILED",
-                            "next_actions": (),
-                        }
-                    )
-                )
+                stable_code = "GRAPH_PLANNER_FAILED"
+                pre_acceptance.fail(stable_code)
+                print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
                 return 7
             add_executable_path(worker_command.executable)
             for path_entry in worker_command.path_entries:
@@ -1568,17 +1637,9 @@ def _work(args: argparse.Namespace) -> int:
             )
 
         if harness.provisional:
-            print(
-                canonical_json(
-                    {
-                        "schema_version": "2",
-                        "run_id": run_id,
-                        "status": "failed",
-                        "stable_code": "WORKER_DENIED_BY_HARNESS",
-                        "next_actions": (),
-                    }
-                )
-            )
+            stable_code = "WORKER_DENIED_BY_HARNESS"
+            pre_acceptance.fail(stable_code)
+            print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
             return 3
         workspace = GitWorkspaceManager(workspace_root, artifacts)
         harness_digest = project_harness_digest(harness)
@@ -1879,30 +1940,13 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                 )
             except PlanReviewGateError as error:
-                print(
-                    canonical_json(
-                        {
-                            "schema_version": "2",
-                            "run_id": run_id,
-                            "status": "failed",
-                            "stable_code": error.stable_code,
-                            "next_actions": (),
-                        }
-                    )
-                )
+                pre_acceptance.fail(error.stable_code)
+                print(canonical_json(_pre_acceptance_cli_result(store, run_id, error.stable_code)))
                 return 7
             except GraphValidationError:
-                print(
-                    canonical_json(
-                        {
-                            "schema_version": "2",
-                            "run_id": run_id,
-                            "status": "failed",
-                            "stable_code": "GRAPH_PLAN_REJECTED",
-                            "next_actions": (),
-                        }
-                    )
-                )
+                stable_code = "GRAPH_PLAN_REJECTED"
+                pre_acceptance.fail(stable_code)
+                print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
                 return 7
             print(
                 canonical_json(

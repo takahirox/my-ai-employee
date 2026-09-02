@@ -37,7 +37,7 @@ from ai_employee.graph_evaluation import (
     ParentVerificationBinding,
 )
 from ai_employee.graph_execution import GraphExecutionService
-from ai_employee.inspector import inspect_graph_run
+from ai_employee.inspector import inspect_fleet_runs, inspect_graph_run
 from ai_employee.orchestration import WorkRun
 from ai_employee.plan_review import PlanReviewAttempt
 from ai_employee.project import discover_project_harness
@@ -54,6 +54,7 @@ from ai_employee.task_orchestration import (
     GraphRunRecord,
     NodeRouteRecord,
     NodeSemanticAssessmentRecord,
+    PreAcceptanceGraphRunOutcomeRecord,
     TaskGraphAcceptance,
 )
 from ai_employee.task_planning import ProposedGraph
@@ -455,6 +456,54 @@ def _enable_policy_auto_approval(
         "max_patch_bytes": 100000,
     }
     operator.write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_provisional_harness_failure_is_durable_and_keeps_job_context(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, operator, database, _state = _fixture(tmp_path, task_review=False)
+    provisional = discover_project_harness(repository).model_copy(update={"provisional": True})
+    monkeypatch.setattr(cli, "discover_project_harness", lambda _repository: provisional)
+
+    result = cli.main(
+        [
+            "work",
+            "attempt work with provisional Harness",
+            "--repo",
+            str(repository),
+            "--operator-config",
+            str(operator),
+            "--routing-mode",
+            "fixed",
+            "--strategy",
+            "low",
+            "--run-id",
+            "harness-denied-child",
+            "--job-id",
+            "harness-denied-job",
+            "--job-goal",
+            "Complete the larger Harness-governed change",
+        ]
+    )
+
+    assert result == 3
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "failed"
+    assert emitted["stable_code"] == "WORKER_DENIED_BY_HARNESS"
+    assert emitted["job"]["job"]["id"] == "harness-denied-job"
+    with SQLiteStore(database) as store:
+        outcome = store.get(
+            "pre_acceptance_graph_run_outcome_v2",
+            "harness-denied-child",
+            PreAcceptanceGraphRunOutcomeRecord,
+        )
+        overview = inspect_fleet_runs(store)
+    assert outcome.status == "failed"
+    assert outcome.stable_code == "WORKER_DENIED_BY_HARNESS"
+    assert overview["history"][0]["overall_status"] == "failed"
+    assert overview["history"][0]["progress"]["completed"] == 0
 
 
 def test_one_sided_policy_opt_in_persists_manual_reason(

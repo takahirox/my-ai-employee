@@ -109,6 +109,61 @@ def test_cli_transports_job_identity_and_help() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("statuses", "active_indexes", "expected", "successful", "terminal"),
+    (
+        (("running",), (0,), "running", 0, 0),
+        (("planned",), (), "planned", 0, 0),
+        (("paused",), (), "paused", 0, 0),
+        (("waiting_approval",), (), "waiting_approval", 0, 0),
+        (("ready_to_promote",), (), "ready_to_promote", 0, 1),
+        (("completed",), (), "completed", 1, 1),
+        (("failed",), (), "failed", 0, 1),
+        (("cancelled",), (), "cancelled", 0, 1),
+        (("interrupted",), (), "interrupted", 0, 1),
+        (("unrecognized",), (), "unknown", 0, 0),
+        (("failed", "completed"), (), "failed", 1, 2),
+        (("cancelled", "completed"), (), "cancelled", 1, 2),
+        (("interrupted", "completed"), (), "interrupted", 1, 2),
+        (("ready_to_promote", "completed"), (), "ready_to_promote", 1, 2),
+        (("unknown", "completed"), (), "unknown", 1, 1),
+        (("failed", "running"), (1,), "running", 0, 1),
+    ),
+)
+def test_parent_job_single_and_mixed_status_matrix_is_honest(
+    tmp_path,
+    statuses: tuple[str, ...],
+    active_indexes: tuple[int, ...],
+    expected: str,
+    successful: int,
+    terminal: int,
+) -> None:  # type: ignore[no-untyped-def]
+    with SQLiteStore(tmp_path / "fleet.db") as store:
+        for index in range(len(statuses)):
+            store.claim_run_id(
+                f"child-{index + 1}",
+                tmp_path,
+                job_id="parent",
+                job_goal="Parent goal" if index == 0 else None,
+            )
+        summaries = [
+            _summary(f"child-{index + 1}", status) for index, status in enumerate(statuses)
+        ]
+        grouped = _group_parent_jobs(
+            store,
+            [summary for index, summary in enumerate(summaries) if index in active_indexes],
+            [summary for index, summary in enumerate(summaries) if index not in active_indexes],
+        )
+    job = (grouped["active"] or grouped["history"])[0]
+    assert job["overall_status"] == expected
+    assert job["progress"] == {
+        "completed": successful,
+        "successful": successful,
+        "terminal": terminal,
+        "total": len(statuses),
+    }
+
+
 def test_overview_groups_jobs_by_status_and_sequence(tmp_path) -> None:  # type: ignore[no-untyped-def]
     with SQLiteStore(tmp_path / "fleet.db") as store:
         store.claim_run_id("child-1", tmp_path, job_id="parent", job_goal="Parent goal")
@@ -139,6 +194,7 @@ def test_overview_groups_jobs_by_status_and_sequence(tmp_path) -> None:  # type:
         )
         assert historical["active"] == []
         assert historical["history"][0]["current_status"] == "completed"
+        assert historical["history"][0]["overall_status"] == "failed"
 
 
 def test_inspector_lists_clickable_job_children() -> None:
@@ -148,6 +204,7 @@ def test_inspector_lists_clickable_job_children() -> None:
         "job-children",
         "Open child Graph Run ",
         "openRun(child.run_id)",
+        "child Graph Runs completed successfully",
     ):
         assert marker in INDEX
     assert "method:'POST'" not in INDEX

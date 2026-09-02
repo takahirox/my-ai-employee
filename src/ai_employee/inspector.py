@@ -98,6 +98,7 @@ from .task_orchestration import (
     NodeSemanticAssessmentRecord,
     NodeWatchdogRecord,
     PreAcceptanceGoalRecord,
+    PreAcceptanceGraphRunOutcomeRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
@@ -1058,6 +1059,27 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
     }
 
 
+def inspect_pre_acceptance_outcome(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Project a claimed run that terminated before GraphRun authority existed."""
+
+    outcome = store.get(
+        "pre_acceptance_graph_run_outcome_v2",
+        run_id,
+        PreAcceptanceGraphRunOutcomeRecord,
+    )
+    return {
+        "schema_version": "2",
+        "run_id": run_id,
+        "kind": "pre_acceptance_graph_run",
+        "state": outcome.status,
+        "failure_code": outcome.stable_code,
+        "generation": 0,
+        "goal": _json_model(outcome.goal),
+        "pre_acceptance_outcome": _json_model(outcome),
+        "graph_acceptance": None,
+    }
+
+
 def inspect_any_run(
     store: SQLiteStore,
     run_id: str,
@@ -1082,7 +1104,12 @@ def inspect_any_run(
         pass
     else:
         return _attach_repository_context(store, run_id, projection)
-    for inspector in (inspect_failed_plan_review, inspect_work_run, inspect_run):
+    for inspector in (
+        inspect_failed_plan_review,
+        inspect_pre_acceptance_outcome,
+        inspect_work_run,
+        inspect_run,
+    ):
         try:
             projection = inspector(store, run_id)
         except KeyError:
@@ -1221,6 +1248,44 @@ def _attention_facts(
     return unique
 
 
+_JOB_STATUS_PRECEDENCE = (
+    "running",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "unknown",
+    "ready_to_promote",
+    "waiting_approval",
+    "paused",
+    "planned",
+    "completed",
+)
+_JOB_TERMINAL_CHILD_STATES = frozenset(
+    {"cancelled", "completed", "failed", "interrupted", "ready_to_promote"}
+)
+
+
+def _normalized_job_child_status(value: object) -> str:
+    status = str(value or "unknown")
+    if status in {"completed", "passed", "succeeded"}:
+        return "completed"
+    if status in _JOB_STATUS_PRECEDENCE:
+        return status
+    return "unknown"
+
+
+def _aggregate_job_status(children: list[dict[str, Any]], *, has_active_child: bool) -> str:
+    """Apply explicit precedence without converting terminal outcomes into success."""
+
+    statuses = {_normalized_job_child_status(item.get("status")) for item in children}
+    if has_active_child:
+        return "running"
+    for status in _JOB_STATUS_PRECEDENCE:
+        if status in statuses:
+            return status
+    return "unknown"
+
+
 def _group_parent_jobs(
     store: SQLiteStore,
     active: list[dict[str, Any]],
@@ -1273,14 +1338,7 @@ def _group_parent_jobs(
         latest = children[-1]
         has_active_child = any(str(item["run_id"]) in active_ids for item in children)
         current_status = str(latest.get("status") or "not_recorded")
-        successful = {"completed", "ready_to_promote", "succeeded"}
-        overall_status = (
-            "running"
-            if has_active_child
-            else "completed"
-            if all(str(item.get("status")) in successful for item in children)
-            else current_status
-        )
+        overall_status = _aggregate_job_status(children, has_active_child=has_active_child)
         attention = [
             {**fact, "run_id": child["run_id"]}
             for child in children
@@ -1299,11 +1357,11 @@ def _group_parent_jobs(
             for item in children
             if isinstance(item.get("last_updated_at"), str)
         ]
-        terminal_count = sum(
-            str(item.get("status"))
-            in {"cancelled", "completed", "failed", "ready_to_promote", "succeeded"}
-            for item in children
-        )
+        normalized_statuses = [
+            _normalized_job_child_status(item.get("status")) for item in children
+        ]
+        successful_count = sum(status == "completed" for status in normalized_statuses)
+        terminal_count = sum(status in _JOB_TERMINAL_CHILD_STATES for status in normalized_statuses)
         job_summary: dict[str, Any] = {
             "kind": "job",
             "job_id": job.id,
@@ -1313,7 +1371,12 @@ def _group_parent_jobs(
             "current_status": current_status,
             "current_run_id": latest["run_id"],
             "child_graph_runs": children,
-            "progress": {"completed": terminal_count, "total": len(children)},
+            "progress": {
+                "completed": successful_count,
+                "successful": successful_count,
+                "terminal": terminal_count,
+                "total": len(children),
+            },
             "phase": f"{len(children)} child Graph Run(s); current: {current_status}",
             "last_updated_at": max(timestamps) if timestamps else None,
             "requires_attention": any(bool(item.get("requires_attention")) for item in children),
