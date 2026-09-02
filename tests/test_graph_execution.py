@@ -659,6 +659,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         )
         assert {item.node_id for item in manifests} == {"a", "b", "c"}
         manifest_by_node = {item.node_id: item for item in manifests}
+        node_by_id = {item.id: item for item in graph.nodes}
         for node_id, request in requests.items():
             manifest = manifest_by_node[node_id]
             assert manifest.worker_request_digest == request.content_digest
@@ -666,6 +667,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             assert manifest.completion_criteria_digest == canonical_digest(
                 request.completion_criteria
             )
+            assert request.completion_criteria == node_by_id[node_id].completion_criteria
             assert request.completion_criteria
             assert manifest.required_capabilities == request.required_capabilities
             assert manifest.accepted_graph_revision_digest == run.accepted_graph_revision_digest

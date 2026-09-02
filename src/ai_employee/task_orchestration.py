@@ -1875,9 +1875,7 @@ class TaskOrchestrator:
                         goal=repair_goal_by_node.get(node_id, node.objective or node.name),
                         task_kind=graph_run.goal.task_kind,
                         processes_authorized=graph_run.goal.processes_authorized,
-                        completion_criteria=tuple(
-                            item.description for item in node.completion_criteria
-                        ),
+                        completion_criteria=node.completion_criteria,
                         required_capabilities=node.required_capabilities,
                         accepted_plan_digest=graph_digest,
                         node_id=node.id,
@@ -1938,7 +1936,8 @@ class TaskOrchestrator:
                             failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
                         )
                         continue
-                    if not self._pre_dispatch_bindings_are_valid(
+                    contract_failure = _worker_request_contract_failure(node, request)
+                    if contract_failure is not None or not self._pre_dispatch_bindings_are_valid(
                         graph_run,
                         node,
                         request,
@@ -1960,9 +1959,12 @@ class TaskOrchestrator:
                             worker_request_id=request.id,
                             worker_request_digest=_required_digest(request.content_digest),
                             exception_message=(
-                                "pre-dispatch bindings contradict accepted run authority; "
-                                "recreate the route and worker request from the persisted task and "
-                                "effective policy"
+                                contract_failure
+                                or (
+                                    "pre-dispatch bindings contradict accepted run authority; "
+                                    "recreate the route and worker request from the persisted task "
+                                    "and effective policy"
+                                )
                             ),
                             duration_seconds=0.0,
                             configured_timeout_seconds=node.resource_budget.wall_seconds,
@@ -3985,6 +3987,13 @@ class TaskOrchestrator:
         evidence_by_node: dict[str, NodeEvidenceRecord],
         graph_digest: str,
     ) -> None:
+        try:
+            persisted_request = self.store.get("worker_request_v2", request.id, WorkerRequest)
+        except KeyError:
+            raise ValueError("worker request criterion binding is absent or stale") from None
+        if persisted_request != request or request.completion_criteria != node.completion_criteria:
+            raise ValueError("worker request criterion binding is absent or stale")
+
         worker_result = result.worker_result
         patch = result.node_patch
         result_acceptance = result.result_acceptance
@@ -4422,10 +4431,8 @@ class TaskOrchestrator:
             and request.task_kind == manifest.task_kind
             and request.processes_authorized == manifest.processes_authorized
             and canonical_digest(request.completion_criteria) == manifest.completion_criteria_digest
-            and request.completion_criteria
-            == tuple(item.description for item in node.completion_criteria)
-            and request.required_capabilities
-            == node.required_capabilities
+            and request.completion_criteria == node.completion_criteria
+            and request.required_capabilities == node.required_capabilities
             == manifest.required_capabilities
             and request.accepted_plan_digest == graph_digest
             and request.accepted_graph_revision_digest
@@ -5001,6 +5008,56 @@ class TaskOrchestrator:
         if not self.store.put_owned_graph_run(owner, run, observed_at=observed_at):
             self._record_owner_fence("write", observed_at)
             raise RunOwnershipLost("only the authoritative owner can update the run")
+
+
+def _worker_request_contract_failure(node: Node, request: WorkerRequest) -> str | None:
+    if request.completion_criteria != node.completion_criteria:
+        return (
+            "worker request completion criteria do not preserve the accepted node contract; "
+            "rebuild the request from the persisted graph revision"
+        )
+    capabilities = set(request.required_capabilities)
+    for criterion in request.completion_criteria:
+        if isinstance(criterion, str):
+            return (
+                "worker request completion criteria omit typed evidence requirements; "
+                "persist and dispatch the accepted CompletionCriterion records"
+            )
+        if not criterion.mandatory:
+            continue
+        patch_required = "workspace_patch" in criterion.required_artifact_ids
+        if patch_required and request.task_kind == GoalTaskKind.NON_MUTATING:
+            return (
+                f"criterion {criterion.id} requires workspace_patch evidence, but the "
+                "non-mutating task contract cannot produce a workspace patch; select a "
+                "mutating edit_intent contract"
+            )
+        if patch_required and "edit_intent" not in capabilities:
+            return (
+                f"criterion {criterion.id} requires workspace_patch evidence, but the node "
+                "lacks the edit_intent capability; add it to the accepted node contract"
+            )
+        if criterion.verification_requirement_ids and (
+            not request.processes_authorized or "process" not in capabilities
+        ):
+            return (
+                f"criterion {criterion.id} requires process-backed verification evidence, "
+                "but the selected task contract cannot run it; authorize processes and add "
+                "the process capability to the accepted node contract"
+            )
+        if criterion.source == "accepted_non_mutating_result" and (
+            request.task_kind != GoalTaskKind.NON_MUTATING
+            or criterion.id != f"criterion-{node.id}"
+            or criterion.description != "the node-bound worker result is accepted"
+            or criterion.verification_requirement_ids
+            or criterion.required_artifact_ids
+        ):
+            return (
+                f"criterion {criterion.id} selects accepted_non_mutating_result evidence, "
+                "but its task/result binding is incompatible with that reserved source; "
+                "use the canonical node-bound non-mutating result criterion"
+            )
+    return None
 
 
 def _evaluate_criteria(

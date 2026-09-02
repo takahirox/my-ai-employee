@@ -56,7 +56,7 @@ from ai_employee.orchestration import (
 )
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
-from ai_employee.serialization import canonical_digest
+from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
@@ -302,6 +302,26 @@ def worker_request(goal: str = "make a bounded change") -> WorkerRequest:
         effective_policy_digest=ZERO,
         remaining_budgets={"worker_turns": 1},
     )
+
+
+def test_worker_request_preserves_legacy_string_criterion_digest() -> None:
+    legacy = WorkerRequest(
+        id="legacy-criterion-request",
+        run_id="legacy-criterion-run",
+        created_at=NOW,
+        goal="read a historical request",
+        completion_criteria=("the historical criterion passed",),
+        accepted_plan_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=ZERO,
+        remaining_budgets={"worker_turns": 1},
+    )
+    payload = json.loads(canonical_json(legacy.model_dump()))
+    restored = WorkerRequest.model_validate_json(canonical_json(payload))
+
+    assert payload["completion_criteria"] == ["the historical criterion passed"]
+    assert restored == legacy
+    assert restored.content_digest == legacy.content_digest
 
 
 def builtin_policy(run_id: str) -> PolicyLayer:

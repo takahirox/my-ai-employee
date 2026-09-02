@@ -13,7 +13,7 @@ from pydantic.main import BaseModel
 from ai_employee.serialization import versioned_digest
 
 from .base import CanonicalData, Digest, Identifier, StableStrEnum, UtcTimestamp
-from .models import GoalTaskKind
+from .models import CompletionCriterion, GoalTaskKind
 
 
 class SchemaModelV2(BaseModel):
@@ -400,7 +400,9 @@ class WorkerRequest(DigestedRecordV2):
     goal: str = Field(min_length=1, max_length=20_000)
     task_kind: GoalTaskKind = GoalTaskKind.MUTATING
     processes_authorized: bool = True
-    completion_criteria: tuple[str, ...] = ()
+    # Description-only strings remain readable for historical digested records. New graph
+    # dispatches carry the complete typed criterion without adding a digest-bound field.
+    completion_criteria: tuple[str | CompletionCriterion, ...] = ()
     required_capabilities: tuple[Identifier, ...] = ()
     accepted_plan_digest: Digest
     node_id: Identifier | None = None

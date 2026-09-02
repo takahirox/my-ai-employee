@@ -302,6 +302,7 @@ def test_non_mutating_task_dispatches_with_strategy_capability_superset(
 
     assert run.status == "completed"
     assert len(dispatched) == 1
+    assert dispatched[0][0].completion_criteria == goal.completion_criteria
     assert dispatched[0][0].required_capabilities == ()
     assert set(dispatched[0][1].capabilities) == {"edit_intent", "process"}
 
@@ -393,6 +394,69 @@ def test_tampered_required_capability_binding_fails_before_runner(
         "pre-dispatch bindings contradict accepted run authority; recreate the route and worker "
         "request from the persisted task and effective policy"
     )
+
+
+def test_missing_criterion_evidence_capability_fails_before_runner(tmp_path: Path) -> None:
+    runner_calls = 0
+
+    def runner(
+        _node: Node,
+        _request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("an impossible criterion contract must not reach the runner")
+
+    criterion = CompletionCriterion(
+        id="criterion-verification",
+        description="the required verification passes",
+        verification_requirement_ids=("test",),
+    )
+    node = _node("impossible").model_copy(
+        update={
+            "required_capabilities": (),
+            "completion_criteria": (criterion,),
+        }
+    )
+    graph = Graph(
+        id="impossible-criterion-graph",
+        nodes=(node,),
+        entry_node_ids=(node.id,),
+        terminal_node_ids=(node.id,),
+        budget=Budget(max_attempts=1, max_nodes=1),
+    )
+    goal = Goal(id="impossible-criterion-goal", statement="require unavailable evidence")
+
+    with SQLiteStore(tmp_path / "impossible-criterion.db") as store:
+        run = TaskOrchestrator(store, runner, (_strategy(),)).run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="impossible-criterion-run",
+            available_capabilities=("process",),
+        )
+        diagnostics = store.list_records(
+            "worker_boundary_diagnostic_v2",
+            WorkerBoundaryDiagnostic,
+            run_id=run.id,
+        )
+        requests = store.list_records("worker_request_v2", WorkerRequest, run_id=run.id)
+
+    assert run.status == "failed"
+    assert runner_calls == 0
+    assert len(requests) == 1
+    assert requests[0].completion_criteria == (criterion,)
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.stage == "pre_dispatch"
+    assert diagnostic.code == (
+        StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value
+    )
+    assert "criterion criterion-verification" in (diagnostic.exception_message or "")
+    assert "process capability" in (diagnostic.exception_message or "")
 
 
 def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> None:
