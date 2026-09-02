@@ -137,6 +137,17 @@ _OWNED_TERMINAL_GRAPH_STATES = frozenset(
 )
 
 
+_PROTOCOL_PREFLIGHT_CORRECTION_REASON = "ACCEPTED_PROTOCOL_PREFLIGHT_CORRECTION"
+_PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES = frozenset(
+    {
+        StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
+        StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+        StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+        StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+    }
+)
+
+
 class RunOwnershipLost(RuntimeError):
     """The caller no longer holds authority for the graph execution."""
 
@@ -1485,11 +1496,18 @@ class TaskOrchestrator:
                         "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
                     )
         loop_counts: dict[tuple[str, LoopAction], int] = defaultdict(int)
+        correction_counts: dict[str, int] = defaultdict(int)
         for transition in self.store.list_records(
             "loop_transition_v2", LoopTransitionRecord, run_id=run_id
         ):
             if transition.node_id is not None:
-                loop_counts[(transition.node_id, transition.action)] += 1
+                if (
+                    transition.action is LoopAction.REPAIR
+                    and transition.reason_code == _PROTOCOL_PREFLIGHT_CORRECTION_REASON
+                ):
+                    correction_counts[transition.node_id] += 1
+                else:
+                    loop_counts[(transition.node_id, transition.action)] += 1
         repair_feedback_by_node: dict[str, tuple[Digest, ...]] = {}
         repair_goal_by_node: dict[str, str] = {}
         for node_id, record in records.items():
@@ -1508,7 +1526,10 @@ class TaskOrchestrator:
                     repair_goal_by_node[node_id] = self._task_review_repair_goal(
                         nodes[node_id], repair.evidence_digests
                     )
-                elif repair.reason_code == "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+                elif repair.reason_code in {
+                    "ACCEPTED_NODE_EVALUATION_FEEDBACK",
+                    _PROTOCOL_PREFLIGHT_CORRECTION_REASON,
+                }:
                     repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
                         nodes[node_id], repair.evidence_digests
                     )
@@ -2468,7 +2489,15 @@ class TaskOrchestrator:
                                 }
                             )
                         ):
-                            repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
+                            protocol_correction = (
+                                current.failure_code
+                                in _PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES
+                            )
+                            repair_count = (
+                                correction_counts[node_id]
+                                if protocol_correction
+                                else loop_counts[(node_id, LoopAction.REPAIR)]
+                            )
                             repair_limit = graph_run.max_repairs
                             remaining = cast(
                                 Mapping[str, int | float], reservation.remaining_budgets
@@ -2480,7 +2509,11 @@ class TaskOrchestrator:
                                     run_id=run_id,
                                     created_at=now(),
                                     action=LoopAction.REPAIR,
-                                    reason_code="ACCEPTED_NODE_EVALUATION_FEEDBACK",
+                                    reason_code=(
+                                        _PROTOCOL_PREFLIGHT_CORRECTION_REASON
+                                        if protocol_correction
+                                        else "ACCEPTED_NODE_EVALUATION_FEEDBACK"
+                                    ),
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
                                     attempt=node.attempt,
@@ -2492,7 +2525,10 @@ class TaskOrchestrator:
                                     limit=repair_limit,
                                 )
                                 self._save_loop_transition(transition)
-                                loop_counts[(node_id, LoopAction.REPAIR)] += 1
+                                if protocol_correction:
+                                    correction_counts[node_id] += 1
+                                else:
+                                    loop_counts[(node_id, LoopAction.REPAIR)] += 1
                                 repair_feedback_by_node[node_id] = feedback
                                 repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
                                     node, feedback
@@ -3247,6 +3283,7 @@ class TaskOrchestrator:
                 "loop_transition_v2", LoopTransitionRecord, run_id=run_id
             )
             if item.action is LoopAction.REPAIR and item.node_id == node.id
+            and item.reason_code != _PROTOCOL_PREFLIGHT_CORRECTION_REASON
         )
         replay = self.replay(run_id)
         prior = next((item for item in replay.nodes if item.node_id == node.id), None)
@@ -4414,7 +4451,10 @@ class TaskOrchestrator:
                 and evaluation.accepted_graph_revision_digest
                 == repair.accepted_graph_revision_digest
             )
-        if len(feedback) < 2 or repair.reason_code != "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+        if len(feedback) < 2 or repair.reason_code not in {
+            "ACCEPTED_NODE_EVALUATION_FEEDBACK",
+            _PROTOCOL_PREFLIGHT_CORRECTION_REASON,
+        }:
             return False
         history = self.store.list_records(
             "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id
