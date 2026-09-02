@@ -140,10 +140,22 @@ class _ExecutionSession:
         finally:
             coordinator.store.close()
         if result.node_patch is not None:
+            patch = result.node_patch
             with self._lock:
-                if node.id in self.node_patches:
+                if patch.node_id != node.id:
+                    raise ValueError("node patch identity does not match executed node")
+                previous = self.node_patches.get(node.id)
+                if previous is not None and (
+                    patch.node_id != previous.node_id
+                    or (
+                        patch.accepted_graph_revision_digest
+                        != previous.accepted_graph_revision_digest
+                    )
+                    or patch.generation != previous.generation
+                    or patch.attempt <= previous.attempt
+                ):
                     raise ValueError("node patch was produced more than once")
-                self.node_patches[node.id] = result.node_patch
+                self.node_patches[node.id] = patch
         return result
 
 
