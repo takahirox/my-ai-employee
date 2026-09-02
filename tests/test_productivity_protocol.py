@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,11 @@ from ai_employee.serialization import canonical_digest, canonical_json
 
 MANIFEST = Path("examples/productivity/protocols.json")
 PRODUCER = Path("tests/fixtures/productivity_protocol_producer.py").resolve()
+
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="secure protocol collection requires Linux containment primitives",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -235,6 +242,44 @@ def test_collect_protocol_rejects_untrusted_producer_outputs(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _collect(tmp_path, mode)
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+@pytest.mark.parametrize("mode", ("replace-stage", "symlink-output"))
+def test_collect_protocol_rejects_replaced_or_linked_stage(tmp_path: Path, mode: str) -> None:
+    with pytest.raises(ValueError, match=r"replaced|unsafe|identity"):
+        _collect(tmp_path, mode)
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+def test_collect_protocol_kills_detached_late_mutator(tmp_path: Path) -> None:
+    command_path = _collect(tmp_path, "lingering-child")
+    before = (command_path.parent / "result-bundle.json").read_bytes()
+    time.sleep(0.7)
+    assert (command_path.parent / "result-bundle.json").read_bytes() == before
+    load_result_bundle(before)
+
+
+def test_collect_protocol_rechecks_after_atomic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = productivity_protocol._rename_noreplace
+
+    def mutate(parent: int, source: str, destination: str) -> None:
+        original(parent, source, destination)
+        if destination == "codex-direct":
+            directory = productivity_protocol._open_directory(destination, parent)
+            try:
+                os.chmod("result-bundle.json", 0o600, dir_fd=directory)
+                descriptor = os.open("result-bundle.json", os.O_WRONLY, dir_fd=directory)
+                os.write(descriptor, b"x")
+                os.close(descriptor)
+            finally:
+                os.close(directory)
+
+    monkeypatch.setattr(productivity_protocol, "_rename_noreplace", mutate)
+    with pytest.raises(ValueError, match="published artifact changed"):
+        _collect(tmp_path)
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
 
 

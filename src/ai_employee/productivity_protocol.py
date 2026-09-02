@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -10,9 +13,11 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -346,6 +351,88 @@ def _resolve_isolation_backend() -> _IsolationBackend:
     raise ValueError(f"network isolation is unsupported on platform: {sys.platform}")
 
 
+def _require_secure_runtime() -> None:
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/proc/self/stat").is_file()
+        or any(not hasattr(os, name) for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"))
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        raise ValueError(
+            "secure protocol collection requires Linux procfs and no-follow dir-fd primitives"
+        )
+    library = ctypes.CDLL(None)
+    if getattr(library, "prctl", None) is None or getattr(library, "renameat2", None) is None:
+        raise ValueError("secure protocol collection requires prctl and renameat2")
+
+
+def _process_snapshot() -> dict[int, tuple[int, str]]:
+    result: dict[int, tuple[int, str]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdecimal():
+            continue
+        try:
+            raw = Path("/proc", entry, "stat").read_text(encoding="utf-8")
+            fields = raw[raw.rindex(")") + 2 :].split()
+            result[int(entry)] = (int(fields[1]), fields[19])
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return result
+
+
+def _set_subreaper(enabled: bool) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    if library.prctl(36, int(enabled), 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise ValueError(f"cannot configure child-subreaper containment: {os.strerror(error)}")
+
+
+def _descendants(
+    leader: int,
+    baseline: Mapping[int, tuple[int, str]],
+    observed: dict[int, tuple[int, str]],
+) -> tuple[int, ...]:
+    current = _process_snapshot()
+    if leader in current:
+        observed.setdefault(leader, current[leader])
+    changed = True
+    while changed:
+        changed = False
+        parents = {leader, *observed}
+        for pid, identity in current.items():
+            if identity[0] in parents and observed.get(pid) != identity:
+                observed[pid] = identity
+                changed = True
+    for pid, identity in current.items():
+        if identity[0] == os.getpid() and baseline.get(pid) != identity:
+            observed[pid] = identity
+    return tuple(pid for pid, identity in observed.items() if current.get(pid) == identity)
+
+
+def _terminate_tree(
+    process: subprocess.Popen[bytes],
+    baseline: Mapping[int, tuple[int, str]],
+    observed: dict[int, tuple[int, str]],
+) -> None:
+    for sig, grace in ((signal.SIGTERM, 0.25), (signal.SIGKILL, 2.0)):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, sig)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            alive = _descendants(process.pid, baseline, observed)
+            for pid in alive:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, sig)
+                if pid != process.pid:
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(pid, os.WNOHANG)
+            if process.poll() is not None and not alive:
+                return
+            time.sleep(0.01)
+    raise ValueError("protocol process-tree cleanup could not be confirmed")
+
+
 def _run(
     argv: tuple[str, ...],
     repository: Path,
@@ -357,31 +444,56 @@ def _run(
 ) -> tuple[bytes, bytes, str, str, int]:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number")
+    _require_secure_runtime()
     environment = os.environ.copy()
     environment["FLEET_PRODUCTIVITY_NETWORK"] = network
     started_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    process = subprocess.Popen(
-        _wrapped_argv(isolation, argv),
-        cwd=repository,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    baseline = _process_snapshot()
+    _set_subreaper(True)
+    process: subprocess.Popen[bytes] | None = None
+    observed: dict[int, tuple[int, str]] = {}
+    cleaned = False
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
-        raise ValueError(f"arm command timed out after {timeout} seconds") from exc
+        process = subprocess.Popen(
+            _wrapped_argv(isolation, argv),
+            cwd=repository,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout
+        captured: tuple[bytes, bytes] | None = None
+        expired = False
+        while captured is None:
+            _descendants(process.pid, baseline, observed)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                expired = True
+                break
+            try:
+                captured = process.communicate(timeout=min(0.02, remaining))
+            except subprocess.TimeoutExpired:
+                if process.poll() is not None:
+                    break
+        exit_code = process.poll()
+        _terminate_tree(process, baseline, observed)
+        cleaned = True
+        if captured is None:
+            captured = process.communicate(timeout=2)
+        if expired:
+            raise ValueError(f"arm command timed out after {timeout} seconds")
+        if exit_code is None:
+            raise ValueError("protocol process exited without a stable status")
+        stdout, stderr = captured
+    finally:
+        if process is not None and not cleaned:
+            _terminate_tree(process, baseline, observed)
+        _set_subreaper(False)
     if observation_limit is not None and len(stdout) + len(stderr) > observation_limit:
         raise ValueError("evaluator observation exceeds size limit")
     ended_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    return stdout, stderr, started_at, ended_at, process.returncode
+    return stdout, stderr, started_at, ended_at, exit_code
 
 
 def _probe_network_isolation(backend: _IsolationBackend, repository: Path) -> Mapping[str, object]:
@@ -445,16 +557,101 @@ def _establish_network_isolation(repository: Path) -> _NetworkIsolation:
     )
 
 
-def _read_draft(stage: Path) -> bytes:
-    actual = {item.name for item in stage.iterdir()}
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_directory(path: Path | str, parent: int | None = None) -> int:
+    try:
+        descriptor = os.open(path, _directory_flags(), dir_fd=parent)
+    except OSError as exc:
+        raise ValueError("protocol directory was replaced or is unsafe") from exc
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError("protocol directory is not a directory")
+    return descriptor
+
+
+def _identity(descriptor: int) -> tuple[int, int]:
+    status = os.fstat(descriptor)
+    return status.st_dev, status.st_ino
+
+
+def _read_regular(directory: int, name: str) -> bytes:
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    except OSError as exc:
+        raise ValueError(f"artifact is missing, replaced, or unsafe: {name}") from exc
+    try:
+        before = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"artifact must be a single regular file: {name}")
+        data = bytearray()
+        while len(data) <= _MAX_ARTIFACT_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, _MAX_ARTIFACT_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        if len(data) > _MAX_ARTIFACT_BYTES:
+            raise ValueError(f"artifact exceeds size limit: {name}")
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ValueError(f"artifact changed while being read: {name}")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _write_regular(directory: int, name: str, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(name, flags, 0o400, dir_fd=directory)
+    try:
+        remaining = memoryview(data)
+        while remaining:
+            remaining = remaining[os.write(descriptor, remaining) :]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+    finally:
+        os.close(descriptor)
+
+
+def _read_draft(stage: int) -> bytes:
+    actual = set(os.listdir(stage))
     if actual != {"result-bundle.json"}:
         raise ValueError("producer must create exactly one canonical draft result-bundle.json")
-    path = stage / "result-bundle.json"
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("producer draft result bundle must be a regular file")
-    if path.stat().st_size > _MAX_ARTIFACT_BYTES:
-        raise ValueError("producer draft result bundle exceeds size limit")
-    return path.read_bytes()
+    return _read_regular(stage, "result-bundle.json")
+
+
+def _rename_noreplace(parent: int, source: str, destination: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    function = library.renameat2
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    if function(parent, os.fsencode(source), parent, os.fsencode(destination), 1) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(f"refusing to overwrite protocol artifacts: {destination}")
+    raise OSError(error, os.strerror(error))
 
 
 def _validate_evaluator_templates(task: TaskIdentity) -> None:
@@ -618,6 +815,7 @@ def collect_protocol(
 ) -> Path:
     """Execute and atomically retain one exact, validated protocol result."""
 
+    _require_secure_runtime()
     manifest_path = manifest_path.resolve(strict=True)
     manifest, manifest_bytes = load_protocol_manifest(manifest_path)
     selected = tuple(item for item in manifest.protocols if item.id == protocol_id)
@@ -643,6 +841,10 @@ def collect_protocol(
     isolation = _establish_network_isolation(repository)
     final_directory.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{protocol.id}-", dir=final_directory.parent))
+    parent_descriptor = _open_directory(final_directory.parent)
+    stage_descriptor = _open_directory(stage)
+    stage_identity = _identity(stage_descriptor)
+    published = False
     try:
         original_argv, argv = _resolve_argv(
             arm_command,
@@ -666,7 +868,7 @@ def collect_protocol(
         )
         if exit_code != 0:
             raise ValueError(f"arm command exited with {exit_code}")
-        draft_bytes = _read_draft(stage)
+        draft_bytes = _read_draft(stage_descriptor)
         draft = load_result_bundle(draft_bytes)
         _validate_draft_bundle(protocol, task, draft)
         bundle, outputs = _evaluate_checks(
@@ -679,8 +881,11 @@ def collect_protocol(
             network=network,
             isolation=isolation.backend,
         )
-        for name, data in outputs.items():
-            (stage / name).write_bytes(data)
+        if set(os.listdir(stage_descriptor)) != {"result-bundle.json"}:
+            raise ValueError("staging artifacts changed after validation")
+        os.unlink("result-bundle.json", dir_fd=stage_descriptor)
+        for name, data in sorted(outputs.items()):
+            _write_regular(stage_descriptor, name, data)
         content_digests = {name: _digest(value) for name, value in sorted(outputs.items())}
         command_record = {
             "argv": argv,
@@ -711,16 +916,59 @@ def collect_protocol(
             "task_path": str(task_path),
             "timeout_seconds": timeout,
         }
-        (stage / command_relative.name).write_bytes(
-            (canonical_json(command_record) + "\n").encode("utf-8")
-        )
-        if final_directory.exists():
-            raise FileExistsError(f"refusing to overwrite protocol artifacts: {final_directory}")
-        os.rename(stage, final_directory)
+        command_bytes = (canonical_json(command_record) + "\n").encode("utf-8")
+        _write_regular(stage_descriptor, command_relative.name, command_bytes)
+        expected = {**outputs, command_relative.name: command_bytes}
+        if set(os.listdir(stage_descriptor)) != set(expected):
+            raise ValueError("staging artifact set changed before publication")
+        for name, data in sorted(expected.items()):
+            if _read_regular(stage_descriptor, name) != data:
+                raise ValueError(f"artifact changed before publication: {name}")
+        os.fchmod(stage_descriptor, 0o500)
+        os.fsync(stage_descriptor)
+        named_stage = _open_directory(stage.name, parent_descriptor)
+        try:
+            if _identity(named_stage) != stage_identity:
+                raise ValueError("protocol staging directory identity changed")
+        finally:
+            os.close(named_stage)
+        _rename_noreplace(parent_descriptor, stage.name, final_directory.name)
+        published = True
+        final_descriptor = _open_directory(final_directory.name, parent_descriptor)
+        try:
+            if _identity(final_descriptor) != stage_identity:
+                raise ValueError("published protocol directory identity changed")
+            if set(os.listdir(final_descriptor)) != set(expected):
+                raise ValueError("published artifact set changed")
+            for name, data in sorted(expected.items()):
+                if _read_regular(final_descriptor, name) != data:
+                    raise ValueError(f"published artifact changed: {name}")
+            os.fsync(final_descriptor)
+        except BaseException:
+            _rename_noreplace(parent_descriptor, final_directory.name, stage.name)
+            published = False
+            raise
+        finally:
+            os.close(final_descriptor)
+        os.fsync(parent_descriptor)
         return final_command
     finally:
-        if stage.exists():
-            shutil.rmtree(stage)
+        if not published:
+            os.fchmod(stage_descriptor, 0o700)
+            for name in os.listdir(stage_descriptor):
+                os.unlink(name, dir_fd=stage_descriptor)
+            try:
+                named_stage = _open_directory(stage.name, parent_descriptor)
+            except ValueError:
+                pass
+            else:
+                try:
+                    if _identity(named_stage) == stage_identity:
+                        os.rmdir(stage.name, dir_fd=parent_descriptor)
+                finally:
+                    os.close(named_stage)
+        os.close(stage_descriptor)
+        os.close(parent_descriptor)
 
 
 def build_parser() -> argparse.ArgumentParser:

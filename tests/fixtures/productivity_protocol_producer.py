@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -142,6 +144,9 @@ def main() -> int:
             "stopping",
             "pricing",
             "randomized-order",
+            "replace-stage",
+            "symlink-output",
+            "lingering-child",
         ),
     )
     args = parser.parse_args()
@@ -221,8 +226,34 @@ def main() -> int:
     if args.mode == "noncanonical-bundle":
         bundle_bytes = bundle_bytes.replace(b":", b": ", 1)
     output = Path(args.output)
+    if args.mode == "replace-stage":
+        moved = output.with_name(output.name + "-moved")
+        output.rename(moved)
+        output.symlink_to(moved, target_is_directory=True)
+        output = moved
+    if args.mode == "symlink-output":
+        external = output.with_name(output.name + "-draft.json")
+        external.write_bytes(bundle_bytes)
+        (output / "result-bundle.json").symlink_to(external)
+        return 0
     if args.mode != "missing":
         (output / "result-bundle.json").write_bytes(bundle_bytes)
+    if args.mode == "lingering-child":
+        directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+        child = os.fork()
+        if child == 0:
+            os.setsid()
+            with open(os.devnull, "rb") as source, open(os.devnull, "ab") as sink:
+                os.dup2(source.fileno(), 0)
+                os.dup2(sink.fileno(), 1)
+                os.dup2(sink.fileno(), 2)
+            time.sleep(0.5)
+            os.chmod("result-bundle.json", 0o600, dir_fd=directory)
+            descriptor = os.open("result-bundle.json", os.O_WRONLY | os.O_TRUNC, dir_fd=directory)
+            os.write(descriptor, b"late mutation\n")
+            os._exit(0)
+        os.close(directory)
+        time.sleep(0.1)
     if args.mode == "claim-artifact":
         (output / "acceptance.json").write_bytes(b"{}\n")
     if args.mode == "extra":

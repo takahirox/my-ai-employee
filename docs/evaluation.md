@@ -261,6 +261,14 @@ bundle.
 
 Only after every command and binding validates does the runner add canonical
 `command.json` metadata and atomically rename the staging directory to the declared destination.
+Collection is supported only where Linux procfs, child-subreaper containment, `renameat2` with
+`RENAME_NOREPLACE`, and no-follow directory descriptors are available. The collector pins the
+original staging and publication-parent inode identities, reads and writes bounded regular files
+relative to those descriptors, rejects symlink or hard-linked artifacts, and terminates and reaps
+the launched process group plus observed and reparented descendants before validation. Every file
+and staging directory is fsynced before publication; the parent directory is fsynced afterward.
+The published directory identity and exact bytes are checked again after the atomic rename, with a
+no-replace rollback if concurrent mutation is detected. Missing primitives fail closed.
 It records original and resolved payload argv separately from the fully wrapped execution argv,
 plus the isolation backend, exact wrapper argv, Darwin profile digest (or null for the Linux
 namespace backend), and the successful probe's payload/execution argv, socket-denial result,
