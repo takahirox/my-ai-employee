@@ -124,6 +124,23 @@ def test_post_uses_exact_endpoint_request_and_headers() -> None:
     assert connection.closed
 
 
+def test_patch_uses_exact_endpoint_request_and_headers() -> None:
+    response = FakeResponse(b'{"number":7}')
+    client, connection, factory = make_client(response)
+
+    assert client.request("PATCH", "/repos/o/r/issues/7", {"title": "fixed"}) == {"number": 7}
+    assert factory.calls == [("api.github.com", 10)]
+    method, path, body, headers = connection.requests[0]
+    assert (method, path, body) == (
+        "PATCH",
+        "/repos/o/r/issues/7",
+        b'{"title":"fixed"}',
+    )
+    assert headers["Authorization"] == "Bearer safe-token"
+    assert headers["Content-Type"] == "application/json"
+    assert connection.closed
+
+
 def test_get_sends_no_body_or_content_type() -> None:
     client, connection, _ = make_client()
 

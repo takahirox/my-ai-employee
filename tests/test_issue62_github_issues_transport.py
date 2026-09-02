@@ -99,13 +99,14 @@ def test_search_rejects_a_malformed_matching_receipt() -> None:
     assert CANARY not in str(caught.value)
 
 
-def test_create_and_occurrence_comment_have_exact_paths_and_payloads() -> None:
+def test_create_and_idempotent_update_have_exact_paths_and_payloads() -> None:
     url = f"https://github.com/{REPOSITORY}/issues/7"
-    requester = FakeRequester({"number": 7, "html_url": url}, {"id": 11})
+    receipt = {"number": 7, "html_url": url}
+    requester = FakeRequester(receipt, receipt)
     transport = GitHubIssuesTransport(requester)
 
     assert transport.create_issue(REPOSITORY, *ISSUE[:3]) == (7, url)
-    transport.update_occurrence_summary(REPOSITORY, 7, SUMMARY)
+    assert transport.update_issue(REPOSITORY, 7, *ISSUE[:3]) == (7, url)
 
     assert requester.calls == [
         (
@@ -114,9 +115,9 @@ def test_create_and_occurrence_comment_have_exact_paths_and_payloads() -> None:
             {"title": ISSUE.title, "body": ISSUE.body, "labels": list(ISSUE.labels)},
         ),
         (
-            "POST",
-            f"/repos/{REPOSITORY}/issues/7/comments",
-            {"body": SUMMARY},
+            "PATCH",
+            f"/repos/{REPOSITORY}/issues/7",
+            {"title": ISSUE.title, "body": ISSUE.body, "labels": list(ISSUE.labels)},
         ),
     ]
 
@@ -133,7 +134,7 @@ def test_invalid_repository_never_reaches_requester(repository: str) -> None:
     with pytest.raises(IncidentError, match="INVALID_REPOSITORY"):
         transport.create_issue(repository, *ISSUE[:3])
     with pytest.raises(IncidentError, match="INVALID_REPOSITORY"):
-        transport.update_occurrence_summary(repository, 1, SUMMARY)
+        transport.update_issue(repository, 1, *ISSUE[:3])
     assert requester.calls == []
 
 
@@ -148,6 +149,7 @@ def test_invalid_marker_never_searches(marker: str) -> None:
     assert requester.calls == []
 
 
+@pytest.mark.parametrize("operation", ("create", "update"))
 @pytest.mark.parametrize(
     ("title", "body", "labels", "code"),
     (
@@ -164,28 +166,19 @@ def test_invalid_marker_never_searches(marker: str) -> None:
     ),
 )
 def test_invalid_rendered_issue_never_posts(
-    title: str, body: str, labels: tuple[str, ...], code: str
+    operation: str,
+    title: str,
+    body: str,
+    labels: tuple[str, ...],
+    code: str,
 ) -> None:
     requester = FakeRequester()
     with pytest.raises(IncidentError, match=code) as caught:
-        GitHubIssuesTransport(requester).create_issue(REPOSITORY, title, body, labels)
-    assert CANARY not in str(caught.value)
-    assert requester.calls == []
-
-
-@pytest.mark.parametrize(
-    "summary",
-    (
-        CANARY,
-        SUMMARY.replace("Occurrences: 1", "Occurrences: 0"),
-        SUMMARY.replace("runtime_error", "future_failure"),
-        SUMMARY + "\nextra",
-    ),
-)
-def test_invalid_summary_never_posts(summary: str) -> None:
-    requester = FakeRequester()
-    with pytest.raises(IncidentError, match="INVALID_SUMMARY") as caught:
-        GitHubIssuesTransport(requester).update_occurrence_summary(REPOSITORY, 1, summary)
+        transport = GitHubIssuesTransport(requester)
+        if operation == "create":
+            transport.create_issue(REPOSITORY, title, body, labels)
+        else:
+            transport.update_issue(REPOSITORY, 1, title, body, labels)
     assert CANARY not in str(caught.value)
     assert requester.calls == []
 
@@ -194,10 +187,10 @@ def test_invalid_summary_never_posts(summary: str) -> None:
 def test_invalid_issue_number_never_posts(number: object) -> None:
     requester = FakeRequester()
     with pytest.raises(IncidentError, match="INVALID_ISSUE_NUMBER"):
-        GitHubIssuesTransport(requester).update_occurrence_summary(
+        GitHubIssuesTransport(requester).update_issue(
             REPOSITORY,
             number,
-            SUMMARY,  # type: ignore[arg-type]
+            *ISSUE[:3],  # type: ignore[arg-type]
         )
     assert requester.calls == []
 
@@ -217,10 +210,24 @@ def test_invalid_create_receipt_fails_closed(response: dict[str, object]) -> Non
     assert CANARY not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "response",
+    (
+        {"number": 8, "html_url": f"https://github.com/{REPOSITORY}/issues/8"},
+        {"number": 7, "html_url": CANARY},
+    ),
+)
+def test_invalid_update_receipt_fails_closed(response: dict[str, object]) -> None:
+    requester = FakeRequester(response)
+    with pytest.raises(IncidentError) as caught:
+        GitHubIssuesTransport(requester).update_issue(REPOSITORY, 7, *ISSUE[:3])
+    assert CANARY not in str(caught.value)
+
+
 def test_transport_exposes_only_the_protocol_operations() -> None:
     transport = GitHubIssuesTransport(FakeRequester())
     assert callable(transport.find_issue_by_marker)
     assert callable(transport.create_issue)
-    assert callable(transport.update_occurrence_summary)
+    assert callable(transport.update_issue)
     assert not hasattr(transport, "token")
     assert not hasattr(transport, "publish")

@@ -440,9 +440,14 @@ class Transport(Protocol):
         self, repository: str, title: str, body: str, labels: tuple[str, ...]
     ) -> tuple[int, str]: ...
 
-    def update_occurrence_summary(
-        self, repository: str, issue_number: int, summary: str
-    ) -> None: ...
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> tuple[int, str]: ...
 
 
 class FakeTransport:
@@ -481,8 +486,16 @@ class FakeTransport:
             self.issues[(repository, match.group())] = (number, url)
         return number, url
 
-    def update_occurrence_summary(self, repository: str, issue_number: int, summary: str) -> None:
-        self._call("update_occurrence_summary", repository, issue_number, summary)
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> tuple[int, str]:
+        self._call("update_issue", repository, issue_number, title, body, labels)
+        return issue_number, f"https://github.com/{repository}/issues/{issue_number}"
 
 
 _SCHEMA = (
@@ -993,9 +1006,20 @@ class Outbox:
                 )
             else:
                 number, url = existing
-                summary = _summary(report)
-                _scan_sink(summary, 256)
-                transport.update_occurrence_summary(repository, number, summary)
+                if (
+                    not isinstance(number, int)
+                    or isinstance(number, bool)
+                    or number < 1
+                    or url != f"https://github.com/{repository}/issues/{number}"
+                ):
+                    raise IncidentError("INVALID_TRANSPORT_RECEIPT")
+                number, url = transport.update_issue(
+                    repository,
+                    number,
+                    issue.title,
+                    issue.body,
+                    issue.labels,
+                )
             if not isinstance(number, int) or isinstance(number, bool) or number < 1:
                 raise IncidentError("INVALID_TRANSPORT_RECEIPT")
             if url != f"https://github.com/{repository}/issues/{number}":

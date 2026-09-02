@@ -623,9 +623,9 @@ def test_existing_marker_updates_occurrences_instead_of_creating(tmp_path: Path)
 
     assert [call[0] for call in transport.calls] == [
         "find_issue_by_marker",
-        "update_occurrence_summary",
+        "update_issue",
     ]
-    assert transport.calls[-1][-1].startswith("Occurrences: 2 of 999;")
+    assert "Occurrences: 2 of 999;" in transport.calls[-1][4]
 
 
 def test_published_recurrence_returns_to_valid_pending_and_republishes(
@@ -678,7 +678,7 @@ def test_published_recurrence_returns_to_valid_pending_and_republishes(
         "find_issue_by_marker",
         "create_issue",
         "find_issue_by_marker",
-        "update_occurrence_summary",
+        "update_issue",
     ]
 
 
@@ -687,7 +687,7 @@ def test_published_recurrence_returns_to_valid_pending_and_republishes(
     (
         ("find_issue_by_marker", False),
         ("create_issue", False),
-        ("update_occurrence_summary", True),
+        ("update_issue", True),
     ),
 )
 def test_transport_failure_rolls_back_and_retry_records_one_receipt(
@@ -723,6 +723,61 @@ def test_transport_failure_rolls_back_and_retry_records_one_receipt(
     assert sum(call[0] == operation for call in transport.calls) == 2
     if operation == "create_issue":
         assert transport.next_issue == 2
+
+
+def test_unknown_update_response_retries_the_same_idempotent_issue_state(
+    tmp_path: Path,
+) -> None:
+    clean = report()
+    policy = auto_policy()
+
+    class AcceptedUnknownTransport(FakeTransport):
+        def __init__(self, marker: str) -> None:
+            super().__init__(
+                existing={
+                    (REPOSITORY, marker): (
+                        8,
+                        f"https://github.com/{REPOSITORY}/issues/8",
+                    )
+                }
+            )
+            self.updates: list[tuple[object, ...]] = []
+
+        def update_issue(
+            self,
+            repository: str,
+            issue_number: int,
+            title: str,
+            body: str,
+            labels: tuple[str, ...],
+        ) -> tuple[int, str]:
+            desired_state = (repository, issue_number, title, body, labels)
+            self.updates.append(desired_state)
+            if len(self.updates) == 1:
+                raise IncidentError("REQUEST_FAILED")
+            return issue_number, f"https://github.com/{repository}/issues/{issue_number}"
+
+    with Outbox(outbox_path(tmp_path)) as box:
+        box.enqueue(clean, policy, NOW)
+        preview = box.preview(clean.fingerprint, policy, KEY, NOW)
+        transport = AcceptedUnknownTransport(preview.issue.marker)
+        with pytest.raises(IncidentError, match=r"^REQUEST_FAILED$"):
+            box.publish(clean.fingerprint, preview.digest, policy, KEY, transport, NOW)
+        assert box.db.execute("SELECT count(*) FROM publication_log").fetchone()[0] == 0
+
+        assert box.publish(
+            clean.fingerprint,
+            preview.digest,
+            policy,
+            KEY,
+            transport,
+            NOW,
+        ) == (8, f"https://github.com/{REPOSITORY}/issues/8")
+        assert box.db.execute("SELECT count(*) FROM publication_log").fetchone()[0] == 1
+
+    assert len(transport.updates) == 2
+    assert transport.updates[0] == transport.updates[1]
+    assert "/comments" not in repr(transport.updates)
 
 
 def test_private_transport_receipt_is_rejected_and_rolled_back(tmp_path: Path) -> None:

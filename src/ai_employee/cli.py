@@ -506,8 +506,15 @@ class _LazyGitHubIssuesTransport:
     ) -> tuple[int, str]:
         return self._get_transport().create_issue(repository, title, body, labels)
 
-    def update_occurrence_summary(self, repository: str, issue_number: int, summary: str) -> None:
-        self._get_transport().update_occurrence_summary(repository, issue_number, summary)
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> tuple[int, str]:
+        return self._get_transport().update_issue(repository, issue_number, title, body, labels)
 
 
 def _incident_repository_key(harness: ProjectHarnessV2) -> bytes:

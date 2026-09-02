@@ -100,10 +100,10 @@ Only validated public report JSON and bounded metadata are stored in this outbox
 | publications per target repository per UTC day | 3 | 1-20 |
 | pending entries per target repository | 20 | 1-100 |
 
-Occurrence counts saturate at 999. Listing is repository-scoped and bounded to at most 100 rows. Approval is bound to the current report and preview digests and expires at the earlier of its approval window or the outbox row's retention expiry. A changed report, occurrence count, or preview makes an old digest stale.
+Occurrence counts saturate at 999. Listing is repository-scoped and bounded to at most 100 rows. Approval is bound to the complete current policy plus the report and preview digests, and expires at the earlier of its approval window or the outbox row's retention expiry. A changed policy, report, occurrence count, or preview makes an old digest stale.
 
 The 64-character fingerprint is an HMAC under the repository-specific key over the closed incident classification plus version and commit.
-The outbox deduplicates by target repository and fingerprint. The public issue contains a separate keyed marker; publishing searches that repository for the marker. If a matching issue exists, Fleet posts a bounded occurrence-summary comment instead of creating another issue. New occurrences update the count and require a new preview and, in `approval_required` mode, a new approval.
+The outbox deduplicates by target repository and fingerprint. The public issue contains a separate keyed marker; publishing searches that repository for the marker. If a matching issue exists, Fleet applies the same validated title, labels, marker, report, and bounded occurrence summary as an idempotent desired-state Issue update instead of creating another Issue or comment. An accepted update with an unknown response can therefore be retried without duplicating comments. New occurrences update the count and require a new preview and, in `approval_required` mode, a new approval.
 
 ## Operator procedure
 

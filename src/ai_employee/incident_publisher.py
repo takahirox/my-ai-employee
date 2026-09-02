@@ -124,7 +124,7 @@ class GitHubApiClient:
         path: str,
         payload: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        if method not in {"GET", "POST"}:
+        if method not in {"GET", "POST", "PATCH"}:
             raise IncidentError("INVALID_METHOD")
         _validate_path(path)
         body = _encode_payload(payload)
@@ -309,17 +309,62 @@ class GitHubIssuesTransport(Transport):
         )
         return self._receipt(response, repository)
 
-    def update_occurrence_summary(self, repository: str, issue_number: int, summary: str) -> None:
+    def update_issue(
+        self,
+        repository: str,
+        issue_number: int,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> tuple[int, str]:
         repository = _require_repository(repository)
         issue_number = _require_issue_number(issue_number, "INVALID_ISSUE_NUMBER")
-        summary = _public_text(summary, 256, "INVALID_SUMMARY")
-        if _SUMMARY_PATTERN.fullmatch(summary) is None:
-            raise IncidentError("INVALID_SUMMARY")
-        self._requester.request(
-            "POST",
-            f"/repos/{repository}/issues/{issue_number}/comments",
-            {"body": summary},
+        title = _public_text(title, 256, "INVALID_TITLE")
+        title_match = _TITLE_PATTERN.fullmatch(title)
+        if title_match is None:
+            raise IncidentError("INVALID_TITLE")
+        body = _public_text(body, 4_096, "INVALID_BODY", allow_line_feed=True)
+        markers = re.findall(_MARKER_TEXT, body)
+        sections = body.split("\n\n")
+        if (
+            len(sections) != 4
+            or sections[0] != _BODY_PREFIX.rstrip("\n")
+            or len(markers) != 1
+            or sections[3] != markers[0]
+        ):
+            raise IncidentError("INVALID_BODY")
+        try:
+            report = Report.model_validate_json(sections[2], strict=True)
+            if public_json(report) != sections[2] or _summary(report) != sections[1]:
+                raise ValueError
+        except Exception:
+            raise IncidentError("INVALID_BODY") from None
+        expected_title = (
+            f"[incident] {report.category.value}: {report.failure.value} "
+            f"({report.exception_class.value}) at {report.stage.value}"
         )
+        if title != expected_title:
+            raise IncidentError("INVALID_TITLE")
+        category = report.category.value
+        expected_labels = (
+            "ai-employee-incident",
+            f"incident:{category}",
+        )
+        if labels != expected_labels:
+            raise IncidentError("INVALID_LABELS")
+        for label in labels:
+            _public_text(label, 64, "INVALID_LABELS")
+
+        response = self._requester.request(
+            "PATCH",
+            f"/repos/{repository}/issues/{issue_number}",
+            {"title": title, "body": body, "labels": list(labels)},
+        )
+        number, url = self._receipt(response, repository)
+        expected_url = f"https://github.com/{repository}/issues/{issue_number}"
+        if number != issue_number or url != expected_url:
+            raise IncidentError("INVALID_ISSUE_RESPONSE")
+        return number, url
 
     @staticmethod
     def _receipt(response: object, repository: str) -> tuple[int, str]:
