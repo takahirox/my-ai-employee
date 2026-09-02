@@ -74,6 +74,7 @@ class StableFailureCode(StableStrEnum):
     EVALUATOR_EXECUTION_UNAVAILABLE = "EVALUATOR_EXECUTION_UNAVAILABLE"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     VERIFICATION_BINDING_INVALID = "VERIFICATION_BINDING_INVALID"
+    VERIFICATION_WORKSPACE_MUTATED = "VERIFICATION_WORKSPACE_MUTATED"
     REVIEW_BLOCKED = "REVIEW_BLOCKED"
     WORKSPACE_CONFLICT = "WORKSPACE_CONFLICT"
     PROMOTION_FAILED = "PROMOTION_FAILED"
@@ -175,6 +176,8 @@ class ProcessRequest(DigestedRecordV2):
     stderr_bytes: int = Field(default=1_000_000, ge=1)
     budget_class: Identifier = "default"
     purpose: str = Field(min_length=1, max_length=1_000)
+    candidate_patch_digest: Digest | None = None
+    verification_workspace_digest: Digest | None = None
 
     _contained_cwd = field_validator("cwd")(_relative_path)
 
@@ -213,7 +216,14 @@ class ProcessRequest(DigestedRecordV2):
         binding_names = [binding.name for binding in self.secret_bindings]
         if len(binding_names) != len(set(binding_names)):
             raise ValueError("secret binding names must be unique")
+        if (self.candidate_patch_digest is None) != (self.verification_workspace_digest is None):
+            raise ValueError("candidate patch and verification workspace must be bound together")
         return self
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        if self.candidate_patch_digest is not None:
+            return frozenset()
+        return frozenset({"candidate_patch_digest", "verification_workspace_digest"})
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -783,6 +793,8 @@ class ExecutionResult(DigestedRecordV2):
     resource_usage: CanonicalData = None
     stdout_artifact_digest: Digest | None = None
     stderr_artifact_digest: Digest | None = None
+    candidate_patch_digest: Digest | None = None
+    verification_workspace_digest: Digest | None = None
 
     @model_validator(mode="after")
     def _status_and_failure_are_consistent(self) -> Self:
@@ -792,7 +804,14 @@ class ExecutionResult(DigestedRecordV2):
             raise ValueError("non-successful execution requires a stable failure")
         if not math.isfinite(self.duration_seconds):
             raise ValueError("execution duration must be finite")
+        if (self.candidate_patch_digest is None) != (self.verification_workspace_digest is None):
+            raise ValueError("candidate patch and verification workspace must be bound together")
         return self
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        if self.candidate_patch_digest is not None:
+            return frozenset()
+        return frozenset({"candidate_patch_digest", "verification_workspace_digest"})
 
 
 class DownloadResult(ExecutionResult):
@@ -861,8 +880,9 @@ class WorkerResult(ExecutionResult):
     boundary_diagnostic: WorkerBoundaryDiagnostic | None = None
 
     def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        inherited = super()._digest_compatibility_exclusions()
         # The nested diagnostic binds the already-computed historical result digest.
-        return frozenset({"boundary_diagnostic"})
+        return frozenset({*inherited, "boundary_diagnostic"})
 
 
 class WorkspaceSnapshot(DigestedRecordV2):

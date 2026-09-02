@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from hashlib import sha256
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
@@ -197,7 +197,12 @@ def _node_verification_diagnostic(
             for criterion in run.completion_criteria
         ),
         "requests": tuple(
-            {"request_id": request.id, "request_digest": request.content_digest}
+            {
+                "request_id": request.id,
+                "request_digest": request.content_digest,
+                "candidate_patch_digest": request.candidate_patch_digest,
+                "verification_workspace_digest": request.verification_workspace_digest,
+            }
             for request in requests
         ),
         "bindings": tuple(
@@ -211,6 +216,71 @@ def _node_verification_diagnostic(
             for binding in bindings
         ),
     }
+
+
+def _bind_node_verification_candidate(
+    requests: tuple[ProcessRequest, ...],
+    bindings: tuple[NodeVerificationBinding, ...],
+    *,
+    candidate_patch_digest: str,
+    verification_workspace_digest: str,
+) -> tuple[tuple[ProcessRequest, ...], tuple[NodeVerificationBinding, ...]]:
+    bound_requests = tuple(
+        ProcessRequest.model_validate(
+            {
+                **request.model_dump(mode="python", exclude={"content_digest"}),
+                "candidate_patch_digest": candidate_patch_digest,
+                "verification_workspace_digest": verification_workspace_digest,
+            },
+            strict=True,
+        )
+        for request in requests
+    )
+    request_by_id = {request.id: request for request in bound_requests}
+    bound_bindings = tuple(
+        binding
+        if binding.process_request_id not in request_by_id
+        else NodeVerificationBinding.model_validate(
+            {
+                **binding.model_dump(mode="python", exclude={"content_digest"}),
+                "process_request_digest": request_by_id[binding.process_request_id].content_digest,
+            },
+            strict=True,
+        )
+        for binding in bindings
+    )
+    return bound_requests, bound_bindings
+
+
+def _changed_diff_paths(before: bytes, after: bytes) -> tuple[int, tuple[str, ...]]:
+    def sections(body: bytes) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for section in body.split(b"diff --git ")[1:]:
+            old_path: bytes | None = None
+            new_path: bytes | None = None
+            for line in section.splitlines():
+                if line.startswith(b"--- a/"):
+                    old_path = line[6:]
+                elif line.startswith(b"+++ b/"):
+                    new_path = line[6:]
+            raw_path = new_path or old_path
+            if raw_path is None:
+                continue
+            decoded = raw_path.decode("utf-8", "replace")
+            path = "".join(character if character.isprintable() else "?" for character in decoded)
+            values[path[:1_000]] = sha256(b"diff --git " + section).hexdigest()
+        return values
+
+    before_sections = sections(before)
+    after_sections = sections(after)
+    changed = tuple(
+        sorted(
+            path
+            for path in set(before_sections) | set(after_sections)
+            if before_sections.get(path) != after_sections.get(path)
+        )
+    )
+    return len(changed), changed[:32]
 
 
 class _Cancellation:
@@ -922,7 +992,8 @@ class WorkCoordinator:
                 harness_digest=run.harness_digest,
             )
             self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
-            retain((patch,))
+            if run.worker_request_digest is None:
+                retain((patch,))
             patch_bytes = self.artifact_reader(patch)
             if not patch_bytes.strip():
                 return self._update(run, status="failed", failure_code="EMPTY_PATCH")
@@ -950,6 +1021,16 @@ class WorkCoordinator:
         binding_failed = False
         node_bound = run.worker_request_digest is not None
         writing_node_bound = node_bound and run.capture_patch
+        if writing_node_bound:
+            assert patch is not None
+            self.verification_requests, self.verification_bindings = (
+                _bind_node_verification_candidate(
+                    self.verification_requests,
+                    self.verification_bindings,
+                    candidate_patch_digest=patch.artifact_digest,
+                    verification_workspace_digest=cast(str, snapshot.content_digest),
+                )
+            )
         if writing_node_bound and not _node_verification_configuration_is_valid(
             run.id,
             run.completion_criteria,
@@ -1023,6 +1104,16 @@ class WorkCoordinator:
                 bind_service_decision(request, proposal_decision),
                 cancellation,
             )
+            if writing_node_bound:
+                assert patch is not None
+                result = type(result).model_validate(
+                    {
+                        **result.model_dump(mode="python", exclude={"content_digest"}),
+                        "candidate_patch_digest": patch.artifact_digest,
+                        "verification_workspace_digest": snapshot.content_digest,
+                    },
+                    strict=True,
+                )
             request_digest = request.content_digest or ""
             if (
                 result.run_id != run.id
@@ -1049,6 +1140,74 @@ class WorkCoordinator:
             for item in persisted_results
         ):
             binding_failed = True
+
+        workspace_mutated = False
+        if writing_node_bound:
+            assert patch is not None
+            try:
+                recaptured_patch = self.workspace.capture_diff(
+                    snapshot,
+                    generated_paths=self.generated_paths,
+                    harness_digest=run.harness_digest,
+                )
+                recaptured_body = self.artifact_reader(recaptured_patch)
+            except (OSError, ValueError) as error:
+                workspace_mutated = True
+                retain((patch,))
+                mutation_facts: dict[str, object] = {
+                    "candidate_patch_digest": patch.artifact_digest,
+                    "verification_workspace_digest": snapshot.content_digest,
+                    "changed_path_count": 0,
+                    "changed_paths": (),
+                    "changed_paths_truncated": False,
+                    "recapture_error_type": type(error).__name__[:200],
+                    "remediation": (
+                        "Run verification in a fresh node workspace; Fleet did not delete or "
+                        "promote verification outputs."
+                    ),
+                }
+            else:
+                if recaptured_patch.artifact_digest != patch.artifact_digest:
+                    workspace_mutated = True
+                    retain((patch,))
+                    changed_path_count, changed_paths = _changed_diff_paths(
+                        patch_bytes, recaptured_body
+                    )
+                    mutation_facts = {
+                        "candidate_patch_digest": patch.artifact_digest,
+                        "recaptured_patch_digest": recaptured_patch.artifact_digest,
+                        "verification_workspace_digest": snapshot.content_digest,
+                        "changed_path_count": changed_path_count,
+                        "changed_paths": changed_paths,
+                        "changed_paths_truncated": changed_path_count > len(changed_paths),
+                        "remediation": (
+                            "Declare generated outputs in the accepted Harness or make "
+                            "verification leave tracked and undeclared untracked files unchanged."
+                        ),
+                    }
+                else:
+                    self.store.put("artifact_descriptor_v2", recaptured_patch, run_id=run.id)
+                    retain((recaptured_patch,))
+                    patch = recaptured_patch
+                    run = self._update(
+                        run,
+                        patch_artifact_id=patch.id,
+                        output_artifact_ids=tuple(output_artifact_ids),
+                    )
+            if workspace_mutated:
+                self._event(
+                    run.id,
+                    "verification_workspace_mutation_failed",
+                    "runtime",
+                    details=freeze_json(
+                        {
+                            "stable_failure_code": (
+                                StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
+                            ),
+                            "facts": mutation_facts,
+                        }
+                    ),
+                )
         successful_result_digest_by_request = {
             item.request_digest: item.content_digest
             for item in persisted_results
@@ -1143,13 +1302,17 @@ class WorkCoordinator:
             {
                 "patch": patch.artifact_digest,
                 "verification_results": tuple(verification_digests),
-                "blocked": verification_failed,
+                "blocked": verification_failed or workspace_mutated,
             }
         )
-        criteria = _declared_criterion_evidence(
-            run.completion_criteria,
-            verification_by_requirement,
-            (patch,),
+        criteria = (
+            _uncovered_criterion_evidence(run.completion_criteria)
+            if workspace_mutated
+            else _declared_criterion_evidence(
+                run.completion_criteria,
+                verification_by_requirement,
+                (patch,),
+            )
         )
         ledger = AcceptanceLedger(
             id=identifier("acceptance-ledger"),
@@ -1170,13 +1333,17 @@ class WorkCoordinator:
         if (
             binding_failed
             or verification_failed
+            or workspace_mutated
             or (writing_node_bound and (not evidence_authoritative or not acceptance_satisfied))
         ):
-            failure_code = (
-                StableFailureCode.VERIFICATION_BINDING_INVALID
-                if binding_failed or (writing_node_bound and not evidence_authoritative)
-                else StableFailureCode.VERIFICATION_FAILED
-            )
+            if binding_failed:
+                failure_code = StableFailureCode.VERIFICATION_BINDING_INVALID
+            elif workspace_mutated:
+                failure_code = StableFailureCode.VERIFICATION_WORKSPACE_MUTATED
+            elif writing_node_bound and not evidence_authoritative:
+                failure_code = StableFailureCode.VERIFICATION_BINDING_INVALID
+            else:
+                failure_code = StableFailureCode.VERIFICATION_FAILED
             self._event(
                 run.id,
                 (
@@ -1708,6 +1875,10 @@ def _authoritative_node_verification_results(
     verification_failure = (
         run.status == "failed" and run.failure_code == StableFailureCode.VERIFICATION_FAILED.value
     )
+    workspace_mutation_failure = (
+        run.status == "failed"
+        and run.failure_code == StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
+    )
     if successful_terminal:
         if len(ordered_tuple) != len(requests) or any(
             item.status != "succeeded" for item in ordered_tuple
@@ -1719,6 +1890,11 @@ def _authoritative_node_verification_results(
         ):
             return None
         if any(item.status != "succeeded" for item in ordered_tuple[:-1]):
+            return None
+    elif workspace_mutation_failure:
+        if len(ordered_tuple) != len(requests) or any(
+            item.status != "succeeded" for item in ordered_tuple
+        ):
             return None
     else:
         return None

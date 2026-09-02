@@ -562,6 +562,7 @@ def test_canonical_diff_ignores_only_declared_untracked_generated_files(
     (repository / "generated").mkdir()
     (repository / "generated" / "tracked.txt").write_text("tracked-before\n")
     (repository / "source.txt").write_text("source-before\n")
+    (repository / ".gitignore").write_text("ignored.log\n")
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
     subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
     head = subprocess.check_output(
@@ -584,6 +585,10 @@ def test_canonical_diff_ignores_only_declared_untracked_generated_files(
     scope = {"generated_paths": ("generated/**",), "harness_digest": "4" * 64}
     candidate = manager.capture_diff(snapshot, **scope)
     (isolated / "generated" / "report.json").write_text("{}\n")
+    pycache = isolated / "generated" / "pkg" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "module.cpython-313.pyc").write_bytes(b"pyc")
+    (isolated / "ignored.log").write_text("ignored byproduct\n")
     assert manager.capture_diff(snapshot, **scope).artifact_digest == candidate.artifact_digest
     assert candidate.source.get("generated_paths") == scope["generated_paths"]
     assert candidate.source.get("harness_digest") == scope["harness_digest"]
@@ -592,6 +597,9 @@ def test_canonical_diff_ignores_only_declared_untracked_generated_files(
     (isolated / "generated" / "tracked.txt").write_text("tracked-before\n")
     (isolated / "undeclared.txt").write_text("undeclared\n")
     assert manager.capture_diff(snapshot, **scope).artifact_digest != candidate.artifact_digest
+    manager.cleanup(snapshot)
+    assert not isolated.exists()
+    assert (repository / "source.txt").read_text() == "source-before\n"
 
 
 def test_git_workspace_rejects_state_root_inside_repository(tmp_path: Path) -> None:
