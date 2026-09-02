@@ -1238,11 +1238,11 @@ def test_cli_worker_does_not_split_header_shaped_hunk_content() -> None:
     ),
 )
 def test_cli_worker_rejects_unsafe_or_unrecognized_headerless_paths(patch: str) -> None:
-    with pytest.raises(ValueError, match="header-less unified diff"):
+    with pytest.raises(ValueError, match="edit-intent diff is invalid; correct section 1"):
         _validate_worker_envelope(_edit_envelope(patch, ("safe.txt",)))
 
 
-def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> None:
+def test_codex_adapter_classifies_headerless_rename_as_invalid_edit_diff() -> None:
     output = json.loads(_edit_envelope("--- a/old.txt\n+++ b/new.txt\n", ("old.txt", "new.txt")))
     output.update({"assistant_note": "", "usage_json": "{}"})
     executor = SuccessfulExecutor()
@@ -1267,7 +1267,102 @@ def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> N
     assert result.failure is not None
     assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
     assert result.boundary_diagnostic is not None
-    assert result.boundary_diagnostic.code == "WORKER_ENVELOPE_MALFORMED"
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("patch", "paths"),
+    (
+        (
+            "diff --git a/created.txt b/created.txt\n"
+            "new file mode 100644\n"
+            "--- dev/null\n"
+            "+++ b/created.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+created\n",
+            ("created.txt",),
+        ),
+        (
+            "diff --git a/actual.txt b/actual.txt\n"
+            "--- a/actual.txt\n"
+            "+++ b/actual.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n",
+            ("declared.txt",),
+        ),
+    ),
+)
+def test_codex_adapter_rejects_invalid_edit_diff_before_action_dispatch(
+    patch: str,
+    paths: tuple[str, ...],
+) -> None:
+    output = json.loads(_edit_envelope(patch, paths))
+    output.update({"assistant_note": "", "usage_json": "{}"})
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
+        id="invalid-diff-process",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+    channel = Channel()
+
+    result = CodexCliWorkerAdapter(
+        executor,
+        lambda _digest: json.dumps(output).encode(),
+        allow_worker,
+        run_id="run-1",
+    ).propose(worker_request(), channel)  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+    assert channel.submissions == 0
+    assert "created\n" not in result.boundary_diagnostic.exception_message
+    assert "before" not in result.boundary_diagnostic.exception_message
+
+
+def test_scripted_adapter_rejects_noncanonical_dev_null_before_action_dispatch() -> None:
+    patch = (
+        "diff --git a/created.txt b/created.txt\n"
+        "new file mode 100644\n"
+        "--- dev/null\n"
+        "+++ b/created.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+private-body-canary\n"
+    )
+    channel = Channel()
+    edit = EditIntentRequest(
+        id="invalid-edit",
+        run_id="run-1",
+        created_at=NOW,
+        paths=("created.txt",),
+        summary="Exercise pre-dispatch validation.",
+        unified_diff=patch,
+    )
+    proposal = ActionProposal(
+        id="invalid-proposal",
+        run_id="run-1",
+        created_at=NOW,
+        worker_id="worker-1",
+        kind=ActionKind.EDIT_INTENT,
+        payload=edit,
+        reason="Verify the invalid diff cannot reach mediation.",
+    )
+    envelope = WorkerProposalEnvelope(proposals=(proposal,))
+    result = ScriptedWorkerAdapter([envelope]).propose(worker_request(), channel)  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+    assert "private-body-canary" not in result.boundary_diagnostic.exception_message
+    assert channel.submissions == 0
 
 
 _HEADERLESS_TWO_FILE_PATCH = (

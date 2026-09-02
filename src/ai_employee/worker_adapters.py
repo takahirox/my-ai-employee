@@ -19,6 +19,7 @@ from .domain.services_v2 import Cancellation, MediatedActionChannel, ProcessExec
 from .domain.v2 import (
     ActionProposal,
     DecisionOutcome,
+    EditIntentRequest,
     ExecutionResult,
     NonMutatingResult,
     PolicyDecision,
@@ -152,6 +153,19 @@ class ScriptedWorkerAdapter:
                     if isinstance(raw, Mapping) and raw.get("non_mutating_result") is not None
                     else "WORKER_ENVELOPE_MALFORMED"
                 ),
+                error=error,
+            )
+        try:
+            _validate_edit_intent_diffs(envelope)
+        except _InvalidEditIntentDiff as error:
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_PROTOCOL_ERROR,
+                str(error),
+                adapter=self.adapter,
+                stage="envelope",
+                diagnostic_code="EDIT_INTENT_DIFF_INVALID",
                 error=error,
             )
         empty_failure = _empty_mutating_envelope_failure(
@@ -357,6 +371,7 @@ class CliWorkerAdapter:
                 and decoded_payload.get("non_mutating_result") is not None
             )
             envelope = _validate_worker_envelope(payload)
+            _validate_edit_intent_diffs(envelope)
         except _WorkerProtocolDiagnostic as error:
             return _worker_failure(
                 request,
@@ -370,24 +385,31 @@ class CliWorkerAdapter:
                 error=error,
             )
         except (KeyError, TypeError, ValueError) as error:
-            evidence_error = _evidence_ref_shape_error(decoded_payload)
+            invalid_diff = isinstance(error, _InvalidEditIntentDiff)
+            evidence_error = None if invalid_diff else _evidence_ref_shape_error(decoded_payload)
             return _worker_failure(
                 request,
                 started,
                 (
                     StableFailureCode.TYPED_RESULT_MALFORMED
-                    if typed_result_supplied
+                    if typed_result_supplied and not invalid_diff
                     else StableFailureCode.WORKER_PROTOCOL_ERROR
                 ),
                 (
-                    "malformed non-mutating result"
+                    str(error)
+                    if invalid_diff
+                    else "malformed non-mutating result"
                     if typed_result_supplied
                     else "malformed worker proposal envelope"
                 ),
                 adapter=self.adapter,
-                stage="typed_result" if typed_result_supplied else "envelope",
+                stage=(
+                    "typed_result" if typed_result_supplied and not invalid_diff else "envelope"
+                ),
                 diagnostic_code=(
-                    "TYPED_RESULT_MALFORMED"
+                    "EDIT_INTENT_DIFF_INVALID"
+                    if invalid_diff
+                    else "TYPED_RESULT_MALFORMED"
                     if typed_result_supplied
                     else "DIFF_HUNK_AMBIGUOUS"
                     if isinstance(error, _AmbiguousDiffHunk)
@@ -964,6 +986,181 @@ class _AmbiguousDiffHunk(ValueError):
     """Fail-closed marker for an existing-file hunk that cannot be recounted safely."""
 
 
+class _InvalidEditIntentDiff(ValueError):
+    """Bounded marker for a normalized edit-intent diff that fails the closed grammar."""
+
+    def __init__(self, section: int, path: str | None = None) -> None:
+        location = (
+            f"path {path}"
+            if path is not None and len(path) <= 200 and _safe_diff_path(path)
+            else f"section {section}"
+        )
+        super().__init__(f"edit-intent diff is invalid; correct {location}")
+
+
+def _validate_edit_intent_diffs(envelope: WorkerProposalEnvelope) -> None:
+    """Validate every normalized edit diff before any proposal reaches mediation."""
+
+    for proposal in envelope.proposals:
+        if proposal.kind.value != "edit_intent":
+            continue
+        payload = proposal.payload
+        if not isinstance(payload, EditIntentRequest):
+            raise _InvalidEditIntentDiff(1)
+        _validate_edit_intent_diff(payload)
+
+
+def _validate_edit_intent_diff(request: EditIntentRequest) -> None:
+    """Parse one textual Git diff using a small, closed, deterministic grammar."""
+
+    pieces = request.unified_diff.split("\n")
+    lines: list[str] = []
+    for index, piece in enumerate(pieces):
+        followed_by_newline = index < len(pieces) - 1
+        if followed_by_newline and piece.endswith("\r"):
+            piece = piece[:-1]
+        if "\r" in piece:
+            raise _InvalidEditIntentDiff(1)
+        lines.append(piece)
+    if request.unified_diff.endswith("\n"):
+        lines.pop()
+
+    parsed_paths: set[str] = set()
+    index = 0
+    section = 0
+    metadata_pattern = re.compile(
+        r"(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?"
+        r"|(?:new file|deleted file|old|new) mode [0-7]{6})"
+    )
+    hunk_pattern = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?")
+    no_newline_marker = "\\ No newline at end of file"
+
+    def invalid(path: str | None = None) -> None:
+        raise _InvalidEditIntentDiff(max(section, 1), path)
+
+    while index < len(lines):
+        section += 1
+        header = re.fullmatch(r"diff --git a/(.+) b/(.+)", lines[index])
+        if header is None:
+            invalid()
+        assert header is not None
+        old_diff_path, new_diff_path = header.groups()
+        if (
+            old_diff_path != new_diff_path
+            or not _safe_diff_path(old_diff_path)
+            or lines[index] != f"diff --git a/{old_diff_path} b/{old_diff_path}"
+        ):
+            invalid()
+        path = old_diff_path
+        parsed_paths.add(path)
+        index += 1
+
+        metadata: list[str] = []
+        while index < len(lines) and not lines[index].startswith("--- "):
+            if lines[index].startswith(("@@ ", "diff --git ")):
+                invalid(path)
+            if metadata_pattern.fullmatch(lines[index]) is None:
+                invalid(path)
+            metadata.append(lines[index])
+            index += 1
+
+        if index + 1 >= len(lines) or not lines[index + 1].startswith("+++ "):
+            invalid(path)
+        old_header = lines[index][4:]
+        new_header = lines[index + 1][4:]
+        index += 2
+
+        old_absent = old_header == "/dev/null"
+        new_absent = new_header == "/dev/null"
+        if old_absent == new_absent:
+            if old_header != f"a/{path}" or new_header != f"b/{path}":
+                invalid(path)
+        elif old_absent:
+            if new_header != f"b/{path}":
+                invalid(path)
+        elif old_header != f"a/{path}":
+            invalid(path)
+        if old_absent and new_absent:
+            invalid(path)
+        if len(metadata) != len(set(metadata)):
+            invalid(path)
+        if any(line.startswith("new file mode ") for line in metadata) and not old_absent:
+            invalid(path)
+        if any(line.startswith("deleted file mode ") for line in metadata) and not new_absent:
+            invalid(path)
+        if old_absent and any(
+            line.startswith(("deleted file mode ", "old mode ")) for line in metadata
+        ):
+            invalid(path)
+        if new_absent and any(
+            line.startswith(("new file mode ", "new mode ")) for line in metadata
+        ):
+            invalid(path)
+        old_modes = sum(line.startswith("old mode ") for line in metadata)
+        new_modes = sum(line.startswith("new mode ") for line in metadata)
+        if old_modes != new_modes:
+            invalid(path)
+
+        hunk_count = 0
+        while index < len(lines) and lines[index].startswith("@@ "):
+            match = hunk_pattern.fullmatch(lines[index])
+            if match is None:
+                invalid(path)
+            assert match is not None
+            expected_old = int(match.group(2) or "1")
+            expected_new = int(match.group(4) or "1")
+            observed_old = 0
+            observed_new = 0
+            changed = False
+            previous_was_body = False
+            index += 1
+
+            while observed_old < expected_old or observed_new < expected_new:
+                if index >= len(lines):
+                    invalid(path)
+                line = lines[index]
+                if line == no_newline_marker:
+                    if not previous_was_body:
+                        invalid(path)
+                    previous_was_body = False
+                    index += 1
+                    continue
+                if not line or line[0] not in (" ", "+", "-"):
+                    invalid(path)
+                body_marker = line[0]
+                if old_absent and body_marker != "+":
+                    invalid(path)
+                if new_absent and body_marker != "-":
+                    invalid(path)
+                if body_marker in (" ", "-"):
+                    observed_old += 1
+                if body_marker in (" ", "+"):
+                    observed_new += 1
+                if observed_old > expected_old or observed_new > expected_new:
+                    invalid(path)
+                changed = changed or body_marker in ("+", "-")
+                previous_was_body = True
+                index += 1
+
+            if index < len(lines) and lines[index] == no_newline_marker:
+                if not previous_was_body:
+                    invalid(path)
+                index += 1
+            if not changed or (expected_old == 0 and expected_new == 0):
+                invalid(path)
+            hunk_count += 1
+
+        if hunk_count == 0:
+            invalid(path)
+        if index < len(lines) and not lines[index].startswith("diff --git "):
+            invalid(path)
+
+    declared_paths = set(request.paths)
+    if parsed_paths != declared_paths:
+        mismatch = sorted(parsed_paths ^ declared_paths)
+        raise _InvalidEditIntentDiff(1, mismatch[0] if mismatch else None)
+
+
 def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
     """Validate proposals after replacing worker-claimed digests with local computation."""
 
@@ -983,7 +1180,12 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
                 request.pop("digest_metadata", None)
                 unified_diff = request.get("unified_diff")
                 if proposal.get("kind") == "edit_intent" and isinstance(unified_diff, str):
-                    request["unified_diff"] = _normalize_unified_diff(unified_diff)
+                    try:
+                        request["unified_diff"] = _normalize_unified_diff(unified_diff)
+                    except _AmbiguousDiffHunk:
+                        raise
+                    except ValueError as error:
+                        raise _InvalidEditIntentDiff(1) from error
     normalized = json.dumps(raw, separators=(",", ":"))
     return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
 
