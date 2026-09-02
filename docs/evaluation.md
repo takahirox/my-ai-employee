@@ -1,9 +1,11 @@
 # Productivity evaluation
 
 Fleet's productivity suite is a reproducibility protocol, not a performance claim. It records
-strict `fleet-productivity-results/1` bundles and keeps quality, human effort, elapsed time,
+strict `fleet-productivity-results/2` bundles and keeps quality, human effort, elapsed time,
 cost, reliability, and orchestration separate. A process exit code is not acceptance:
-authoritative success and regression evidence determine whether a trial is accepted.
+canonical criterion and regression outcome records bind each declared check ID and authority to
+a pass/fail disposition and evidence digest. Success, regression freedom, and acceptance are
+derived from those records rather than supplied by a caller.
 
 The CLI is deliberately read-only and offline. It does not start a worker, alter Fleet
 authority, fetch a benchmark, or write an evaluation database:
@@ -21,13 +23,21 @@ Unknown fields, tampering, missing arms, unpaired trials, capability mismatches,
 formats fail closed. JSON reports are canonical. Markdown reports explicitly separate human
 active time (operator attention) from wall-clock time (elapsed latency) and list task classes
 where paired Fleet trials have lower acceptance or equal acceptance with more human time.
+Bundles also require canonical task/arm/result ordering, unique trial IDs and logical keys, stable
+arm families, and complete check coverage. A terminal outcome and failure classification are
+retained for every unsuccessful trial and reported as rates.
 
 ## Controlled direct-versus-Fleet protocol
 
 Define the task, baseline commit, acceptance authorities, regression checks, tool surface,
 environment image, model snapshot, budgets, and stopping rules before observing outcomes. Every
-pair uses the same task baseline, worker, provider, model, model version, tools, environment,
-fairness configuration, seed, and repetition. Only the arm configuration changes.
+pair uses the same task baseline, worker, seed and repetition. Retained environment and fairness
+manifests bind executable/version, dependency lock, sandbox/network, cache/machine, prompt/context,
+model/reasoning, tools, resource budgets, stopping conditions, pricing allocation, and the complete
+randomized order. Their stored digests must equal their canonical content digests. Direct-versus-
+Fleet validation compares every controlled manifest field. Arm manifests retain planning, review,
+repair and parallelism settings. An ablation is valid only when its declared disabled component is
+the sole differing arm-manifest field.
 
 For Codex:
 
@@ -101,8 +111,12 @@ must use the same worker capabilities and acceptance authority or be labeled non
 The SWE-bench adapter is an offline import profile. Obtain and retain the dataset separately,
 pin its version and repository commits, and feed local case JSON to the normalizer. Fleet neither
 downloads SWE-bench nor claims a score. The imported fail-to-pass and pass-to-pass tests become
-explicit acceptance authorities; evaluation infrastructure and contamination limitations must
-be reported with any results.
+separate acceptance and regression authorities; evaluation infrastructure and contamination
+limitations must be reported with any results. Representative native records may use uppercase
+`FAIL_TO_PASS` and `PASS_TO_PASS` arrays or JSON-encoded arrays. The projected standard fields
+`problem_statement`, `hints_text`, `patch`, `test_patch`, `version`, `created_at`, and
+`environment_setup_commit` are retained when present. Other fields remain forbidden, and parsing
+performs no network access.
 
 For real work, use controlled A/B experiments on consented, eligible tasks. Randomize assignment
 within repository and task-class blocks; keep workers, tools, environment, review policy, and
@@ -116,7 +130,7 @@ Retain the exact canonical bundle, benchmark/task manifests, acceptance evidence
 fairness digests, arm configuration, pricing table, tool/model versions, randomization schedule,
 and analysis code. Treat bundles as immutable content-addressed records.
 
-The current format is `fleet-productivity-results/1`; schema models use schema version `2`.
+The current format is `fleet-productivity-results/2`; schema models use schema version `2`.
 Reject unsupported versions. Historical comparison requires an explicit compatibility record
 mapping every old task and arm to the new version and affirming equivalent baselines, criteria,
 and capabilities. If those assertions cannot be made, publish separate results rather than a
@@ -151,8 +165,49 @@ load, evaluator coverage, pricing allocation, imperfect active-time capture, and
 between Fleet components limit causal and external validity. Markdown summaries aid review but do
 not replace retained bundles and evidence. The suite makes no claim until a protocol is run.
 
-Run cheap deterministic fixture and bundle-compatibility regressions on every change. Run a small
-frozen smoke panel on material orchestration or adapter changes. Expensive external benchmarks
-should run on a documented release cadence (for example, before a release or quarterly), and when
-the worker/model, evaluator authority, benchmark version, or Fleet algorithm changes materially.
-Never spend benchmark budget merely to refresh a headline; publish versioned, reproducible runs.
+The exact cheap cadence is every pull request. The exact expensive cadence is Sunday at 03:00 UTC
+and every release candidate; it also runs whenever the worker/model, evaluator authority,
+benchmark version, or Fleet algorithm changes materially. Never spend benchmark budget merely to
+refresh a headline; publish versioned, reproducible runs.
+
+## Version-controlled offline protocols
+
+[`examples/productivity/protocols.json`](../examples/productivity/protocols.json) is the canonical
+offline-safe protocol index. It covers direct Codex, Codex through Fleet, direct Claude, Claude
+through Fleet, each one-component ablation, an OSS comparator, native SWE-bench normalization,
+randomized real A/B dry-run assignment, and release regression. Each record declares exact argv,
+disabled network, artifact paths, and evidence paths. The commands are fixtures: replacing one
+with a credentialed external worker requires a separately reviewed manifest and opt-in authority.
+
+Run the cheap per-PR gate against the exact candidate:
+
+```bash
+git diff --check
+uv run --offline pytest -q tests/test_productivity_evaluation.py tests/test_productivity_cli.py
+uv run --offline ruff check src/ai_employee/productivity_evaluation.py src/ai_employee/productivity_cli.py tests/test_productivity_evaluation.py tests/test_productivity_cli.py
+uv run --offline mypy
+```
+
+Run the scheduled/release gate against the same exact candidate:
+
+```bash
+git diff --check
+uv run --offline pytest -q
+uv run --offline ruff check .
+uv run --offline mypy
+```
+
+For every protocol command, the runner creates the declared artifact directory before execution,
+captures stdout and stderr as bytes, records argv, UTC start/end, exit code, candidate tree digest,
+manifest digest, and SHA-256 digests for every captured file in `command.json`, then writes the
+criterion and regression check records to `acceptance.json` and `regression.json`. It validates and
+stores the canonical `result-bundle.json` with:
+
+```bash
+fleet productivity validate artifacts/<protocol-id>/result-bundle.json
+fleet productivity report artifacts/<protocol-id>/result-bundle.json --format markdown
+```
+
+No missing artifact, failed check, stale candidate binding, duplicate evidence record, or
+noncanonical bundle is counted. The protocol runner may copy results out of a disposable worktree,
+but the productivity CLI remains read-only and has no Fleet execution or promotion authority.

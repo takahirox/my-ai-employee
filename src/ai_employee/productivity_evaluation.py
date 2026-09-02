@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable, Mapping
 from typing import ClassVar, Literal, Protocol, Self
@@ -30,8 +31,46 @@ class ArmKind(StableStrEnum):
     OSS_ADAPTER = "oss_adapter"
 
 
+class CheckDisposition(StableStrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class TerminalOutcome(StableStrEnum):
+    ACCEPTED = "accepted"
+    CHECKS_FAILED = "checks_failed"
+    EXECUTION_FAILED = "execution_failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+
+
+class FailureClassification(StableStrEnum):
+    ASSERTION = "assertion"
+    PROCESS = "process"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    INFRASTRUCTURE = "infrastructure"
+    POLICY = "policy"
+    PROTOCOL = "protocol"
+
+
+class CheckOutcome(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_check_outcome"
+    check_id: Identifier
+    authority: str = Field(min_length=1, max_length=1_000)
+    disposition: CheckDisposition
+    evidence_digest: Digest
+
+
 class AcceptanceCriterion(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_acceptance_criterion"
+    id: Identifier
+    description: str = Field(min_length=1, max_length=4_000)
+    authority: str = Field(min_length=1, max_length=1_000)
+
+
+class RegressionCheck(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_regression_check"
     id: Identifier
     description: str = Field(min_length=1, max_length=4_000)
     authority: str = Field(min_length=1, max_length=1_000)
@@ -47,13 +86,90 @@ class TaskIdentity(SchemaModelV2):
     baseline_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
     task_class: TaskClass
     acceptance_criteria: tuple[AcceptanceCriterion, ...] = Field(min_length=1)
+    regression_checks: tuple[RegressionCheck, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _criteria_are_canonical(self) -> Self:
-        ids = tuple(item.id for item in self.acceptance_criteria)
-        if ids != tuple(sorted(set(ids))):
-            raise ValueError("acceptance criteria must be unique and sorted by id")
+        for name, checks in (
+            ("acceptance criteria", self.acceptance_criteria),
+            ("regression checks", self.regression_checks),
+        ):
+            ids = tuple(item.id for item in checks)
+            if ids != tuple(sorted(set(ids))):
+                raise ValueError(f"{name} must be unique and sorted by id")
         return self
+
+
+class ResourceBudgetManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_resource_budget_manifest"
+    wall_seconds: float = Field(gt=0)
+    input_tokens: int = Field(gt=0)
+    output_tokens: int = Field(gt=0)
+    cost_limit: float | None = Field(default=None, ge=0)
+
+
+class StoppingManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_stopping_manifest"
+    maximum_attempts: int = Field(ge=1)
+    maximum_retries: int = Field(ge=0)
+    maximum_repairs: int = Field(ge=0)
+    terminal_conditions: tuple[Identifier, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _canonical_conditions(self) -> Self:
+        if self.terminal_conditions != tuple(sorted(set(self.terminal_conditions))):
+            raise ValueError("terminal conditions must be unique and sorted")
+        return self
+
+
+class PricingManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_pricing_manifest"
+    currency: Identifier
+    input_per_million: float | None = Field(default=None, ge=0)
+    output_per_million: float | None = Field(default=None, ge=0)
+    subscription_allocation: str = Field(min_length=1, max_length=1_000)
+
+
+class EnvironmentManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_environment_manifest"
+    executable: str = Field(min_length=1, max_length=4_096)
+    executable_version: str = Field(min_length=1, max_length=500)
+    dependency_lock_digest: Digest
+    sandbox_mode: Identifier
+    network_mode: Identifier
+    cache_policy: Identifier
+    machine_digest: Digest
+
+
+class FairnessConfigManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_fairness_config_manifest"
+    prompt_digest: Digest
+    context_digest: Digest
+    model_provider: Identifier
+    model_name: str = Field(min_length=1, max_length=500)
+    model_version: str = Field(min_length=1, max_length=500)
+    reasoning_effort: Identifier
+    tools: tuple[Identifier, ...]
+    budgets: ResourceBudgetManifest
+    stopping: StoppingManifest
+    pricing: PricingManifest
+    randomized_order: tuple[Identifier, ...] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def _canonical_controls(self) -> Self:
+        if self.tools != tuple(sorted(set(self.tools))):
+            raise ValueError("tools must be unique and sorted")
+        if len(self.randomized_order) != len(set(self.randomized_order)):
+            raise ValueError("randomized order must contain unique arm ids")
+        return self
+
+
+class ArmConfigManifest(SchemaModelV2):
+    schema_name: ClassVar[str] = "productivity_arm_config_manifest"
+    planning: bool
+    review: bool
+    repair: bool
+    maximum_parallelism: int = Field(ge=1)
 
 
 class ArmIdentity(SchemaModelV2):
@@ -62,10 +178,9 @@ class ArmIdentity(SchemaModelV2):
     kind: ArmKind
     adapter: Identifier
     worker: Identifier
-    model_provider: Identifier
-    model_name: str = Field(min_length=1, max_length=500)
-    model_version: str = Field(min_length=1, max_length=500)
-    tools: tuple[Identifier, ...]
+    environment: EnvironmentManifest
+    fairness_config: FairnessConfigManifest
+    arm_config: ArmConfigManifest
     environment_digest: Digest
     fairness_config_digest: Digest
     arm_config_digest: Digest
@@ -75,12 +190,22 @@ class ArmIdentity(SchemaModelV2):
 
     @model_validator(mode="after")
     def _provenance_is_canonical(self) -> Self:
-        if self.tools != tuple(sorted(set(self.tools))):
-            raise ValueError("tools must be unique and sorted")
         if self.disabled_components != tuple(sorted(set(self.disabled_components))):
             raise ValueError("disabled components must be unique and sorted")
         if (self.kind is ArmKind.FLEET_ABLATION) != bool(self.disabled_components):
             raise ValueError("exactly Fleet ablation arms must disable components")
+        bindings = (
+            ("environment", self.environment_digest, canonical_digest(self.environment)),
+            (
+                "fairness config",
+                self.fairness_config_digest,
+                canonical_digest(self.fairness_config),
+            ),
+            ("arm config", self.arm_config_digest, canonical_digest(self.arm_config)),
+        )
+        for name, supplied, actual in bindings:
+            if supplied != actual:
+                raise ValueError(f"{name} digest does not bind its retained manifest")
         return self
 
 
@@ -127,16 +252,27 @@ class TrialMetrics(SchemaModelV2):
             raise ValueError("trial metrics must be finite")
         return value
 
+    @model_validator(mode="after")
+    def _durations_are_coherent(self) -> Self:
+        if (
+            self.time_to_accepted_seconds is not None
+            and self.time_to_accepted_seconds > self.wall_seconds
+        ):
+            raise ValueError("time to accepted cannot exceed wall time")
+        if self.critical_path_seconds > self.wall_seconds:
+            raise ValueError("critical path cannot exceed wall time")
+        return self
+
 
 class TrialResult(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_trial_result"
     id: Identifier
     task: TaskIdentity
     arm: ArmIdentity
-    authoritative_success: bool
-    regression_free: bool
-    acceptance_evidence_digests: tuple[Digest, ...] = ()
-    regression_evidence_digests: tuple[Digest, ...] = ()
+    acceptance_outcomes: tuple[CheckOutcome, ...]
+    regression_outcomes: tuple[CheckOutcome, ...]
+    terminal_outcome: TerminalOutcome
+    failure_classification: FailureClassification | None = None
     process_exit_code: int | None = None
     metrics: TrialMetrics
 
@@ -144,19 +280,60 @@ class TrialResult(SchemaModelV2):
     def _authoritative_evidence_is_complete(self) -> Self:
         if self.id != trial_id(self.task, self.arm):
             raise ValueError("trial id does not match task and arm provenance")
-        if len(self.acceptance_evidence_digests) != len(set(self.acceptance_evidence_digests)):
-            raise ValueError("acceptance evidence must be unique")
-        if len(self.regression_evidence_digests) != len(set(self.regression_evidence_digests)):
-            raise ValueError("regression evidence must be unique")
-        if self.authoritative_success and len(self.acceptance_evidence_digests) != len(
-            self.task.acceptance_criteria
-        ):
-            raise ValueError("success requires evidence for every acceptance criterion")
-        if self.regression_free and not self.regression_evidence_digests:
-            raise ValueError("regression freedom requires authoritative evidence")
+        self._validate_outcomes(
+            self.task.acceptance_criteria, self.acceptance_outcomes, "acceptance"
+        )
+        self._validate_outcomes(self.task.regression_checks, self.regression_outcomes, "regression")
         if self.accepted != (self.metrics.time_to_accepted_seconds is not None):
             raise ValueError("time-to-accepted is present exactly for accepted trials")
+        if self.accepted:
+            if self.terminal_outcome is not TerminalOutcome.ACCEPTED:
+                raise ValueError("passing checks require an accepted terminal outcome")
+            if self.process_exit_code != 0 or self.failure_classification is not None:
+                raise ValueError("accepted trials require exit zero and no failure classification")
+        elif self.terminal_outcome is TerminalOutcome.ACCEPTED:
+            raise ValueError("accepted terminal outcome requires every declared check to pass")
+        if self.terminal_outcome is TerminalOutcome.CHECKS_FAILED and (
+            self.process_exit_code != 0
+            or self.failure_classification is not FailureClassification.ASSERTION
+        ):
+            raise ValueError("check failure requires exit zero and assertion classification")
+        if self.terminal_outcome is TerminalOutcome.EXECUTION_FAILED and (
+            self.process_exit_code in (None, 0) or self.failure_classification is None
+        ):
+            raise ValueError("execution failure requires a nonzero exit and classification")
+        expected = {
+            TerminalOutcome.TIMED_OUT: FailureClassification.TIMEOUT,
+            TerminalOutcome.CANCELLED: FailureClassification.CANCELLED,
+        }.get(self.terminal_outcome)
+        if expected is not None and self.failure_classification is not expected:
+            raise ValueError("terminal outcome and failure classification are incoherent")
         return self
+
+    @staticmethod
+    def _validate_outcomes(
+        definitions: tuple[AcceptanceCriterion, ...] | tuple[RegressionCheck, ...],
+        outcomes: tuple[CheckOutcome, ...],
+        family: str,
+    ) -> None:
+        if tuple(item.check_id for item in outcomes) != tuple(
+            sorted(item.check_id for item in outcomes)
+        ):
+            raise ValueError(f"{family} outcomes must be in canonical check-id order")
+        declared = {item.id: item.authority for item in definitions}
+        actual = {item.check_id: item.authority for item in outcomes}
+        if len(actual) != len(outcomes) or actual != declared:
+            raise ValueError(
+                f"{family} outcomes must exactly cover declared checks and authorities"
+            )
+
+    @property
+    def authoritative_success(self) -> bool:
+        return all(item.disposition is CheckDisposition.PASSED for item in self.acceptance_outcomes)
+
+    @property
+    def regression_free(self) -> bool:
+        return all(item.disposition is CheckDisposition.PASSED for item in self.regression_outcomes)
 
     @property
     def accepted(self) -> bool:
@@ -169,12 +346,8 @@ def trial_id(task: TaskIdentity, arm: ArmIdentity) -> Identifier:
 
 _COMPARABLE_FIELDS = (
     "worker",
-    "model_provider",
-    "model_name",
-    "model_version",
-    "tools",
-    "environment_digest",
-    "fairness_config_digest",
+    "environment",
+    "fairness_config",
     "seed",
     "repetition",
 )
@@ -244,6 +417,19 @@ def _values(result: TrialResult) -> dict[str, float | None]:
         accepted=float(result.accepted),
         authoritative_success=float(result.authoritative_success),
         regression_free=float(result.regression_free),
+        terminal_failure=float(not result.accepted),
+    )
+    values.update(
+        {
+            f"outcome_{item.value}": float(result.terminal_outcome is item)
+            for item in TerminalOutcome
+        }
+    )
+    values.update(
+        {
+            f"failure_{item.value}": float(result.failure_classification is item)
+            for item in FailureClassification
+        }
     )
     return values
 
@@ -262,9 +448,19 @@ def _statistics(values: Iterable[float], *, rate: bool = False) -> Statistics:
 
 
 def _aggregates(value_sets: Mapping[str, Iterable[float]]) -> tuple[MetricAggregate, ...]:
-    rates = {"accepted", "authoritative_success", "regression_free"}
+    rates = {
+        "accepted",
+        "authoritative_success",
+        "regression_free",
+        "terminal_failure",
+    }
     return tuple(
-        MetricAggregate(metric=name, statistics=_statistics(value_sets[name], rate=name in rates))
+        MetricAggregate(
+            metric=name,
+            statistics=_statistics(
+                value_sets[name], rate=name in rates or name.startswith(("outcome_", "failure_"))
+            ),
+        )
         for name in sorted(value_sets)
     )
 
@@ -394,6 +590,19 @@ def component_ablation_contribution(
         ):
             raise ValueError("ablation comparison requires ablated and complete Fleet arms")
         _validate_same_capability(ablation, complete)
+        left_config = ablation.arm.arm_config.model_dump(mode="python")
+        right_config = complete.arm.arm_config.model_dump(mode="python")
+        changed = tuple(
+            sorted(name for name in left_config if left_config[name] != right_config[name])
+        )
+        component_field = {
+            "planning": "planning",
+            "review": "review",
+            "repair": "repair",
+            "parallelism": "maximum_parallelism",
+        }.get(ablation.arm.disabled_components[0])
+        if component_field is None or changed != (component_field,):
+            raise ValueError("ablation must prove an exact one-component-only configuration delta")
     return AblationContribution(
         component=next(iter(components))[0],
         pairs=len(pairs),
@@ -403,7 +612,7 @@ def component_ablation_contribution(
 
 class ResultBundle(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_result_bundle"
-    format: Literal["fleet-productivity-results/1"] = "fleet-productivity-results/1"
+    format: Literal["fleet-productivity-results/2"] = "fleet-productivity-results/2"
     id: Identifier
     run_id: Identifier
     created_at: UtcTimestamp
@@ -416,17 +625,50 @@ class ResultBundle(SchemaModelV2):
     def _bind_digest(self) -> Self:
         if self.id != self.run_id:
             raise ValueError("bundle id and run id must match")
-        bindings = tuple(
-            (canonical_digest(item.task), canonical_digest(item.arm)) for item in self.results
+        if len({item.id for item in self.results}) != len(self.results):
+            raise ValueError("bundle contains duplicate trial ids")
+        keys = tuple(
+            (canonical_digest(item.task), item.arm.id, item.arm.seed, item.arm.repetition)
+            for item in self.results
         )
-        if len(bindings) != len(set(bindings)):
-            raise ValueError("bundle contains duplicate trials")
+        if len(keys) != len(set(keys)):
+            raise ValueError("bundle contains duplicate logical task/arm/seed/repetition keys")
         if any(
             item.task.benchmark != self.benchmark
             or item.task.benchmark_version != self.benchmark_version
             for item in self.results
         ):
             raise ValueError("bundle contains a foreign task")
+        task_families: dict[tuple[str, str], str] = {}
+        arm_families: dict[str, str] = {}
+        for item in self.results:
+            task_key = (item.task.task_id, item.task.task_version)
+            task_family = canonical_digest(item.task)
+            if task_key in task_families and task_families[task_key] != task_family:
+                raise ValueError("logical task provenance changed within bundle")
+            task_families[task_key] = task_family
+            arm_family = canonical_digest(
+                item.arm.model_dump(mode="python", exclude={"seed", "repetition"})
+            )
+            if item.arm.id in arm_families and arm_families[item.arm.id] != arm_family:
+                raise ValueError("logical arm provenance changed within bundle")
+            arm_families[item.arm.id] = arm_family
+        canonical_order = tuple(
+            sorted(
+                self.results,
+                key=lambda item: (
+                    item.task.task_id,
+                    item.task.task_version,
+                    item.arm.id,
+                    item.arm.seed,
+                    item.arm.repetition,
+                    item.id,
+                ),
+            )
+        )
+        if self.results != canonical_order:
+            raise ValueError("bundle results must use canonical task/arm/seed/repetition order")
+        aggregate_trials(self.results)
         actual = canonical_digest(self.model_dump(mode="python", exclude={"bundle_digest"}))
         if self.bundle_digest is not None and self.bundle_digest != actual:
             raise ValueError("bundle digest does not match canonical content")
@@ -459,6 +701,17 @@ class HistoryCompatibility(SchemaModelV2):
     baselines_equivalent: Literal[True]
     criteria_equivalent: Literal[True]
     capabilities_equivalent: Literal[True]
+
+    @model_validator(mode="after")
+    def _mappings_are_canonical_bijections(self) -> Self:
+        for name, pairs in (("task", self.task_pairs), ("arm", self.arm_pairs)):
+            if pairs != tuple(sorted(pairs)):
+                raise ValueError(f"{name} compatibility pairs must be canonically sorted")
+            left = tuple(item[0] for item in pairs)
+            right = tuple(item[1] for item in pairs)
+            if len(left) != len(set(left)) or len(right) != len(set(right)):
+                raise ValueError(f"{name} compatibility mapping must be a bijection")
+        return self
 
 
 class HistoricalComparison(SchemaModelV2):
@@ -494,6 +747,19 @@ def compare_history(
         (canonical_digest(item.task), item.arm.id, item.arm.seed, item.arm.repetition): item
         for item in current.results
     }
+    mapped_keys = {
+        (
+            task_map[canonical_digest(item.task)],
+            arm_map[item.arm.id],
+            item.arm.seed,
+            item.arm.repetition,
+        )
+        for item in previous.results
+    }
+    if mapped_keys != set(current_index):
+        raise ValueError(
+            "historical mapping must produce the exact one-to-one current trial key set"
+        )
     regressions: list[str] = []
     compared = 0
     for old in sorted(previous.results, key=lambda item: item.id):
@@ -549,12 +815,50 @@ class SWEBenchCase(SchemaModelV2):
     base_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     fail_to_pass: tuple[str, ...] = ()
     pass_to_pass: tuple[str, ...] = ()
+    problem_statement: str | None = None
+    hints_text: str | None = None
+    patch: str | None = None
+    test_patch: str | None = None
+    version: str | None = None
+    created_at: str | None = None
+    environment_setup_commit: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_native_fields(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise TypeError("SWE-bench case must be an object")
+        data = dict(value)
+        for native, normalized in (
+            ("FAIL_TO_PASS", "fail_to_pass"),
+            ("PASS_TO_PASS", "pass_to_pass"),
+        ):
+            if native in data and normalized in data:
+                raise ValueError(f"conflicting SWE-bench fields: {native} and {normalized}")
+            if native in data:
+                data[normalized] = data.pop(native)
+        for field in ("fail_to_pass", "pass_to_pass"):
+            raw = data.get(field, ())
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{field} must be a JSON array") from exc
+            if not isinstance(raw, (list, tuple)) or any(not isinstance(item, str) for item in raw):
+                raise ValueError(f"{field} must be an array of strings")
+            data[field] = tuple(raw)
+        return data
 
     @model_validator(mode="after")
     def _tests_are_valid(self) -> Self:
-        tests = (*self.fail_to_pass, *self.pass_to_pass)
-        if not tests or any(not item for item in tests) or len(tests) != len(set(tests)):
-            raise ValueError("SWE-bench tests must be non-empty and unique")
+        for name, tests in (
+            ("FAIL_TO_PASS", self.fail_to_pass),
+            ("PASS_TO_PASS", self.pass_to_pass),
+        ):
+            if not tests or any(not item for item in tests) or len(tests) != len(set(tests)):
+                raise ValueError(f"SWE-bench {name} tests must be non-empty and unique")
+        if set(self.fail_to_pass) & set(self.pass_to_pass):
+            raise ValueError("SWE-bench acceptance and regression tests must not overlap")
         return self
 
 
@@ -570,18 +874,22 @@ class SWEBenchAdapter:
 
     def normalize_case(self, payload: Mapping[str, object]) -> TaskIdentity:
         case = SWEBenchCase.model_validate_json(canonical_json(payload), strict=True)
-        criteria = [
+        criteria = tuple(
             AcceptanceCriterion(
-                id=f"{kind}-{index:04d}",
+                id=f"fail-to-pass-{index:04d}",
                 description=test,
-                authority=f"swe-bench.{kind.replace('-', '_')}",
+                authority="swe-bench.fail_to_pass",
             )
-            for kind, tests in (
-                ("fail-to-pass", sorted(case.fail_to_pass)),
-                ("pass-to-pass", sorted(case.pass_to_pass)),
+            for index, test in enumerate(sorted(case.fail_to_pass), start=1)
+        )
+        regressions = tuple(
+            RegressionCheck(
+                id=f"pass-to-pass-{index:04d}",
+                description=test,
+                authority="swe-bench.pass_to_pass",
             )
-            for index, test in enumerate(tests, start=1)
-        ]
+            for index, test in enumerate(sorted(case.pass_to_pass), start=1)
+        )
         return TaskIdentity(
             benchmark="swe-bench",
             benchmark_version=self.dataset_version,
@@ -590,5 +898,6 @@ class SWEBenchAdapter:
             repository=case.repo,
             baseline_commit=case.base_commit,
             task_class=TaskClass.BUG_FIX,
-            acceptance_criteria=tuple(criteria),
+            acceptance_criteria=criteria,
+            regression_checks=regressions,
         )

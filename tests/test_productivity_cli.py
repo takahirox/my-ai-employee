@@ -7,16 +7,28 @@ import pytest
 from ai_employee.cli import main
 from ai_employee.productivity_evaluation import (
     AcceptanceCriterion,
+    ArmConfigManifest,
     ArmIdentity,
     ArmKind,
+    CheckDisposition,
+    CheckOutcome,
+    EnvironmentManifest,
+    FailureClassification,
+    FairnessConfigManifest,
+    PricingManifest,
+    RegressionCheck,
+    ResourceBudgetManifest,
     ResultBundle,
+    StoppingManifest,
     TaskClass,
     TaskIdentity,
+    TerminalOutcome,
     TrialMetrics,
     TrialResult,
     dump_result_bundle,
     trial_id,
 )
+from ai_employee.serialization import canonical_digest
 
 D1, D2 = "1" * 64, "2" * 64
 
@@ -31,22 +43,61 @@ def _task() -> TaskIdentity:
         baseline_commit="a" * 40,
         task_class=TaskClass.BUG_FIX,
         acceptance_criteria=(AcceptanceCriterion(id="test", description="pass", authority="test"),),
+        regression_checks=(
+            RegressionCheck(id="regression", description="stay passing", authority="test"),
+        ),
     )
 
 
 def _arm(kind: ArmKind, arm_id: str, environment: str = D1) -> ArmIdentity:
+    environment_manifest = EnvironmentManifest(
+        executable="/usr/bin/fixture-worker",
+        executable_version="1.0.0",
+        dependency_lock_digest=D2,
+        sandbox_mode="workspace-write",
+        network_mode="disabled",
+        cache_policy="cold",
+        machine_digest=environment,
+    )
+    fairness_manifest = FairnessConfigManifest(
+        prompt_digest=D1,
+        context_digest=D2,
+        model_provider="openai",
+        model_name="model",
+        model_version="snapshot",
+        reasoning_effort="high",
+        tools=("edit_intent", "process"),
+        budgets=ResourceBudgetManifest(wall_seconds=60, input_tokens=10_000, output_tokens=2_000),
+        stopping=StoppingManifest(
+            maximum_attempts=2,
+            maximum_retries=1,
+            maximum_repairs=1,
+            terminal_conditions=("accepted",),
+        ),
+        pricing=PricingManifest(
+            currency="USD",
+            input_per_million=1,
+            output_per_million=2,
+            subscription_allocation="none",
+        ),
+        randomized_order=("direct", "fleet"),
+    )
+    arm_manifest = (
+        ArmConfigManifest(planning=False, review=False, repair=False, maximum_parallelism=1)
+        if kind is ArmKind.DIRECT_AGENT
+        else ArmConfigManifest(planning=True, review=True, repair=True, maximum_parallelism=2)
+    )
     return ArmIdentity(
         id=arm_id,
         kind=kind,
         adapter="fixture",
         worker="codex",
-        model_provider="openai",
-        model_name="model",
-        model_version="snapshot",
-        tools=("edit_intent", "process"),
-        environment_digest=environment,
-        fairness_config_digest=D1,
-        arm_config_digest=D2,
+        environment=environment_manifest,
+        fairness_config=fairness_manifest,
+        arm_config=arm_manifest,
+        environment_digest=canonical_digest(environment_manifest),
+        fairness_config_digest=canonical_digest(fairness_manifest),
+        arm_config_digest=canonical_digest(arm_manifest),
         seed=7,
         repetition=1,
     )
@@ -83,10 +134,24 @@ def _result(bound_arm: ArmIdentity, *, accepted: bool, active: float) -> TrialRe
         id=trial_id(bound_task, bound_arm),
         task=bound_task,
         arm=bound_arm,
-        authoritative_success=accepted,
-        regression_free=accepted,
-        acceptance_evidence_digests=(D1,) if accepted else (),
-        regression_evidence_digests=(D2,) if accepted else (),
+        acceptance_outcomes=(
+            CheckOutcome(
+                check_id="test",
+                authority="test",
+                disposition=CheckDisposition.PASSED if accepted else CheckDisposition.FAILED,
+                evidence_digest=D1,
+            ),
+        ),
+        regression_outcomes=(
+            CheckOutcome(
+                check_id="regression",
+                authority="test",
+                disposition=CheckDisposition.PASSED if accepted else CheckDisposition.FAILED,
+                evidence_digest=D2,
+            ),
+        ),
+        terminal_outcome=TerminalOutcome.ACCEPTED if accepted else TerminalOutcome.CHECKS_FAILED,
+        failure_classification=None if accepted else FailureClassification.ASSERTION,
         process_exit_code=0,
         metrics=metrics,
     )
@@ -154,6 +219,8 @@ def test_productivity_validate_and_json_report_are_canonical(
     assert comparison["direct_arm_id"] == "direct"
     assert comparison["fleet_arm_id"] == "fleet"
     assert comparison["task_classes_where_fleet_hurts"] == ["bug_fix"]
+    reliability = report["arms"][0]["metric_families"]["reliability_recovery"]
+    assert {item["metric"] for item in reliability} >= {"terminal_failure", "failure_assertion"}
 
 
 def test_productivity_markdown_distinguishes_active_and_wall_time(

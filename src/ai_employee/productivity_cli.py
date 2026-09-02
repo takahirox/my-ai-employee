@@ -35,6 +35,19 @@ _METRIC_FAMILIES = {
         "replans",
         "escalations",
         "recoveries",
+        "terminal_failure",
+        "outcome_accepted",
+        "outcome_checks_failed",
+        "outcome_execution_failed",
+        "outcome_timed_out",
+        "outcome_cancelled",
+        "failure_assertion",
+        "failure_process",
+        "failure_timeout",
+        "failure_cancelled",
+        "failure_infrastructure",
+        "failure_policy",
+        "failure_protocol",
     ),
     "orchestration": (
         "decomposed_nodes",
@@ -154,6 +167,8 @@ def _markdown_report(
         "",
         "> Human active time is operator attention. Wall-clock time is elapsed latency; "
         "the two are not interchangeable.",
+        "> Terminal-outcome and failure-classification rates retain unsuccessful trials; "
+        "a recovery is not an accepted result.",
     ]
     for family, title in _FAMILY_TITLES.items():
         lines.extend(("", f"## {title}"))
