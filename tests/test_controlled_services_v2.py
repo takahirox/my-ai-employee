@@ -261,6 +261,39 @@ def test_process_executor_fails_closed_on_stderr_only_overflow_and_confirms_clea
     assert len(descriptor_path.read_bytes()) == 4
 
 
+def test_stderr_overflow_kills_term_ignoring_descendant_after_leader_exit(
+    tmp_path: Path,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.5)
+    request = ProcessRequest(
+        id="stderr-overflow-descendant",
+        run_id="run-stderr-descendant",
+        created_at=NOW,
+        argv=(
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; "
+            "(trap '' TERM; touch descendant-ready; while :; do :; done) & "
+            "while [ ! -f descendant-ready ]; do :; done; "
+            "while :; do printf 12345 >&2; done",
+        ),
+        timeout_seconds=10.0,
+        stdout_bytes=4,
+        stderr_bytes=4,
+        purpose="confirm output overflow cleans a TERM-ignoring descendant group",
+    )
+
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+    assert result.duration_seconds < 2.0
+    assert result.resource_usage["output_limit_stream"] == "stderr"
+    assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
+
+
 def test_process_output_descriptor_requires_exact_provenance_when_digest_repeats(
     tmp_path: Path,
 ) -> None:

@@ -295,7 +295,13 @@ class LocalProcessExecutor:
             if leader_exited:
                 return "sigkill_confirmed"
             process.wait(timeout=self.terminate_grace_seconds)
-            return "sigterm_confirmed"
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return "sigterm_confirmed"
+            except PermissionError:
+                return "already_exited"
+            return "sigkill_confirmed"
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
