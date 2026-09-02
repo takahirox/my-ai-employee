@@ -184,7 +184,9 @@ refresh a headline; publish versioned, reproducible runs.
 protocol index. It contains runner templates for direct Codex, Codex through full Fleet, direct
 Claude, Claude through full Fleet, every exact one-component ablation, a generic OSS producer,
 native SWE-bench import, randomized real A/B collection, and release regression. Angle-bracketed
-values are mandatory operator substitutions; none of the templates claims measured performance.
+values are mandatory operator substitutions; replace every placeholder in both the command and
+treatment manifests, then recompute the adjacent canonical manifest digests. None of the templates
+claims measured performance.
 
 The runner is deliberately separate from the `fleet` command and does not change Fleet execution
 or promotion authority. For example, after creating a canonical `TaskIdentity` JSON file and an
@@ -206,7 +208,9 @@ python -m ai_employee.productivity_protocol \
 The arm command is an argv array, never a shell string. Each of `{task}`, `{repository}`,
 `{output}`, and `{protocol}` must occur once as a complete argument. The runner resolves the task,
 checkout, output staging directory, protocol ID, and executable before launching the producer with
-the checkout as its explicit working directory. The task file must be the canonical JSON encoding
+the checkout as its explicit working directory. Symlinks in the producer path are resolved, and the
+resulting executable must exactly equal every treatment environment executable before the process
+is started. The task file must be the canonical JSON encoding
 of one `TaskIdentity`, followed by one newline. The selected manifest and caller must both declare
 the same network policy, and every result arm must retain that policy in its environment manifest.
 
@@ -219,9 +223,13 @@ The producer must create exactly three regular files in `{output}`:
 
 Each check artifact lists canonical `(trial_id, check_id, authority, disposition)` records. Every
 matching `CheckOutcome.evidence_digest` must be the SHA-256 digest of the complete, exact bytes of
-its family artifact. The bundle run ID must equal the selected protocol ID, its task must equal the
-supplied task, and its exact arm IDs, kinds, adapters, workers, configurations, disabled components,
-and network modes must match the manifest treatments.
+its family artifact. The bundle run ID must equal the selected protocol ID and its task must equal
+the supplied task. Every arm's ID, kind, adapter, worker, complete environment and fairness
+manifests, canonical manifest digests, arm configuration, and disabled components must match its
+protocol treatment exactly. Each treatment digest is validated against its predeclared manifest
+while loading the protocol, and each result-arm digest is validated against its retained manifest
+while loading the bundle; a producer cannot make invented controls acceptable merely by digesting
+them consistently.
 
 Only after the command exits zero and every binding validates does the runner add canonical
 `command.json` metadata and atomically rename the staging directory to the declared destination.

@@ -9,17 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ai_employee.productivity_evaluation import (
-    ArmConfigManifest,
     ArmIdentity,
-    ArmKind,
     CheckDisposition,
     CheckOutcome,
-    EnvironmentManifest,
-    FairnessConfigManifest,
-    PricingManifest,
-    ResourceBudgetManifest,
     ResultBundle,
-    StoppingManifest,
     TaskIdentity,
     TerminalOutcome,
     TrialMetrics,
@@ -27,7 +20,11 @@ from ai_employee.productivity_evaluation import (
     dump_result_bundle,
     trial_id,
 )
-from ai_employee.productivity_protocol import ProtocolCheckArtifact, ProtocolCheckRecord
+from ai_employee.productivity_protocol import (
+    ProtocolCheckArtifact,
+    ProtocolCheckRecord,
+    load_protocol_manifest,
+)
 from ai_employee.serialization import canonical_digest, canonical_json, loads_model
 
 
@@ -35,63 +32,65 @@ def _dump(value: object) -> bytes:
     return (canonical_json(value) + "\n").encode("utf-8")
 
 
-def _arm(arm_id: str) -> ArmIdentity:
-    environment = EnvironmentManifest(
-        executable=str(Path(__file__).resolve()),
-        executable_version="fixture-1",
-        dependency_lock_digest="1" * 64,
-        sandbox_mode="workspace-write",
-        network_mode="disabled",
-        cache_policy="cold",
-        machine_digest="2" * 64,
-    )
-    fairness = FairnessConfigManifest(
-        prompt_digest="3" * 64,
-        context_digest="4" * 64,
-        model_provider="fixture",
-        model_name="fixture",
-        model_version="fixture-1",
-        reasoning_effort="fixed",
-        tools=("edit_intent", "process"),
-        budgets=ResourceBudgetManifest(
-            wall_seconds=60,
-            input_tokens=1000,
-            output_tokens=1000,
-        ),
-        stopping=StoppingManifest(
-            maximum_attempts=1,
-            maximum_retries=0,
-            maximum_repairs=0,
-            terminal_conditions=("accepted",),
-        ),
-        pricing=PricingManifest(
-            currency="USD",
-            input_per_million=0,
-            output_per_million=0,
-            subscription_allocation="fixture",
-        ),
-        randomized_order=(arm_id, "unused-control"),
-    )
-    config = ArmConfigManifest(
-        planning=False,
-        review=False,
-        repair=False,
-        maximum_parallelism=1,
-    )
+def _arm(manifest_path: Path, arm_id: str, mode: str) -> ArmIdentity:
+    manifest, _ = load_protocol_manifest(manifest_path)
+    protocol = next(item for item in manifest.protocols if item.id == "codex-direct")
+    treatment = protocol.treatments[0]
+    environment = treatment.environment
+    fairness = treatment.fairness_config
+    if mode == "environment-version":
+        environment = environment.model_copy(update={"executable_version": "fictional-2"})
+    elif mode == "dependency-lock":
+        environment = environment.model_copy(update={"dependency_lock_digest": "f" * 64})
+    elif mode == "sandbox-network":
+        environment = environment.model_copy(update={"sandbox_mode": "fictional"})
+    elif mode == "cache-machine":
+        environment = environment.model_copy(update={"cache_policy": "warm"})
+    elif mode == "prompt-context":
+        fairness = fairness.model_copy(update={"context_digest": "e" * 64})
+    elif mode == "model":
+        fairness = fairness.model_copy(update={"reasoning_effort": "fictional"})
+    elif mode == "tools":
+        fairness = fairness.model_copy(update={"tools": ("browser", *fairness.tools)})
+    elif mode == "budgets":
+        fairness = fairness.model_copy(
+            update={"budgets": fairness.budgets.model_copy(update={"wall_seconds": 3601.0})}
+        )
+    elif mode == "stopping":
+        fairness = fairness.model_copy(
+            update={"stopping": fairness.stopping.model_copy(update={"maximum_retries": 99})}
+        )
+    elif mode == "pricing":
+        fairness = fairness.model_copy(
+            update={
+                "pricing": fairness.pricing.model_copy(
+                    update={"subscription_allocation": "fictional"}
+                )
+            }
+        )
+    elif mode == "randomized-order":
+        fairness = fairness.model_copy(
+            update={"randomized_order": tuple(reversed(fairness.randomized_order))}
+        )
+    if arm_id != treatment.id:
+        fairness = fairness.model_copy(
+            update={"randomized_order": (arm_id, *fairness.randomized_order[1:])}
+        )
     return ArmIdentity(
         id=arm_id,
-        kind=ArmKind.DIRECT_AGENT,
-        adapter="codex",
-        worker="codex",
+        kind=treatment.kind,
+        adapter=treatment.adapter,
+        worker=treatment.worker,
         environment=environment,
         fairness_config=fairness,
-        arm_config=config,
+        arm_config=treatment.arm_config,
         environment_digest=canonical_digest(environment),
         fairness_config_digest=canonical_digest(fairness),
-        arm_config_digest=canonical_digest(config),
+        arm_config_digest=canonical_digest(treatment.arm_config),
         seed=1,
         repetition=1,
-        assignment_index=0,
+        assignment_index=fairness.randomized_order.index(arm_id),
+        disabled_components=treatment.disabled_components,
     )
 
 
@@ -122,6 +121,7 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--protocol", required=True)
+    parser.add_argument("--manifest", required=True)
     parser.add_argument(
         "--mode",
         default="valid",
@@ -134,6 +134,17 @@ def main() -> int:
             "nonzero",
             "wrong-arm",
             "wrong-task",
+            "environment-version",
+            "dependency-lock",
+            "sandbox-network",
+            "cache-machine",
+            "prompt-context",
+            "model",
+            "tools",
+            "budgets",
+            "stopping",
+            "pricing",
+            "randomized-order",
         ),
     )
     args = parser.parse_args()
@@ -146,7 +157,11 @@ def main() -> int:
     task = loads_model(Path(args.task).read_bytes(), TaskIdentity)
     if args.mode == "wrong-task":
         task = task.model_copy(update={"task_version": "stale-v2"})
-    arm = _arm("unexpected-arm" if args.mode == "wrong-arm" else "codex-direct")
+    arm = _arm(
+        Path(args.manifest),
+        "unexpected-arm" if args.mode == "wrong-arm" else "codex-direct",
+        args.mode,
+    )
     bound_trial_id = trial_id(task, arm)
     acceptance = _artifact("acceptance", bound_trial_id, task)
     regression = _artifact("regression", bound_trial_id, task)

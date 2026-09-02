@@ -18,12 +18,14 @@ from typing import ClassVar, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
-from .domain.base import Identifier
+from .domain.base import Digest, Identifier
 from .domain.v2 import SchemaModelV2
 from .productivity_evaluation import (
     ArmConfigManifest,
     ArmKind,
     CheckDisposition,
+    EnvironmentManifest,
+    FairnessConfigManifest,
     ResultBundle,
     TaskIdentity,
     load_result_bundle,
@@ -50,7 +52,11 @@ class ProtocolTreatment(SchemaModelV2):
     kind: ArmKind
     adapter: Identifier
     worker: Identifier
+    environment: EnvironmentManifest
+    fairness_config: FairnessConfigManifest
     arm_config: ArmConfigManifest
+    environment_digest: Digest
+    fairness_config_digest: Digest
     disabled_components: tuple[Identifier, ...] = ()
 
     @model_validator(mode="after")
@@ -59,6 +65,17 @@ class ProtocolTreatment(SchemaModelV2):
             raise ValueError("disabled components must be unique and sorted")
         if (self.kind is ArmKind.FLEET_ABLATION) != (len(self.disabled_components) == 1):
             raise ValueError("Fleet ablation treatments must disable exactly one component")
+        bindings = (
+            ("environment", self.environment_digest, canonical_digest(self.environment)),
+            (
+                "fairness config",
+                self.fairness_config_digest,
+                canonical_digest(self.fairness_config),
+            ),
+        )
+        for name, supplied, actual in bindings:
+            if supplied != actual:
+                raise ValueError(f"{name} digest does not bind its protocol treatment manifest")
         return self
 
 
@@ -90,6 +107,8 @@ class ProtocolDefinition(SchemaModelV2):
         expected = tuple((command_path.parent / name).as_posix() for name in _CHECK_FILENAMES)
         if self.evidence != expected:
             raise ValueError("protocol must declare the exact three sibling evidence artifacts")
+        if any(item.environment.network_mode != self.network for item in self.treatments):
+            raise ValueError("treatment environment network policy must match the protocol")
         ids = tuple(item.id for item in self.treatments)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("protocol treatments must be unique and sorted")
@@ -223,6 +242,20 @@ def _resolve_argv(
     return original, tuple(resolved)
 
 
+def _validate_execution_contract(
+    protocol: ProtocolDefinition, resolved_argv: tuple[str, ...]
+) -> None:
+    executable = resolved_argv[0]
+    mismatched = tuple(
+        item.id for item in protocol.treatments if item.environment.executable != executable
+    )
+    if mismatched:
+        raise ValueError(
+            "resolved producer executable does not match every predeclared treatment: "
+            + ", ".join(mismatched)
+        )
+
+
 def _run(
     argv: tuple[str, ...], repository: Path, timeout: float, network: str
 ) -> tuple[bytes, bytes, str, str, int]:
@@ -308,7 +341,11 @@ def _validate_bundle(
             arm.kind is not expected.kind
             or arm.adapter != expected.adapter
             or arm.worker != expected.worker
+            or arm.environment != expected.environment
+            or arm.fairness_config != expected.fairness_config
             or arm.arm_config != expected.arm_config
+            or arm.environment_digest != expected.environment_digest
+            or arm.fairness_config_digest != expected.fairness_config_digest
             or arm.disabled_components != expected.disabled_components
         ):
             raise ValueError(f"result bundle treatment mismatch: {arm_id}")
@@ -370,6 +407,7 @@ def collect_protocol(
             output=stage,
             protocol=protocol.id,
         )
+        _validate_execution_contract(protocol, argv)
         stdout, stderr, started_at, ended_at, exit_code = _run(argv, repository, timeout, network)
         if exit_code != 0:
             raise ValueError(f"arm command exited with {exit_code}")

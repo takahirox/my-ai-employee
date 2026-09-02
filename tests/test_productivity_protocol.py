@@ -9,12 +9,13 @@ import pytest
 
 from ai_employee.productivity_evaluation import (
     AcceptanceCriterion,
+    EnvironmentManifest,
     RegressionCheck,
     TaskClass,
     TaskIdentity,
 )
-from ai_employee.productivity_protocol import collect_protocol
-from ai_employee.serialization import canonical_json
+from ai_employee.productivity_protocol import collect_protocol, load_protocol_manifest
+from ai_employee.serialization import canonical_digest, canonical_json
 
 MANIFEST = Path("examples/productivity/protocols.json")
 PRODUCER = Path("tests/fixtures/productivity_protocol_producer.py").resolve()
@@ -48,7 +49,18 @@ def _task(path: Path) -> Path:
     return path
 
 
-def _command(mode: str = "valid") -> list[str]:
+def _manifest(path: Path) -> Path:
+    data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    protocol = next(item for item in data["protocols"] if item["id"] == "codex-direct")
+    treatment = protocol["treatments"][0]
+    treatment["environment"]["executable"] = str(Path(sys.executable).absolute())
+    environment = EnvironmentManifest.model_validate(treatment["environment"], strict=True)
+    treatment["environment_digest"] = canonical_digest(environment)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _command(manifest: Path, mode: str = "valid") -> list[str]:
     return [
         sys.executable,
         str(PRODUCER),
@@ -60,6 +72,8 @@ def _command(mode: str = "valid") -> list[str]:
         "{output}",
         "--protocol",
         "{protocol}",
+        "--manifest",
+        str(manifest),
         "--mode",
         mode,
     ]
@@ -68,15 +82,16 @@ def _command(mode: str = "valid") -> list[str]:
 def _collect(tmp_path: Path, mode: str = "valid") -> Path:
     repository = tmp_path / "repository"
     repository.mkdir(exist_ok=True)
+    manifest = _manifest(tmp_path / "protocols.json")
     return collect_protocol(
-        manifest_path=MANIFEST,
+        manifest_path=manifest,
         protocol_id="codex-direct",
         task_path=_task(tmp_path / "task.json"),
         repository=repository,
         output_root=tmp_path,
         timeout=10,
         network="disabled",
-        arm_command=_command(mode),
+        arm_command=_command(manifest, mode),
     )
 
 
@@ -140,16 +155,17 @@ def test_collect_protocol_rejects_nonzero_and_overwrite(tmp_path: Path) -> None:
 def test_collect_protocol_rejects_network_mismatch_before_execution(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
     with pytest.raises(ValueError, match="network policies"):
         collect_protocol(
-            manifest_path=MANIFEST,
+            manifest_path=manifest,
             protocol_id="codex-direct",
             task_path=_task(tmp_path / "task.json"),
             repository=repository,
             output_root=tmp_path,
             timeout=10,
             network="enabled",
-            arm_command=_command(),
+            arm_command=_command(manifest),
         )
 
 
@@ -169,5 +185,65 @@ def test_collect_protocol_rejects_manifest_path_escape(tmp_path: Path) -> None:
             output_root=tmp_path,
             timeout=10,
             network="disabled",
-            arm_command=_command(),
+            arm_command=_command(escaped_manifest),
         )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "environment-version",
+        "dependency-lock",
+        "sandbox-network",
+        "cache-machine",
+        "prompt-context",
+        "model",
+        "tools",
+        "budgets",
+        "stopping",
+        "pricing",
+        "randomized-order",
+    ),
+)
+def test_collect_protocol_rejects_self_consistent_fictional_controls(
+    tmp_path: Path, mode: str
+) -> None:
+    with pytest.raises(ValueError, match="treatment mismatch"):
+        _collect(tmp_path, mode)
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+def test_collect_protocol_rejects_resolved_execution_identity_mismatch(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
+    with pytest.raises(ValueError, match="resolved producer executable"):
+        collect_protocol(
+            manifest_path=manifest,
+            protocol_id="codex-direct",
+            task_path=_task(tmp_path / "task.json"),
+            repository=repository,
+            output_root=tmp_path,
+            timeout=10,
+            network="disabled",
+            arm_command=["/usr/bin/env", *_command(manifest)],
+        )
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+@pytest.mark.parametrize(
+    ("digest_field", "message"),
+    (
+        ("environment_digest", "environment digest"),
+        ("fairness_config_digest", "fairness config digest"),
+    ),
+)
+def test_protocol_manifest_rejects_stale_predeclared_control_digest(
+    tmp_path: Path, digest_field: str, message: str
+) -> None:
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    manifest["protocols"][0]["treatments"][0][digest_field] = "f" * 64
+    path = tmp_path / "protocols.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_protocol_manifest(path)
