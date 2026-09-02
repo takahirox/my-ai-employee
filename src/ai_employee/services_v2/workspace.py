@@ -9,8 +9,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
-from ai_employee.domain.base import freeze_json
-from ai_employee.domain.services_v2 import ArtifactStore, Cancellation
+from ai_employee.domain.base import CanonicalData, freeze_json
+from ai_employee.domain.services_v2 import (
+    ArtifactStore,
+    Cancellation,
+    WorkspacePreflightError,
+)
 from ai_employee.domain.v2 import (
     ApprovalRecord,
     ArtifactDescriptor,
@@ -50,14 +54,59 @@ class GitWorkspaceManager:
         if self.state_root == repository or repository in self.state_root.parents:
             raise ValueError("Fleet state root must be outside the source repository")
         head = run_git(repository, "rev-parse", "HEAD").decode().strip()
+        tree = run_git(repository, "rev-parse", "HEAD^{tree}").decode().strip()
         requested = (
             run_git(repository, "rev-parse", f"{request.base_commit}^{{commit}}").decode().strip()
         )
         if requested != head:
-            raise ValueError("base_commit must match the source worktree HEAD")
+            raise WorkspacePreflightError(
+                StableFailure(
+                    code=StableFailureCode.PATCH_PREFLIGHT_FAILED,
+                    message="requested source baseline does not match the captured source HEAD",
+                    details=freeze_json(
+                        {
+                            "cause": "source_head_mismatch",
+                            "captured_source_head": head,
+                            "captured_base_tree": tree,
+                            "requested_base_commit": requested,
+                            "tracked_file_count": 0,
+                            "untracked_file_count": 0,
+                            "file_count": 0,
+                            "hunk_count": 0,
+                            "remediation": (
+                                "Regenerate the request from the captured source HEAD and retry; "
+                                "Fleet did not modify or reset the source repository."
+                            ),
+                        }
+                    ),
+                )
+            )
         status = run_git(repository, "status", "--porcelain=v2", "--untracked-files=all")
         if status:
-            raise ValueError("source worktree is dirty")
+            tracked_count, untracked_count = self._status_counts(status)
+            file_count = tracked_count + untracked_count
+            raise WorkspacePreflightError(
+                StableFailure(
+                    code=StableFailureCode.SOURCE_WORKTREE_DIRTY,
+                    message="source worktree contains tracked or untracked changes",
+                    details=freeze_json(
+                        {
+                            "cause": "dirty_source_worktree",
+                            "captured_source_head": head,
+                            "captured_base_tree": tree,
+                            "requested_base_commit": requested,
+                            "tracked_file_count": tracked_count,
+                            "untracked_file_count": untracked_count,
+                            "file_count": file_count,
+                            "hunk_count": 0,
+                            "remediation": (
+                                "Commit, stash, or remove the source changes and retry; "
+                                "Fleet did not modify or reset the source repository."
+                            ),
+                        }
+                    ),
+                )
+            )
         ignored = run_git(
             repository,
             "status",
@@ -65,7 +114,6 @@ class GitWorkspaceManager:
             "--untracked-files=all",
             "--ignored=matching",
         )
-        tree = run_git(repository, "rev-parse", "HEAD^{tree}").decode().strip()
         index = self._git_path(repository, "--git-path", "index")
         identity_payload = b"\0".join(
             (str(common_dir).encode(), str(repository).encode(), head.encode(), tree.encode())
@@ -185,7 +233,24 @@ class GitWorkspaceManager:
             return self._edit_failure(
                 request,
                 StableFailureCode.PATCH_PREFLIGHT_FAILED,
-                check.stderr.decode("utf-8", "replace")[:2_000] or "patch preflight failed",
+                "patch does not apply to the captured workspace baseline",
+                details=freeze_json(
+                    {
+                        "cause": "stale_workspace_baseline",
+                        "captured_source_head": snapshot.head_commit,
+                        "captured_base_tree": snapshot.base_tree,
+                        "workspace_id": snapshot.id,
+                        "workspace_digest": snapshot.content_digest,
+                        "file_count": len(observed),
+                        "hunk_count": sum(
+                            1 for line in request.unified_diff.splitlines() if line.startswith("@@")
+                        ),
+                        "remediation": (
+                            "Regenerate the edit against the captured base tree and resubmit it; "
+                            "Fleet did not apply or reset files."
+                        ),
+                    }
+                ),
             )
         applied = subprocess.run(
             (
@@ -330,11 +395,22 @@ class GitWorkspaceManager:
         return paths
 
     @staticmethod
+    def _status_counts(status: bytes) -> tuple[int, int]:
+        tracked = sum(
+            1
+            for line in status.splitlines()
+            if line.startswith((b"1 ", b"2 ", b"u "))
+        )
+        untracked = sum(1 for line in status.splitlines() if line.startswith(b"? "))
+        return tracked, untracked
+
+    @staticmethod
     def _edit_failure(
         request: EditIntentRequest,
         code: StableFailureCode,
         message: str,
         *,
+        details: CanonicalData = None,
         status: Literal["failed", "cancelled"] = "failed",
     ) -> ExecutionResult:
         return ExecutionResult.model_validate(
@@ -344,7 +420,9 @@ class GitWorkspaceManager:
                 "created_at": now(),
                 "request_digest": request.content_digest,
                 "status": status,
-                "failure": StableFailure(code=code, message=message),
+                "failure": StableFailure(
+                    code=code, message=message, details=details
+                ),
                 "duration_seconds": 0.0,
             },
             strict=True,

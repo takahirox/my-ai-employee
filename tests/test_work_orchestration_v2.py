@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -1454,6 +1455,15 @@ def test_headerless_sections_reject_base_mismatch_through_workspace_manager(
 
     assert result.failure is not None
     assert result.failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+    details = result.failure.details
+    assert isinstance(details, Mapping)
+    assert details["cause"] == "stale_workspace_baseline"
+    assert details["captured_source_head"] == snapshot.head_commit
+    assert details["captured_base_tree"] == snapshot.base_tree
+    assert details["workspace_digest"] == snapshot.content_digest
+    assert details["file_count"] == 2
+    assert details["hunk_count"] == 2
+    assert "not the base" not in json.dumps(dict(details))
     isolated = Path(snapshot.isolated_worktree)
     assert (isolated / "first.txt").read_text() == "before one\n"
     assert (isolated / "second.txt").read_text() == "before two\n"
@@ -2770,3 +2780,112 @@ def test_offline_work_run_applies_typed_edit_only_in_isolated_worktree(
         actions = store.list_records("action_result_v2", ExecutionResult, run_id=run.id)
         assert len(actions) == 1
         assert actions[0].request_digest == edit.content_digest
+        assert not any(
+            item.kind == "workspace_preflight_failed" for item in store.work_events(run.id)
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "preflight_case",
+        "expected_code",
+        "expected_cause",
+        "tracked_count",
+        "untracked_count",
+    ),
+    (
+        ("tracked", "SOURCE_WORKTREE_DIRTY", "dirty_source_worktree", 1, 0),
+        ("untracked", "SOURCE_WORKTREE_DIRTY", "dirty_source_worktree", 0, 1),
+        ("stale", "PATCH_PREFLIGHT_FAILED", "source_head_mismatch", 0, 0),
+    ),
+)
+def test_workspace_preflight_fails_closed_before_worker_dispatch(
+    tmp_path: Path,
+    preflight_case: str,
+    expected_code: str,
+    expected_cause: str,
+    tracked_count: int,
+    untracked_count: int,
+) -> None:
+    repository = tmp_path / "preflight-repo"
+    repository.mkdir()
+    subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True
+    )
+    source = repository / "file.txt"
+    source.write_text("base\n")
+    subprocess.run(("git", "-C", str(repository), "add", "file.txt"), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    requested_head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    canary = f"private-{preflight_case}-canary"
+    private_path = repository / "private-untracked.txt"
+    if preflight_case == "untracked":
+        private_path.write_text(canary)
+    else:
+        source.write_text(f"{canary}\n")
+        if preflight_case == "stale":
+            subprocess.run(
+                ("git", "-C", str(repository), "commit", "-qam", "advance"), check=True
+            )
+    captured_head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    dispatches: list[str] = []
+
+    def worker_factory(
+        snapshot: WorkspaceSnapshot | None, _cancellation: object
+    ) -> ScriptedWorkerAdapter:
+        if snapshot is not None:
+            dispatches.append(snapshot.id)
+        return ScriptedWorkerAdapter([WorkerProposalEnvelope()])
+
+    artifacts = AtomicArtifactStore(tmp_path / "preflight-artifacts")
+    with SQLiteStore(tmp_path / "preflight.db") as store:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            GitWorkspaceManager(tmp_path / "preflight-workspaces", artifacts),
+            worker_factory,  # type: ignore[arg-type]
+            lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+            lambda descriptor: artifacts.open_verified(descriptor).read(),
+            (builtin_policy(f"work-{preflight_case}"),),
+        )
+        run = coordinator.start(
+            "change file safely",
+            str(repository),
+            requested_head,
+            worker_name="scripted",
+            run_id=f"work-{preflight_case}",
+        )
+        view = inspect_work_run(store, run.id)
+
+    assert run.status == "failed"
+    assert run.failure_code == expected_code
+    assert dispatches == []
+    assert view["workspace"] == []
+    assert view["worker"]["results"] == []
+    diagnostic = next(
+        item for item in view["events"] if item["kind"] == "workspace_preflight_failed"
+    )["details"]
+    assert diagnostic["stable_failure_code"] == expected_code
+    facts = diagnostic["facts"]
+    assert facts["cause"] == expected_cause
+    assert facts["captured_source_head"] == captured_head
+    assert facts["requested_base_commit"] == requested_head
+    assert facts["tracked_file_count"] == tracked_count
+    assert facts["untracked_file_count"] == untracked_count
+    assert facts["file_count"] == tracked_count + untracked_count
+    assert facts["hunk_count"] == 0
+    assert canary not in json.dumps(diagnostic)
+    assert "private-untracked.txt" not in json.dumps(diagnostic)
+    if preflight_case == "untracked":
+        assert private_path.read_text() == canary
+    else:
+        assert source.read_text() == f"{canary}\n"

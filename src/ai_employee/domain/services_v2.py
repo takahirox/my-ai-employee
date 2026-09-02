@@ -20,6 +20,7 @@ from .v2 import (
     PolicyDecision,
     ProcessRequest,
     PromotionRecord,
+    StableFailure,
     WorkerAvailability,
     WorkerRequest,
     WorkerResult,
@@ -30,6 +31,14 @@ from .v2 import (
 
 class Cancellation(Protocol):
     def cancelled(self) -> bool: ...
+
+
+class WorkspacePreflightError(ValueError):
+    """A typed, Inspector-safe rejection before an isolated workspace exists."""
+
+    def __init__(self, failure: StableFailure) -> None:
+        self.failure = failure
+        super().__init__(failure.message)
 
 
 class MediatedActionChannel(Protocol):

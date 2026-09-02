@@ -30,6 +30,7 @@ from .domain.services_v2 import (
     ProcessExecutor,
     WorkerAdapter,
     WorkspaceManager,
+    WorkspacePreflightError,
 )
 from .domain.v2 import (
     AcceptanceLedger,
@@ -473,7 +474,27 @@ class WorkCoordinator:
             base_commit=base_commit,
         )
         self.store.put("workspace_request_v2", request, run_id=run.id)
-        snapshot = self.workspace.create(request)
+        try:
+            snapshot = self.workspace.create(request)
+        except WorkspacePreflightError as error:
+            failure = error.failure
+            self._event(
+                run.id,
+                "workspace_preflight_failed",
+                "service",
+                request_digest=request.content_digest,
+                details={
+                    "stable_failure_code": failure.code.value,
+                    "message": failure.message,
+                    "retryable": failure.retryable,
+                    "facts": failure.details,
+                },
+            )
+            return self._update(
+                run,
+                status="failed",
+                failure_code=failure.code.value,
+            )
         self.store.put("workspace_v2", snapshot, run_id=run.id)
         self._event(
             run.id,
