@@ -44,6 +44,15 @@ class TerminalOutcome(StableStrEnum):
     CANCELLED = "cancelled"
 
 
+_TERMINAL_CONDITION_BY_OUTCOME: Mapping[TerminalOutcome, str] = {
+    TerminalOutcome.ACCEPTED: "accepted",
+    TerminalOutcome.CHECKS_FAILED: "checks-failed",
+    TerminalOutcome.EXECUTION_FAILED: "execution-failed",
+    TerminalOutcome.TIMED_OUT: "timed-out",
+    TerminalOutcome.CANCELLED: "cancelled",
+}
+
+
 class FailureClassification(StableStrEnum):
     ASSERTION = "assertion"
     PROCESS = "process"
@@ -133,6 +142,13 @@ class StoppingManifest(SchemaModelV2):
     def _canonical_conditions(self) -> Self:
         if self.terminal_conditions != tuple(sorted(set(self.terminal_conditions))):
             raise ValueError("terminal conditions must be unique and sorted")
+        if set(_TERMINAL_CONDITION_BY_OUTCOME) != set(TerminalOutcome) or len(
+            set(_TERMINAL_CONDITION_BY_OUTCOME.values())
+        ) != len(TerminalOutcome):
+            raise ValueError("terminal condition contract must cover every terminal outcome once")
+        unknown = set(self.terminal_conditions).difference(_TERMINAL_CONDITION_BY_OUTCOME.values())
+        if unknown:
+            raise ValueError(f"unknown terminal conditions: {', '.join(sorted(unknown))}")
         return self
 
 
@@ -356,6 +372,9 @@ class TrialResult(SchemaModelV2):
         }.get(self.terminal_outcome)
         if expected is not None and self.failure_classification is not expected:
             raise ValueError("terminal outcome and failure classification are incoherent")
+        required_condition = _TERMINAL_CONDITION_BY_OUTCOME[self.terminal_outcome]
+        if required_condition not in self.arm.fairness_config.stopping.terminal_conditions:
+            raise ValueError("terminal outcome is not allowed by the retained stopping policy")
         budgets = self.arm.fairness_config.budgets
         stopping = self.arm.fairness_config.stopping
         if self.metrics.wall_seconds > budgets.wall_seconds:

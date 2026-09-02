@@ -73,7 +73,7 @@ def _arm(kind: ArmKind, arm_id: str, environment: str = D1) -> ArmIdentity:
             maximum_attempts=2,
             maximum_retries=1,
             maximum_repairs=1,
-            terminal_conditions=("accepted",),
+            terminal_conditions=("accepted", "checks-failed"),
         ),
         pricing=PricingManifest(
             currency="USD",

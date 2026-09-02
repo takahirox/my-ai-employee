@@ -87,7 +87,7 @@ def fairness() -> FairnessConfigManifest:
             maximum_attempts=2,
             maximum_retries=1,
             maximum_repairs=1,
-            terminal_conditions=("accepted", "budget-exhausted"),
+            terminal_conditions=("accepted", "checks-failed"),
         ),
         pricing=PricingManifest(
             currency="USD",
@@ -515,6 +515,53 @@ def test_swe_bench_standard_fields_are_retained_and_round_trip() -> None:
                 "swe_bench_provenance": normalized.swe_bench_provenance,
             }
         )
+
+
+def test_stopping_conditions_are_canonical_and_bind_terminal_outcomes() -> None:
+    stopping = fairness().stopping
+    complete = StoppingManifest(
+        maximum_attempts=stopping.maximum_attempts,
+        maximum_retries=stopping.maximum_retries,
+        maximum_repairs=stopping.maximum_repairs,
+        terminal_conditions=(
+            "accepted",
+            "cancelled",
+            "checks-failed",
+            "execution-failed",
+            "timed-out",
+        ),
+    )
+    assert len(complete.terminal_conditions) == len(TerminalOutcome)
+    with pytest.raises(ValidationError, match="unknown terminal conditions"):
+        StoppingManifest(
+            maximum_attempts=stopping.maximum_attempts,
+            maximum_retries=stopping.maximum_retries,
+            maximum_repairs=stopping.maximum_repairs,
+            terminal_conditions=("accepted", "budget-exhausted"),
+        )
+
+    bound_task = task()
+    failed = result(bound_task, arm(ArmKind.FLEET, "fleet"), accepted=False)
+    restricted_stopping = StoppingManifest(
+        maximum_attempts=stopping.maximum_attempts,
+        maximum_retries=stopping.maximum_retries,
+        maximum_repairs=stopping.maximum_repairs,
+        terminal_conditions=("accepted",),
+    )
+    restricted_fairness = failed.arm.fairness_config.model_copy(
+        update={"stopping": restricted_stopping}
+    )
+    restricted_arm = failed.arm.model_copy(
+        update={
+            "fairness_config": restricted_fairness,
+            "fairness_config_digest": canonical_digest(restricted_fairness),
+        }
+    )
+    payload = failed.model_dump(mode="python")
+    payload["arm"] = restricted_arm.model_dump(mode="python")
+    payload["id"] = trial_id(bound_task, restricted_arm)
+    with pytest.raises(ValidationError, match="not allowed by the retained stopping policy"):
+        TrialResult.model_validate(payload)
 
 
 def test_terminal_outcomes_and_durations_are_coherent() -> None:

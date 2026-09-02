@@ -40,6 +40,11 @@ randomized order. Their stored digests must equal their canonical content digest
 Fleet validation compares every controlled manifest field. Arm manifests retain planning, review,
 repair and parallelism settings. An ablation is valid only when its declared disabled component is
 the sole differing arm-manifest field.
+Stopping conditions use exactly one canonical identifier per terminal outcome: `accepted` maps to
+`accepted`, `checks-failed` to `checks_failed`, `execution-failed` to `execution_failed`,
+`timed-out` to `timed_out`, and `cancelled` to `cancelled`. Unknown identifiers and incomplete
+internal mappings fail manifest validation. A trial also fails validation when its retained
+stopping policy does not list the identifier mapped to its observed terminal outcome.
 
 For Codex:
 
