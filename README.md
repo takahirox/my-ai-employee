@@ -79,6 +79,32 @@ fleet work "Make one small objectively verifiable improvement" \
   --repo /path/to/project --json
 ```
 
+### Grouping delegated Graph Runs under a parent Job
+
+A larger delegated goal can span several independent `fleet work` invocations. Give the first
+invocation a stable `--job-id` and its original higher-level `--job-goal`; later invocations
+reuse only the Job ID:
+
+```bash
+fleet work "Implement the persistence slice" --repo /path/to/project \
+  --job-id issue-67 --job-goal "Implement GitHub Issue #67 completely" --json
+fleet work "Implement the Inspector slice" --repo /path/to/project \
+  --job-id issue-67 --json
+fleet work "Add end-to-end tests and documentation" --repo /path/to/project \
+  --job-id issue-67 --json
+```
+
+The Job and every ordered child relationship are persisted before that child Graph Run starts.
+A reused Job ID must retain the exact original goal. Supplying an unknown Job ID without
+`--job-goal`, or trying to replace an existing Job's goal, fails without claiming the requested
+Run ID. `--run-id` may also be supplied when an external delegator needs to retain its own child
+identity.
+
+Jobs do not change execution authority. Each child remains an independent Graph Run with its own
+accepted revisions, evidence, verification, approval, promotion, replay, and control state. A
+same-run replan creates another accepted graph revision under that Run; it never creates another
+Job child. Runs created without `--job-id` retain the existing standalone behavior.
+
 The selected CLI must already be installed and authenticated by its own official
 login flow. Fleet does not read or store its credential. Codex is invoked in a
 read-only proposal sandbox; edits are returned as typed unified diffs and applied

@@ -39,6 +39,17 @@ persisted as a `GraphRunRecord`. Fixed routing constructs a one-node authoritati
 adaptive routing accepts a Planner-proposed child DAG. Inspector drill-down reads those
 Graph-owned node, route, execution, evidence, and review records.
 
+An optional `JobRecord` sits above this authority tree solely as durable grouping identity.
+`JobGraphRunRecord` appends independently claimed Graph Run IDs to the Job with a monotonic
+sequence. The relationship is established explicitly by `fleet work --job-id`; it is not inferred
+from goal text, repository, worker ancestry, timestamps, or graph revision lineage. Consequently:
+
+- a new invocation under a Job creates a new ordered child Graph Run;
+- a replan changes the accepted revision and generation of the same Graph Run; and
+- omitting `--job-id` preserves the pre-Job standalone-run model.
+
+Job records carry no policy, evidence, verification, promotion, replay, or mutation authority.
+
 The worker never writes authoritative state and free-form prose is never executable.
 General commands use `LocalProcessExecutor`. Git worktree lifecycle, diff construction,
 exact patch application, and promotion are deterministic system operations encapsulated

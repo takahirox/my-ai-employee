@@ -8,6 +8,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -28,6 +29,7 @@ from .domain import (
     VerificationEvidence,
 )
 from .domain.base import ensure_utc
+from .jobs import JobGraphRunRecord, JobRecord
 from .run_ownership import (
     RunExecutionOwnerRecord,
     RunLeaseClosureRecord,
@@ -623,8 +625,18 @@ class SQLiteStore:
     def save_run(self, run: Run) -> None:
         self.put("run", run, run_id=run.id, revision=run.generation + 1)
 
-    def claim_run_id(self, run_id: str, repository: str | Path) -> None:
-        """Atomically bind a new run ID to one repository without overwriting history."""
+    def claim_run_id(
+        self,
+        run_id: str,
+        repository: str | Path,
+        *,
+        job_id: str | None = None,
+        job_goal: str | None = None,
+    ) -> JobGraphRunRecord | None:
+        """Atomically claim a run and optionally append it to an immutable parent Job."""
+
+        if job_id is None and job_goal is not None:
+            raise ValueError("--job-goal requires --job-id")
 
         repository_id, normalized = _repository_details(repository)
         connection = self._connection
@@ -650,7 +662,53 @@ class SQLiteStore:
                 "INSERT INTO run_repositories(run_id,repository_id) VALUES(?,?)",
                 (run_id, repository_id),
             )
+            binding: JobGraphRunRecord | None = None
+            if job_id is not None:
+                created_at = datetime.now(UTC)
+                row = connection.execute(
+                    "SELECT payload FROM records WHERE kind='job_v2' AND record_id=? "
+                    "ORDER BY revision DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    if job_goal is None:
+                        raise ValueError(
+                            f"Job {job_id!r} does not exist; supply --job-goal on its first run"
+                        )
+                    job = JobRecord(id=job_id, goal=job_goal, created_at=created_at)
+                    connection.execute(
+                        "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                        "VALUES('job_v2',?,NULL,1,?)",
+                        (job.id, canonical_json(job)),
+                    )
+                else:
+                    job = JobRecord.model_validate_json(row["payload"], strict=True)
+                    if job_goal is not None and job_goal != job.goal:
+                        raise ValueError(f"Job {job_id!r} already has a different original goal")
+                sequence_row = connection.execute(
+                    "SELECT COALESCE(MAX(CAST(json_extract(payload,'$.sequence') AS INTEGER)),0) "
+                    "FROM records WHERE kind='job_graph_run_v2' "
+                    "AND json_extract(payload,'$.job_id')=?",
+                    (job_id,),
+                ).fetchone()
+                sequence = int(sequence_row[0]) + 1
+                relationship_id = (
+                    "job-run-" + hashlib.sha256(f"{job_id}\0{run_id}".encode()).hexdigest()[:24]
+                )
+                binding = JobGraphRunRecord(
+                    id=relationship_id,
+                    job_id=job_id,
+                    graph_run_id=run_id,
+                    sequence=sequence,
+                    created_at=created_at,
+                )
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                    "VALUES('job_graph_run_v2',?,?,1,?)",
+                    (binding.id, run_id, canonical_json(binding)),
+                )
             connection.commit()
+            return binding
         except BaseException:
             connection.rollback()
             raise
@@ -665,6 +723,25 @@ class SQLiteStore:
         if row is None:
             return None
         return {"repository_id": str(row[0]), "repository": str(row[1])}
+
+    def job_context_for_run(self, run_id: str) -> dict[str, object] | None:
+        """Return the explicit Job relationship for a run without inferring ancestry."""
+
+        bindings = tuple(
+            item
+            for item in self.list_records("job_graph_run_v2", JobGraphRunRecord, run_id=run_id)
+            if item.graph_run_id == run_id
+        )
+        if not bindings:
+            return None
+        if len(bindings) != 1:
+            raise ValueError(f"Graph Run {run_id!r} has ambiguous parent Job relationships")
+        binding = bindings[0]
+        job = self.get("job_v2", binding.job_id, JobRecord)
+        return {
+            "job": job.model_dump(mode="json"),
+            "relationship": binding.model_dump(mode="json"),
+        }
 
     def list_run_repositories(
         self, repository_id: str | None = None

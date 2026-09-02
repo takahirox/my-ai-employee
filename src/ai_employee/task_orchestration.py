@@ -263,6 +263,21 @@ class PreAcceptanceGoalRecord(DigestedRecordV2):
         return self
 
 
+class PreAcceptanceGraphRunOutcomeRecord(DigestedRecordV2):
+    """Terminal outcome for a claimed run that never gained GraphRun authority."""
+
+    schema_name: ClassVar[str] = "pre_acceptance_graph_run_outcome_record"
+    goal: Goal
+    status: Literal["failed", "interrupted"]
+    stable_code: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def _run_identity_is_exact(self) -> Self:
+        if self.id != self.run_id:
+            raise ValueError("pre-acceptance outcome identity must match its claimed run")
+        return self
+
+
 class RetainedNodeBinding(DigestedRecordV2):
     schema_name: ClassVar[str] = "retained_node_binding"
     node_id: Identifier

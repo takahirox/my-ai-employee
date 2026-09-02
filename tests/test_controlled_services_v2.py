@@ -395,6 +395,33 @@ def test_process_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
 
 
+def test_process_base_exception_terminates_spawned_process_group(tmp_path: Path) -> None:
+    class InterruptingExecutor(LocalProcessExecutor):
+        spawned: subprocess.Popen[bytes] | None = None
+
+        def _capture(self, process, *args, **kwargs):  # type: ignore[no-untyped-def,override]
+            del args, kwargs
+            self.spawned = process
+            raise KeyboardInterrupt("simulated parent SIGTERM")
+
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = InterruptingExecutor((tmp_path,), store, terminate_grace_seconds=0.1)
+    request = ProcessRequest(
+        id="process-base-exception",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", "trap '' TERM; sleep 30"),
+        timeout_seconds=10.0,
+        purpose="verify asynchronous interruption cleanup",
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="simulated parent SIGTERM"):
+        executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert executor.spawned is not None
+    assert executor.spawned.poll() is not None
+
+
 def test_process_timeout_terminates_descendant_after_leader_exit(tmp_path: Path) -> None:
     store = AtomicArtifactStore(tmp_path / "artifacts")
     executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.1)

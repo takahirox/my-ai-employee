@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -32,6 +34,7 @@ from ai_employee.domain.v2 import (
     PolicyDecision,
     ProcessRequest,
 )
+from ai_employee.inspector import inspect_fleet_runs
 from ai_employee.plan_review import (
     CliPlanReviewer,
     PlanReviewFinding,
@@ -44,6 +47,7 @@ from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
     GraphRunRecord,
+    PreAcceptanceGraphRunOutcomeRecord,
     TaskGraphAcceptance,
     one_node_graph,
 )
@@ -702,6 +706,12 @@ def test_adaptive_planner_failure_is_closed_and_stable(
             str(repository),
             "--operator-config",
             str(operator_config),
+            "--run-id",
+            "planner-failure-child",
+            "--job-id",
+            "planner-failure-job",
+            "--job-goal",
+            "Complete the larger planned change",
         ]
     )
 
@@ -709,3 +719,65 @@ def test_adaptive_planner_failure_is_closed_and_stable(
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["status"] == "failed"
     assert emitted["stable_code"] == "GRAPH_PLANNER_FAILED"
+    assert emitted["job"]["job"]["id"] == "planner-failure-job"
+
+    with SQLiteStore(db_path) as store:
+        outcome = store.get(
+            "pre_acceptance_graph_run_outcome_v2",
+            "planner-failure-child",
+            PreAcceptanceGraphRunOutcomeRecord,
+        )
+        overview = inspect_fleet_runs(store)
+    assert outcome.status == "failed"
+    assert outcome.stable_code == "GRAPH_PLANNER_FAILED"
+    assert overview["active"] == []
+    job = overview["history"][0]
+    assert job["job_id"] == "planner-failure-job"
+    assert job["overall_status"] == "failed"
+    assert job["child_graph_runs"][0]["status"] == "failed"
+    assert job["progress"]["completed"] == 0
+
+
+def test_sigterm_during_planning_persists_interrupted_job_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: db_path)
+
+    def interrupted_plan(
+        self: CliProposedGraphPlanner, *args: object, **kwargs: object
+    ) -> ProposedGraph:
+        del self, args, kwargs
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM handler did not interrupt planning")
+
+    monkeypatch.setattr(CliProposedGraphPlanner, "plan", interrupted_plan)
+    with pytest.raises(BaseException, match="SIGTERM"):
+        cli.main(
+            [
+                "work",
+                "plan until interrupted",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator_config),
+                "--run-id",
+                "interrupted-child",
+                "--job-id",
+                "interrupted-job",
+                "--job-goal",
+                "Complete the interrupted larger job",
+            ]
+        )
+
+    with SQLiteStore(db_path) as store:
+        outcome = store.get(
+            "pre_acceptance_graph_run_outcome_v2",
+            "interrupted-child",
+            PreAcceptanceGraphRunOutcomeRecord,
+        )
+        overview = inspect_fleet_runs(store)
+    assert outcome.status == "interrupted"
+    assert overview["active"] == []
+    assert overview["history"][0]["overall_status"] == "interrupted"

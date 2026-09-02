@@ -57,6 +57,7 @@ from .graph_evaluation import (
 )
 from .incident_runtime import INCIDENT_RUN_RECORD_KIND, IncidentRunRecord
 from .inspector_ui import INDEX as _INDEX
+from .jobs import JobGraphRunRecord, JobRecord
 from .parent_review import (
     ParentSemanticRepairRequest,
     ParentSemanticReviewDecision,
@@ -97,6 +98,7 @@ from .task_orchestration import (
     NodeSemanticAssessmentRecord,
     NodeWatchdogRecord,
     PreAcceptanceGoalRecord,
+    PreAcceptanceGraphRunOutcomeRecord,
     RetainedNodeBinding,
     StaleNodeResultRecord,
     TaskGraphAcceptance,
@@ -1057,6 +1059,27 @@ def inspect_failed_plan_review(store: SQLiteStore, run_id: str) -> dict[str, Any
     }
 
 
+def inspect_pre_acceptance_outcome(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    """Project a claimed run that terminated before GraphRun authority existed."""
+
+    outcome = store.get(
+        "pre_acceptance_graph_run_outcome_v2",
+        run_id,
+        PreAcceptanceGraphRunOutcomeRecord,
+    )
+    return {
+        "schema_version": "2",
+        "run_id": run_id,
+        "kind": "pre_acceptance_graph_run",
+        "state": outcome.status,
+        "failure_code": outcome.stable_code,
+        "generation": 0,
+        "goal": _json_model(outcome.goal),
+        "pre_acceptance_outcome": _json_model(outcome),
+        "graph_acceptance": None,
+    }
+
+
 def inspect_any_run(
     store: SQLiteStore,
     run_id: str,
@@ -1081,7 +1104,12 @@ def inspect_any_run(
         pass
     else:
         return _attach_repository_context(store, run_id, projection)
-    for inspector in (inspect_failed_plan_review, inspect_work_run, inspect_run):
+    for inspector in (
+        inspect_failed_plan_review,
+        inspect_pre_acceptance_outcome,
+        inspect_work_run,
+        inspect_run,
+    ):
         try:
             projection = inspector(store, run_id)
         except KeyError:
@@ -1095,6 +1123,7 @@ _TERMINAL_RUN_STATES = frozenset(
         "cancelled",
         "completed",
         "failed",
+        "interrupted",
         "rejected",
         "succeeded",
     }
@@ -1220,6 +1249,167 @@ def _attention_facts(
     return unique
 
 
+_JOB_STATUS_PRECEDENCE = (
+    "running",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "unknown",
+    "ready_to_promote",
+    "waiting_approval",
+    "paused",
+    "planned",
+    "completed",
+)
+_JOB_TERMINAL_CHILD_STATES = frozenset(
+    {"cancelled", "completed", "failed", "interrupted", "ready_to_promote"}
+)
+
+
+def _normalized_job_child_status(value: object) -> str:
+    status = str(value or "unknown")
+    if status in {"completed", "passed", "succeeded"}:
+        return "completed"
+    if status in _JOB_STATUS_PRECEDENCE:
+        return status
+    return "unknown"
+
+
+def _aggregate_job_status(children: list[dict[str, Any]], *, has_active_child: bool) -> str:
+    """Apply explicit precedence without converting terminal outcomes into success."""
+
+    statuses = {_normalized_job_child_status(item.get("status")) for item in children}
+    if has_active_child:
+        return "running"
+    for status in _JOB_STATUS_PRECEDENCE:
+        if status in statuses:
+            return status
+    return "unknown"
+
+
+def _group_parent_jobs(
+    store: SQLiteStore,
+    active: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collapse explicitly related Graph Runs into ordered parent Job summaries."""
+
+    jobs = {
+        item.id: item
+        for item in store.list_records("job_v2", JobRecord)
+        if isinstance(item, JobRecord)
+    }
+    bindings = tuple(
+        item
+        for item in store.list_records("job_graph_run_v2", JobGraphRunRecord)
+        if isinstance(item, JobGraphRunRecord)
+    )
+    if not jobs or not bindings:
+        return {"active": active, "history": history}
+
+    active_ids = {str(item["run_id"]) for item in active}
+    summaries = {
+        str(item["run_id"]): item
+        for item in (*active, *history)
+        if isinstance(item.get("run_id"), str)
+    }
+    grouped_run_ids: set[str] = set()
+    active_jobs: list[dict[str, Any]] = []
+    historical_jobs: list[dict[str, Any]] = []
+    for job_id, job in jobs.items():
+        ordered_bindings = sorted(
+            (item for item in bindings if item.job_id == job_id),
+            key=lambda item: (item.sequence, item.graph_run_id),
+        )
+        children: list[dict[str, Any]] = []
+        for binding in ordered_bindings:
+            summary = summaries.get(binding.graph_run_id)
+            if summary is None:
+                continue
+            grouped_run_ids.add(binding.graph_run_id)
+            children.append(
+                {
+                    **summary,
+                    "job_sequence": binding.sequence,
+                    "job_relationship_created_at": binding.created_at,
+                }
+            )
+        if not children:
+            continue
+        latest = children[-1]
+        has_active_child = any(str(item["run_id"]) in active_ids for item in children)
+        current_status = str(latest.get("status") or "not_recorded")
+        overall_status = _aggregate_job_status(children, has_active_child=has_active_child)
+        attention = [
+            {**fact, "run_id": child["run_id"]}
+            for child in children
+            for fact in _as_dicts(child.get("attention"))
+        ]
+        repositories = {
+            str(item["repository"]) for item in children if isinstance(item.get("repository"), str)
+        }
+        repository_ids = {
+            str(item["repository_id"])
+            for item in children
+            if isinstance(item.get("repository_id"), str)
+        }
+        timestamps = [
+            str(item["last_updated_at"])
+            for item in children
+            if isinstance(item.get("last_updated_at"), str)
+        ]
+        normalized_statuses = [
+            _normalized_job_child_status(item.get("status")) for item in children
+        ]
+        successful_count = sum(status == "completed" for status in normalized_statuses)
+        terminal_count = sum(status in _JOB_TERMINAL_CHILD_STATES for status in normalized_statuses)
+        job_summary: dict[str, Any] = {
+            "kind": "job",
+            "job_id": job.id,
+            "goal": job.goal,
+            "status": overall_status,
+            "overall_status": overall_status,
+            "current_status": current_status,
+            "current_run_id": latest["run_id"],
+            "child_graph_runs": children,
+            "progress": {
+                "completed": successful_count,
+                "successful": successful_count,
+                "terminal": terminal_count,
+                "total": len(children),
+            },
+            "phase": f"{len(children)} child Graph Run(s); current: {current_status}",
+            "last_updated_at": max(timestamps) if timestamps else None,
+            "requires_attention": any(bool(item.get("requires_attention")) for item in children),
+            "attention": attention,
+            "attention_count": sum(int(item.get("attention_count") or 0) for item in children),
+            "attention_available": all(
+                item.get("attention_available", True) is not False for item in children
+            ),
+            "repository": (
+                next(iter(repositories)) if len(repositories) == 1 else "Multiple repositories"
+            ),
+            "repository_id": (next(iter(repository_ids)) if len(repository_ids) == 1 else None),
+            "created_at": job.created_at,
+        }
+        (active_jobs if has_active_child else historical_jobs).append(job_summary)
+
+    grouped_active = [item for item in active if str(item["run_id"]) not in grouped_run_ids]
+    grouped_history = [item for item in history if str(item["run_id"]) not in grouped_run_ids]
+    grouped_active.extend(active_jobs)
+    grouped_history.extend(historical_jobs)
+    grouped_active.sort(
+        key=lambda item: (
+            not item["requires_attention"],
+            str(item.get("job_id") or item.get("run_id")),
+        )
+    )
+    grouped_history.sort(
+        key=lambda item: str(item.get("job_id") or item.get("run_id")), reverse=True
+    )
+    return {"active": grouped_active, "history": grouped_history}
+
+
 def inspect_fleet_runs(
     store: SQLiteStore,
     repository_id: str | None = None,
@@ -1227,6 +1417,83 @@ def inspect_fleet_runs(
     clock: Callable[[], datetime] = _utc_now,
 ) -> dict[str, Any]:
     """Project a live, read-only summary of top-level persisted Fleet runs."""
+
+    if repository_id is not None:
+        visible_run_ids = {
+            str(context["run_id"])
+            for context in store.list_run_repositories(repository_id)
+            if isinstance(context.get("run_id"), str)
+        }
+        global_overview = inspect_fleet_runs(store, clock=clock)
+
+        def visible_items(items: object) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            for item in _as_dicts(items):
+                if item.get("kind") != "job":
+                    if str(item.get("run_id")) in visible_run_ids:
+                        result.append(item)
+                    continue
+                children = [
+                    child
+                    for child in _as_dicts(item.get("child_graph_runs"))
+                    if str(child.get("run_id")) in visible_run_ids
+                ]
+                if not children:
+                    continue
+                visible = {**item, "child_graph_runs": children}
+                latest = children[-1]
+                visible["current_run_id"] = latest.get("run_id")
+                visible["current_status"] = latest.get("status")
+                visible["visible_child_count"] = len(children)
+                visible["aggregate_scope"] = "global_job"
+                visible["phase"] = (
+                    f"{len(children)} visible child Graph Run(s); "
+                    f"current: {visible['current_status']}"
+                )
+                visible_attention = [
+                    {**fact, "run_id": child["run_id"]}
+                    for child in children
+                    for fact in _as_dicts(child.get("attention"))
+                ]
+                visible["attention"] = visible_attention
+                visible["attention_count"] = sum(
+                    int(child.get("attention_count") or 0) for child in children
+                )
+                visible["attention_available"] = all(
+                    child.get("attention_available", True) is not False for child in children
+                )
+                visible["requires_attention"] = any(
+                    bool(child.get("requires_attention")) for child in children
+                )
+                visible_timestamps = [
+                    str(child["last_updated_at"])
+                    for child in children
+                    if isinstance(child.get("last_updated_at"), str)
+                ]
+                visible["last_updated_at"] = max(visible_timestamps) if visible_timestamps else None
+                repositories = {
+                    str(child["repository"])
+                    for child in children
+                    if isinstance(child.get("repository"), str)
+                }
+                repository_ids = {
+                    str(child["repository_id"])
+                    for child in children
+                    if isinstance(child.get("repository_id"), str)
+                }
+                visible["repository"] = (
+                    next(iter(repositories)) if len(repositories) == 1 else "Multiple repositories"
+                )
+                visible["repository_id"] = (
+                    next(iter(repository_ids)) if len(repository_ids) == 1 else None
+                )
+                result.append(visible)
+            return result
+
+        return {
+            "active": visible_items(global_overview.get("active")),
+            "history": visible_items(global_overview.get("history")),
+        }
 
     active: list[dict[str, Any]] = []
     history: list[dict[str, Any]] = []
@@ -1385,7 +1652,7 @@ def inspect_fleet_runs(
         target.append(item)
     active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
     history.sort(key=lambda item: str(item["run_id"]), reverse=True)
-    return {"active": active, "history": history}
+    return _group_parent_jobs(store, active, history)
 
 
 def _attach_repository_context(
@@ -1401,6 +1668,9 @@ def _attach_repository_context(
     repository = store.repository_for_run(run_id)
     if repository is not None:
         projection["repository_context"] = repository
+    job_context = store.job_context_for_run(run_id)
+    if job_context is not None:
+        projection["job_context"] = job_context
     return projection
 
 
