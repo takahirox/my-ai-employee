@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal, Self
@@ -280,6 +281,74 @@ class HarnessBudgets(HarnessModel):
         return value
 
 
+class HarnessIncidentReporting(HarnessModel):
+    """Repository-scoped incident-reporting intent without publishing authority."""
+
+    schema_name: ClassVar[str] = "harness_incident_reporting"
+    mode: Literal["off", "approval_required", "auto"] = "off"
+    target_repository: str | None = Field(default=None, max_length=140)
+    repository_key_env: str | None = Field(
+        default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    )
+    auto_categories: tuple[
+        Literal["trust_kernel_failure", "persistence_failure", "worker_boundary_failure"], ...
+    ] = ()
+    auto_failures: tuple[
+        Literal["assertion_error", "os_error", "runtime_error", "type_error", "value_error"], ...
+    ] = ()
+    outbox_path: str = "~/.fleet/incident-reporting/outbox.sqlite3"
+    retention_hours: int = Field(default=168, ge=1, le=720)
+    approval_hours: int = Field(default=24, ge=1, le=168)
+    daily_limit: int = Field(default=3, ge=1, le=20)
+    pending_cap: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("target_repository")
+    @classmethod
+    def _public_github_repository(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}",
+            value,
+        ):
+            raise ValueError("target repository must be a public GitHub owner/repository slug")
+        return value
+
+    @field_validator("outbox_path")
+    @classmethod
+    def _private_local_outbox(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if (
+            not value
+            or "\x00" in value
+            or "://" in value
+            or not (value.startswith("/") or value.startswith("~/"))
+            or ".." in path.parts
+        ):
+            raise ValueError("incident outbox must be an absolute or home-relative local path")
+        return value
+
+    @model_validator(mode="after")
+    def _authority_is_explicit_and_narrow(self) -> Self:
+        active = self.target_repository is not None or self.repository_key_env is not None
+        if self.mode == "off":
+            if active or self.auto_categories or self.auto_failures:
+                raise ValueError("off incident reporting cannot declare active authority")
+            return self
+        if not self.target_repository or not self.repository_key_env:
+            raise ValueError(
+                "enabled incident reporting requires a target repository "
+                "and key environment variable"
+            )
+        if self.mode != "auto" and (self.auto_categories or self.auto_failures):
+            raise ValueError("auto allowlists require auto incident reporting")
+        if self.mode == "auto" and (not self.auto_categories or not self.auto_failures):
+            raise ValueError("auto incident reporting requires category and failure allowlists")
+        if len(self.auto_categories) != len(set(self.auto_categories)):
+            raise ValueError("incident category allowlist must be unique")
+        if len(self.auto_failures) != len(set(self.auto_failures)):
+            raise ValueError("incident failure allowlist must be unique")
+        return self
+
+
 class ProjectHarnessV2(HarnessModel):
     """Repository intent; provisional instances grant no execution authority."""
 
@@ -295,6 +364,7 @@ class ProjectHarnessV2(HarnessModel):
     approvals: HarnessApprovals = HarnessApprovals()
     worker: HarnessWorker = HarnessWorker()
     budgets: HarnessBudgets = HarnessBudgets()
+    incident_reporting: HarnessIncidentReporting = HarnessIncidentReporting()
     provisional: bool = False
     migrated_from: Literal["1"] | None = None
 
@@ -339,6 +409,8 @@ class ProjectHarnessV2(HarnessModel):
         if self.provisional:
             if self.approvals.promotion == "policy":
                 raise ValueError("provisional Harness cannot grant promotion auto-approval")
+            if self.incident_reporting.mode != "off":
+                raise ValueError("provisional Harness cannot enable incident reporting")
             if self.network.mode is not NetworkMode.DISABLED:
                 raise ValueError("provisional Harness cannot grant network authority")
             if self.install.ecosystems or self.install.existing_lock is not InstallDisposition.DENY:
