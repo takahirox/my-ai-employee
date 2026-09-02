@@ -5037,19 +5037,10 @@ def _worker_request_contract_failure(node: Node, request: WorkerRequest) -> str 
                 f"criterion {criterion.id} requires workspace_patch evidence, but the node "
                 "lacks the edit_intent capability; add it to the accepted node contract"
             )
-        if criterion.verification_requirement_ids and (
-            not request.processes_authorized or "process" not in capabilities
-        ):
-            return (
-                f"criterion {criterion.id} requires process-backed verification evidence, "
-                "but the selected task contract cannot run it; authorize processes and add "
-                "the process capability to the accepted node contract"
-            )
         if criterion.source == "accepted_non_mutating_result" and (
             request.task_kind != GoalTaskKind.NON_MUTATING
             or criterion.id != f"criterion-{node.id}"
             or criterion.description != "the node-bound worker result is accepted"
-            or criterion.verification_requirement_ids
             or criterion.required_artifact_ids
         ):
             return (

@@ -410,8 +410,8 @@ def test_missing_criterion_evidence_capability_fails_before_runner(tmp_path: Pat
 
     criterion = CompletionCriterion(
         id="criterion-verification",
-        description="the required verification passes",
-        verification_requirement_ids=("test",),
+        description="the required workspace patch is produced",
+        required_artifact_ids=("workspace_patch",),
     )
     node = _node("impossible").model_copy(
         update={
@@ -456,7 +456,7 @@ def test_missing_criterion_evidence_capability_fails_before_runner(tmp_path: Pat
         StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value
     )
     assert "criterion criterion-verification" in (diagnostic.exception_message or "")
-    assert "process capability" in (diagnostic.exception_message or "")
+    assert "edit_intent capability" in (diagnostic.exception_message or "")
 
 
 def test_parallel_three_node_fork_join_persists_and_replays(tmp_path: Path) -> None:
