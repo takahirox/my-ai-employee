@@ -57,8 +57,8 @@ class ProtocolTreatment(SchemaModelV2):
     def _canonical_components(self) -> Self:
         if self.disabled_components != tuple(sorted(set(self.disabled_components))):
             raise ValueError("disabled components must be unique and sorted")
-        if (self.kind is ArmKind.FLEET_ABLATION) != bool(self.disabled_components):
-            raise ValueError("exactly Fleet ablation treatments disable components")
+        if (self.kind is ArmKind.FLEET_ABLATION) != (len(self.disabled_components) == 1):
+            raise ValueError("Fleet ablation treatments must disable exactly one component")
         return self
 
 
@@ -429,7 +429,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.arm_command:
+    arm_command = tuple(args.arm_command)
+    if arm_command[:1] == ("--",):
+        arm_command = arm_command[1:]
+    if not arm_command or arm_command[0] == "--":
         parser.error("an arm command is required after --")
     try:
         result = collect_protocol(
@@ -440,7 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root=Path(args.output_root),
             timeout=args.timeout,
             network=args.network,
-            arm_command=args.arm_command,
+            arm_command=arm_command,
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))

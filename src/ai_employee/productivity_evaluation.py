@@ -193,8 +193,8 @@ class ArmIdentity(SchemaModelV2):
     def _provenance_is_canonical(self) -> Self:
         if self.disabled_components != tuple(sorted(set(self.disabled_components))):
             raise ValueError("disabled components must be unique and sorted")
-        if (self.kind is ArmKind.FLEET_ABLATION) != bool(self.disabled_components):
-            raise ValueError("exactly Fleet ablation arms must disable components")
+        if (self.kind is ArmKind.FLEET_ABLATION) != (len(self.disabled_components) == 1):
+            raise ValueError("Fleet ablation arms must disable exactly one component")
         if self.assignment_index >= len(self.fairness_config.randomized_order) or (
             self.fairness_config.randomized_order[self.assignment_index] != self.id
         ):
@@ -346,19 +346,23 @@ class TrialResult(SchemaModelV2):
         stopping = self.arm.fairness_config.stopping
         if self.metrics.wall_seconds > budgets.wall_seconds:
             raise ValueError("observed wall time exceeds the retained budget")
-        if (
-            self.metrics.input_tokens is not None
-            and self.metrics.input_tokens > budgets.input_tokens
-        ):
+        if self.metrics.input_tokens is None:
+            raise ValueError("input-token evidence is required for a capped trial")
+        if self.metrics.input_tokens > budgets.input_tokens:
             raise ValueError("observed input tokens exceed the retained budget")
-        if (
-            self.metrics.output_tokens is not None
-            and self.metrics.output_tokens > budgets.output_tokens
-        ):
+        if self.metrics.output_tokens is None:
+            raise ValueError("output-token evidence is required for a capped trial")
+        if self.metrics.output_tokens > budgets.output_tokens:
             raise ValueError("observed output tokens exceed the retained budget")
-        observed_cost = (self.metrics.api_cost or 0) + (self.metrics.compute_cost or 0)
-        if budgets.cost_limit is not None and observed_cost > budgets.cost_limit:
-            raise ValueError("observed cost exceeds the retained budget")
+        if budgets.cost_limit is not None:
+            costs = (self.metrics.api_cost, self.metrics.compute_cost)
+            if any(value is None for value in costs):
+                raise ValueError("complete cost evidence is required for a cost-capped trial")
+            observed_cost = sum(value for value in costs if value is not None)
+            if observed_cost > budgets.cost_limit:
+                raise ValueError("observed cost exceeds the retained budget")
+        if 1 + self.metrics.retries > stopping.maximum_attempts:
+            raise ValueError("observed attempts exceed the retained stopping rule")
         if self.metrics.retries > stopping.maximum_retries:
             raise ValueError("observed retries exceed the retained stopping rule")
         if self.metrics.repairs > stopping.maximum_repairs:
@@ -862,6 +866,12 @@ def compare_history(
             regressions.append(f"{old.task.task_id}:{old.arm.id}:accepted")
         for metric in ("human_active_seconds", "wall_seconds", "api_cost", "compute_cost"):
             old_value, new_value = _values(old)[metric], _values(new)[metric]
+            if (
+                metric in {"api_cost", "compute_cost"}
+                and old_value is not None
+                and new_value is None
+            ):
+                raise ValueError(f"current historical cost evidence is missing for {metric}")
             if old_value is not None and new_value is not None and new_value > old_value:
                 regressions.append(f"{old.task.task_id}:{old.arm.id}:{metric}")
     if compared != len(current.results):
