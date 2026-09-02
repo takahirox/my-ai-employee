@@ -224,13 +224,28 @@ but such tasks cannot be collected until the operator supplies the evaluator com
 manifest and caller must both declare the same network policy, and every result arm must retain that
 policy in its environment manifest.
 
+The disabled network policy is OS-enforced; the environment variable passed to commands is only
+informational. On Darwin, the collector uses the fixed `/usr/bin/sandbox-exec` executable with a
+deterministic profile that permits local process and file operations while denying every network
+operation. On Linux, it requires a resolved `unshare` executable that can create a user-mapped
+network namespace. Other platforms, missing executables, and Linux hosts that prohibit the required
+namespace fail closed.
+
+Before it creates a staging directory or launches a producer, the collector opens a private
+loopback listener and tries to connect to it from a Python probe launched through the exact
+isolation wrapper. The run is rejected unless the wrapped probe reports an OS socket error; a
+successful connection, malformed evidence, wrapper failure, or timeout is never treated as an
+offline result. The successfully probed immutable wrapper prefix is then applied to the producer
+and every evaluator subprocess.
+
 The untrusted producer must create exactly one regular file in `{output}`:
 
 - `result-bundle.json`, a canonical draft `fleet-productivity-results/2` `ResultBundle`.
 
 Producer-supplied claim artifacts are rejected. After the producer exits zero, the collector runs
-each predeclared evaluator directly without a shell and bounds its combined stdout and stderr to
-1,000,000 bytes. Exit zero alone derives `passed`; every other exit derives `failed`. The collector
+each predeclared evaluator through the same isolation wrapper without a shell and bounds its
+combined stdout and stderr to 1,000,000 bytes. Exit zero alone derives `passed`;
+every other exit derives `failed`. The collector
 then creates canonical `fleet-productivity-check-artifact/2` acceptance and regression records with
 the trial and check identities, authority, resolved evaluator argv and executable, exit code,
 observation digest, and derived disposition. It rebuilds every final `CheckOutcome` so its evidence
@@ -246,8 +261,11 @@ bundle.
 
 Only after every command and binding validates does the runner add canonical
 `command.json` metadata and atomically rename the staging directory to the declared destination.
-It records original and resolved argv, protocol and task configuration, explicit cwd, timeout,
-network policy, UTC start/end, exit code, stdout/stderr digests, and exact artifact digests. Existing
+It records original and resolved payload argv separately from the fully wrapped execution argv,
+plus the isolation backend, exact wrapper argv, Darwin profile digest (or null for the Linux
+namespace backend), and the successful probe's payload/execution argv, socket-denial result,
+timestamps, exit code, and output digests. It also records protocol and task configuration,
+explicit cwd, timeout, network policy, UTC start/end, exit code, and exact artifact digests. Existing
 destinations, path escapes, missing or extra checks, empty or malformed evaluator commands,
 noncanonical drafts, oversized observations, producer claim artifacts, and stale task or protocol
 data fail without publishing the staged artifacts.

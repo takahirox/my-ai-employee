@@ -9,9 +9,12 @@ import math
 import os
 import shutil
 import signal
+import socket
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, Literal, Self, cast
@@ -42,6 +45,40 @@ _PRODUCER_PLACEHOLDERS = ("{task}", "{repository}", "{output}", "{protocol}")
 _EVALUATOR_PLACEHOLDERS = ("{task}", "{repository}", "{trial}", "{protocol}")
 _MAX_ARTIFACT_BYTES = 10_000_000
 _MAX_OBSERVATION_BYTES = 1_000_000
+
+_DARWIN_SANDBOX_PROFILE = "(version 1)\n(allow default)\n(deny network*)\n"
+_NETWORK_PROBE_SCRIPT = """\
+import socket
+import sys
+
+try:
+    connection = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1)
+except OSError as error:
+    print(f'{{"denied":true,"errno":{error.errno}}}')
+    raise SystemExit(0)
+else:
+    connection.close()
+    print('{"denied":false,"errno":null}')
+    raise SystemExit(97)
+"""
+_NETWORK_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class _IsolationBackend:
+    name: str
+    wrapper_argv: tuple[str, ...]
+    profile_digest: str | None
+
+
+@dataclass(frozen=True)
+class _NetworkIsolation:
+    backend: _IsolationBackend
+    probe: Mapping[str, object]
+
+
+def _wrapped_argv(backend: _IsolationBackend, payload_argv: tuple[str, ...]) -> tuple[str, ...]:
+    return (*backend.wrapper_argv, *payload_argv)
 
 
 def _relative_artifact_path(value: str) -> str:
@@ -278,12 +315,44 @@ def _validate_execution_contract(
         )
 
 
+def _resolve_isolation_backend() -> _IsolationBackend:
+    if sys.platform == "darwin":
+        executable = Path("/usr/bin/sandbox-exec")
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError("Darwin network isolation backend is unavailable")
+        return _IsolationBackend(
+            name="darwin-sandbox-exec",
+            wrapper_argv=(str(executable), "-p", _DARWIN_SANDBOX_PROFILE),
+            profile_digest=_digest(_DARWIN_SANDBOX_PROFILE.encode("utf-8")),
+        )
+    if sys.platform.startswith("linux"):
+        discovered = shutil.which("unshare")
+        if discovered is None:
+            raise ValueError("Linux network namespace backend is unavailable")
+        executable = Path(discovered).resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError("Linux network namespace backend is unavailable")
+        return _IsolationBackend(
+            name="linux-unshare-user-net",
+            wrapper_argv=(
+                str(executable),
+                "--user",
+                "--map-root-user",
+                "--net",
+                "--",
+            ),
+            profile_digest=None,
+        )
+    raise ValueError(f"network isolation is unsupported on platform: {sys.platform}")
+
+
 def _run(
     argv: tuple[str, ...],
     repository: Path,
     timeout: float,
     network: str,
     *,
+    isolation: _IsolationBackend,
     observation_limit: int | None = None,
 ) -> tuple[bytes, bytes, str, str, int]:
     if not math.isfinite(timeout) or timeout <= 0:
@@ -292,7 +361,7 @@ def _run(
     environment["FLEET_PRODUCTIVITY_NETWORK"] = network
     started_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     process = subprocess.Popen(
-        argv,
+        _wrapped_argv(isolation, argv),
         cwd=repository,
         env=environment,
         stdout=subprocess.PIPE,
@@ -313,6 +382,67 @@ def _run(
         raise ValueError("evaluator observation exceeds size limit")
     ended_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     return stdout, stderr, started_at, ended_at, process.returncode
+
+
+def _probe_network_isolation(backend: _IsolationBackend, repository: Path) -> Mapping[str, object]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        payload_argv = (
+            str(Path(sys.executable).resolve(strict=True)),
+            "-c",
+            _NETWORK_PROBE_SCRIPT,
+            str(port),
+        )
+        stdout, stderr, started_at, ended_at, exit_code = _run(
+            payload_argv,
+            repository,
+            _NETWORK_PROBE_TIMEOUT_SECONDS,
+            "disabled",
+            isolation=backend,
+            observation_limit=4_096,
+        )
+    finally:
+        listener.close()
+    if exit_code == 97:
+        raise ValueError("network isolation probe permitted networking")
+    if exit_code != 0:
+        raise ValueError(
+            f"network isolation backend or probe is unavailable (exit code {exit_code})"
+        )
+    try:
+        parsed = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("network isolation probe returned invalid evidence") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("network isolation probe returned invalid evidence")
+    evidence = cast(dict[str, object], parsed)
+    if set(evidence) != {"denied", "errno"}:
+        raise ValueError("network isolation probe returned invalid evidence")
+    denied = evidence["denied"]
+    error_number = evidence["errno"]
+    if denied is not True or not isinstance(error_number, int) or isinstance(error_number, bool):
+        raise ValueError("network isolation probe did not prove socket denial")
+    return {
+        "ended_at": ended_at,
+        "execution_argv": _wrapped_argv(backend, payload_argv),
+        "exit_code": exit_code,
+        "payload_argv": payload_argv,
+        "result": evidence,
+        "started_at": started_at,
+        "stderr_digest": _digest(stderr),
+        "stdout_digest": _digest(stdout),
+    }
+
+
+def _establish_network_isolation(repository: Path) -> _NetworkIsolation:
+    backend = _resolve_isolation_backend()
+    return _NetworkIsolation(
+        backend=backend,
+        probe=_probe_network_isolation(backend, repository),
+    )
 
 
 def _read_draft(stage: Path) -> bytes:
@@ -380,6 +510,7 @@ def _evaluate_checks(
     draft: ResultBundle,
     timeout: float,
     network: str,
+    isolation: _IsolationBackend,
 ) -> tuple[ResultBundle, dict[str, bytes]]:
     records: dict[str, list[ProtocolCheckRecord]] = {"acceptance": [], "regression": []}
     dispositions: dict[tuple[str, str, str], CheckDisposition] = {}
@@ -406,6 +537,7 @@ def _evaluate_checks(
                     repository,
                     timeout,
                     network,
+                    isolation=isolation,
                     observation_limit=_MAX_OBSERVATION_BYTES,
                 )
                 disposition = CheckDisposition.PASSED if exit_code == 0 else CheckDisposition.FAILED
@@ -508,6 +640,7 @@ def collect_protocol(
     final_directory = final_command.parent
     if final_directory.exists():
         raise FileExistsError(f"refusing to overwrite protocol artifacts: {final_directory}")
+    isolation = _establish_network_isolation(repository)
     final_directory.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{protocol.id}-", dir=final_directory.parent))
     try:
@@ -524,7 +657,13 @@ def collect_protocol(
             label="arm",
         )
         _validate_execution_contract(protocol, argv)
-        stdout, stderr, started_at, ended_at, exit_code = _run(argv, repository, timeout, network)
+        stdout, stderr, started_at, ended_at, exit_code = _run(
+            argv,
+            repository,
+            timeout,
+            network,
+            isolation=isolation.backend,
+        )
         if exit_code != 0:
             raise ValueError(f"arm command exited with {exit_code}")
         draft_bytes = _read_draft(stage)
@@ -538,6 +677,7 @@ def collect_protocol(
             draft=draft,
             timeout=timeout,
             network=network,
+            isolation=isolation.backend,
         )
         for name, data in outputs.items():
             (stage / name).write_bytes(data)
@@ -548,8 +688,15 @@ def collect_protocol(
             "content_digests": content_digests,
             "cwd": str(repository),
             "ended_at": ended_at,
+            "execution_argv": _wrapped_argv(isolation.backend, argv),
             "exit_code": exit_code,
             "format": "fleet-productivity-command/1",
+            "isolation": {
+                "backend": isolation.backend.name,
+                "probe": isolation.probe,
+                "profile_digest": isolation.backend.profile_digest,
+                "wrapper_argv": isolation.backend.wrapper_argv,
+            },
             "manifest_digest": _digest(manifest_bytes),
             "manifest_path": str(manifest_path),
             "network": network,

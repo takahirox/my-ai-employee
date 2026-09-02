@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_employee.productivity_protocol as productivity_protocol
 from ai_employee.productivity_evaluation import (
     AcceptanceCriterion,
     EnvironmentManifest,
@@ -20,6 +21,34 @@ from ai_employee.serialization import canonical_digest, canonical_json
 
 MANIFEST = Path("examples/productivity/protocols.json")
 PRODUCER = Path("tests/fixtures/productivity_protocol_producer.py").resolve()
+
+
+@pytest.fixture(autouse=True)
+def _trusted_network_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = str(Path("/usr/bin/env").resolve(strict=True))
+    backend = productivity_protocol._IsolationBackend(
+        name="test-deny",
+        wrapper_argv=(wrapper,),
+        profile_digest=None,
+    )
+    isolation = productivity_protocol._NetworkIsolation(
+        backend=backend,
+        probe={
+            "ended_at": "2026-01-01T00:00:00.000001Z",
+            "execution_argv": (wrapper, "test-probe"),
+            "exit_code": 0,
+            "payload_argv": ("test-probe",),
+            "result": {"denied": True, "errno": 1},
+            "started_at": "2026-01-01T00:00:00.000000Z",
+            "stderr_digest": hashlib.sha256(b"").hexdigest(),
+            "stdout_digest": hashlib.sha256(b"denied").hexdigest(),
+        },
+    )
+    monkeypatch.setattr(
+        productivity_protocol,
+        "_establish_network_isolation",
+        lambda _: isolation,
+    )
 
 
 def _evaluator(check_id: str, mode: str) -> tuple[str, ...]:
@@ -153,6 +182,13 @@ def test_collect_protocol_crosses_process_boundary_and_atomically_records(tmp_pa
     assert command["network"] == "disabled"
     assert command["cwd"] == str((tmp_path / "repository").resolve())
     assert all("{" not in item for item in command["argv"])
+    wrapper = str(Path("/usr/bin/env").resolve(strict=True))
+    assert command["execution_argv"] == [wrapper, *command["argv"]]
+    assert command["isolation"]["backend"] == "test-deny"
+    assert command["isolation"]["wrapper_argv"] == [wrapper]
+    assert command["isolation"]["profile_digest"] is None
+    assert command["isolation"]["probe"]["exit_code"] == 0
+    assert command["isolation"]["probe"]["result"]["denied"] is True
     for name in ("acceptance.json", "regression.json", "result-bundle.json"):
         assert (
             command["content_digests"][name]
@@ -250,6 +286,71 @@ def test_collect_protocol_rejects_network_mismatch_before_execution(tmp_path: Pa
             network="enabled",
             arm_command=_command(manifest),
         )
+
+
+def test_collect_protocol_rejects_unavailable_isolation_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable(_: Path) -> productivity_protocol._NetworkIsolation:
+        raise ValueError("network isolation backend is unavailable")
+
+    monkeypatch.setattr(
+        productivity_protocol,
+        "_establish_network_isolation",
+        unavailable,
+    )
+    with pytest.raises(ValueError, match="isolation backend is unavailable"):
+        _collect(tmp_path)
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+def test_network_isolation_probe_records_exact_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = productivity_protocol._IsolationBackend(
+        name="trusted-test",
+        wrapper_argv=("trusted-wrapper", "--"),
+        profile_digest="a" * 64,
+    )
+
+    def denied_run(*_args: object, **_kwargs: object) -> tuple[bytes, bytes, str, str, int]:
+        return (
+            b'{"denied":true,"errno":1}\n',
+            b"",
+            "2026-01-01T00:00:00.000000Z",
+            "2026-01-01T00:00:00.000001Z",
+            0,
+        )
+
+    monkeypatch.setattr(productivity_protocol, "_run", denied_run)
+    evidence = productivity_protocol._probe_network_isolation(backend, tmp_path)
+    execution_argv = evidence["execution_argv"]
+    assert isinstance(execution_argv, tuple)
+    assert execution_argv[:2] == ("trusted-wrapper", "--")
+    assert evidence["result"] == {"denied": True, "errno": 1}
+
+
+def test_network_isolation_probe_rejects_permissive_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = productivity_protocol._IsolationBackend(
+        name="permissive-test",
+        wrapper_argv=("trusted-wrapper", "--"),
+        profile_digest=None,
+    )
+
+    def permissive_run(*_args: object, **_kwargs: object) -> tuple[bytes, bytes, str, str, int]:
+        return (
+            b'{"denied":false,"errno":null}\n',
+            b"",
+            "2026-01-01T00:00:00.000000Z",
+            "2026-01-01T00:00:00.000001Z",
+            97,
+        )
+
+    monkeypatch.setattr(productivity_protocol, "_run", permissive_run)
+    with pytest.raises(ValueError, match="probe permitted networking"):
+        productivity_protocol._probe_network_isolation(backend, tmp_path)
 
 
 def test_collect_protocol_rejects_manifest_path_escape(tmp_path: Path) -> None:
