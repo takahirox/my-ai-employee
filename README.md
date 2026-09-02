@@ -327,7 +327,10 @@ approval. Host-global installation remains denied.
 
 ## Documentation
 
-- [Architecture and authority boundaries](docs/architecture.md)
+- [Architecture and authority boundaries](docs/architecture.md), including the read-only
+  productivity reporting boundary
+- [Productivity evaluation protocol](docs/evaluation.md) for same-worker direct-versus-Fleet
+  trials, ablations, offline benchmark imports, canonical bundles, and regression comparison
 - [Project Harness guide](docs/project-harness.md) and
   [example profile](examples/project/.fleet/project.yaml)
 - [OpenAI Agents SDK and TAKT influences](docs/influences.md)

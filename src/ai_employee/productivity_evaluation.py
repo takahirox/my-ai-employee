@@ -236,7 +236,9 @@ class ArmAggregate(SchemaModelV2):
 def _values(result: TrialResult) -> dict[str, float | None]:
     values = {
         name: None if value is None else float(value)
-        for name, value in result.metrics.model_dump(mode="python").items()
+        for name, value in result.metrics.model_dump(
+            mode="python", exclude={"schema_version"}
+        ).items()
     }
     values.update(
         accepted=float(result.accepted),
