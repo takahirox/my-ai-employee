@@ -660,6 +660,8 @@ def _remediation(code: str) -> str:
         return "recreate the route and worker request from persisted accepted authority"
     if code in {"PATCH_PREFLIGHT_FAILED", "SOURCE_WORKTREE_DIRTY", "WORKSPACE_CONFLICT"}:
         return "resolve the workspace preflight contradiction and create a fresh workspace"
+    if code == "VERIFICATION_WORKSPACE_MUTATED":
+        return "run verification in a fresh workspace after declaring or removing its byproducts"
     return "inspect the bounded causal record and retry only when its policy permits"
 
 
@@ -678,7 +680,8 @@ def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
     workspace_preflights = [
         item
         for item in _mappings(view.get("events"))
-        if item.get("kind") == "workspace_preflight_failed"
+        if item.get("kind")
+        in {"workspace_preflight_failed", "verification_workspace_mutation_failed"}
     ]
     wrappers = [
         item
@@ -730,7 +733,11 @@ def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
         details = _mapping(selected.get("details"))
         facts = _mapping(details.get("facts"))
         code = str(details.get("stable_failure_code") or run_failure_code)
-        stage = "workspace_preflight"
+        stage = (
+            "verification_workspace"
+            if selected.get("kind") == "verification_workspace_mutation_failed"
+            else "workspace_preflight"
+        )
     elif source == "budget":
         facts = {}
         code = str(selected.get("failure_code") or "WORKER_BUDGET_INADEQUATE")

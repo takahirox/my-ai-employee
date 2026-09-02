@@ -49,6 +49,7 @@ from ai_employee.domain.v2 import (
     WorkerContextManifest,
     WorkerRequest,
     WorkerResult,
+    WorkspaceSnapshot,
 )
 from ai_employee.graph_composition import GraphPatchComposer, GraphPatchCompositionRecord
 from ai_employee.graph_evaluation import (
@@ -787,6 +788,29 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 bindings[0].content_digest
             )
             assert len(inner_view["verification_requests"]) == 1
+            verification_request = store.list_records(
+                "verification_request_v2", ProcessRequest, run_id=inner_run.id
+            )[0]
+            verification_result = store.list_records(
+                "verification_result_v2", ExecutionResult, run_id=inner_run.id
+            )[0]
+            node_patch = store.get(
+                "artifact_descriptor_v2",
+                by_node[name].patch_artifact_id or "missing",
+                ArtifactDescriptor,
+            )
+            node_workspace = store.get(
+                "workspace_v2", by_node[name].workspace_id or "missing", WorkspaceSnapshot
+            )
+            assert verification_request.candidate_patch_digest == node_patch.artifact_digest
+            assert verification_result.candidate_patch_digest == node_patch.artifact_digest
+            assert verification_request.verification_workspace_digest == (
+                node_workspace.content_digest
+            )
+            assert verification_result.verification_workspace_digest == (
+                node_workspace.content_digest
+            )
+            assert verification_result.request_digest == verification_request.content_digest
         node_transitions = store.list_records(
             "loop_transition_v2", LoopTransitionRecord, run_id=run.id
         )

@@ -54,7 +54,7 @@ from ai_employee.orchestration import (
     _mediated_result_artifacts,
     _node_verification_configuration_is_valid,
 )
-from ai_employee.run_explanation import explain_any_run
+from ai_employee.run_explanation import _explain_work_run, explain_any_run
 from ai_employee.runtime import DeterministicRuntime
 from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
@@ -247,10 +247,12 @@ def allow_worker(request: ProcessRequest) -> PolicyDecision:
 
 
 class FakeWorkspace:
-    def __init__(self, patch: bytes) -> None:
+    def __init__(self, patch: bytes, subsequent_patch: bytes | None = None) -> None:
         self.patch = patch
+        self.subsequent_patch = patch if subsequent_patch is None else subsequent_patch
         self.snapshot: WorkspaceSnapshot | None = None
         self.descriptor: ArtifactDescriptor | None = None
+        self.capture_count = 0
 
     def create(self, request: WorkspaceRequest) -> WorkspaceSnapshot:
         self.snapshot = WorkspaceSnapshot(
@@ -275,14 +277,16 @@ class FakeWorkspace:
         harness_digest: str | None = None,
     ) -> ArtifactDescriptor:
         assert snapshot is self.snapshot
-        digest = sha256(self.patch).hexdigest()
+        self.capture_count += 1
+        body = self.patch if self.capture_count == 1 else self.subsequent_patch
+        digest = sha256(body).hexdigest()
         self.descriptor = ArtifactDescriptor(
-            id="patch-1",
+            id=f"patch-{self.capture_count}",
             run_id=snapshot.run_id,
             created_at=NOW,
             artifact_digest=digest,
             media_type="text/x-diff",
-            size_bytes=len(self.patch),
+            size_bytes=len(body),
             logical_kind="workspace_patch",
             producer_action_id=snapshot.id,
             source={
@@ -2597,6 +2601,110 @@ def test_node_run_with_missing_binding_fails_closed_with_inspector_diagnostic(
         assert diagnostic["bindings"] == []
     finally:
         store.close()
+
+
+def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
+    tmp_path: Path,
+) -> None:
+    run_id = "node-verification-mutation"
+    candidate = (
+        b"diff --git a/file.txt b/file.txt\n"
+        b"--- a/file.txt\n"
+        b"+++ b/file.txt\n"
+        b"@@ -1 +1 @@\n-before\n+after\n"
+    )
+    mutated = candidate + (
+        b"diff --git a/rogue.py b/rogue.py\n"
+        b"new file mode 100644\n"
+        b"--- /dev/null\n"
+        b"+++ b/rogue.py\n"
+        b"@@ -0,0 +1 @@\n+unexpected = True\n"
+    )
+    workspace = FakeWorkspace(candidate, mutated)
+    policy = builtin_policy(run_id)
+    verification = ProcessRequest(
+        id="verify-mutation",
+        run_id=run_id,
+        created_at=NOW,
+        argv=("python", "-m", "pytest"),
+        purpose="offline verification",
+    )
+    binding = NodeVerificationBinding(
+        id="binding-mutation",
+        run_id=run_id,
+        created_at=NOW,
+        requirement_id="test",
+        process_request_id=verification.id,
+        process_request_digest=verification.content_digest or ZERO,
+    )
+    request = WorkerRequest(
+        id="accepted-mutation-request",
+        run_id=run_id,
+        created_at=NOW,
+        goal="make an exactly verified change",
+        accepted_plan_digest=ZERO,
+        node_id="fix",
+        graph_run_id="graph-run",
+        accepted_graph_revision_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=canonical_digest([policy.content_digest]),
+        remaining_budgets={"worker_turns": 1},
+    )
+    with SQLiteStore(tmp_path / "mutation.db") as store:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            workspace,  # type: ignore[arg-type]
+            lambda _snapshot, _cancellation: ScriptedWorkerAdapter([WorkerProposalEnvelope()]),
+            lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+            lambda descriptor: (
+                candidate
+                if descriptor.artifact_digest == sha256(candidate).hexdigest()
+                else mutated
+            ),
+            (policy,),
+            verification_requests=(verification,),
+            verification_bindings=(binding,),
+            allowed_processes=(verification.argv,),
+        )
+        run = coordinator.execute_node(
+            request,
+            (
+                CompletionCriterion(
+                    id="criterion-test",
+                    description="the exact candidate passes tests",
+                    verification_requirement_ids=("test",),
+                    required_artifact_ids=("workspace_patch",),
+                ),
+            ),
+            str(tmp_path),
+            "a" * 40,
+            worker_name="scripted",
+        )
+        persisted_request = store.list_records(
+            "verification_request_v2", ProcessRequest, run_id=run.id
+        )[0]
+        persisted_result = store.list_records(
+            "verification_result_v2", ExecutionResult, run_id=run.id
+        )[0]
+        event = next(
+            item
+            for item in inspect_work_run(store, run.id)["events"]
+            if item["kind"] == "verification_workspace_mutation_failed"
+        )
+        facts = event["details"]["facts"]
+        explanation = _explain_work_run(inspect_work_run(store, run.id))
+
+    assert run.status == "failed"
+    assert run.failure_code == StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
+    assert persisted_request.candidate_patch_digest == sha256(candidate).hexdigest()
+    assert persisted_result.candidate_patch_digest == sha256(candidate).hexdigest()
+    assert persisted_result.request_digest == persisted_request.content_digest
+    assert facts["changed_path_count"] == 1
+    assert facts["changed_paths"] == ["rogue.py"]
+    assert facts["changed_paths_truncated"] is False
+    assert explanation["primary_root_cause"]["code"] == "VERIFICATION_WORKSPACE_MUTATED"
+    assert explanation["primary_root_cause"]["stage"] == "verification_workspace"
 
 
 def _complete_coordinator_run(

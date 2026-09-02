@@ -819,6 +819,19 @@ def _authoritative_node_result(
             result_acceptance=result_acceptance,
             failure_code=StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
         )
+    verification_workspace_mutated = (
+        writing
+        and run.status == "failed"
+        and run.failure_code == StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
+    )
+    if verification_workspace_mutated:
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=run.workspace_id,
+            result_acceptance=result_acceptance,
+            failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
+        )
     if writing:
         binding_configuration_valid = _node_verification_configuration_is_valid(
             run.id,
@@ -1009,6 +1022,44 @@ def _authoritative_node_result(
             or source.get("harness_digest") != request.harness_digest
         ):
             raise ValueError("patch is empty or not bound to the exact workspace")
+        if any(
+            item.candidate_patch_digest != patch.artifact_digest
+            or item.verification_workspace_digest != workspace.content_digest
+            for item in coordinator.verification_requests
+        ) or any(
+            item.candidate_patch_digest != patch.artifact_digest
+            or item.verification_workspace_digest != workspace.content_digest
+            for item in authoritative_verification_results
+        ):
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=workspace.id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_BINDING_INVALID.value,
+            )
+        try:
+            current_patch = coordinator.workspace.capture_diff(
+                workspace,
+                generated_paths=coordinator.generated_paths,
+                harness_digest=request.harness_digest,
+            )
+        except (OSError, ValueError):
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=workspace.id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
+            )
+        if current_patch.artifact_digest != patch.artifact_digest:
+            return NodeExecutionResult(
+                worker_result=worker_result,
+                criterion_evidence=(),
+                workspace_id=workspace.id,
+                result_acceptance=result_acceptance,
+                failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
+            )
 
     verification_digests = tuple(
         _required(item.content_digest) for item in authoritative_verification_results
