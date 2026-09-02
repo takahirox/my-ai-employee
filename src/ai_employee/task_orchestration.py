@@ -2080,7 +2080,9 @@ class TaskOrchestrator:
                             run_id=run_id,
                         )
                 for future, active_item in tuple(active.items()):
-                    if future.done() or future in watchdog_signals:
+                    # `done()` can flip after `wait` returns at the deadline; only the
+                    # completed snapshot is authoritative for this scheduler iteration.
+                    if future in completed or future in watchdog_signals:
                         continue
                     active_node_id, active_node, active_request, *_middle, started_at = active_item
                     if observed_at < (

@@ -127,6 +127,7 @@ def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, P
                                 "required_artifact_ids": ["workspace_patch"],
                             }
                         ],
+                        "resource_budget": {"wall_seconds": 5.0},
                         "semantic_profile": {
                             "task_type": "mechanical",
                             "reasoning_class": "mechanical",
@@ -219,6 +220,7 @@ def _fixture(tmp_path: Path, *, task_review: bool = True) -> tuple[Path, Path, P
                         "description": f"{node_name} produced an exact patch",
                         "required_artifact_ids": ["workspace_patch"],
                     }],
+                    "resource_budget": {"wall_seconds": 5.0},
                     "semantic_profile": {
                         "task_type": "mechanical",
                         "reasoning_class": "mechanical",

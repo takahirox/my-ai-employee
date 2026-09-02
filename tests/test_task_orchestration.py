@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_employee.task_orchestration as task_orchestration
 from ai_employee.domain import (
     Budget,
     CompletionCriterion,
@@ -73,7 +74,9 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
 
 
-def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(tmp_path: Path) -> None:
+def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     goal = Goal(
         id="watchdog-goal",
         statement="bound the worker",
@@ -87,12 +90,14 @@ def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(tmp_path: Path)
         max_wall_seconds=0.05,
     )
 
+    release_runner = threading.Event()
+
     def slow_runner(
         _node_value: Node,
         request: WorkerRequest,
         _strategy_value: ExecutionStrategy,
     ) -> NodeExecutionResult:
-        threading.Event().wait(0.1)
+        assert release_runner.wait(timeout=1.0)
         return NodeExecutionResult(
             worker_result=WorkerResult(
                 id="late-watchdog-result",
@@ -104,6 +109,23 @@ def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(tmp_path: Path)
             ),
             criterion_evidence=(),
         )
+
+    original_wait = task_orchestration.wait
+    first_wait = True
+
+    def wait_with_completion_after_snapshot(futures, *, timeout, return_when):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            release_runner.set()
+            done, _pending = original_wait(futures, timeout=1.0, return_when=return_when)
+            assert done == set(futures)
+            return set(), set(futures)
+        return original_wait(futures, timeout=timeout, return_when=return_when)
+
+    monotonic_samples = iter((0.0, 0.05))
+    monkeypatch.setattr(task_orchestration, "monotonic", lambda: next(monotonic_samples, 0.05))
+    monkeypatch.setattr(task_orchestration, "wait", wait_with_completion_after_snapshot)
 
     with SQLiteStore(tmp_path / "watchdog.db") as store:
         run = TaskOrchestrator(store, slow_runner, (_strategy(),)).run(
