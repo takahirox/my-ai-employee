@@ -4,11 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from ai_employee.cli import _graph_run_cli_result, build_parser
-from ai_employee.inspector import _group_parent_jobs
+from ai_employee.cli import _graph_run_cli_result, _PreAcceptanceOutcomeGuard, build_parser
+from ai_employee.domain import Goal
+from ai_employee.inspector import _group_parent_jobs, inspect_fleet_runs
 from ai_employee.inspector_ui import INDEX
 from ai_employee.jobs import JobGraphRunRecord, JobRecord
 from ai_employee.storage import SQLiteStore
+from ai_employee.task_orchestration import PreAcceptanceGraphRunOutcomeRecord
 
 
 def _summary(run_id: str, status: str, *, attention: bool = False) -> dict[str, object]:
@@ -57,6 +59,37 @@ def test_job_identity_goal_and_order_are_durable_and_atomic(tmp_path) -> None:  
         with pytest.raises(ValueError, match="different original goal"):
             store.claim_run_id("child-3", tmp_path, job_id="issue-67", job_goal="Replace the goal")
         assert store.repository_for_run("child-3") is None
+
+
+def test_interruption_after_claim_commit_is_durably_closed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    with SQLiteStore(tmp_path / "fleet.db") as store:
+        original_claim = store.claim_run_id
+
+        def commit_then_interrupt(*args, **kwargs):  # type: ignore[no-untyped-def]
+            original_claim(*args, **kwargs)
+            raise KeyboardInterrupt("after claim commit")
+
+        monkeypatch.setattr(store, "claim_run_id", commit_then_interrupt)
+        guard = _PreAcceptanceOutcomeGuard(
+            store,
+            "interrupted-child",
+            Goal(id="interrupted-goal", statement="Complete interrupted work"),
+        )
+        with pytest.raises(KeyboardInterrupt, match="after claim commit"), guard:
+            guard.claim(
+                tmp_path,
+                job_id="interrupted-job",
+                job_goal="Complete the larger interrupted job",
+            )
+
+        outcome = store.get(
+            "pre_acceptance_graph_run_outcome_v2",
+            "interrupted-child",
+            PreAcceptanceGraphRunOutcomeRecord,
+        )
+    assert outcome.status == "interrupted"
 
 
 def test_new_job_requires_original_goal_and_ungrouped_runs_remain_compatible(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -208,3 +241,46 @@ def test_inspector_lists_clickable_job_children() -> None:
     ):
         assert marker in INDEX
     assert "method:'POST'" not in INDEX
+
+
+def test_repository_filter_keeps_global_job_failure_without_leaking_children(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    repository_a = tmp_path / "a"
+    repository_b = tmp_path / "b"
+    repository_a.mkdir()
+    repository_b.mkdir()
+    with SQLiteStore(tmp_path / "fleet.db") as store:
+        store.claim_run_id(
+            "child-a",
+            repository_a,
+            job_id="cross-repository-job",
+            job_goal="Complete work in both repositories",
+        )
+        store.claim_run_id("child-b", repository_b, job_id="cross-repository-job")
+        repository_a_id = store.repository_for_run("child-a")["repository_id"]  # type: ignore[index]
+
+        def projection(_store, run_id: str, **_kwargs):  # type: ignore[no-untyped-def]
+            return {
+                "schema_version": "2",
+                "run_id": run_id,
+                "kind": "pre_acceptance_graph_run",
+                "state": "completed" if run_id == "child-a" else "failed",
+                "generation": 0,
+                "goal": {"statement": f"Goal for {run_id}"},
+                "graph_acceptance": None,
+            }
+
+        monkeypatch.setattr("ai_employee.inspector.inspect_any_run", projection)
+        filtered = inspect_fleet_runs(store, repository_id=repository_a_id)
+
+    job = filtered["history"][0]
+    assert job["overall_status"] == "failed"
+    assert job["progress"] == {
+        "completed": 1,
+        "successful": 1,
+        "terminal": 2,
+        "total": 2,
+    }
+    assert job["aggregate_scope"] == "global_job"
+    assert [child["run_id"] for child in job["child_graph_runs"]] == ["child-a"]

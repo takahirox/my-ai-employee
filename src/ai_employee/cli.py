@@ -8,13 +8,15 @@ import io
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from . import __version__
 from .config import OperatorConfig, WorkerName, load_operator_config
@@ -978,6 +980,10 @@ def _graph_run_cli_result(
     return result
 
 
+class _PreAcceptanceTerminationSignal(BaseException):
+    """Convert pre-acceptance SIGTERM into a durable interruption."""
+
+
 class _PreAcceptanceOutcomeGuard:
     """Close a newly claimed run unless authoritative GraphRun state supersedes it."""
 
@@ -987,11 +993,39 @@ class _PreAcceptanceOutcomeGuard:
         self._goal = goal
         self._claimed = False
         self._stable_code: str | None = None
+        self._previous_sigterm: Any | None = None
 
     def __enter__(self) -> _PreAcceptanceOutcomeGuard:
+        if threading.current_thread() is threading.main_thread():
+            self._previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def interrupt_for_sigterm(_signum: int, _frame: object) -> None:
+                raise _PreAcceptanceTerminationSignal("SIGTERM")
+
+            signal.signal(signal.SIGTERM, interrupt_for_sigterm)
         return self
 
-    def mark_claimed(self) -> None:
+    def claim(
+        self,
+        repository: Path,
+        *,
+        job_id: str | None,
+        job_goal: str | None,
+    ) -> None:
+        """Claim the run while closing the post-commit asynchronous interruption window."""
+
+        try:
+            self._store.claim_run_id(
+                self._run_id,
+                repository,
+                job_id=job_id,
+                job_goal=job_goal,
+            )
+        except Exception:
+            raise
+        except BaseException:
+            self._claimed = self._store.repository_for_run(self._run_id) is not None
+            raise
         self._claimed = True
 
     def fail(self, stable_code: str) -> None:
@@ -1003,6 +1037,13 @@ class _PreAcceptanceOutcomeGuard:
         _exception: BaseException | None,
         _traceback: object,
     ) -> Literal[False]:
+        try:
+            return self._close(exc_type)
+        finally:
+            if self._previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, self._previous_sigterm)
+
+    def _close(self, exc_type: type[BaseException] | None) -> Literal[False]:
         if not self._claimed:
             return False
         try:
@@ -1013,7 +1054,8 @@ class _PreAcceptanceOutcomeGuard:
             return False
         status: Literal["failed", "interrupted"] = (
             "interrupted"
-            if exc_type is not None and not issubclass(exc_type, Exception)
+            if exc_type is not None
+            and issubclass(exc_type, (KeyboardInterrupt, _PreAcceptanceTerminationSignal))
             else "failed"
         )
         stable_code = self._stable_code or (
@@ -1288,13 +1330,11 @@ def _work(args: argparse.Namespace) -> int:
         _PreAcceptanceOutcomeGuard(store, run_id, goal) as pre_acceptance,
     ):
         if resume_run is None:
-            store.claim_run_id(
-                run_id,
+            pre_acceptance.claim(
                 repository,
                 job_id=getattr(args, "job_id", None),
                 job_goal=getattr(args, "job_goal", None),
             )
-            pre_acceptance.mark_claimed()
 
         def executor_for(root: Path) -> LocalProcessExecutor:
             return LocalProcessExecutor(

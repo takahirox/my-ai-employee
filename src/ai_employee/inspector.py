@@ -1123,6 +1123,7 @@ _TERMINAL_RUN_STATES = frozenset(
         "cancelled",
         "completed",
         "failed",
+        "interrupted",
         "rejected",
         "succeeded",
     }
@@ -1416,6 +1417,58 @@ def inspect_fleet_runs(
     clock: Callable[[], datetime] = _utc_now,
 ) -> dict[str, Any]:
     """Project a live, read-only summary of top-level persisted Fleet runs."""
+
+    if repository_id is not None:
+        visible_run_ids = {
+            str(context["run_id"])
+            for context in store.list_run_repositories(repository_id)
+            if isinstance(context.get("run_id"), str)
+        }
+        global_overview = inspect_fleet_runs(store, clock=clock)
+
+        def visible_items(items: object) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            for item in _as_dicts(items):
+                if item.get("kind") != "job":
+                    if str(item.get("run_id")) in visible_run_ids:
+                        result.append(item)
+                    continue
+                children = [
+                    child
+                    for child in _as_dicts(item.get("child_graph_runs"))
+                    if str(child.get("run_id")) in visible_run_ids
+                ]
+                if not children:
+                    continue
+                visible = {**item, "child_graph_runs": children}
+                latest = children[-1]
+                visible["current_run_id"] = latest.get("run_id")
+                visible["current_status"] = latest.get("status")
+                visible["visible_child_count"] = len(children)
+                visible["aggregate_scope"] = "global_job"
+                repositories = {
+                    str(child["repository"])
+                    for child in children
+                    if isinstance(child.get("repository"), str)
+                }
+                repository_ids = {
+                    str(child["repository_id"])
+                    for child in children
+                    if isinstance(child.get("repository_id"), str)
+                }
+                visible["repository"] = (
+                    next(iter(repositories)) if len(repositories) == 1 else "Multiple repositories"
+                )
+                visible["repository_id"] = (
+                    next(iter(repository_ids)) if len(repository_ids) == 1 else None
+                )
+                result.append(visible)
+            return result
+
+        return {
+            "active": visible_items(global_overview.get("active")),
+            "history": visible_items(global_overview.get("history")),
+        }
 
     active: list[dict[str, Any]] = []
     history: list[dict[str, Any]] = []
