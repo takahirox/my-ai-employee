@@ -22,6 +22,7 @@ from ai_employee.incident_reporting import (
     Mode,
     Outbox,
     Policy,
+    PublicExceptionClass,
     Report,
     Stage,
     TerminalState,
@@ -45,6 +46,7 @@ def diagnosis(**changes: object) -> Diagnosis:
         "terminal_state": TerminalState.FAILED,
         "disposition": Disposition.INTERNAL_PRODUCT_FAILURE,
         "failure": Failure.RUNTIME,
+        "exception_class": PublicExceptionClass.RUNTIME_ERROR,
         "stage": Stage.RUNTIME,
         "private_detail": CANARY,
     }
@@ -96,6 +98,53 @@ def test_private_and_public_models_are_strict_frozen_and_extra_forbid() -> None:
         Diagnosis.model_validate(raw)
 
 
+def test_public_exception_class_is_exact_closed_allowlist_and_round_trips() -> None:
+    assert [value.value for value in PublicExceptionClass] == [
+        "AssertionError",
+        "KeyError",
+        "OSError",
+        "RuntimeError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    ]
+    for exception_class in PublicExceptionClass:
+        clean = compose(
+            diagnosis(exception_class=exception_class),
+            KEY,
+            "1.2.3",
+            COMMIT,
+            1,
+            64,
+        )
+        assert clean.exception_class is exception_class
+        round_trip = Report.model_validate_json(public_json(clean), strict=True)
+        assert round_trip.exception_class is exception_class
+
+    private_payload = diagnosis().model_dump()
+    private_payload["exception_class"] = "ArbitraryError"
+    with pytest.raises(ValidationError):
+        Diagnosis.model_validate(private_payload, strict=True)
+
+    public_payload = report().model_dump(mode="json")
+    public_payload["exception_class"] = "ArbitraryError"
+    with pytest.raises(ValidationError):
+        Report.model_validate_json(json.dumps(public_payload), strict=True)
+
+
+@pytest.mark.parametrize("field", ["message", "exception_message", "unknown"])
+def test_exception_message_and_unknown_fields_are_never_accepted(field: str) -> None:
+    private_payload = diagnosis().model_dump()
+    private_payload[field] = "private exception prose"
+    with pytest.raises(ValidationError):
+        Diagnosis.model_validate(private_payload, strict=True)
+
+    public_payload = report().model_dump(mode="json")
+    public_payload[field] = "private exception prose"
+    with pytest.raises(ValidationError):
+        Report.model_validate_json(json.dumps(public_payload), strict=True)
+
+
 @pytest.mark.parametrize(
     "terminal_state",
     [state for state in TerminalState if state is not TerminalState.FAILED],
@@ -129,6 +178,15 @@ def test_internal_failed_event_qualifies_and_fingerprint_is_repository_keyed() -
     assert first == compose(candidate, KEY, "1.2.3", COMMIT, 1, 64)
     assert first.fingerprint != compose(candidate, OTHER_KEY, "1.2.3", COMMIT, 1, 64).fingerprint
     assert re.fullmatch(r"[0-9a-f]{64}", first.fingerprint)
+    other_class = compose(
+        diagnosis(exception_class=PublicExceptionClass.TYPE_ERROR),
+        KEY,
+        "1.2.3",
+        COMMIT,
+        1,
+        64,
+    )
+    assert first.fingerprint != other_class.fingerprint
 
 
 @pytest.mark.parametrize(
@@ -247,6 +305,7 @@ PUBLIC_STRING_FIELDS = (
     "terminal_state",
     "disposition",
     "failure",
+    "exception_class",
     "stage",
     "version",
     "commit",
@@ -307,7 +366,7 @@ def test_rendering_is_deterministic_and_labels_are_closed() -> None:
     second = render_public_issue(report(), KEY)
     assert first == second
     assert first.labels == ("ai-employee-incident", "incident:trust_kernel_failure")
-    assert first.title == "[incident] trust_kernel_failure: runtime_error at runtime"
+    assert first.title == "[incident] trust_kernel_failure: runtime_error (RuntimeError) at runtime"
     assert re.fullmatch(r"<!-- ai-employee-incident:[0-9a-f]{64} -->", first.marker)
     assert first.body.endswith(first.marker)
     assert json.loads(public_json(report())) == report().model_dump(mode="json")

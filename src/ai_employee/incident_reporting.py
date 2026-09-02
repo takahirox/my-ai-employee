@@ -62,6 +62,16 @@ class Failure(StrEnum):
     VALUE = "value_error"
 
 
+class PublicExceptionClass(StrEnum):
+    ASSERTION_ERROR = "AssertionError"
+    KEY_ERROR = "KeyError"
+    OS_ERROR = "OSError"
+    RUNTIME_ERROR = "RuntimeError"
+    TIMEOUT_ERROR = "TimeoutError"
+    TYPE_ERROR = "TypeError"
+    VALUE_ERROR = "ValueError"
+
+
 class Stage(StrEnum):
     RUNTIME = "runtime"
     STORAGE = "storage"
@@ -78,6 +88,7 @@ class Diagnosis(BaseModel):
     terminal_state: TerminalState
     disposition: Disposition
     failure: Failure
+    exception_class: PublicExceptionClass
     stage: Stage
     private_detail: str = Field(max_length=100_000)
 
@@ -101,6 +112,7 @@ class Report(BaseModel):
     terminal_state: TerminalState
     disposition: Disposition
     failure: Failure
+    exception_class: PublicExceptionClass
     stage: Stage
     version: str = Field(min_length=5, max_length=128, pattern=_SEMVER_PATTERN)
     commit: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -219,6 +231,7 @@ def compose(
         "terminal_state": diagnosis.terminal_state.value,
         "disposition": diagnosis.disposition.value,
         "failure": diagnosis.failure.value,
+        "exception_class": diagnosis.exception_class.value,
         "stage": diagnosis.stage.value,
         "version": version,
         "commit": commit,
@@ -234,6 +247,7 @@ def compose(
         terminal_state=diagnosis.terminal_state,
         disposition=diagnosis.disposition,
         failure=diagnosis.failure,
+        exception_class=diagnosis.exception_class,
         stage=diagnosis.stage,
         version=version,
         commit=commit,
@@ -270,7 +284,8 @@ def _scan_sink(value: str, limit: int) -> None:
 def _summary(report: Report) -> str:
     value = (
         f"Occurrences: {report.occurrences} of 999; category={report.category.value}; "
-        f"failure={report.failure.value}; stage={report.stage.value}"
+        f"failure={report.failure.value}; exception_class={report.exception_class.value}; "
+        f"stage={report.stage.value}"
     )
     _scan_sink(value, 256)
     return value
@@ -288,7 +303,10 @@ def render_public_issue(report: Report, repository_key: bytes) -> RenderedIssue:
         hashlib.sha256,
     ).hexdigest()
     marker = f"<!-- ai-employee-incident:{digest} -->"
-    title = f"[incident] {report.category.value}: {report.failure.value} at {report.stage.value}"
+    title = (
+        f"[incident] {report.category.value}: {report.failure.value} "
+        f"({report.exception_class.value}) at {report.stage.value}"
+    )
     labels = ("ai-employee-incident", f"incident:{report.category.value}")
     body = f"## Sanitized incident report\n\n{_summary(report)}\n\n{payload}\n\n{marker}"
     for value, limit in ((title, 256), (body, _MAX_PUBLIC_BYTES), (marker, 128)):
