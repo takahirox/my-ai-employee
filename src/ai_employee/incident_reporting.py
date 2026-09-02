@@ -145,6 +145,120 @@ class Policy(BaseModel):
         return self
 
 
+_VIEW_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
+
+
+def _view_time_is_valid(value: datetime) -> bool:
+    return value.tzinfo is not None and value.utcoffset() == timedelta(0) and value.microsecond == 0
+
+
+class OutboxEntry(BaseModel):
+    """Sanitized metadata for one incident outbox row."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
+
+    repository: str = Field(pattern=r"^[\w.-]+/[\w.-]+$")
+    fingerprint: str = Field(pattern=_VIEW_DIGEST_PATTERN)
+    status: Literal["pending", "published"]
+    occurrence_count: int = Field(ge=1, le=999)
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
+    report_digest: str = Field(pattern=_VIEW_DIGEST_PATTERN)
+    preview_digest: str | None = Field(default=None, pattern=_VIEW_DIGEST_PATTERN)
+    approval_digest: str | None = Field(default=None, pattern=_VIEW_DIGEST_PATTERN)
+    approval_expires_at: datetime | None = None
+    issue_number: int | None = Field(default=None, ge=1)
+    public_url: str | None = None
+    public_report_digest: str | None = Field(default=None, pattern=_VIEW_DIGEST_PATTERN)
+    authorization_mode: Literal["approval_required", "auto"] | None = None
+    authorization_digest: str | None = Field(default=None, pattern=_VIEW_DIGEST_PATTERN)
+    authorized_at: datetime | None = None
+    published_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def coherent_shape(self) -> OutboxEntry:
+        times = (self.created_at, self.updated_at, self.expires_at)
+        if not all(_view_time_is_valid(value) for value in times):
+            raise ValueError("invalid timestamp")
+        if not self.created_at <= self.updated_at < self.expires_at:
+            raise ValueError("invalid timestamp order")
+        has_approval = self.approval_digest is not None
+        has_approval_expiry = self.approval_expires_at is not None
+        if has_approval != has_approval_expiry:
+            raise ValueError("incomplete approval")
+        if self.approval_expires_at is not None and not _view_time_is_valid(
+            self.approval_expires_at
+        ):
+            raise ValueError("invalid approval timestamp")
+        publication = (
+            self.issue_number,
+            self.public_url,
+            self.public_report_digest,
+            self.authorization_mode,
+            self.authorization_digest,
+            self.authorized_at,
+            self.published_at,
+        )
+        if self.status == "pending":
+            if any(value is not None for value in publication):
+                raise ValueError("pending entry has publication data")
+            return self
+        if any(value is None for value in publication):
+            raise ValueError("published entry lacks publication data")
+        if self.preview_digest is None:
+            raise ValueError("published entry lacks preview")
+        if self.public_report_digest != self.report_digest:
+            raise ValueError("published report mismatch")
+        if self.public_url != (f"https://github.com/{self.repository}/issues/{self.issue_number}"):
+            raise ValueError("invalid public URL")
+        if self.authorization_mode == "auto":
+            if self.approval_digest is not None:
+                raise ValueError("auto publication has approval")
+        elif self.authorization_mode == "approval_required":
+            if self.approval_digest is None:
+                raise ValueError("approved publication lacks approval")
+        else:
+            raise ValueError("invalid authorization mode")
+        authorized_at = self.authorized_at
+        published_at = self.published_at
+        if authorized_at is None or published_at is None:
+            raise ValueError("published entry lacks timestamps")
+        if not all(_view_time_is_valid(value) for value in (authorized_at, published_at)):
+            raise ValueError("invalid publication timestamp")
+        if not self.created_at <= authorized_at <= published_at <= self.updated_at:
+            raise ValueError("invalid publication order")
+        if self.approval_expires_at is not None and self.approval_expires_at < authorized_at:
+            raise ValueError("expired approval")
+        return self
+
+
+class PublicationReceipt(BaseModel):
+    """Sanitized immutable evidence for a completed publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
+
+    repository: str = Field(pattern=r"^[\w.-]+/[\w.-]+$")
+    fingerprint: str = Field(pattern=_VIEW_DIGEST_PATTERN)
+    issue_number: int = Field(ge=1)
+    public_url: str
+    public_report_digest: str = Field(pattern=_VIEW_DIGEST_PATTERN)
+    authorization_mode: Literal["approval_required", "auto"]
+    authorization_digest: str = Field(pattern=_VIEW_DIGEST_PATTERN)
+    authorized_at: datetime
+    published_at: datetime
+
+    @model_validator(mode="after")
+    def coherent_shape(self) -> PublicationReceipt:
+        if self.public_url != (f"https://github.com/{self.repository}/issues/{self.issue_number}"):
+            raise ValueError("invalid public URL")
+        if not all(_view_time_is_valid(value) for value in (self.authorized_at, self.published_at)):
+            raise ValueError("invalid publication timestamp")
+        if self.authorized_at > self.published_at:
+            raise ValueError("invalid publication order")
+        return self
+
+
 _PUBLIC_FIELDS = frozenset(Report.model_fields)
 _MAX_PUBLIC_BYTES = 4_096
 _SENSITIVE_TEXT = tuple(
@@ -408,6 +522,21 @@ def _authorization(policy: Policy, report_digest: str, preview_digest: str) -> s
     )
 
 
+_OUTBOX_VIEW_COLUMNS = (
+    "repository,fingerprint,status,occurrence_count,created_at,updated_at,expires_at,"
+    "report_digest,preview_digest,preview_report_digest,approval_digest,"
+    "approval_expires_at,issue_number,public_url,public_report_digest,"
+    "authorization_mode,authorization_digest,authorized_at,published_at,report_json"
+)
+_OUTBOX_LIST_QUERY = (
+    "SELECT " + _OUTBOX_VIEW_COLUMNS + " FROM incidents WHERE repository=? "
+    "ORDER BY updated_at DESC,fingerprint ASC LIMIT ?"
+)
+_OUTBOX_RECEIPT_QUERY = (
+    "SELECT " + _OUTBOX_VIEW_COLUMNS + " FROM incidents WHERE repository=? AND fingerprint=?"
+)
+
+
 class Outbox:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
@@ -437,6 +566,208 @@ class Outbox:
 
     def close(self) -> None:
         self.db.close()
+
+    def _view_policy(self, policy: Policy) -> Policy:
+        try:
+            if type(policy) is not Policy or set(policy.__dict__) != set(Policy.model_fields):
+                raise ValueError
+            validated = Policy.model_validate(policy.model_dump(), strict=True)
+            if validated.mode is Mode.OFF or validated.repository is None:
+                raise ValueError
+            for segment in validated.repository.split("/"):
+                _scan_sink(segment, 100)
+        except (AttributeError, IncidentError, ValidationError, ValueError):
+            raise IncidentError("POLICY_INVALID") from None
+        return validated
+
+    @staticmethod
+    def _view_datetime(value: object) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = datetime.fromisoformat(value)
+        if not _view_time_is_valid(parsed) or _time(parsed) != value:
+            raise ValueError
+        return parsed
+
+    @staticmethod
+    def _view_digest(value: object) -> str:
+        if not isinstance(value, str) or re.fullmatch(_VIEW_DIGEST_PATTERN, value) is None:
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _optional_view_digest(value: object) -> str | None:
+        if value is None:
+            return None
+        return Outbox._view_digest(value)
+
+    def _view_entry(self, row: sqlite3.Row, policy: Policy, now: datetime) -> OutboxEntry:
+        try:
+            raw_report = row["report_json"]
+            if not isinstance(raw_report, str):
+                raise ValueError
+            report = Report.model_validate_json(raw_report, strict=True)
+            public_json(report)
+            repository = row["repository"]
+            if not isinstance(repository, str):
+                raise ValueError
+            if self._repository(policy, report) != repository:
+                raise ValueError
+            fingerprint = self._view_digest(row["fingerprint"])
+            report_digest = self._view_digest(row["report_digest"])
+            preview_digest = self._optional_view_digest(row["preview_digest"])
+            preview_report_digest = self._optional_view_digest(row["preview_report_digest"])
+            approval_digest = self._optional_view_digest(row["approval_digest"])
+            approval_expires_value = row["approval_expires_at"]
+            if fingerprint != report.fingerprint:
+                raise ValueError
+            if report_digest != _digest(report):
+                raise ValueError
+            if row["occurrence_count"] != report.occurrences:
+                raise ValueError
+            if (preview_digest is None) != (preview_report_digest is None):
+                raise ValueError
+            if preview_digest is not None and preview_report_digest != report_digest:
+                raise ValueError
+            if (approval_digest is None) != (approval_expires_value is None):
+                raise ValueError
+            approval_expires_at = (
+                None
+                if approval_expires_value is None
+                else self._view_datetime(approval_expires_value)
+            )
+            entry = OutboxEntry(
+                repository=repository,
+                fingerprint=fingerprint,
+                status=row["status"],
+                occurrence_count=row["occurrence_count"],
+                created_at=self._view_datetime(row["created_at"]),
+                updated_at=self._view_datetime(row["updated_at"]),
+                expires_at=self._view_datetime(row["expires_at"]),
+                report_digest=report_digest,
+                preview_digest=preview_digest,
+                approval_digest=approval_digest,
+                approval_expires_at=approval_expires_at,
+                issue_number=row["issue_number"],
+                public_url=row["public_url"],
+                public_report_digest=self._optional_view_digest(row["public_report_digest"]),
+                authorization_mode=row["authorization_mode"],
+                authorization_digest=self._optional_view_digest(row["authorization_digest"]),
+                authorized_at=(
+                    None
+                    if row["authorized_at"] is None
+                    else self._view_datetime(row["authorized_at"])
+                ),
+                published_at=(
+                    None
+                    if row["published_at"] is None
+                    else self._view_datetime(row["published_at"])
+                ),
+            )
+            if entry.expires_at <= _utc(now):
+                raise ValueError
+            if entry.approval_digest is not None:
+                if entry.preview_digest is None:
+                    raise ValueError
+                expected_approval = _authorization(
+                    policy, entry.report_digest, entry.preview_digest
+                )
+                if entry.approval_digest != expected_approval:
+                    raise ValueError
+            if entry.status == "published":
+                if (
+                    entry.preview_digest is None
+                    or entry.authorization_digest is None
+                    or entry.authorization_mode != policy.mode.value
+                ):
+                    raise ValueError
+                expected_authorization = _authorization(
+                    policy, entry.report_digest, entry.preview_digest
+                )
+                if entry.authorization_digest != expected_authorization:
+                    raise ValueError
+            return entry
+        except (
+            IncidentError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValidationError,
+            ValueError,
+        ):
+            raise IncidentError("OUTBOX_VIEW_INVALID") from None
+
+    def list_entries(self, policy: Policy, now: datetime) -> list[OutboxEntry]:
+        policy = self._view_policy(policy)
+        repository = cast(str, policy.repository)
+        limit = min(100, policy.pending_cap + 20)
+        try:
+            with self.db:
+                self._purge(now)
+                rows = self.db.execute(
+                    _OUTBOX_LIST_QUERY,
+                    (repository, limit),
+                ).fetchall()
+                return [self._view_entry(row, policy, now) for row in rows]
+        except IncidentError:
+            raise
+        except sqlite3.Error:
+            raise IncidentError("OUTBOX_VIEW_INVALID") from None
+
+    def publication_receipt(
+        self, fingerprint: str, policy: Policy, now: datetime
+    ) -> PublicationReceipt:
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(_VIEW_DIGEST_PATTERN, fingerprint) is None
+        ):
+            raise IncidentError("FINGERPRINT_INVALID")
+        policy = self._view_policy(policy)
+        repository = cast(str, policy.repository)
+        try:
+            with self.db:
+                self._purge(now)
+                row = self.db.execute(
+                    _OUTBOX_RECEIPT_QUERY,
+                    (repository, fingerprint),
+                ).fetchone()
+                if row is None:
+                    raise IncidentError("PUBLICATION_NOT_FOUND")
+                entry = self._view_entry(cast(sqlite3.Row, row), policy, now)
+        except IncidentError:
+            raise
+        except sqlite3.Error:
+            raise IncidentError("OUTBOX_VIEW_INVALID") from None
+        if entry.status != "published":
+            raise IncidentError("PUBLICATION_NOT_FOUND")
+        issue_number = entry.issue_number
+        public_url = entry.public_url
+        public_report_digest = entry.public_report_digest
+        authorization_mode = entry.authorization_mode
+        authorization_digest = entry.authorization_digest
+        authorized_at = entry.authorized_at
+        published_at = entry.published_at
+        if (
+            issue_number is None
+            or public_url is None
+            or public_report_digest is None
+            or authorization_mode is None
+            or authorization_digest is None
+            or authorized_at is None
+            or published_at is None
+        ):
+            raise IncidentError("OUTBOX_VIEW_INVALID")
+        return PublicationReceipt(
+            repository=repository,
+            fingerprint=fingerprint,
+            issue_number=issue_number,
+            public_url=public_url,
+            public_report_digest=public_report_digest,
+            authorization_mode=authorization_mode,
+            authorization_digest=authorization_digest,
+            authorized_at=authorized_at,
+            published_at=published_at,
+        )
 
     def _repository(self, policy: Policy, report: Report) -> str:
         try:
@@ -665,13 +996,15 @@ class Outbox:
             self.db.execute(
                 "UPDATE incidents SET status='published',issue_number=?,public_url=?,"
                 "public_report_digest=?,authorization_mode=?,authorization_digest=?,"
-                "authorized_at=?,published_at=? WHERE repository=? AND fingerprint=?",
+                "authorized_at=?,published_at=?,updated_at=? "
+                "WHERE repository=? AND fingerprint=?",
                 (
                     number,
                     url,
                     report_digest,
                     policy.mode.value,
                     authorization,
+                    timestamp,
                     timestamp,
                     timestamp,
                     repository,
