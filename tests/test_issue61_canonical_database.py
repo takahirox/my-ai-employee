@@ -94,6 +94,8 @@ def test_import_preserves_relationships_permissions_wal_and_is_idempotent(
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
     assert _digest(source) == before
+    assert not Path(f"{source}-wal").exists()
+    assert not Path(f"{source}-shm").exists()
     with SQLiteStore(destination) as store:
         context = store.repository_for_run("legacy-run")
         assert context is not None

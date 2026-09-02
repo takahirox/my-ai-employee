@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import shlex
 from pathlib import Path
 
 import pytest

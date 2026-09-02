@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import sqlite3
 from collections.abc import Mapping
@@ -148,8 +147,9 @@ def _file_signature(path: Path) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _read_only_connection(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10.0)
+def _read_only_connection(path: Path, *, immutable: bool = False) -> sqlite3.Connection:
+    options = "mode=ro&immutable=1" if immutable else "mode=ro"
+    connection = sqlite3.connect(f"{path.as_uri()}?{options}", uri=True, timeout=10.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
     connection.execute("PRAGMA foreign_keys = ON")
@@ -191,7 +191,9 @@ def _validate_source(
     }
     missing = required - tables
     if missing:
-        raise ValueError("legacy database is missing required tables: " + ", ".join(sorted(missing)))
+        raise ValueError(
+            "legacy database is missing required tables: " + ", ".join(sorted(missing))
+        )
 
     for table in sorted(tables):
         expected_columns = _TABLE_SPECS[table][0]
@@ -331,7 +333,7 @@ def import_legacy_database(
 
     initial_signature = _file_signature(source_path)
     source_digest = _file_digest(source_path)
-    source_connection = _read_only_connection(source_path)
+    source_connection = _read_only_connection(source_path, immutable=True)
     source_connection.execute("BEGIN")
     try:
         schema_version, tables, source_counts = _validate_source(source_connection)
@@ -371,6 +373,10 @@ def import_legacy_database(
                     skipped_rows += skipped
                 if connection.execute("PRAGMA foreign_key_check").fetchall():
                     raise ValueError("legacy import would break destination relationships")
+                if any(Path(f"{source_path}{suffix}").exists() for suffix in ("-wal", "-shm")):
+                    raise ValueError(
+                        "legacy database appears active; stop Fleet and checkpoint it first"
+                    )
                 if (
                     _file_signature(source_path) != initial_signature
                     or _file_digest(source_path) != source_digest
