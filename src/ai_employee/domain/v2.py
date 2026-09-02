@@ -60,6 +60,7 @@ class StableFailureCode(StableStrEnum):
     WORKER_EMPTY_OUTPUT = "WORKER_EMPTY_OUTPUT"
     WORKER_STRUCTURED_OUTPUT_MISSING = "WORKER_STRUCTURED_OUTPUT_MISSING"
     WORKER_BOUNDARY_ERROR = "WORKER_BOUNDARY_ERROR"
+    WORKER_DISPATCH_CONTRACT_CONTRADICTION = "WORKER_DISPATCH_CONTRACT_CONTRADICTION"
     WORKER_BUDGET_INADEQUATE = "WORKER_BUDGET_INADEQUATE"
     CONTEXT_INSUFFICIENT = "CONTEXT_INSUFFICIENT"
     TYPED_RESULT_MALFORMED = "TYPED_RESULT_MALFORMED"
@@ -816,7 +817,9 @@ class WorkerBoundaryDiagnostic(DigestedRecordV2):
 
     schema_name: ClassVar[str] = "worker_boundary_diagnostic"
     adapter: Identifier
-    stage: Literal["probe", "process", "transport", "envelope", "typed_result", "runner"]
+    stage: Literal[
+        "probe", "process", "transport", "envelope", "typed_result", "runner", "pre_dispatch"
+    ]
     code: Identifier
     retryable: bool = False
     graph_run_id: Identifier | None = None

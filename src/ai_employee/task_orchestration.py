@@ -1938,6 +1938,45 @@ class TaskOrchestrator:
                             failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
                         )
                         continue
+                    if not self._pre_dispatch_bindings_are_valid(
+                        graph_run,
+                        node,
+                        request,
+                        route,
+                        predecessors[node_id],
+                    ):
+                        diagnostic = WorkerBoundaryDiagnostic(
+                            id=identifier("worker-boundary-diagnostic"),
+                            run_id=request.run_id,
+                            created_at=self.clock(),
+                            adapter=route.selected_strategy.backend,
+                            stage="pre_dispatch",
+                            code=(StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value),
+                            graph_run_id=run_id,
+                            node_id=node.id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=node.generation,
+                            attempt=node.attempt,
+                            worker_request_id=request.id,
+                            worker_request_digest=_required_digest(request.content_digest),
+                            exception_message=(
+                                "pre-dispatch bindings contradict accepted run authority; "
+                                "recreate the route and worker request from the persisted task and "
+                                "effective policy"
+                            ),
+                            duration_seconds=0.0,
+                            configured_timeout_seconds=node.resource_budget.wall_seconds,
+                            effective_timeout_seconds=timeout_profile.effective_timeout_seconds,
+                        )
+                        self.store.put("worker_boundary_diagnostic_v2", diagnostic, run_id=run_id)
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code=(
+                                StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value
+                            ),
+                        )
+                        continue
                     records[node_id] = self._advance(
                         records[node_id],
                         status="running",
@@ -2490,8 +2529,7 @@ class TaskOrchestrator:
                             )
                         ):
                             protocol_correction = (
-                                current.failure_code
-                                in _PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES
+                                current.failure_code in _PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES
                             )
                             repair_count = (
                                 correction_counts[node_id]
@@ -3282,7 +3320,8 @@ class TaskOrchestrator:
             for item in self.store.list_records(
                 "loop_transition_v2", LoopTransitionRecord, run_id=run_id
             )
-            if item.action is LoopAction.REPAIR and item.node_id == node.id
+            if item.action is LoopAction.REPAIR
+            and item.node_id == node.id
             and item.reason_code != _PROTOCOL_PREFLIGHT_CORRECTION_REASON
         )
         replay = self.replay(run_id)
@@ -4299,6 +4338,63 @@ class TaskOrchestrator:
         return (
             outputs,
             tuple(_required_digest(record.evidence_digest) for record in predecessors),
+        )
+
+    def _pre_dispatch_bindings_are_valid(
+        self,
+        graph_run: GraphRunRecord,
+        node: Node,
+        request: WorkerRequest,
+        route: NodeRouteRecord,
+        dependency_ids: tuple[str, ...],
+    ) -> bool:
+        try:
+            persisted_run = self.store.get("graph_run_v2", graph_run.id, GraphRunRecord)
+            persisted_request = self.store.get("worker_request_v2", request.id, WorkerRequest)
+            persisted_route = self.store.get("node_route_v2", route.id, NodeRouteRecord)
+        except (KeyError, ValueError):
+            return False
+
+        expected_facts = self._routing_facts(
+            node,
+            dependency_ids,
+            self._deterministic_node_assessment(graph_run.id, node),
+            graph_run.effective_policy_digest,
+            graph_run.harness_digest,
+        )
+        required = set(expected_facts.required_capabilities)
+        available = set(graph_run.available_capabilities) - set(
+            graph_run.execution_policy.denied_capabilities
+        )
+        return not (
+            persisted_run != graph_run
+            or persisted_request != request
+            or persisted_route != route
+            or request.graph_run_id != graph_run.id
+            or request.node_id != node.id
+            or request.accepted_plan_digest != graph_run.accepted_graph_revision_digest
+            or request.accepted_graph_revision_digest != graph_run.accepted_graph_revision_digest
+            or request.generation != node.generation
+            or request.attempt != node.attempt
+            or request.task_kind != graph_run.goal.task_kind
+            or request.processes_authorized != graph_run.goal.processes_authorized
+            or request.harness_digest != graph_run.harness_digest
+            or request.effective_policy_digest != graph_run.effective_policy_digest
+            or request.required_capabilities != expected_facts.required_capabilities
+            or route.run_id != graph_run.id
+            or route.node_id != node.id
+            or route.accepted_graph_revision_digest != graph_run.accepted_graph_revision_digest
+            or route.generation != node.generation
+            or route.attempt != node.attempt
+            or route.effective_policy_digest != graph_run.effective_policy_digest
+            or route.harness_digest != graph_run.harness_digest
+            or route.routing_facts != expected_facts
+            or route.assessment.run_id != graph_run.id
+            or route.assessment.required_capabilities != expected_facts.required_capabilities
+            or not required <= set(route.selected_strategy.capabilities)
+            or not required <= available
+            or (request.task_kind == GoalTaskKind.NON_MUTATING and "edit_intent" in required)
+            or (not request.processes_authorized and "process" in required)
         )
 
     def _worker_context_is_valid(

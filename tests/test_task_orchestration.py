@@ -60,6 +60,7 @@ from ai_employee.task_orchestration import (
     NodeExecutionRecord,
     NodeExecutionResult,
     NodeReservationRecord,
+    NodeRouteRecord,
     NodeWatchdogRecord,
     PreAcceptanceGoalRecord,
     TaskGraphAcceptance,
@@ -242,6 +243,155 @@ def _strategy() -> ExecutionStrategy:
         model="fixture",
         effort="bounded",
         capabilities=("process",),
+    )
+
+
+def test_non_mutating_task_dispatches_with_strategy_capability_superset(
+    tmp_path: Path,
+) -> None:
+    dispatched: list[tuple[WorkerRequest, ExecutionStrategy]] = []
+    strategy = _strategy().model_copy(update={"capabilities": ("edit_intent", "process")})
+
+    def runner(
+        node: Node,
+        request: WorkerRequest,
+        selected_strategy: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        dispatched.append((request, selected_strategy))
+        return NodeExecutionResult(
+            worker_result=WorkerResult(
+                id="non-mutating-dispatch-result",
+                run_id=request.run_id,
+                created_at=NOW,
+                request_digest=request.content_digest or ZERO,
+                status="succeeded",
+                duration_seconds=0.01,
+            ),
+            criterion_evidence=(
+                CriterionEvidence(
+                    criterion_id="criterion-diagnosis",
+                    disposition="satisfied",
+                    evidence_refs=(ZERO,),
+                ),
+            ),
+        )
+
+    goal = Goal(
+        id="non-mutating-dispatch-goal",
+        statement="return one bounded diagnosis",
+        task_kind=GoalTaskKind.NON_MUTATING,
+        processes_authorized=False,
+        completion_criteria=(_criterion("diagnosis"),),
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="non-mutating-dispatch-graph",
+        node_id="non-mutating-dispatch-node",
+        required_capabilities=(),
+    )
+    with SQLiteStore(tmp_path / "non-mutating-dispatch.db") as store:
+        run = TaskOrchestrator(store, runner, (strategy,)).run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="non-mutating-dispatch-run",
+            available_capabilities=(),
+        )
+
+    assert run.status == "completed"
+    assert len(dispatched) == 1
+    assert dispatched[0][0].required_capabilities == ()
+    assert set(dispatched[0][1].capabilities) == {"edit_intent", "process"}
+
+
+def test_tampered_required_capability_binding_fails_before_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = _strategy().model_copy(update={"capabilities": ("edit_intent", "process")})
+    original_route = TaskOrchestrator._route
+
+    def tampered_route(
+        orchestrator: TaskOrchestrator,
+        run_id: str,
+        node: Node,
+        dependency_ids: tuple[str, ...],
+        graph_digest: str,
+        effective_policy_digest: str,
+        harness_digest: str,
+        *,
+        independent_node_assessment: bool,
+    ) -> NodeRouteRecord:
+        route = original_route(
+            orchestrator,
+            run_id,
+            node,
+            dependency_ids,
+            graph_digest,
+            effective_policy_digest,
+            harness_digest,
+            independent_node_assessment=independent_node_assessment,
+        )
+        facts = route.routing_facts
+        assert facts is not None
+        return NodeRouteRecord(
+            **route.model_dump(exclude={"content_digest", "routing_facts"}),
+            routing_facts=facts.model_copy(
+                update={"required_capabilities": ("edit_intent", "process")}
+            ),
+        )
+
+    runner_calls = 0
+
+    def runner(
+        _node: Node,
+        _request: WorkerRequest,
+        _strategy_value: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        nonlocal runner_calls
+        runner_calls += 1
+        raise AssertionError("tampered bindings must fail before dispatch")
+
+    monkeypatch.setattr(TaskOrchestrator, "_route", tampered_route)
+    goal = Goal(
+        id="tampered-route-goal",
+        statement="reject a stale routed capability binding",
+        completion_criteria=(_criterion("tampered-route"),),
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="tampered-route-graph",
+        node_id="tampered-route-node",
+        required_capabilities=("process",),
+    )
+    with SQLiteStore(tmp_path / "tampered-route.db") as store:
+        run = TaskOrchestrator(store, runner, (strategy,)).run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="tampered-route-run",
+            available_capabilities=("edit_intent", "process"),
+        )
+        diagnostics = store.list_records(
+            "worker_boundary_diagnostic_v2",
+            WorkerBoundaryDiagnostic,
+            run_id=run.id,
+        )
+
+    assert run.status == "failed"
+    assert runner_calls == 0
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.stage == "pre_dispatch"
+    assert diagnostic.code == (StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value)
+    assert diagnostic.retryable is False
+    assert diagnostic.exception_message == (
+        "pre-dispatch bindings contradict accepted run authority; recreate the route and worker "
+        "request from the persisted task and effective policy"
     )
 
 
