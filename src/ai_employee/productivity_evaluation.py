@@ -766,6 +766,87 @@ def load_result_bundle(data: str | bytes) -> ResultBundle:
     return bundle
 
 
+def combine_result_bundles(bundles: Iterable[ResultBundle]) -> ResultBundle:
+    """Combine independently collected one-arm bundles without inventing provenance."""
+
+    sources = tuple(bundles)
+    if len(sources) < 2:
+        raise ValueError("combination requires at least two source bundles")
+    benchmarks = {(item.benchmark, item.benchmark_version) for item in sources}
+    if len(benchmarks) != 1:
+        raise ValueError("source bundles have mismatched benchmark identity or version")
+
+    arm_ids: list[str] = []
+    results: list[TrialResult] = []
+    for source in sources:
+        source_arm_ids = {item.arm.id for item in source.results}
+        if len(source_arm_ids) != 1:
+            raise ValueError("each source bundle must contain exactly one logical arm")
+        arm_ids.append(next(iter(source_arm_ids)))
+        results.extend(source.results)
+    trial_ids = tuple(item.id for item in results)
+    if len(trial_ids) != len(set(trial_ids)):
+        raise ValueError("source bundles contain a duplicate trial identity")
+    if len(arm_ids) != len(set(arm_ids)):
+        raise ValueError("source bundles contain a duplicate arm identity")
+
+    expected_tasks = {canonical_digest(item.task) for item in sources[0].results}
+    if any(
+        {canonical_digest(item.task) for item in source.results} != expected_tasks
+        for source in sources[1:]
+    ):
+        raise ValueError("source bundles have mismatched task identity")
+
+    def run_scope(source: ResultBundle) -> set[tuple[str, int, int]]:
+        return {
+            (canonical_digest(item.task), item.arm.seed, item.arm.repetition)
+            for item in source.results
+        }
+
+    expected_scope = run_scope(sources[0])
+    if any(run_scope(source) != expected_scope for source in sources[1:]):
+        raise ValueError("source bundles have incompatible task/seed/repetition run scope")
+
+    reference = {
+        (canonical_digest(item.task), item.arm.seed, item.arm.repetition): item
+        for item in sources[0].results
+    }
+    for source in sources[1:]:
+        current = {
+            (canonical_digest(item.task), item.arm.seed, item.arm.repetition): item
+            for item in source.results
+        }
+        for key in sorted(reference):
+            _validate_same_capability(reference[key], current[key])
+
+    source_digests = tuple(item.bundle_digest for item in sources if item.bundle_digest is not None)
+    if len(source_digests) != len(sources):
+        raise ValueError("source bundle digest is missing")
+    run_id = "productivity-combined-" + canonical_digest(tuple(sorted(source_digests)))
+    combined_results = tuple(
+        sorted(
+            results,
+            key=lambda item: (
+                item.task.task_id,
+                item.task.task_version,
+                item.arm.id,
+                item.arm.seed,
+                item.arm.repetition,
+                item.id,
+            ),
+        )
+    )
+    benchmark, benchmark_version = next(iter(benchmarks))
+    return ResultBundle(
+        id=run_id,
+        run_id=run_id,
+        created_at=max(item.created_at for item in sources),
+        benchmark=benchmark,
+        benchmark_version=benchmark_version,
+        results=combined_results,
+    )
+
+
 class HistoryCompatibility(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_history_compatibility"
     benchmark: Identifier

@@ -29,6 +29,7 @@ from ai_employee.productivity_evaluation import (
     TrialMetrics,
     TrialResult,
     aggregate_trials,
+    combine_result_bundles,
     compare_direct_to_fleet,
     compare_history,
     component_ablation_contribution,
@@ -195,6 +196,17 @@ def bundle(version: str, value: TrialResult) -> ResultBundle:
     )
 
 
+def source_bundle(name: str, value: TrialResult, day: int = 3) -> ResultBundle:
+    return ResultBundle(
+        id=name,
+        run_id=name,
+        created_at=datetime(2026, 9, day, tzinfo=UTC),
+        benchmark=value.task.benchmark,
+        benchmark_version=value.task.benchmark_version,
+        results=(value,),
+    )
+
+
 def test_authority_fairness_aggregation_and_ablation() -> None:
     direct = result(task(), arm(ArmKind.DIRECT_AGENT, "direct"))
     fleet = result(task(), arm(ArmKind.FLEET, "fleet"), accepted=False, active=5)
@@ -225,6 +237,88 @@ def test_authority_fairness_aggregation_and_ablation() -> None:
     ablated = result(task(), arm(ArmKind.FLEET_ABLATION, "no-review"), accepted=False)
     contribution = component_ablation_contribution((result(task(), fleet.arm),), (ablated,))
     assert contribution.component == "review"
+
+
+def test_combine_result_bundles_is_deterministic_and_comparison_ready() -> None:
+    direct_source = source_bundle(
+        "source-direct", result(task(), arm(ArmKind.DIRECT_AGENT, "direct")), day=2
+    )
+    fleet_source = source_bundle(
+        "source-fleet",
+        result(task(), arm(ArmKind.FLEET, "fleet"), accepted=False),
+        day=3,
+    )
+    combined = combine_result_bundles((direct_source, fleet_source))
+    reverse = combine_result_bundles((fleet_source, direct_source))
+
+    assert dump_result_bundle(combined) == dump_result_bundle(reverse)
+    assert combined.id == combined.run_id
+    assert combined.id.startswith("productivity-combined-")
+    assert combined.created_at == fleet_source.created_at
+    assert tuple(item.arm.id for item in combined.results) == ("direct", "fleet")
+    comparison = compare_direct_to_fleet(
+        tuple(item for item in combined.results if item.arm.id == "direct"),
+        tuple(item for item in combined.results if item.arm.id == "fleet"),
+    )
+    assert comparison.pairs == 1
+    for retained, original in zip(
+        combined.results,
+        (direct_source.results[0], fleet_source.results[0]),
+        strict=True,
+    ):
+        assert retained.arm.environment_digest == original.arm.environment_digest
+        assert retained.arm.fairness_config_digest == original.arm.fairness_config_digest
+        assert retained.arm.arm_config_digest == original.arm.arm_config_digest
+        assert retained.acceptance_outcomes == original.acceptance_outcomes
+        assert retained.regression_outcomes == original.regression_outcomes
+
+    ablation_source = source_bundle(
+        "source-ablation",
+        result(task(), arm(ArmKind.FLEET_ABLATION, "no-review"), accepted=False),
+    )
+    ablation_bundle = combine_result_bundles((fleet_source, ablation_source))
+    contribution = component_ablation_contribution(
+        tuple(item for item in ablation_bundle.results if item.arm.id == "fleet"),
+        tuple(item for item in ablation_bundle.results if item.arm.id == "no-review"),
+    )
+    assert contribution.component == "review"
+
+
+def test_combine_result_bundles_fails_closed() -> None:
+    direct = source_bundle("source-direct", result(task(), arm(ArmKind.DIRECT_AGENT, "direct")))
+
+    with pytest.raises(ValueError, match="at least two"):
+        combine_result_bundles((direct,))
+    with pytest.raises(ValueError, match="duplicate trial identity"):
+        combine_result_bundles((direct, direct))
+    repeated_direct = source_bundle(
+        "source-direct-repeated",
+        result(task(), arm(ArmKind.DIRECT_AGENT, "direct", repetition=2)),
+    )
+    with pytest.raises(ValueError, match="duplicate arm identity"):
+        combine_result_bundles((direct, repeated_direct))
+
+    foreign_version = bundle("v2", result(task("v2"), arm(ArmKind.FLEET, "fleet")))
+    with pytest.raises(ValueError, match="benchmark identity or version"):
+        combine_result_bundles((direct, foreign_version))
+    foreign_task = source_bundle(
+        "foreign-task",
+        result(task(baseline="b" * 40), arm(ArmKind.FLEET, "fleet")),
+    )
+    with pytest.raises(ValueError, match="mismatched task identity"):
+        combine_result_bundles((direct, foreign_task))
+    different_scope = source_bundle(
+        "different-scope",
+        result(task(), arm(ArmKind.FLEET, "fleet", repetition=2)),
+    )
+    with pytest.raises(ValueError, match=r"incompatible.*run scope"):
+        combine_result_bundles((direct, different_scope))
+    different_controls = source_bundle(
+        "different-controls",
+        result(task(), arm(ArmKind.FLEET, "fleet", machine=D3)),
+    )
+    with pytest.raises(ValueError, match="same capability and controls"):
+        combine_result_bundles((direct, different_controls))
 
 
 def test_adapters_bundles_tamper_and_history() -> None:

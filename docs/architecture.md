@@ -103,9 +103,11 @@ indeterminate results must continue to escalate rather than pass or repair autom
 ## Productivity evaluation boundary
 
 Productivity evaluation models are deterministic records outside the execution authority path.
-The `fleet productivity` CLI only reads a caller-supplied canonical result bundle, validates its
-digest and schema, aggregates existing trials, and optionally performs an explicitly named paired
-direct-versus-Fleet comparison. It neither invokes workers nor opens Fleet's operational database,
+The `fleet productivity` CLI validates canonical result bundles, aggregates existing trials, and
+optionally performs an explicitly named paired direct-versus-Fleet comparison. Its offline
+`combine` command writes only one explicitly named new canonical bundle from validated one-arm
+sources; validation and reporting remain read-only. It neither invokes workers nor opens Fleet's
+operational database,
 changes policy, downloads benchmarks, or promotes work. Metric families remain separate so cost,
 latency, or orchestration cannot silently override authoritative quality or human effort. See the
 [productivity evaluation protocol](evaluation.md) for experiment design and retention rules.

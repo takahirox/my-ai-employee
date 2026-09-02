@@ -7,10 +7,12 @@ canonical criterion and regression outcome records bind each declared check ID a
 a pass/fail disposition and evidence digest. Success, regression freedom, and acceptance are
 derived from those records rather than supplied by a caller.
 
-The CLI is deliberately read-only and offline. It does not start a worker, alter Fleet
-authority, fetch a benchmark, or write an evaluation database:
+The CLI is deliberately offline. It does not start a worker, alter Fleet authority, fetch a
+benchmark, or write an evaluation database. Validation and reporting are read-only; combination
+writes only the explicitly named, previously absent output file:
 
 ```bash
+fleet productivity combine --output results.json direct.json fleet.json
 fleet productivity validate results.json
 fleet productivity report results.json
 fleet productivity report results.json --direct-arm codex-direct --fleet-arm codex-fleet
@@ -222,6 +224,47 @@ It records original and resolved argv, protocol and task configuration, explicit
 network policy, UTC start/end, exit code, stdout/stderr digests, and exact artifact digests. Existing
 destinations, path escapes, missing or extra files, stale task/check data, malformed JSON, and
 protocol or evidence mismatches fail without publishing the staged artifacts.
+
+### Combine separately collected arms
+
+Each executable protocol above deliberately produces a one-arm bundle. Combine the separately
+collected direct Codex and full Fleet arms, then run the existing paired report, entirely offline:
+
+```bash
+fleet productivity combine \
+  --output ./codex-direct-vs-fleet.json \
+  artifacts/codex-direct/result-bundle.json \
+  artifacts/codex-fleet/result-bundle.json
+fleet productivity validate ./codex-direct-vs-fleet.json
+fleet productivity report ./codex-direct-vs-fleet.json \
+  --direct-arm codex-direct --fleet-arm codex-fleet --format markdown
+```
+
+Combine full Fleet with exactly one ablation the same way; this example isolates review:
+
+```bash
+fleet productivity combine \
+  --output ./codex-fleet-vs-no-review.json \
+  artifacts/codex-fleet/result-bundle.json \
+  artifacts/ablation-no-review/result-bundle.json
+fleet productivity validate ./codex-fleet-vs-no-review.json
+fleet productivity report ./codex-fleet-vs-no-review.json --format markdown
+```
+
+Combination accepts at least two canonical, independently collected one-arm bundles and writes
+exactly one new canonical `ResultBundle`; it never overwrites a path. Every retained
+`TrialResult`, task/arm/environment/fairness/configuration manifest, and check-evidence digest is
+copied unchanged. Inputs must have distinct trial and arm identities, the exact same benchmark
+version and task identities, identical task/seed/repetition scope, and the worker, environment,
+fairness, seed, and repetition controls required by the paired and ablation comparisons. A
+noncanonical input or any mismatch fails before the output is opened.
+
+The combined `run_id` (and matching bundle `id`) is `productivity-combined-` followed by the
+full SHA-256 canonical digest of the lexicographically sorted source `bundle_digest` values.
+Consequently input order cannot change the output identity, while the identity commits to every
+exact source bundle. The combined `created_at` is the latest source `created_at`, so no wall-clock
+timestamp or false collection time is invented. Retain the immutable source bundles alongside the
+combined bundle to resolve and audit that provenance commitment.
 
 Run the cheap per-PR gate against the exact candidate:
 

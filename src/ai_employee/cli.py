@@ -206,9 +206,14 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--json", action="store_true")
 
     productivity = commands.add_parser(
-        "productivity", help="validate or report a canonical productivity result bundle"
+        "productivity", help="combine, validate, or report productivity result bundles"
     )
     productivity_commands = productivity.add_subparsers(dest="productivity_command", required=True)
+    productivity_combine = productivity_commands.add_parser(
+        "combine", help="combine canonical one-arm result bundles"
+    )
+    productivity_combine.add_argument("bundles", nargs="+")
+    productivity_combine.add_argument("--output", required=True)
     productivity_validate = productivity_commands.add_parser(
         "validate", help="validate one canonical result bundle"
     )

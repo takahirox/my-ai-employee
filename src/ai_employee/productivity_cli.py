@@ -1,4 +1,4 @@
-"""Read-only reporting for canonical productivity result bundles."""
+"""Offline combination and reporting for canonical productivity result bundles."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from .productivity_evaluation import (
     PairedComparison,
     ResultBundle,
     aggregate_trials,
+    combine_result_bundles,
     compare_direct_to_fleet,
+    dump_result_bundle,
     load_result_bundle,
 )
 from .serialization import canonical_json
@@ -198,8 +200,18 @@ def _markdown_report(
 
 
 def run_productivity(args: argparse.Namespace) -> int:
-    """Validate or report a local bundle without workers, state, or network access."""
+    """Combine, validate, or report local bundles without workers, state, or network."""
 
+    if args.productivity_command == "combine":
+        sources = tuple(load_result_bundle(Path(item).read_bytes()) for item in args.bundles)
+        encoded = dump_result_bundle(combine_result_bundles(sources))
+        output = Path(args.output)
+        try:
+            with output.open("xb") as stream:
+                stream.write(encoded)
+        except FileExistsError as exc:
+            raise ValueError(f"refusing to overwrite combined bundle: {output}") from exc
+        return 0
     bundle = load_result_bundle(Path(args.bundle).read_bytes())
     if args.productivity_command == "validate":
         print(

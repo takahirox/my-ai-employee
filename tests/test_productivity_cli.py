@@ -26,6 +26,7 @@ from ai_employee.productivity_evaluation import (
     TrialMetrics,
     TrialResult,
     dump_result_bundle,
+    load_result_bundle,
     trial_id,
 )
 from ai_employee.serialization import canonical_digest
@@ -171,6 +172,82 @@ def _bundle(path: Path, *, fleet_environment: str = D1) -> Path:
     )
     path.write_bytes(dump_result_bundle(bundle))
     return path
+
+
+def _single_bundle(path: Path, bundle_id: str, value: TrialResult, day: int) -> Path:
+    bundle = ResultBundle(
+        id=bundle_id,
+        run_id=bundle_id,
+        created_at=datetime(2026, 9, day, tzinfo=UTC),
+        benchmark="fixture",
+        benchmark_version="v1",
+        results=(value,),
+    )
+    path.write_bytes(dump_result_bundle(bundle))
+    return path
+
+
+def test_productivity_combine_is_canonical_and_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    direct = _single_bundle(
+        tmp_path / "direct.json",
+        "source-direct",
+        _result(_arm(ArmKind.DIRECT_AGENT, "direct"), accepted=True, active=2),
+        2,
+    )
+    fleet = _single_bundle(
+        tmp_path / "fleet.json",
+        "source-fleet",
+        _result(_arm(ArmKind.FLEET, "fleet"), accepted=False, active=5),
+        3,
+    )
+    output = tmp_path / "combined.json"
+    assert main(["productivity", "combine", "--output", str(output), str(direct), str(fleet)]) == 0
+    assert capsys.readouterr().out == ""
+    combined = load_result_bundle(output.read_bytes())
+    assert tuple(item.arm.id for item in combined.results) == ("direct", "fleet")
+    assert (
+        main(
+            [
+                "productivity",
+                "report",
+                str(output),
+                "--direct-arm",
+                "direct",
+                "--fleet-arm",
+                "fleet",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["paired_comparison"]["pairs"] == 1
+
+    reverse = tmp_path / "reverse.json"
+    assert main(["productivity", "combine", "--output", str(reverse), str(fleet), str(direct)]) == 0
+    assert output.read_bytes() == reverse.read_bytes()
+
+    with pytest.raises(SystemExit) as existing:
+        main(["productivity", "combine", "--output", str(output), str(direct), str(fleet)])
+    assert existing.value.code == 2
+    assert "refusing to overwrite" in capsys.readouterr().err
+
+    noncanonical = tmp_path / "noncanonical-source.json"
+    noncanonical.write_bytes(b" " + direct.read_bytes())
+    with pytest.raises(SystemExit) as malformed:
+        main(
+            [
+                "productivity",
+                "combine",
+                "--output",
+                str(tmp_path / "rejected.json"),
+                str(noncanonical),
+                str(fleet),
+            ]
+        )
+    assert malformed.value.code == 2
+    assert "not canonical JSON" in capsys.readouterr().err
+    assert not (tmp_path / "rejected.json").exists()
 
 
 def test_productivity_validate_and_json_report_are_canonical(
