@@ -46,9 +46,7 @@ def _attach_child_work_runs(store: SQLiteStore, explanation: dict[str, Any]) -> 
     parent_failures = explanation.get("failure_path")
     if not isinstance(parent_failures, list):
         return
-    primary_causes = [
-        item for item in [_mapping(explanation.get("primary_root_cause"))] if item
-    ]
+    primary_causes = [item for item in [_mapping(explanation.get("primary_root_cause"))] if item]
     for story in _mappings(explanation.get("task_stories")):
         child_ids = tuple(
             dict.fromkeys(
@@ -776,12 +774,8 @@ def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
     if source == "budget":
         root["denied_authorities"] = selected.get("denied_authorities", [])
 
-    authority = _latest_causal_record(
-        _mappings(view.get("worker_timeout_authorities")), selected
-    )
-    profile = _latest_causal_record(
-        _mappings(view.get("worker_timeout_profiles")), selected
-    )
+    authority = _latest_causal_record(_mappings(view.get("worker_timeout_authorities")), selected)
+    profile = _latest_causal_record(_mappings(view.get("worker_timeout_profiles")), selected)
     configured_timeout = selected.get("configured_timeout_seconds")
     if configured_timeout is None:
         configured_timeout = authority.get("node_attempt_timeout_seconds")
@@ -813,9 +807,7 @@ def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
             and item.get("content_digest") == selected.get("worker_result_digest")
         )
     ]
-    worker_result = (
-        max(bound_worker_results, key=_record_key) if bound_worker_results else {}
-    )
+    worker_result = max(bound_worker_results, key=_record_key) if bound_worker_results else {}
     worker_usage = _mapping(worker_result.get("resource_usage"))
     for key in (
         "stdout_bytes",
@@ -844,11 +836,7 @@ def _primary_root_cause(view: dict[str, Any]) -> dict[str, Any] | None:
         }
 
     no_progress = sorted(
-        (
-            item
-            for item in matching_heartbeats
-            if item.get("no_observable_progress")
-        ),
+        (item for item in matching_heartbeats if item.get("no_observable_progress")),
         key=_record_key,
     )
     if no_progress:

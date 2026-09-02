@@ -254,9 +254,8 @@ class LocalProcessExecutor:
             cancelled = cancellation.cancelled()
             timed_out = elapsed >= timeout
             if (
-                (stdout_exceeded or stderr_exceeded or cancelled or timed_out)
-                and cleanup == "not_required"
-            ):
+                stdout_exceeded or stderr_exceeded or cancelled or timed_out
+            ) and cleanup == "not_required":
                 cleanup = self._terminate_group(process)
             for key, _events in selector.select(timeout=0.05):
                 buffer, limit = key.data

@@ -1379,9 +1379,7 @@ def inspect_fleet_runs(
             primary_root_cause = _primary_root_cause(projection)
             if projection.get("kind") == "graph_run":
                 explained = explain_any_run(store, run_id, clock=clock)
-                primary_root_cause = (
-                    explained.get("primary_root_cause") or primary_root_cause
-                )
+                primary_root_cause = explained.get("primary_root_cause") or primary_root_cause
             if primary_root_cause is not None:
                 item["primary_root_cause"] = primary_root_cause
         target.append(item)

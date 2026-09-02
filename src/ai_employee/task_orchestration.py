@@ -4432,7 +4432,8 @@ class TaskOrchestrator:
             and request.processes_authorized == manifest.processes_authorized
             and canonical_digest(request.completion_criteria) == manifest.completion_criteria_digest
             and request.completion_criteria == node.completion_criteria
-            and request.required_capabilities == node.required_capabilities
+            and request.required_capabilities
+            == node.required_capabilities
             == manifest.required_capabilities
             and request.accepted_plan_digest == graph_digest
             and request.accepted_graph_revision_digest

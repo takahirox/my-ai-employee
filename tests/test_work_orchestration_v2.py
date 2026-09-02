@@ -2846,9 +2846,7 @@ def test_workspace_preflight_fails_closed_before_worker_dispatch(
         ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
         check=True,
     )
-    subprocess.run(
-        ("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True
-    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True)
     source = repository / "file.txt"
     source.write_text("base\n")
     subprocess.run(("git", "-C", str(repository), "add", "file.txt"), check=True)
@@ -2863,9 +2861,7 @@ def test_workspace_preflight_fails_closed_before_worker_dispatch(
     else:
         source.write_text(f"{canary}\n")
         if preflight_case == "stale":
-            subprocess.run(
-                ("git", "-C", str(repository), "commit", "-qam", "advance"), check=True
-            )
+            subprocess.run(("git", "-C", str(repository), "commit", "-qam", "advance"), check=True)
     captured_head = subprocess.check_output(
         ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
     ).strip()

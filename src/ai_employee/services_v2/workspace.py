@@ -396,11 +396,7 @@ class GitWorkspaceManager:
 
     @staticmethod
     def _status_counts(status: bytes) -> tuple[int, int]:
-        tracked = sum(
-            1
-            for line in status.splitlines()
-            if line.startswith((b"1 ", b"2 ", b"u "))
-        )
+        tracked = sum(1 for line in status.splitlines() if line.startswith((b"1 ", b"2 ", b"u ")))
         untracked = sum(1 for line in status.splitlines() if line.startswith(b"? "))
         return tracked, untracked
 
@@ -420,9 +416,7 @@ class GitWorkspaceManager:
                 "created_at": now(),
                 "request_digest": request.content_digest,
                 "status": status,
-                "failure": StableFailure(
-                    code=code, message=message, details=details
-                ),
+                "failure": StableFailure(code=code, message=message, details=details),
                 "duration_seconds": 0.0,
             },
             strict=True,

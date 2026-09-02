@@ -452,9 +452,7 @@ def test_missing_criterion_evidence_capability_fails_before_runner(tmp_path: Pat
     assert len(diagnostics) == 1
     diagnostic = diagnostics[0]
     assert diagnostic.stage == "pre_dispatch"
-    assert diagnostic.code == (
-        StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value
-    )
+    assert diagnostic.code == (StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value)
     assert "criterion criterion-verification" in (diagnostic.exception_message or "")
     assert "edit_intent capability" in (diagnostic.exception_message or "")
 
