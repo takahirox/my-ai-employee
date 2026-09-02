@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from .database import DEFAULT_DATABASE_PATH
 from .domain import (
     AcceptedGraphRevision,
     Artifact,
@@ -111,7 +112,7 @@ def _prepare_database_file(path: Path) -> None:
 class SQLiteStore:
     """Small vendor-neutral storage API backed by SQLite by default."""
 
-    def __init__(self, path: str | Path = "~/.fleet/fleet.db") -> None:
+    def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH) -> None:
         self.path = str(Path(path).expanduser()) if str(path) != ":memory:" else ":memory:"
         if self.path != ":memory:":
             _prepare_database_file(Path(self.path))
@@ -204,6 +205,15 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS run_repositories_repository
                 ON run_repositories(repository_id, run_id);
+            CREATE TABLE IF NOT EXISTS legacy_imports (
+                source_digest TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                source_schema_version INTEGER NOT NULL,
+                source_rows INTEGER NOT NULL,
+                imported_rows INTEGER NOT NULL,
+                skipped_rows INTEGER NOT NULL
+            );
             """
         )
         with self._connection:
@@ -223,47 +233,52 @@ class SQLiteStore:
     def migrate_v2(self) -> None:
         """Transactionally add v2 projections only when a v2 write is requested."""
         with self.transaction() as connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS work_events_v2 ("
-                "sequence INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "event_id TEXT NOT NULL UNIQUE,run_id TEXT NOT NULL,payload TEXT NOT NULL)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS work_events_v2_run ON work_events_v2(run_id, sequence)"
-            )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS work_checkpoints_v2 ("
-                "run_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,payload TEXT NOT NULL)"
-            )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS graph_claims_v2 ("
-                "run_id TEXT NOT NULL,node_id TEXT NOT NULL,"
-                "PRIMARY KEY(run_id,node_id))"
-            )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS graph_reservations_v2 ("
-                "run_id TEXT NOT NULL,node_id TEXT NOT NULL,generation INTEGER NOT NULL,"
-                "attempt INTEGER NOT NULL,worker_turns INTEGER NOT NULL,"
-                "processes INTEGER NOT NULL,wall_seconds REAL NOT NULL,"
-                "artifact_bytes INTEGER NOT NULL,"
-                "PRIMARY KEY(run_id,node_id,generation,attempt))"
-            )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS run_execution_owners_v2 ("
-                "run_id TEXT PRIMARY KEY,owner_record_id TEXT NOT NULL,"
-                "owner_record_digest TEXT NOT NULL,graph_revision_digest TEXT NOT NULL,"
-                "generation INTEGER NOT NULL,execution_attempt INTEGER NOT NULL,"
-                "owner_instance_id TEXT NOT NULL,last_heartbeat_at TEXT NOT NULL,"
-                "expires_at TEXT NOT NULL,heartbeat_digest TEXT NOT NULL,"
-                "status TEXT NOT NULL CHECK(status IN ('active','closed','recovered')),"
-                "closure_record_id TEXT,closure_record_digest TEXT)"
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('fleet_version','0.2.1')"
-            )
+            self._migrate_v2_in_transaction(connection)
+
+    def _migrate_v2_in_transaction(self, connection: sqlite3.Connection) -> None:
+        """Add v2 projections without committing the caller's transaction."""
+
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS work_events_v2 ("
+            "sequence INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "event_id TEXT NOT NULL UNIQUE,run_id TEXT NOT NULL,payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS work_events_v2_run ON work_events_v2(run_id, sequence)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS work_checkpoints_v2 ("
+            "run_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS graph_claims_v2 ("
+            "run_id TEXT NOT NULL,node_id TEXT NOT NULL,"
+            "PRIMARY KEY(run_id,node_id))"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS graph_reservations_v2 ("
+            "run_id TEXT NOT NULL,node_id TEXT NOT NULL,generation INTEGER NOT NULL,"
+            "attempt INTEGER NOT NULL,worker_turns INTEGER NOT NULL,"
+            "processes INTEGER NOT NULL,wall_seconds REAL NOT NULL,"
+            "artifact_bytes INTEGER NOT NULL,"
+            "PRIMARY KEY(run_id,node_id,generation,attempt))"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS run_execution_owners_v2 ("
+            "run_id TEXT PRIMARY KEY,owner_record_id TEXT NOT NULL,"
+            "owner_record_digest TEXT NOT NULL,graph_revision_digest TEXT NOT NULL,"
+            "generation INTEGER NOT NULL,execution_attempt INTEGER NOT NULL,"
+            "owner_instance_id TEXT NOT NULL,last_heartbeat_at TEXT NOT NULL,"
+            "expires_at TEXT NOT NULL,heartbeat_digest TEXT NOT NULL,"
+            "status TEXT NOT NULL CHECK(status IN ('active','closed','recovered')),"
+            "closure_record_id TEXT,closure_record_digest TEXT)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('schema_version','2')"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO fleet_meta(key,value) VALUES('fleet_version','0.2.1')"
+        )
 
     def put(
         self,

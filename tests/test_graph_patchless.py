@@ -1061,11 +1061,14 @@ def test_mixed_graph_composes_only_writing_nodes_and_preserves_artifact_refs(
 
 
 def test_cli_rejects_diff_and_promotion_for_completed_patchless_graph(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution = _execute_patchless(tmp_path, "patchless-cli-run")
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: execution.database)
 
-    assert cli.main(["diff", execution.run.id, "--db", str(execution.database)]) == 5
+    assert cli.main(["diff", execution.run.id]) == 5
     diff_output = json.loads(capsys.readouterr().out)
     assert diff_output["stable_code"] == "PATCHLESS_RUN_HAS_NO_DIFF"
 
@@ -1076,8 +1079,6 @@ def test_cli_rejects_diff_and_promotion_for_completed_patchless_graph(
                 execution.run.id,
                 "--patch-digest",
                 ZERO,
-                "--db",
-                str(execution.database),
             ]
         )
         == 5

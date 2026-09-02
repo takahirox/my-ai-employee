@@ -340,9 +340,7 @@ def test_scripted_adapter_rejects_empty_edit_required_mutating_envelope() -> Non
     adapter = ScriptedWorkerAdapter(
         [{"schema_version": "2", "proposals": (), "assistant_note": ""}]
     )
-    request = worker_request().model_copy(
-        update={"required_capabilities": ("edit_intent",)}
-    )
+    request = worker_request().model_copy(update={"required_capabilities": ("edit_intent",)})
 
     result = adapter.propose(request, Channel())  # type: ignore[arg-type]
 
@@ -1127,15 +1125,9 @@ def test_cli_worker_synthesizes_only_missing_file_delimiters_idempotently() -> N
     assert isinstance(payload, EditIntentRequest)
     assert payload.unified_diff.startswith(delimited)
     assert payload.unified_diff.count("diff --git a/kept.txt b/kept.txt\n") == 1
-    assert (
-        "diff --git a/existing.txt b/existing.txt\n--- a/existing.txt\n"
-        in payload.unified_diff
-    )
+    assert "diff --git a/existing.txt b/existing.txt\n--- a/existing.txt\n" in payload.unified_diff
     assert "diff --git a/created.txt b/created.txt\n--- /dev/null\n" in payload.unified_diff
-    assert (
-        "diff --git a/deleted.txt b/deleted.txt\n--- a/deleted.txt\n"
-        in payload.unified_diff
-    )
+    assert "diff --git a/deleted.txt b/deleted.txt\n--- a/deleted.txt\n" in payload.unified_diff
     assert _normalize_unified_diff(payload.unified_diff) == payload.unified_diff
 
 
@@ -1251,9 +1243,7 @@ def test_cli_worker_rejects_unsafe_or_unrecognized_headerless_paths(patch: str) 
 
 
 def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> None:
-    output = json.loads(
-        _edit_envelope("--- a/old.txt\n+++ b/new.txt\n", ("old.txt", "new.txt"))
-    )
+    output = json.loads(_edit_envelope("--- a/old.txt\n+++ b/new.txt\n", ("old.txt", "new.txt")))
     output.update({"assistant_note": "", "usage_json": "{}"})
     executor = SuccessfulExecutor()
     executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
@@ -1303,9 +1293,7 @@ def _headerless_workspace(tmp_path: Path) -> tuple[GitWorkspaceManager, Workspac
         ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
         check=True,
     )
-    subprocess.run(
-        ("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True
-    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True)
     (repository / "first.txt").write_text("before one\n")
     (repository / "second.txt").write_text("before two\n")
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
@@ -1338,7 +1326,10 @@ def test_headerless_sections_apply_through_workspace_manager(tmp_path: Path) -> 
     assert isinstance(request, EditIntentRequest)
 
     result = manager.apply_edit(
-        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+        snapshot,
+        request,
+        allow_worker(request),
+        _NotCancelled(),  # type: ignore[arg-type]
     )
 
     assert result.status == "succeeded"
@@ -1352,9 +1343,7 @@ def test_headerless_sections_reject_base_mismatch_through_workspace_manager(
     tmp_path: Path,
 ) -> None:
     manager, snapshot = _headerless_workspace(tmp_path)
-    mismatched_patch = _HEADERLESS_TWO_FILE_PATCH.replace(
-        "-before one\n", "-not the base\n", 1
-    )
+    mismatched_patch = _HEADERLESS_TWO_FILE_PATCH.replace("-before one\n", "-not the base\n", 1)
     envelope = _validate_worker_envelope(
         _edit_envelope(mismatched_patch, _HEADERLESS_TWO_FILE_PATHS)
     )
@@ -1362,7 +1351,10 @@ def test_headerless_sections_reject_base_mismatch_through_workspace_manager(
     assert isinstance(request, EditIntentRequest)
 
     result = manager.apply_edit(
-        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+        snapshot,
+        request,
+        allow_worker(request),
+        _NotCancelled(),  # type: ignore[arg-type]
     )
 
     assert result.failure is not None
@@ -1376,14 +1368,15 @@ def test_headerless_sections_reject_declared_paths_mismatch_through_workspace_ma
     tmp_path: Path,
 ) -> None:
     manager, snapshot = _headerless_workspace(tmp_path)
-    envelope = _validate_worker_envelope(
-        _edit_envelope(_HEADERLESS_TWO_FILE_PATCH, ("first.txt",))
-    )
+    envelope = _validate_worker_envelope(_edit_envelope(_HEADERLESS_TWO_FILE_PATCH, ("first.txt",)))
     request = envelope.proposals[0].payload
     assert isinstance(request, EditIntentRequest)
 
     result = manager.apply_edit(
-        snapshot, request, allow_worker(request), _NotCancelled()  # type: ignore[arg-type]
+        snapshot,
+        request,
+        allow_worker(request),
+        _NotCancelled(),  # type: ignore[arg-type]
     )
 
     assert result.failure is not None
@@ -1657,10 +1650,7 @@ def test_cli_worker_rejects_unprefixed_count_inconsistent_existing_hunks(
     "patch",
     (
         pytest.param(
-            "--- a/example.txt\n"
-            "+++ b/example.txt\n"
-            "@@ -1,2 +1,2 @@\n"
-            " only one line\n",
+            "--- a/example.txt\n+++ b/example.txt\n@@ -1,2 +1,2 @@\n only one line\n",
             id="headerless",
         ),
         pytest.param(

@@ -315,11 +315,16 @@ def test_non_mutating_goal_is_persistently_typed_before_criteria() -> None:
 
 
 def test_goal_contradiction_fails_before_external_configuration(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fleet = tmp_path / ".fleet"
     fleet.mkdir()
     (fleet / "project.json").write_text(json.dumps(valid_harness()), encoding="utf-8")
+    database = tmp_path / "fleet.db"
+    monkeypatch.delenv("FLEET_DB", raising=False)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
 
     result = cli.main(
         [
@@ -328,14 +333,13 @@ def test_goal_contradiction_fails_before_external_configuration(
             "--repo",
             str(tmp_path),
             "--no-allow-processes",
-            "--db",
-            str(tmp_path / "fleet.db"),
         ]
     )
 
     assert result == 2
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["stable_code"] == "GOAL_CONTRADICTION"
+    assert not database.exists()
 
 
 def test_required_browser_evaluator_defines_scenario_bound_goal_criteria() -> None:

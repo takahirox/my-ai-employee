@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import shlex
 from pathlib import Path
 
 import pytest
@@ -39,66 +37,57 @@ def test_database_resolution_and_eval_semantics_are_preserved(
     assert explicit_eval.db == "custom-evals.db"
 
 
-def test_run_explicit_temporary_database_warns_on_stderr_and_keeps_json_stdout(
+def test_run_database_override_is_not_a_parser_surface(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    temporary_directory = tmp_path / "platform temporary directory"
-    temporary_directory.mkdir()
-    database = temporary_directory / "run.db"
-    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: str(temporary_directory))
-
-    assert cli.main(["run", _graph(), "--run-id", "temporary-run", "--db", str(database)]) == 0
+    database = tmp_path / "run.db"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("FLEET_DB", raising=False)
+    with pytest.raises(SystemExit):
+        cli.main(["run", _graph(), "--run-id", "temporary-run", "--db", str(database)])
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"run_id": "temporary-run", "state": "succeeded"}
-    resolved = database.resolve()
-    assert captured.err == (
-        f"warning: temporary database {resolved} is absent from the default Inspector; "
-        f"run `{shlex.join(('fleet', 'serve', '--db', str(resolved)))}` to inspect it.\n"
-    )
+    assert captured.out == ""
+    assert "unrecognized arguments: --db" in captured.err
+    assert not database.exists()
+    assert not (home / ".fleet").exists()
 
 
-def test_work_environment_temporary_database_warns_and_keeps_json_stdout(
+def test_work_rejects_database_environment_before_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     temporary_directory = tmp_path / "platform-temporary-directory"
     temporary_directory.mkdir()
     database = temporary_directory / "work.db"
-    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: str(temporary_directory))
     monkeypatch.setenv("FLEET_DB", str(database))
+    called = False
 
     def fake_work(args: argparse.Namespace) -> int:
-        assert args.db == str(database)
-        print('{"run_id":"temporary-work","status":"planned"}')
+        nonlocal called
+        called = True
         return 0
 
     monkeypatch.setattr(cli, "_work", fake_work)
-    assert cli.main(["work", "plan a bounded change", "--json"]) == 0
+    with pytest.raises(SystemExit):
+        cli.main(["work", "plan a bounded change", "--json"])
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"run_id": "temporary-work", "status": "planned"}
-    resolved = database.resolve()
-    assert captured.err == (
-        f"warning: temporary database {resolved} is absent from the default Inspector; "
-        f"run `fleet serve --db {resolved}` to inspect it.\n"
-    )
+    assert captured.out == ""
+    assert "FLEET_DB is not supported" in captured.err
+    assert called is False
+    assert not database.exists()
 
 
-def test_default_and_unrelated_commands_do_not_warn_for_temporary_paths(
+def test_default_operational_command_does_not_warn_for_canonical_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    temporary_directory = tmp_path / "platform-temporary-directory"
-    temporary_directory.mkdir()
-    home = temporary_directory / "home"
+    home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: str(temporary_directory))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("FLEET_DB", raising=False)
 
     assert cli.main(["run", _graph(), "--run-id", "shared-default-run"]) == 0
-    assert capsys.readouterr().err == ""
-
-    cli._warn_for_explicit_temporary_database("run", str(tmp_path / "tmp-sibling" / "db.sqlite"))
-    cli._warn_for_explicit_temporary_database("inspect", str(temporary_directory / "other.db"))
     assert capsys.readouterr().err == ""
 
 
@@ -106,15 +95,19 @@ def test_serve_reports_loopback_url_and_resolved_database_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("FLEET_DB", raising=False)
     calls: list[tuple[Path, str, int]] = []
 
     def fake_serve(store: SQLiteStore, host: str, port: int) -> None:
         calls.append((Path(store.path).resolve(), host, port))
 
     monkeypatch.setattr(cli, "serve", fake_serve)
-    assert cli.main(["serve", "--db", "inspector.db"]) == 0
+    assert cli.main(["serve"]) == 0
 
-    database = (tmp_path / "inspector.db").resolve()
+    database = (home / ".fleet" / "fleet.db").resolve()
     captured = capsys.readouterr()
     assert captured.out == (f"Fleet Inspector: http://127.0.0.1:8765 (database: {database})\n")
     assert captured.err == ""

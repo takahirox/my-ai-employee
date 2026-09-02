@@ -27,7 +27,7 @@ def test_database_resolution_precedence_and_home_expansion(
         resolve_database_path(None, environment={"FLEET_DB": ""})
 
 
-def test_normal_cli_uses_global_default_environment_and_explicit_override(
+def test_normal_cli_uses_only_canonical_database_and_rejects_retired_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = tmp_path / "home"
@@ -45,14 +45,24 @@ def test_normal_cli_uses_global_default_environment_and_explicit_override(
 
     environment_database = tmp_path / "environment.db"
     monkeypatch.setenv("FLEET_DB", str(environment_database))
-    assert cli.main(["demo", "--run-id", "environment-run"]) == 0
-    capsys.readouterr()
-    assert environment_database.is_file()
+    with pytest.raises(SystemExit) as environment_error:
+        cli.main(["demo", "--run-id", "environment-run"])
+    assert environment_error.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "FLEET_DB is not supported" in captured.err
+    assert not environment_database.exists()
 
+    monkeypatch.delenv("FLEET_DB")
     explicit_database = tmp_path / "explicit.db"
-    assert cli.main(["demo", "--run-id", "explicit-run", "--db", str(explicit_database)]) == 0
-    capsys.readouterr()
-    assert explicit_database.is_file()
+    with pytest.raises(SystemExit) as explicit_error:
+        cli.main(["demo", "--run-id", "explicit-run", "--db", str(explicit_database)])
+    assert explicit_error.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unrecognized arguments: --db" in captured.err
+    assert not explicit_database.exists()
+    assert default_database.is_file()
 
 
 def test_eval_database_remains_intentionally_repository_local() -> None:

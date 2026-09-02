@@ -60,6 +60,14 @@ from ai_employee.task_planning import ProposedGraph
 from ai_employee.task_review import TaskReviewDecision
 
 
+@pytest.fixture(autouse=True)
+def _inject_cli_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FLEET_DB", raising=False)
+    monkeypatch.setattr(
+        cli, "resolve_database_path", lambda *_args, **_kwargs: tmp_path / "fleet.db"
+    )
+
+
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
@@ -461,8 +469,6 @@ def test_one_sided_policy_opt_in_persists_manual_reason(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--max-concurrency",
                 "2",
                 "--non-interactive",
@@ -499,8 +505,6 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--max-concurrency",
                 "2",
                 "--non-interactive",
@@ -727,7 +731,7 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
     assert story["authorization_kind"] == "policy_auto"
     assert story["reason_code"] == "eligible_low_risk_exact_evidence"
     assert all((repository / f"{name}.txt").read_text() == f"{name}-before\n" for name in "abc")
-    assert cli.main(["replay", run_id, "--db", str(database)]) == 0
+    assert cli.main(["replay", run_id]) == 0
     replayed_output = json.loads(capsys.readouterr().out)
     assert replayed_output["promotion_invocations"] == 0
     assert (
@@ -894,8 +898,6 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
                 run_id,
                 "--patch-digest",
                 run.parent_candidate_digest or "missing",
-                "--db",
-                str(database),
             ]
         )
         == 8
@@ -910,8 +912,6 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
                 run_id,
                 "--patch-digest",
                 run.parent_candidate_digest or "missing",
-                "--db",
-                str(database),
             ]
         )
         == 0
@@ -936,8 +936,6 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
             str(repository),
             "--operator-config",
             str(operator),
-            "--db",
-            str(database),
             "--max-concurrency",
             "2",
             "--non-interactive",
@@ -1075,7 +1073,7 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     for name in ("a", "b", "c"):
         assert (repository / f"{name}.txt").read_text() == f"{name}-before\n"
 
-    assert cli.main(["inspect", run_id, "--db", str(database)]) == 0
+    assert cli.main(["inspect", run_id]) == 0
     inspected = json.loads(capsys.readouterr().out)
     assert inspected["kind"] == "graph_run"
     assert inspected["state"] == "ready_to_promote"
@@ -1084,11 +1082,11 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
     assert inspected["candidate_patch"]["id"] == graph_run.parent_candidate_artifact_id
     assert len(inspected["approvals"]) == 1
 
-    assert cli.main(["diff", run_id, "--stat", "--db", str(database)]) == 0
+    assert cli.main(["diff", run_id, "--stat"]) == 0
     stat = json.loads(capsys.readouterr().out)
     assert stat["run_id"] == run_id
     assert stat["bytes"] > 0
-    assert cli.main(["diff", run_id, "--db", str(database)]) == 0
+    assert cli.main(["diff", run_id]) == 0
     candidate_diff = capsys.readouterr().out
     assert all(f"diff --git a/{name}.txt b/{name}.txt" in candidate_diff for name in "abc")
 
@@ -1099,8 +1097,6 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
                 run_id,
                 "--patch-digest",
                 graph_run.parent_candidate_digest or "missing",
-                "--db",
-                str(database),
             ]
         )
         == 4
@@ -1117,8 +1113,6 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
                 approval.id,
                 "--request-digest",
                 approval.request_digest,
-                "--db",
-                str(database),
             ]
         )
         == 0
@@ -1129,8 +1123,6 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
         run_id,
         "--patch-digest",
         graph_run.parent_candidate_digest or "missing",
-        "--db",
-        str(database),
     ]
     assert cli.main(promote_argv) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
@@ -1148,12 +1140,12 @@ def test_cli_graph_handoff_inspects_approves_promotes_and_replays(
         )
         == promoted_diff
     )
-    assert cli.main(["replay", run_id, "--db", str(database)]) == 0
+    assert cli.main(["replay", run_id]) == 0
     replay = json.loads(capsys.readouterr().out)
     assert replay["kind"] == "graph_replay"
     assert replay["promotion_invocations"] == 0
     assert len(replay["inspection"]["node_semantic_assessments"]) == 3
-    assert cli.main(["inspect", run_id, "--db", str(database)]) == 0
+    assert cli.main(["inspect", run_id]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "completed"
 
     with SQLiteStore(database) as store:
@@ -1172,8 +1164,6 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
         str(repository),
         "--operator-config",
         str(operator),
-        "--db",
-        str(database),
         "--max-concurrency",
         "2",
         "--non-interactive",
@@ -1218,7 +1208,7 @@ def test_cli_resumes_paused_graph_with_exact_persisted_operator_authority(
     assert compositions_before == ()
     assert not (state / "c.done").exists()
 
-    assert cli.main(["resume", run_id, "--db", str(database)]) == 0
+    assert cli.main(["resume", run_id]) == 0
     resumed_output = json.loads(capsys.readouterr().out)
     assert resumed_output["status"] == "ready_to_promote"
     with SQLiteStore(database) as store:
@@ -1276,8 +1266,6 @@ def test_cli_simple_goal_selects_cheaper_planner(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--plan-only",
             ]
         )
@@ -1307,8 +1295,6 @@ def test_cli_starts_exact_accepted_plan_only_graph_without_replanning(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--max-concurrency",
                 "2",
                 "--plan-only",
@@ -1331,7 +1317,7 @@ def test_cli_starts_exact_accepted_plan_only_graph_without_replanning(
         )
 
     assert planned.generation == 0
-    assert cli.main(["resume", run_id, "--db", str(database)]) == 0
+    assert cli.main(["resume", run_id]) == 0
     started_output = json.loads(capsys.readouterr().out)
     assert started_output["status"] == "ready_to_promote"
 
@@ -1374,8 +1360,6 @@ def test_cli_explicit_fixed_planner_uses_exact_eligible_strategy(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--plan-only",
                 "--planner-strategy",
                 "planner",
@@ -1410,8 +1394,6 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
                 str(repository),
                 "--operator-config",
                 str(operator),
-                "--db",
-                str(database),
                 "--max-concurrency",
                 "2",
                 "--non-interactive",
@@ -1432,8 +1414,6 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
                 approval.id,
                 "--request-digest",
                 approval.request_digest,
-                "--db",
-                str(database),
             ]
         )
         == 0
@@ -1455,8 +1435,6 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
                 run_id,
                 "--patch-digest",
                 run.parent_candidate_digest or "missing",
-                "--db",
-                str(database),
             ]
         )
         == 8

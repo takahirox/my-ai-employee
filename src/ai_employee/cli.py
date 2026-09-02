@@ -5,12 +5,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import io
-import os
-import shlex
 import shutil
 import subprocess
-import sys
-import tempfile
 from collections.abc import Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -19,7 +15,11 @@ from typing import Literal, cast
 
 from . import __version__
 from .config import OperatorConfig, WorkerName, load_operator_config
-from .database import DATABASE_ENVIRONMENT_VARIABLE, resolve_database_path
+from .database import (
+    import_legacy_database,
+    reject_database_environment,
+    resolve_database_path,
+)
 from .demo import run_demo
 from .doctor import doctor_from_projection
 from .domain import (
@@ -169,14 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     demo = commands.add_parser("demo", help="run the deterministic offline demonstration")
-    demo.add_argument("--db")
     demo.add_argument("--run-id", default=None)
 
     run = commands.add_parser("run", help="run a declarative YAML/JSON graph")
     run.add_argument("graph")
     run.add_argument("--goal", default="Execute the accepted declarative graph")
     run.add_argument("--run-id", default=None)
-    run.add_argument("--db")
     run.add_argument("--pause-after", type=int)
 
     evaluate = commands.add_parser(
@@ -194,46 +192,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = commands.add_parser("inspect", help="inspect a persisted run")
     inspect.add_argument("run_id")
-    inspect.add_argument("--db")
 
     explain = commands.add_parser(
         "explain", help="explain one persisted run as a coherent read-only story"
     )
     explain.add_argument("run_id")
-    explain.add_argument("--db")
 
     doctor = commands.add_parser("doctor", help="classify persisted Fleet boundary incidents")
     doctor.add_argument("run_id")
-    doctor.add_argument("--db")
 
     replay = commands.add_parser("replay", help="replay stored control flow without workers")
     replay.add_argument("run_id")
-    replay.add_argument("--db")
 
     resume = commands.add_parser("resume", help="start a planned run or resume a paused run")
     resume.add_argument("run_id")
-    resume.add_argument("--db")
 
     recover = commands.add_parser(
         "recover", help="explicitly terminalize one exact expired orphan as interrupted"
     )
     recover.add_argument("run_id")
-    recover.add_argument("--db")
 
     for name in ("pause", "cancel"):
         control = commands.add_parser(name, help=f"request {name} at the next node boundary")
         control.add_argument("run_id")
-        control.add_argument("--db")
 
     compare = commands.add_parser("compare", help="compare two stored runs and strategies")
     compare.add_argument("left_run_id")
     compare.add_argument("right_run_id")
-    compare.add_argument("--db")
 
     server = commands.add_parser("serve", help="serve the read-only local Inspector")
-    server.add_argument("--db")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
+
+    legacy_import = commands.add_parser(
+        "import-legacy-db", help="safely import a stopped legacy Fleet database"
+    )
+    legacy_import.add_argument("source")
 
     project = commands.add_parser("project", help="show explicit or provisional ProjectProfile")
     project.add_argument("root", nargs="?", default=".")
@@ -289,56 +283,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work.add_argument("--non-interactive", action="store_true")
     work.add_argument("--json", action="store_true")
-    work.add_argument("--db")
 
     approvals = commands.add_parser("approvals", help="manage digest-bound approvals")
     approval_commands = approvals.add_subparsers(dest="approval_command", required=True)
     approval_list = approval_commands.add_parser("list")
     approval_list.add_argument("--run")
-    approval_list.add_argument("--db")
     approval_show = approval_commands.add_parser("show")
     approval_show.add_argument("approval_id")
-    approval_show.add_argument("--db")
     for decision in ("approve", "deny"):
         approval_decide = approval_commands.add_parser(decision)
         approval_decide.add_argument("approval_id")
         approval_decide.add_argument("--request-digest", required=True)
-        approval_decide.add_argument("--db")
 
     logs = commands.add_parser("logs", help="show durable v0.2 events")
     logs.add_argument("run_id")
     logs.add_argument("--follow", action="store_true")
-    logs.add_argument("--db")
 
     diff = commands.add_parser("diff", help="show the exact captured work-run patch")
     diff.add_argument("run_id")
     diff.add_argument("--stat", action="store_true")
-    diff.add_argument("--db")
 
     promote = commands.add_parser("promote", help="apply an explicitly approved exact patch")
     promote.add_argument("run_id")
     promote.add_argument("--patch-digest", required=True)
-    promote.add_argument("--db")
     return parser
 
 
-def _warn_for_explicit_temporary_database(command: str, database_path: str) -> None:
-    if command not in {"run", "work"}:
-        return
-    resolved_path = Path(database_path).resolve()
-    temporary_directory = Path(tempfile.gettempdir()).resolve()
-    if not resolved_path.is_relative_to(temporary_directory):
-        return
-    serve_command = shlex.join(("fleet", "serve", "--db", str(resolved_path)))
-    print(
-        f"warning: temporary database {resolved_path} is absent from the default Inspector; "
-        f"run `{serve_command}` to inspect it.",
-        file=sys.stderr,
-    )
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.command == "project":
         if args.output and not args.migrate:
             build_parser().error("--output requires --migrate")
@@ -353,12 +326,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "eval":
         return _eval(args)
-    database_was_explicitly_selected = (
-        args.db is not None or DATABASE_ENVIRONMENT_VARIABLE in os.environ
-    )
-    args.db = str(resolve_database_path(args.db))
-    if database_was_explicitly_selected:
-        _warn_for_explicit_temporary_database(args.command, args.db)
+    try:
+        reject_database_environment()
+    except ValueError as error:
+        parser.error(str(error))
+    args.db = str(resolve_database_path(None, environment={}))
+    if args.command == "import-legacy-db":
+        print(canonical_json(import_legacy_database(args.source)))
+        return 0
     if args.command == "work":
         return _work(args)
     with SQLiteStore(args.db) as store:
@@ -1372,18 +1347,12 @@ def _work(args: argparse.Namespace) -> int:
                     operator_config_digest=timeout_profile.operator_config_digest,
                     rule_version=timeout_profile.rule_version,
                     rule_id=timeout_profile.rule_id,
-                    recommended_timeout_seconds=(
-                        timeout_profile.recommended_timeout_seconds
-                    ),
+                    recommended_timeout_seconds=(timeout_profile.recommended_timeout_seconds),
                     profile_minimum_seconds=timeout_profile.profile_minimum_seconds,
                     adapter_timeout_seconds=timeout_profile.adapter_timeout_seconds,
-                    node_attempt_timeout_seconds=(
-                        timeout_profile.accepted_node_timeout_seconds
-                    ),
+                    node_attempt_timeout_seconds=(timeout_profile.accepted_node_timeout_seconds),
                     policy_timeout_seconds=timeout_profile.policy_timeout_seconds,
-                    remaining_run_timeout_seconds=(
-                        timeout_profile.remaining_run_timeout_seconds
-                    ),
+                    remaining_run_timeout_seconds=(timeout_profile.remaining_run_timeout_seconds),
                     effective_timeout_seconds=timeout_profile.effective_timeout_seconds,
                 )
                 inner_store.put("worker_timeout_authority_v2", timeout_authority, run_id=run_id)

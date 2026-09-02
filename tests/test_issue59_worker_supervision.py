@@ -231,9 +231,10 @@ def test_periodic_heartbeats_record_progress_and_diagnostic_only_silence() -> No
     )
     initial = WorkerAttemptObservation(process_status="running")
     assert supervisor.sample(initial, elapsed_seconds=0.0, observed_at=NOW) is not None
-    assert supervisor.sample(
-        initial, elapsed_seconds=29.0, observed_at=NOW + timedelta(seconds=29)
-    ) is None
+    assert (
+        supervisor.sample(initial, elapsed_seconds=29.0, observed_at=NOW + timedelta(seconds=29))
+        is None
+    )
     silent = supervisor.sample(
         initial, elapsed_seconds=60.0, observed_at=NOW + timedelta(seconds=60)
     )
@@ -265,12 +266,14 @@ def test_heartbeat_history_is_bounded_but_forced_terminal_record_is_kept() -> No
     observation = WorkerAttemptObservation(process_status="running")
 
     assert supervisor.sample(observation, elapsed_seconds=0.0, observed_at=NOW) is not None
-    assert supervisor.sample(
-        observation, elapsed_seconds=1.0, observed_at=NOW + timedelta(seconds=1)
-    ) is not None
-    assert supervisor.sample(
-        observation, elapsed_seconds=2.0, observed_at=NOW + timedelta(seconds=2)
-    ) is None
+    assert (
+        supervisor.sample(observation, elapsed_seconds=1.0, observed_at=NOW + timedelta(seconds=1))
+        is not None
+    )
+    assert (
+        supervisor.sample(observation, elapsed_seconds=2.0, observed_at=NOW + timedelta(seconds=2))
+        is None
+    )
     terminal = supervisor.sample(
         WorkerAttemptObservation(process_status="succeeded"),
         elapsed_seconds=3.0,
@@ -330,12 +333,15 @@ def test_timeout_recovery_allows_only_exact_same_strategy(
 
 
 def test_budget_or_policy_denial_requires_normally_accepted_replan() -> None:
-    assert timeout_recovery_action(
-        retry_within_policy=False,
-        retry_within_counters=True,
-        retry_within_resource_budgets=True,
-        replan_authorized=True,
-    ) == "replan_required"
+    assert (
+        timeout_recovery_action(
+            retry_within_policy=False,
+            retry_within_counters=True,
+            retry_within_resource_budgets=True,
+            replan_authorized=True,
+        )
+        == "replan_required"
+    )
     recovery = TimeoutRecoveryRecord(
         id="recovery-replan",
         run_id="run",

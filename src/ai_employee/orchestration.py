@@ -1250,16 +1250,12 @@ class WorkCoordinator:
             return None
         requests = tuple(
             item
-            for item in self.store.list_records(
-                "worker_request_v2", WorkerRequest, run_id=run.id
-            )
+            for item in self.store.list_records("worker_request_v2", WorkerRequest, run_id=run.id)
             if item.content_digest == run.worker_request_digest
         )
         results = tuple(
             item
-            for item in self.store.list_records(
-                "worker_result_v2", WorkerResult, run_id=run.id
-            )
+            for item in self.store.list_records("worker_result_v2", WorkerResult, run_id=run.id)
             if item.id == run.worker_result_id
         )
         acceptances = self.store.list_records(
@@ -1505,16 +1501,14 @@ def _accepted_non_mutating_result_criterion_evidence(
         or typed_result.graph_run_id != request.graph_run_id
         or typed_result.worker_request_digest != request_digest
         or typed_result.node_id != request.node_id
-        or typed_result.accepted_graph_revision_digest
-        != request.accepted_graph_revision_digest
+        or typed_result.accepted_graph_revision_digest != request.accepted_graph_revision_digest
         or typed_result.generation != request.generation
         or typed_result.attempt != request.attempt
         or acceptance.status != "accepted"
         or acceptance.run_id != request.run_id
         or acceptance.graph_run_id != request.graph_run_id
         or acceptance.node_id != request.node_id
-        or acceptance.accepted_graph_revision_digest
-        != request.accepted_graph_revision_digest
+        or acceptance.accepted_graph_revision_digest != request.accepted_graph_revision_digest
         or acceptance.generation != request.generation
         or acceptance.attempt != request.attempt
         or acceptance.worker_request_digest != request_digest
@@ -1532,7 +1526,8 @@ def _accepted_non_mutating_result_criterion_evidence(
         or sha256(body).hexdigest() != descriptor.artifact_digest
         or body != canonical_json(typed_result).encode("utf-8")
         or not isinstance(source, Mapping)
-        or set(source) != {
+        or set(source)
+        != {
             "graph_run_id",
             "worker_request_digest",
             "node_id",
@@ -1547,8 +1542,7 @@ def _accepted_non_mutating_result_criterion_evidence(
         or source.get("graph_run_id") != request.graph_run_id
         or source.get("worker_request_digest") != request_digest
         or source.get("node_id") != request.node_id
-        or source.get("accepted_graph_revision_digest")
-        != request.accepted_graph_revision_digest
+        or source.get("accepted_graph_revision_digest") != request.accepted_graph_revision_digest
         or source.get("generation") != request.generation
         or source.get("attempt") != request.attempt
         or source.get("worker_result_id") != worker_result.id
