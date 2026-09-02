@@ -156,6 +156,7 @@ class ParentCandidateEvaluationRequest(DigestedRecordV2):
             not isinstance(source, Mapping)
             or source.get("base_tree") != self.composition_workspace.base_tree
             or source.get("workspace_digest") != self.composition_workspace.content_digest
+            or source.get("harness_digest") != self.harness_digest
         ):
             raise ValueError("parent candidate provenance does not bind the composition workspace")
         evaluator_ids = tuple(item.harness_evaluator_id for item in self.verification_bindings)
@@ -1555,6 +1556,8 @@ class GraphCandidateEvaluator:
             composition_request.accepted_revision != request.accepted_revision
             or composition_request.effective_policy_digest != request.effective_policy_digest
             or composition_request.base_commit != request.candidate.base_commit
+            or composition_request.harness_digest != request.harness_digest
+            or composition_request.generated_paths != self.harness.paths.generated
         ):
             raise ValueError("composition request has stale parent bindings")
         persisted_workspace = self.store.get(
@@ -1607,7 +1610,11 @@ class GraphCandidateEvaluator:
 
     def _validate_live_candidate(self, request: ParentCandidateEvaluationRequest) -> None:
         self.workspace.adopt(request.composition_workspace)
-        current = self.workspace.capture_diff(request.composition_workspace)
+        current = self.workspace.capture_diff(
+            request.composition_workspace,
+            generated_paths=self.harness.paths.generated,
+            harness_digest=request.harness_digest,
+        )
         if current.artifact_digest != request.candidate_artifact.artifact_digest:
             raise ValueError("composition workspace no longer contains the exact candidate")
 

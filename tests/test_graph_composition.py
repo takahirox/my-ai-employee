@@ -30,6 +30,8 @@ from ai_employee.storage import SQLiteStore
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 POLICY_DIGEST = "1" * 64
+HARNESS_DIGEST = "2" * 64
+GENERATED_PATHS = ("generated/**",)
 ZERO = "0" * 64
 
 
@@ -113,7 +115,11 @@ def _node_patch(
         acceptance_ledger_digest=ZERO,
         verification_result_digests=(),
         workspace=snapshot,
-        patch=manager.capture_diff(snapshot),
+        patch=manager.capture_diff(
+            snapshot,
+            generated_paths=GENERATED_PATHS,
+            harness_digest=HARNESS_DIGEST,
+        ),
     )
 
 
@@ -143,6 +149,8 @@ def _request(
         repository=str(repository),
         base_commit=head,
         effective_policy_digest=POLICY_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        generated_paths=GENERATED_PATHS,
         node_patches=patches,
     )
 
@@ -169,6 +177,9 @@ def test_independent_node_patches_compose_in_deterministic_order_and_replay(
         path="a.txt",
         content="a-after\n",
     )
+    generated = Path(patch_a.workspace.isolated_worktree, "generated")
+    generated.mkdir()
+    (generated / "verification.json").write_text("{}\n")
     accepted = _accepted_graph()
 
     with SQLiteStore(tmp_path / "fleet.db") as store:
@@ -180,6 +191,8 @@ def test_independent_node_patches_compose_in_deterministic_order_and_replay(
         assert record.failure is None
         assert record.candidate_patch is not None
         assert record.composition_workspace is not None
+        assert record.candidate_patch.source.get("generated_paths") == GENERATED_PATHS
+        assert record.candidate_patch.source.get("harness_digest") == HARNESS_DIGEST
         assert record.request_digest == request.content_digest
         assert record.accepted_graph_revision_digest == accepted.content_digest
         assert tuple(item.node_id for item in record.ordered_inputs) == (

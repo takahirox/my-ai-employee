@@ -52,7 +52,13 @@ class WorkspaceManager(Protocol):
 
     def adopt(self, snapshot: WorkspaceSnapshot) -> None: ...
 
-    def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor: ...
+    def capture_diff(
+        self,
+        snapshot: WorkspaceSnapshot,
+        *,
+        generated_paths: tuple[str, ...] = (),
+        harness_digest: Digest | None = None,
+    ) -> ArtifactDescriptor: ...
 
     def apply_edit(
         self,

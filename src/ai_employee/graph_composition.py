@@ -65,6 +65,8 @@ class GraphPatchCompositionRequest(DigestedRecordV2):
     repository: str = Field(min_length=1, max_length=4_096)
     base_commit: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     effective_policy_digest: Digest
+    harness_digest: Digest
+    generated_paths: tuple[str, ...] = ()
     node_patches: tuple[NodePatchArtifact, ...] = Field(min_length=1)
 
 
@@ -258,7 +260,11 @@ class GraphPatchComposer:
                     )
                 )
 
-            candidate = self.workspace.capture_diff(composition_workspace)
+            candidate = self.workspace.capture_diff(
+                composition_workspace,
+                generated_paths=request.generated_paths,
+                harness_digest=request.harness_digest,
+            )
             source = candidate.source
             if (
                 candidate.logical_kind != "workspace_patch"
@@ -267,6 +273,8 @@ class GraphPatchComposer:
                 or not isinstance(source, Mapping)
                 or source.get("base_tree") != composition_workspace.base_tree
                 or source.get("workspace_digest") != composition_workspace.content_digest
+                or source.get("generated_paths") != request.generated_paths
+                or source.get("harness_digest") != request.harness_digest
             ):
                 raise _CompositionRejected(
                     StableFailureCode.INTEGRITY_FAILED,
@@ -392,6 +400,8 @@ class GraphPatchComposer:
                 or not isinstance(source, Mapping)
                 or source.get("base_tree") != snapshot.base_tree
                 or source.get("workspace_digest") != snapshot.content_digest
+                or source.get("generated_paths") != request.generated_paths
+                or source.get("harness_digest") != request.harness_digest
             ):
                 raise _CompositionRejected(
                     StableFailureCode.INTEGRITY_FAILED,
@@ -411,7 +421,11 @@ class GraphPatchComposer:
 
             try:
                 self.workspace.adopt(snapshot)
-                current = self.workspace.capture_diff(snapshot)
+                current = self.workspace.capture_diff(
+                    snapshot,
+                    generated_paths=request.generated_paths,
+                    harness_digest=request.harness_digest,
+                )
             except (OSError, ValueError) as error:
                 raise _CompositionRejected(
                     StableFailureCode.WORKSPACE_CONFLICT,

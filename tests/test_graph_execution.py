@@ -19,6 +19,7 @@ from ai_employee.domain import (
     Graph,
     HarnessCommand,
     HarnessEvaluator,
+    HarnessPaths,
     HarnessReview,
     HarnessVerification,
     Node,
@@ -98,6 +99,7 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
         "semantic-repair",
         "semantic-retry",
         "semantic-stale-node",
+        "generated",
     ],
 )
 def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
@@ -106,6 +108,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     semantic_repair = parent_verification_succeeds == "semantic-repair"
     semantic_retry = parent_verification_succeeds == "semantic-retry"
     semantic_stale_node = parent_verification_succeeds == "semantic-stale-node"
+    generated_outputs = parent_verification_succeeds == "generated"
     semantic_enabled = semantic_repair or semantic_retry or semantic_stale_node
     semantic_invoked = semantic_repair or semantic_retry
     deterministic_parent_succeeds = parent_verification_succeeds in {
@@ -114,8 +117,9 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         "semantic-repair",
         "semantic-retry",
         "semantic-stale-node",
+        "generated",
     }
-    parent_ready = parent_verification_succeeds in {True, "browser"}
+    parent_ready = parent_verification_succeeds in {True, "browser", "generated"}
     repository = tmp_path / "repo"
     repository.mkdir()
     subprocess.run(("git", "init", "-q", str(repository)), check=True)
@@ -236,6 +240,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 required_evaluators=("parent-process-evaluator",),
                 review=HarnessReview(parent_semantic_review=semantic_enabled),
             ),
+            paths=HarnessPaths(generated=(("generated/**",) if generated_outputs else ())),
         )
     policy = PolicyLayer(
         id="policy-parent",
@@ -327,12 +332,17 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             )
 
     class Executor:
-        def __init__(self, node_id: str) -> None:
+        def __init__(self, node_id: str, snapshot: object) -> None:
             self.node_id = node_id
+            self.snapshot = snapshot
 
         def execute(
             self, request: ProcessRequest, _decision: PolicyDecision, _cancellation: object
         ) -> ExecutionResult:
+            if generated_outputs:
+                generated = Path(self.snapshot.isolated_worktree, "generated")  # type: ignore[attr-defined]
+                generated.mkdir(exist_ok=True)
+                (generated / f"{self.node_id}.json").write_text("{}\n")
             with lock:
                 finished.add(self.node_id)
             return ExecutionResult(
@@ -369,7 +379,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             DeterministicRuntime({}, store=inner),
             workspace,
             lambda _snapshot, _cancellation: Adapter(selected_node.id),
-            lambda _snapshot: Executor(selected_node.id),
+            lambda snapshot: Executor(selected_node.id, snapshot),
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
             task_assessment=__import__("ai_employee.routing", fromlist=["assess_task"]).assess_task(
@@ -380,6 +390,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             verification_bindings=(binding,),
             allowed_processes=(verification.argv,),
             protected_paths=(".git/**",),
+            generated_paths=harness.paths.generated,
         )
 
     composition_calls = 0
@@ -400,6 +411,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 (isolated / f"{name}.txt").read_text() == f"{name}-after\n"
                 for name in ("a", "b", "c")
             )
+            if generated_outputs:
+                generated = isolated / "generated"
+                generated.mkdir(exist_ok=True)
+                (generated / "parent.json").write_text("{}\n")
             failure = None
             status = "succeeded"
             exit_code = 0
@@ -596,6 +611,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             repository=str(repository),
             base_commit=head,
             max_concurrency=2,
+            generated_paths=harness.paths.generated,
             parent_evaluator=(None if parent_verification_succeeds is None else parent_evaluator),
         )
         run = service.run(
@@ -810,6 +826,8 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             __import__("ai_employee.domain.v2", fromlist=["ArtifactDescriptor"]).ArtifactDescriptor,
         )
         body = artifacts.open_verified(candidate).read().decode()
+        assert candidate.source.get("generated_paths") == harness.paths.generated
+        assert candidate.source.get("harness_digest") == harness_digest
         assert body.count("diff --git") == 3
         assert all(f"+{name}-after" in body for name in ("a", "b", "c"))
         assert all(

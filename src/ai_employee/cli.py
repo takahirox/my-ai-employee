@@ -1730,6 +1730,7 @@ def _work(args: argparse.Namespace) -> int:
                     verification_requests=node_verification_requests,
                     verification_bindings=node_verification_bindings,
                     protected_paths=harness.paths.protected,
+                    generated_paths=harness.paths.generated,
                     allowed_processes=tuple(command.argv for command in harness.commands.values()),
                     artifact_store=artifacts,
                 )
@@ -1773,6 +1774,7 @@ def _work(args: argparse.Namespace) -> int:
                 repository=str(repository),
                 base_commit=head,
                 max_concurrency=args.max_concurrency,
+                generated_paths=harness.paths.generated,
                 routing_mode=routing_mode,
                 fixed_strategy_id=fixed_strategy_id,
                 allowed_strategy_ids=harness.worker.allowed_strategy_ids,
@@ -2487,6 +2489,7 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
         ),
         verification_requests=verification,
         protected_paths=harness.paths.protected,
+        generated_paths=harness.paths.generated,
         allowed_processes=tuple(command.argv for command in harness.commands.values()),
         artifact_store=artifacts,
     )
