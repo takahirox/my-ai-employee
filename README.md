@@ -22,80 +22,33 @@ fleet compare readme-demo declarative-demo
 fleet serve
 ```
 
-Normal Fleet commands select one database in this order:
-
-1. an explicit `--db PATH`;
-2. the `FLEET_DB` environment variable;
-3. `~/.fleet/fleet.db`.
-
-Fleet expands `~`, creates missing database directories privately, restricts the database
-to the current user, and uses WAL journaling plus a busy timeout for concurrent local
-commands. Explicit `--db` remains available for isolated runs. For example,
-`FLEET_DB=~/fleet/team.db fleet inspect RUN_ID` selects an environment default, while
-`fleet inspect RUN_ID --db ~/fleet/one.db` overrides it.
+Every operational Fleet command uses `~/.fleet/fleet.db`. Operational parsers do not expose
+`--db`, and the retired `FLEET_DB` variable is rejected by presence before Fleet opens a
+database, creates a run, or invokes a worker. This single catalog keeps runs from temporary
+repositories and worktrees visible in the same Inspector. Fleet creates missing directories
+privately, restricts the database to the current user, and uses WAL journaling plus a busy
+timeout for concurrent local commands.
 
 Repository policy remains local at `REPOSITORY/.fleet/project.yaml`; only execution history
 is global by default. The `eval` command deliberately retains `.fleet/evals.db` as its
 separate default and does not consult `FLEET_DB`, because evaluation databases belong to
 their reproducible experiment fixtures. `fleet eval --db PATH` still overrides that default.
 
-### Explicit isolation and testing databases
+Tests and embedded callers can continue to dependency-inject a path directly into
+`SQLiteStore`; that internal seam is not an operational CLI override.
 
-Use a temporary database only when a run must be intentionally isolated from normal Fleet
-history, such as a disposable test. Pass the same explicit path to every command that needs that
-history, including its Inspector:
+### Importing an older database
 
-```bash
-fleet run examples/demo_graph.yaml --run-id isolated-test \
-  --db "${TMPDIR:-/tmp}/fleet-isolated.db"
-fleet serve --db "${TMPDIR:-/tmp}/fleet-isolated.db"
-```
-
-`fleet work` and `fleet run` warn on stderr when `--db` or `FLEET_DB` selects a database
-under the platform temporary directory. The run is still accepted, and JSON stdout remains
-machine-readable; the warning gives the matching `fleet serve --db PATH` command because the
-default Inspector will not contain that isolated history.
-
-A temporary repository or Fleet-created worktree does not require a temporary database. AI
-agents and operators should normally omit `--db` and leave `FLEET_DB` unset for temporary
-repositories and worktrees so their runs remain visible in the shared default Inspector. Select
-a temporary database only when the operator explicitly wants database isolation.
-
-To migrate an older repository-local `.fleet/fleet.db`, first stop every Fleet command using
-that database. The following SQLite backup refuses to overwrite an existing global database
-and leaves the source unchanged:
+Stop every Fleet process using the old database, checkpoint it cleanly, and run:
 
 ```bash
-python - <<'PY'
-import os
-import sqlite3
-from pathlib import Path
-
-source_path = Path('.fleet/fleet.db')
-destination_path = Path(os.environ.get('FLEET_DB', '~/.fleet/fleet.db')).expanduser()
-if not source_path.is_file():
-    raise SystemExit(f'No source database: {source_path}')
-destination_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-try:
-    descriptor = os.open(destination_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-except FileExistsError:
-    raise SystemExit(
-        f'Destination already exists; compare and resolve it manually: {destination_path}'
-    ) from None
-os.close(descriptor)
-try:
-    with sqlite3.connect(f'file:{source_path.resolve()}?mode=ro', uri=True) as source:
-        with sqlite3.connect(destination_path) as destination:
-            source.backup(destination)
-except BaseException:
-    raise SystemExit(
-        f'Migration did not complete; source is unchanged and destination needs review: '
-        f'{destination_path}'
-    ) from None
-os.chmod(destination_path, 0o600)
-print(f'Migrated {source_path} to {destination_path}')
-PY
+fleet import-legacy-db /path/to/old/.fleet/fleet.db
 ```
+
+The command validates the source read-only, backs up an existing destination, imports all
+known rows and repository relationships in one transaction, rejects collisions and unknown
+schemas atomically, records an idempotency journal, and prints a verification summary. See
+the [database migration guide](docs/database-migration.md) for rollback and failure handling.
 
 Keep the old database as a rollback copy until current Graph runs inspect successfully. Older
 declarative v0.1 Graph runs remain inspectable and may appear as `v0.1/unassigned` because their

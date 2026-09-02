@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from .database import DEFAULT_DATABASE_PATH
 from .domain import (
     AcceptedGraphRevision,
     Artifact,
@@ -111,7 +112,7 @@ def _prepare_database_file(path: Path) -> None:
 class SQLiteStore:
     """Small vendor-neutral storage API backed by SQLite by default."""
 
-    def __init__(self, path: str | Path = "~/.fleet/fleet.db") -> None:
+    def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH) -> None:
         self.path = str(Path(path).expanduser()) if str(path) != ":memory:" else ":memory:"
         if self.path != ":memory:":
             _prepare_database_file(Path(self.path))
@@ -204,6 +205,15 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS run_repositories_repository
                 ON run_repositories(repository_id, run_id);
+            CREATE TABLE IF NOT EXISTS legacy_imports (
+                source_digest TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                source_schema_version INTEGER NOT NULL,
+                source_rows INTEGER NOT NULL,
+                imported_rows INTEGER NOT NULL,
+                skipped_rows INTEGER NOT NULL
+            );
             """
         )
         with self._connection:
