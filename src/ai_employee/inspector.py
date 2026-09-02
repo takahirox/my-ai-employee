@@ -55,6 +55,7 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRecord,
     ParentCandidateEvaluationRequest,
 )
+from .incident_runtime import INCIDENT_RUN_RECORD_KIND, IncidentRunRecord
 from .inspector_ui import INDEX as _INDEX
 from .parent_review import (
     ParentSemanticRepairRequest,
@@ -731,6 +732,35 @@ def inspect_graph_run(
         "node_watchdogs": [_json_model(item) for item in watchdogs],
         "node_control_propagations": [_json_model(item) for item in control_propagations],
         "child_worker_outcomes": child_worker_outcomes,
+        "incident_reporting": [
+            record.model_dump(
+                mode="json",
+                include={
+                    "state",
+                    "internal_incident_code",
+                    "error_code",
+                    "fingerprint",
+                    "report_digest",
+                    "preview_digest",
+                    "expiry",
+                    "issue_number",
+                    "public_url",
+                    "public_report_digest",
+                    "authorization_mode",
+                    "authorization_digest",
+                    "authorized_at",
+                    "published_at",
+                },
+            )
+            for record in sorted(
+                store.list_records(
+                    INCIDENT_RUN_RECORD_KIND,
+                    IncidentRunRecord,
+                    run_id=run_id,
+                ),
+                key=lambda item: (item.created_at, item.id),
+            )[:20]
+        ],
         "diagnostic_persistence_failures": [
             _json_model(item)
             for item in store.list_records(
