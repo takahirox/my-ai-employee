@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, NamedTuple, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -247,81 +247,419 @@ def compose(
     return report
 
 
+class RenderedIssue(NamedTuple):
+    title: str
+    body: str
+    labels: tuple[str, ...]
+    marker: str
+
+
+class Preview(NamedTuple):
+    digest: str
+    report_digest: str
+    issue: RenderedIssue
+
+
+def _scan_sink(value: str, limit: int) -> None:
+    if not value or len(value.encode()) > limit:
+        raise IncidentError("PUBLIC_OUTPUT_TOO_LARGE")
+    if any(pattern.search(value) for pattern in _SENSITIVE_TEXT):
+        raise IncidentError("PUBLIC_SCAN_DENIED")
+
+
+def _summary(report: Report) -> str:
+    value = (
+        f"Occurrences: {report.occurrences}/999; category={report.category.value}; "
+        f"failure={report.failure.value}; stage={report.stage.value}"
+    )
+    _scan_sink(value, 256)
+    return value
+
+
+def render_public_issue(report: Report, repository_key: bytes) -> RenderedIssue:
+    payload = public_json(report)
+    if not isinstance(repository_key, bytes) or len(repository_key) < 32:
+        raise IncidentError("INVALID_KEY")
+    stable = report.model_dump(mode="json")
+    stable.pop("occurrences")
+    digest = hmac.new(
+        repository_key,
+        b"incident-issue-marker-v1\0" + canonical_json_bytes(stable),
+        hashlib.sha256,
+    ).hexdigest()
+    marker = f"<!-- ai-employee-incident:{digest} -->"
+    title = f"[incident] {report.category.value}: {report.failure.value} at {report.stage.value}"
+    labels = ("ai-employee-incident", f"incident:{report.category.value}")
+    body = f"## Sanitized incident report\n\n{_summary(report)}\n\n{payload}\n\n{marker}"
+    for value, limit in ((title, 256), (body, _MAX_PUBLIC_BYTES), (marker, 128)):
+        _scan_sink(value, limit)
+    for label in labels:
+        _scan_sink(label, 64)
+    return RenderedIssue(title, body, labels, marker)
+
+
 class Transport(Protocol):
+    def find_issue_by_marker(self, repository: str, marker: str) -> tuple[int, str] | None: ...
+
     def create_issue(
-        self,
-        repository: str,
-        title: str,
-        body: str,
-        labels: tuple[str, ...],
+        self, repository: str, title: str, body: str, labels: tuple[str, ...]
     ) -> tuple[int, str]: ...
+
+    def update_occurrence_summary(
+        self, repository: str, issue_number: int, summary: str
+    ) -> None: ...
 
 
 class FakeTransport:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str, tuple[str, ...]]] = []
+    def __init__(
+        self,
+        failures: Mapping[str, int | BaseException] | None = None,
+        existing: Mapping[tuple[str, str], tuple[int, str]] | None = None,
+    ) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.issues = dict(existing or {})
+        self.failures = dict(failures or {})
+        self.next_issue = 1
+
+    def _call(self, name: str, *arguments: object) -> None:
+        self.calls.append((name, *arguments))
+        failure = self.failures.get(name)
+        if isinstance(failure, int) and failure > 0:
+            self.failures[name] = failure - 1
+            raise IncidentError("TRANSPORT_FAILURE")
+        if isinstance(failure, BaseException):
+            raise failure
+
+    def find_issue_by_marker(self, repository: str, marker: str) -> tuple[int, str] | None:
+        self._call("find_issue_by_marker", repository, marker)
+        return self.issues.get((repository, marker))
 
     def create_issue(
-        self,
-        repository: str,
-        title: str,
-        body: str,
-        labels: tuple[str, ...],
+        self, repository: str, title: str, body: str, labels: tuple[str, ...]
     ) -> tuple[int, str]:
-        self.calls.append((repository, title, body, labels))
-        return 1, f"https://github.com/{repository}/issues/1"
+        self._call("create_issue", repository, title, body, labels)
+        number = self.next_issue
+        self.next_issue += 1
+        url = f"https://github.com/{repository}/issues/{number}"
+        match = re.search(r"<!-- ai-employee-incident:[0-9a-f]{64} -->", body)
+        if match:
+            self.issues[(repository, match.group())] = (number, url)
+        return number, url
+
+    def update_occurrence_summary(self, repository: str, issue_number: int, summary: str) -> None:
+        self._call("update_occurrence_summary", repository, issue_number, summary)
+
+
+_SCHEMA = (
+    "CREATE TABLE incidents(repository TEXT NOT NULL,fingerprint TEXT NOT NULL,"
+    "report_json TEXT NOT NULL CHECK(length(report_json)<=4096),"
+    "report_digest TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('pending','published')),"
+    "occurrence_count INTEGER NOT NULL CHECK(occurrence_count BETWEEN 1 AND 999),"
+    "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,expires_at TEXT NOT NULL,"
+    "preview_digest TEXT,preview_report_digest TEXT,approval_digest TEXT,"
+    "approval_expires_at TEXT,issue_number INTEGER,public_url TEXT,"
+    "public_report_digest TEXT,authorization_mode TEXT,authorization_digest TEXT,"
+    "authorized_at TEXT,published_at TEXT,PRIMARY KEY(repository,fingerprint));"
+    "CREATE TABLE publication_log(repository TEXT NOT NULL,fingerprint TEXT NOT NULL,"
+    "published_at TEXT NOT NULL,PRIMARY KEY(repository,fingerprint,published_at));"
+)
+
+
+def _utc(now: datetime) -> datetime:
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise IncidentError("UTC_TIME_REQUIRED")
+    return now.astimezone(UTC)
+
+
+def _time(now: datetime) -> str:
+    return _utc(now).isoformat(timespec="seconds")
+
+
+def _digest(report: Report) -> str:
+    return canonical_digest(report.model_dump(mode="json"))
+
+
+def _authorization(policy: Policy, report_digest: str, preview_digest: str) -> str:
+    return canonical_digest(
+        {
+            "mode": policy.mode.value,
+            "repository": policy.repository,
+            "report_digest": report_digest,
+            "preview_digest": preview_digest,
+        }
+    )
 
 
 class Outbox:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent = self.path.parent
+        if parent.exists():
+            if parent.is_symlink() or not parent.is_dir() or parent.stat().st_mode & 0o077:
+                raise IncidentError("PRIVATE_PARENT_REQUIRED")
+        else:
+            parent.mkdir(mode=0o700, parents=True)
+        if self.path.is_symlink() or (self.path.exists() and not self.path.is_file()):
+            raise IncidentError("PRIVATE_DATABASE_REQUIRED")
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS incidents("
-            "fingerprint TEXT PRIMARY KEY,body TEXT,digest TEXT,status TEXT,count INTEGER,"
-            "expires TEXT,approval TEXT,approval_expires TEXT,receipt TEXT)"
-        )
-        self.db.commit()
+        self.db.execute("PRAGMA busy_timeout=5000")
+        if not self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='incidents'"
+        ).fetchone():
+            self.db.executescript(_SCHEMA)
+            self.db.commit()
         os.chmod(self.path, 0o600)
 
-    def enqueue(self, report: Report, policy: Policy, now: datetime) -> sqlite3.Row | None:
-        body = public_json(report)
-        digest = canonical_digest(report.model_dump(mode="json"))
-        expiry = (now.astimezone(UTC) + timedelta(hours=policy.retention_hours)).isoformat()
-        row = self.db.execute(
-            "SELECT * FROM incidents WHERE fingerprint=?",
-            (report.fingerprint,),
-        ).fetchone()
-        if row:
-            if row["status"] == "published":
-                return cast(sqlite3.Row, row)
-            report = report.model_copy(update={"occurrences": min(row["count"] + 1, 999)})
-            body = public_json(report)
-            digest = canonical_digest(report.model_dump(mode="json"))
-            self.db.execute(
-                "UPDATE incidents SET body=?,digest=?,status='pending',count=?,"
-                "approval=NULL,approval_expires=NULL WHERE fingerprint=?",
-                (body, digest, report.occurrences, report.fingerprint),
-            )
-        else:
-            if (
-                self.db.execute(
-                    "SELECT count(*) FROM incidents WHERE status!='published'"
+    def __enter__(self) -> Outbox:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.db.close()
+
+    def _repository(self, policy: Policy, report: Report) -> str:
+        if policy.mode is Mode.OFF:
+            raise IncidentError("POLICY_OFF")
+        if policy.repository is None:
+            raise IncidentError("REPOSITORY_REQUIRED")
+        if policy.mode is Mode.AUTO and report.category not in policy.auto_categories:
+            raise IncidentError("AUTO_CATEGORY_DENIED")
+        return policy.repository
+
+    def _purge(self, now: datetime) -> int:
+        deleted = self.db.execute(
+            "DELETE FROM incidents WHERE expires_at<=?", (_time(now),)
+        ).rowcount
+        start = _utc(now).replace(hour=0, minute=0, second=0, microsecond=0)
+        self.db.execute("DELETE FROM publication_log WHERE published_at<?", (_time(start),))
+        return deleted
+
+    def purge(self, now: datetime) -> int:
+        with self.db:
+            return self._purge(now)
+
+    def enqueue(self, report: Report, policy: Policy, now: datetime) -> sqlite3.Row:
+        repository = self._repository(policy, report)
+        report = Report.model_validate_json(public_json(report), strict=True)
+        timestamp = _time(now)
+        expires = _time(_utc(now) + timedelta(hours=policy.retention_hours))
+        with self.db:
+            self._purge(now)
+            row = self.db.execute(
+                "SELECT * FROM incidents WHERE repository=? AND fingerprint=?",
+                (repository, report.fingerprint),
+            ).fetchone()
+            if row is None:
+                pending = self.db.execute(
+                    "SELECT count(*) FROM incidents WHERE repository=? AND status='pending'",
+                    (repository,),
                 ).fetchone()[0]
-                >= policy.pending_cap
-            ):
-                raise IncidentError("OUTBOX_CAP")
-            self.db.execute(
-                "INSERT INTO incidents VALUES(?,?,?,'pending',1,?,NULL,NULL,NULL)",
-                (report.fingerprint, body, digest, expiry),
+                if cast(int, pending) >= policy.pending_cap:
+                    raise IncidentError("OUTBOX_CAP")
+                stored = report
+                self.db.execute(
+                    "INSERT INTO incidents(repository,fingerprint,report_json,report_digest,"
+                    "status,occurrence_count,created_at,updated_at,expires_at)"
+                    "VALUES(?,?,?,?,'pending',?,?,?,?)",
+                    (
+                        repository,
+                        report.fingerprint,
+                        public_json(stored),
+                        _digest(stored),
+                        stored.occurrences,
+                        timestamp,
+                        timestamp,
+                        expires,
+                    ),
+                )
+            else:
+                count = min(cast(int, row["occurrence_count"]) + report.occurrences, 999)
+                stored = report.model_copy(update={"occurrences": count})
+                self.db.execute(
+                    "UPDATE incidents SET report_json=?,report_digest=?,status='pending',"
+                    "occurrence_count=?,updated_at=?,expires_at=?,preview_digest=NULL,"
+                    "preview_report_digest=NULL,approval_digest=NULL,approval_expires_at=NULL,"
+                    "public_report_digest=NULL,authorization_mode=NULL,"
+                    "authorization_digest=NULL,authorized_at=NULL,published_at=NULL "
+                    "WHERE repository=? AND fingerprint=?",
+                    (
+                        public_json(stored),
+                        _digest(stored),
+                        count,
+                        timestamp,
+                        expires,
+                        repository,
+                        report.fingerprint,
+                    ),
+                )
+            result = self.db.execute(
+                "SELECT * FROM incidents WHERE repository=? AND fingerprint=?",
+                (repository, report.fingerprint),
+            ).fetchone()
+        if result is None:
+            raise IncidentError("OUTBOX_WRITE_FAILED")
+        return cast(sqlite3.Row, result)
+
+    def _load(self, repository: str, fingerprint: str) -> sqlite3.Row:
+        row = self.db.execute(
+            "SELECT * FROM incidents WHERE repository=? AND fingerprint=?",
+            (repository, fingerprint),
+        ).fetchone()
+        if row is None:
+            raise IncidentError("INCIDENT_NOT_FOUND")
+        return cast(sqlite3.Row, row)
+
+    def preview(
+        self, fingerprint: str, policy: Policy, repository_key: bytes, now: datetime
+    ) -> Preview:
+        if policy.mode is Mode.OFF or policy.repository is None:
+            raise IncidentError("POLICY_OFF")
+        with self.db:
+            self._purge(now)
+            row = self._load(policy.repository, fingerprint)
+            report = Report.model_validate_json(cast(str, row["report_json"]), strict=True)
+            repository = self._repository(policy, report)
+            issue = render_public_issue(report, repository_key)
+            report_digest = _digest(report)
+            preview_digest = canonical_digest(
+                {
+                    "repository": repository,
+                    "report_digest": report_digest,
+                    "title": issue.title,
+                    "body": issue.body,
+                    "labels": issue.labels,
+                    "marker": issue.marker,
+                }
             )
-        self.db.commit()
-        return cast(
-            sqlite3.Row | None,
             self.db.execute(
-                "SELECT * FROM incidents WHERE fingerprint=?",
-                (report.fingerprint,),
-            ).fetchone(),
-        )
+                "UPDATE incidents SET preview_digest=?,preview_report_digest=? "
+                "WHERE repository=? AND fingerprint=?",
+                (preview_digest, report_digest, repository, fingerprint),
+            )
+        return Preview(preview_digest, report_digest, issue)
+
+    def approve(self, fingerprint: str, preview_digest: str, policy: Policy, now: datetime) -> str:
+        if policy.mode is not Mode.APPROVAL_REQUIRED or policy.repository is None:
+            raise IncidentError("APPROVAL_NOT_ALLOWED")
+        with self.db:
+            self._purge(now)
+            row = self._load(policy.repository, fingerprint)
+            report = Report.model_validate_json(cast(str, row["report_json"]), strict=True)
+            repository = self._repository(policy, report)
+            report_digest = _digest(report)
+            if (
+                row["preview_digest"] != preview_digest
+                or row["preview_report_digest"] != report_digest
+            ):
+                raise IncidentError("STALE_PREVIEW")
+            approval = _authorization(policy, report_digest, preview_digest)
+            expiry = min(
+                _utc(now) + timedelta(hours=policy.approval_hours),
+                datetime.fromisoformat(cast(str, row["expires_at"])).astimezone(UTC),
+            )
+            self.db.execute(
+                "UPDATE incidents SET approval_digest=?,approval_expires_at=? "
+                "WHERE repository=? AND fingerprint=?",
+                (approval, _time(expiry), repository, fingerprint),
+            )
+        return approval
+
+    def _authorize(
+        self,
+        row: sqlite3.Row,
+        report: Report,
+        policy: Policy,
+        preview_digest: str,
+        now: datetime,
+    ) -> tuple[str, str]:
+        repository = self._repository(policy, report)
+        report_digest = _digest(report)
+        if row["preview_digest"] != preview_digest or row["preview_report_digest"] != report_digest:
+            raise IncidentError("STALE_PREVIEW")
+        authorization = _authorization(policy, report_digest, preview_digest)
+        if policy.mode is Mode.APPROVAL_REQUIRED:
+            expires = cast(str | None, row["approval_expires_at"])
+            if row["approval_digest"] != authorization:
+                raise IncidentError("APPROVAL_REQUIRED")
+            if expires is None or datetime.fromisoformat(expires) <= _utc(now):
+                raise IncidentError("APPROVAL_EXPIRED")
+        start = _time(_utc(now).replace(hour=0, minute=0, second=0, microsecond=0))
+        count = self.db.execute(
+            "SELECT count(*) FROM publication_log WHERE repository=? AND published_at>=?",
+            (repository, start),
+        ).fetchone()[0]
+        if cast(int, count) >= policy.daily_limit:
+            raise IncidentError("DAILY_LIMIT")
+        return report_digest, authorization
+
+    def publish(
+        self,
+        fingerprint: str,
+        preview_digest: str,
+        policy: Policy,
+        repository_key: bytes,
+        transport: Transport,
+        now: datetime,
+    ) -> tuple[int, str]:
+        if policy.mode is Mode.OFF or policy.repository is None:
+            raise IncidentError("POLICY_OFF")
+        repository = policy.repository
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._purge(now)
+            row = self._load(repository, fingerprint)
+            report = Report.model_validate_json(cast(str, row["report_json"]), strict=True)
+            issue = render_public_issue(report, repository_key)
+            report_digest, authorization = self._authorize(row, report, policy, preview_digest, now)
+            for value, limit in (
+                (issue.title, 256),
+                (issue.body, _MAX_PUBLIC_BYTES),
+                (issue.marker, 128),
+            ):
+                _scan_sink(value, limit)
+            for label in issue.labels:
+                _scan_sink(label, 64)
+            existing = transport.find_issue_by_marker(repository, issue.marker)
+            report_digest, authorization = self._authorize(row, report, policy, preview_digest, now)
+            if existing is None:
+                number, url = transport.create_issue(
+                    repository, issue.title, issue.body, issue.labels
+                )
+            else:
+                number, url = existing
+                summary = _summary(report)
+                _scan_sink(summary, 256)
+                transport.update_occurrence_summary(repository, number, summary)
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise IncidentError("INVALID_TRANSPORT_RECEIPT")
+            if url != f"https://github.com/{repository}/issues/{number}":
+                raise IncidentError("INVALID_TRANSPORT_RECEIPT")
+            timestamp = _time(now)
+            self.db.execute(
+                "UPDATE incidents SET status='published',issue_number=?,public_url=?,"
+                "public_report_digest=?,authorization_mode=?,authorization_digest=?,"
+                "authorized_at=?,published_at=? WHERE repository=? AND fingerprint=?",
+                (
+                    number,
+                    url,
+                    report_digest,
+                    policy.mode.value,
+                    authorization,
+                    timestamp,
+                    timestamp,
+                    repository,
+                    fingerprint,
+                ),
+            )
+            self.db.execute(
+                "INSERT INTO publication_log(repository,fingerprint,published_at)VALUES(?,?,?)",
+                (repository, fingerprint, timestamp),
+            )
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return number, url
