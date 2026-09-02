@@ -37,7 +37,7 @@ from ai_employee.productivity_evaluation import (
     trial_id,
     validate_paired_comparability,
 )
-from ai_employee.serialization import canonical_digest
+from ai_employee.serialization import canonical_digest, canonical_json
 
 D1, D2, D3 = "1" * 64, "2" * 64, "3" * 64
 
@@ -382,6 +382,43 @@ def test_swe_bench_native_records_fail_closed_without_network() -> None:
                 "FAIL_TO_PASS": ["fixed"],
                 "PASS_TO_PASS": ["regression"],
                 "unrecognized_projection": "rejected",
+            }
+        )
+
+
+def test_swe_bench_standard_fields_are_retained_and_round_trip() -> None:
+    projected = {
+        "problem_statement": "Fix the regression.",
+        "hints_text": "Inspect the parser.",
+        "patch": "diff --git a/source.py b/source.py",
+        "test_patch": "diff --git a/test_source.py b/test_source.py",
+        "version": "4.2",
+        "created_at": "2023-01-02T03:04:05Z",
+        "environment_setup_commit": "c" * 40,
+    }
+    normalized = SWEBenchAdapter("verified").normalize_case(
+        {
+            "instance_id": "django__django-1",
+            "repo": "django/django",
+            "base_commit": "b" * 40,
+            "FAIL_TO_PASS": ["fixed"],
+            "PASS_TO_PASS": ["regression"],
+            **projected,
+        }
+    )
+
+    assert normalized.swe_bench_provenance is not None
+    assert normalized.swe_bench_provenance.model_dump(exclude={"schema_version"}) == projected
+    encoded = canonical_json(normalized)
+    assert canonical_json(TaskIdentity.model_validate_json(encoded, strict=True)) == encoded
+
+    unrelated = task()
+    assert unrelated.swe_bench_provenance is None
+    with pytest.raises(ValidationError, match="only valid for SWE-bench"):
+        TaskIdentity.model_validate(
+            {
+                **unrelated.model_dump(mode="python"),
+                "swe_bench_provenance": normalized.swe_bench_provenance,
             }
         )
 

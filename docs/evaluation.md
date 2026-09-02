@@ -113,10 +113,11 @@ pin its version and repository commits, and feed local case JSON to the normaliz
 downloads SWE-bench nor claims a score. The imported fail-to-pass and pass-to-pass tests become
 separate acceptance and regression authorities; evaluation infrastructure and contamination
 limitations must be reported with any results. Representative native records may use uppercase
-`FAIL_TO_PASS` and `PASS_TO_PASS` arrays or JSON-encoded arrays. The projected standard fields
-`problem_statement`, `hints_text`, `patch`, `test_patch`, `version`, `created_at`, and
-`environment_setup_commit` are retained when present. Other fields remain forbidden, and parsing
-performs no network access.
+`FAIL_TO_PASS` and `PASS_TO_PASS` arrays or JSON-encoded arrays. The typed
+`TaskIdentity.swe_bench_provenance` projection retains the standard `problem_statement`,
+`hints_text`, `patch`, `test_patch`, `version`, `created_at`, and
+`environment_setup_commit` fields. Only SWE-bench tasks may populate that projection; unrelated
+adapters leave it null. Other fields remain forbidden, and parsing performs no network access.
 
 For real work, use controlled A/B experiments on consented, eligible tasks. Randomize assignment
 within repository and task-class blocks; keep workers, tools, environment, review policy, and

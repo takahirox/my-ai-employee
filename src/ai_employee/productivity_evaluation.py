@@ -76,6 +76,17 @@ class RegressionCheck(SchemaModelV2):
     authority: str = Field(min_length=1, max_length=1_000)
 
 
+class SWEBenchProvenance(SchemaModelV2):
+    schema_name: ClassVar[str] = "swe_bench_provenance"
+    problem_statement: str | None = None
+    hints_text: str | None = None
+    patch: str | None = None
+    test_patch: str | None = None
+    version: str | None = None
+    created_at: str | None = None
+    environment_setup_commit: str | None = None
+
+
 class TaskIdentity(SchemaModelV2):
     schema_name: ClassVar[str] = "productivity_task_identity"
     benchmark: Identifier
@@ -87,6 +98,7 @@ class TaskIdentity(SchemaModelV2):
     task_class: TaskClass
     acceptance_criteria: tuple[AcceptanceCriterion, ...] = Field(min_length=1)
     regression_checks: tuple[RegressionCheck, ...] = Field(min_length=1)
+    swe_bench_provenance: SWEBenchProvenance | None = None
 
     @model_validator(mode="after")
     def _criteria_are_canonical(self) -> Self:
@@ -97,6 +109,8 @@ class TaskIdentity(SchemaModelV2):
             ids = tuple(item.id for item in checks)
             if ids != tuple(sorted(set(ids))):
                 raise ValueError(f"{name} must be unique and sorted by id")
+        if self.swe_bench_provenance is not None and self.benchmark != "swe-bench":
+            raise ValueError("SWE-bench provenance is only valid for SWE-bench tasks")
         return self
 
 
@@ -995,4 +1009,13 @@ class SWEBenchAdapter:
             task_class=TaskClass.BUG_FIX,
             acceptance_criteria=criteria,
             regression_checks=regressions,
+            swe_bench_provenance=SWEBenchProvenance(
+                problem_statement=case.problem_statement,
+                hints_text=case.hints_text,
+                patch=case.patch,
+                test_patch=case.test_patch,
+                version=case.version,
+                created_at=case.created_at,
+                environment_setup_commit=case.environment_setup_commit,
+            ),
         )
