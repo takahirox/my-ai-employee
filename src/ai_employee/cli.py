@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import getpass
 import io
+import os
+import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -82,9 +85,13 @@ from .graph_evaluation import (
     ParentCandidateEvaluationRequest,
 )
 from .graph_execution import GraphExecutionService
+from .incident_publisher import GitHubApiClient, GitHubIssuesTransport
+from .incident_reporting import IncidentError, Outbox
 from .incident_runtime import (
     IncidentRunRecord,
+    incident_policy_from_harness,
     prepare_graph_run_incidents,
+    record_incident_publication,
 )
 from .inspector import compare_runs, inspect_any_run, inspect_graph_run, serve
 from .parent_review import (
@@ -238,6 +245,21 @@ def build_parser() -> argparse.ArgumentParser:
     project.add_argument("--migrate", action="store_true", help="render a safe v2 candidate")
     project.add_argument("--output", help="write the migration candidate to this new path")
 
+    incidents = commands.add_parser("incidents", help="manage the private incident outbox")
+    incident_commands = incidents.add_subparsers(dest="incident_command", required=True)
+    incident_list = incident_commands.add_parser("list")
+    incident_preview = incident_commands.add_parser("preview")
+    incident_preview.add_argument("fingerprint")
+    incident_approve = incident_commands.add_parser("approve")
+    incident_approve.add_argument("fingerprint")
+    incident_approve.add_argument("--preview-digest", required=True)
+    incident_publish = incident_commands.add_parser("publish")
+    incident_publish.add_argument("run_id")
+    incident_publish.add_argument("fingerprint")
+    incident_publish.add_argument("--preview-digest", required=True)
+    for incident_command in (incident_list, incident_preview, incident_approve, incident_publish):
+        incident_command.add_argument("--repo", default=".")
+
     work = commands.add_parser("work", help="create a mediated v0.2 work run")
     work.add_argument("goal")
     work.add_argument("--repo", default=".")
@@ -335,6 +357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     args.db = str(resolve_database_path(None, environment={}))
+    if args.command == "incidents":
+        return _incidents(args, args.db)
     if args.command == "import-legacy-db":
         print(canonical_json(import_legacy_database(args.source)))
         return 0
@@ -458,6 +482,133 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             serve(store, args.host, args.port)
     return 0
+
+
+class _LazyGitHubIssuesTransport:
+    """Delay token access until an authorized publication reaches transport."""
+
+    def __init__(self) -> None:
+        self._transport: GitHubIssuesTransport | None = None
+
+    def _get_transport(self) -> GitHubIssuesTransport:
+        if self._transport is None:
+            token = os.environ.get("FLEET_GITHUB_ISSUES_TOKEN")
+            if token is None:
+                raise IncidentError("TOKEN_REQUIRED")
+            self._transport = GitHubIssuesTransport(GitHubApiClient(token))
+        return self._transport
+
+    def find_issue_by_marker(self, repository: str, marker: str) -> tuple[int, str] | None:
+        return self._get_transport().find_issue_by_marker(repository, marker)
+
+    def create_issue(
+        self, repository: str, title: str, body: str, labels: tuple[str, ...]
+    ) -> tuple[int, str]:
+        return self._get_transport().create_issue(repository, title, body, labels)
+
+    def update_occurrence_summary(self, repository: str, issue_number: int, summary: str) -> None:
+        self._get_transport().update_occurrence_summary(repository, issue_number, summary)
+
+
+def _incident_repository_key(harness: ProjectHarnessV2) -> bytes:
+    variable = harness.incident_reporting.repository_key_env
+    if variable is None:
+        raise IncidentError("REPOSITORY_KEY_REQUIRED")
+    value = os.environ.get(variable)
+    if value is None:
+        raise IncidentError("REPOSITORY_KEY_REQUIRED")
+    return value.encode("utf-8")
+
+
+def _incident_error_code(error: IncidentError) -> str:
+    code: object = error.args[0] if len(error.args) == 1 else None
+    if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code):
+        return code
+    return "INCIDENT_OPERATION_FAILED"
+
+
+def _incidents(args: argparse.Namespace, database_path: str | Path) -> int:
+    try:
+        repository = Path(args.repo).resolve()
+        harness = discover_project_harness(repository)
+        if harness.incident_reporting.mode == "off":
+            raise IncidentError("POLICY_OFF")
+        try:
+            policy, _auto_failures = incident_policy_from_harness(harness)
+        except (TypeError, ValueError):
+            raise IncidentError("POLICY_INVALID") from None
+        timestamp = now()
+        with Outbox(Path(harness.incident_reporting.outbox_path).expanduser()) as outbox:
+            if args.incident_command == "list":
+                entries = outbox.list_entries(policy, timestamp)
+                payload = [entry.model_dump(mode="json") for entry in entries]
+                print(canonical_json(payload))
+                return 0
+            if args.incident_command == "preview":
+                repository_key = _incident_repository_key(harness)
+                preview = outbox.preview(
+                    args.fingerprint,
+                    policy,
+                    repository_key,
+                    timestamp,
+                )
+                print(
+                    canonical_json(
+                        {
+                            "preview_digest": preview.digest,
+                            "report_digest": preview.report_digest,
+                            "title": preview.issue.title,
+                            "body": preview.issue.body,
+                            "labels": preview.issue.labels,
+                            "marker": preview.issue.marker,
+                        }
+                    )
+                )
+                return 0
+            if args.incident_command == "approve":
+                approval_digest = outbox.approve(
+                    args.fingerprint,
+                    args.preview_digest,
+                    policy,
+                    timestamp,
+                )
+                print(canonical_json({"approval_digest": approval_digest}))
+                return 0
+            if args.incident_command != "publish":
+                raise IncidentError("INCIDENT_COMMAND_INVALID")
+            try:
+                receipt = outbox.publication_receipt(args.fingerprint, policy, timestamp)
+            except IncidentError as error:
+                if error.args != ("PUBLICATION_NOT_FOUND",):
+                    raise
+                outbox.publish(
+                    args.fingerprint,
+                    args.preview_digest,
+                    policy,
+                    _incident_repository_key(harness),
+                    _LazyGitHubIssuesTransport(),
+                    timestamp,
+                )
+                receipt = outbox.publication_receipt(args.fingerprint, policy, timestamp)
+        with SQLiteStore(database_path) as store:
+            record = record_incident_publication(
+                store,
+                args.run_id,
+                args.fingerprint,
+                receipt,
+                clock=lambda: timestamp,
+            )
+        print(canonical_json(record.model_dump(mode="json")))
+        return 0
+    except IncidentError as error:
+        print(
+            _incident_error_code(error),
+            file=sys.stderr,
+        )
+        return 2
+    except Exception:
+        print("INCIDENT_OPERATION_FAILED", file=sys.stderr)
+        return 2
 
 
 def _recover_orphan(store: SQLiteStore, run_id: str) -> int:

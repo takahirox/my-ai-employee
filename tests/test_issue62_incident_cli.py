@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -381,3 +382,280 @@ def test_cli_boundary_cannot_reach_publish_or_transport_methods(
     )
 
     assert calls == ["prepare"]
+
+
+def _operator_harness(tmp_path: Path, *, mode: str = "approval_required") -> Any:
+    return SimpleNamespace(
+        incident_reporting=SimpleNamespace(
+            mode=mode,
+            outbox_path=str(tmp_path / "private" / "incident-outbox.sqlite3"),
+            repository_key_env="ISSUE62_OPERATOR_KEY",
+        )
+    )
+
+
+class _OutboxContext:
+    def __enter__(self) -> Any:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _StoreContext:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> Any:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _configure_incident_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outbox_type: type[object],
+) -> None:
+    harness = _operator_harness(tmp_path)
+    monkeypatch.setattr(cli, "discover_project_harness", lambda _root: harness)
+    monkeypatch.setattr(
+        cli,
+        "incident_policy_from_harness",
+        lambda _harness: (object(), frozenset()),
+    )
+    monkeypatch.setattr(cli, "Outbox", outbox_type)
+
+
+def test_incident_parser_has_closed_subcommands_and_no_secret_arguments() -> None:
+    parser = cli.build_parser()
+    for arguments in (
+        ["incidents", "list"],
+        ["incidents", "preview", "a" * 64],
+        ["incidents", "approve", "a" * 64, "--preview-digest", "b" * 64],
+        [
+            "incidents",
+            "publish",
+            "run-one",
+            "a" * 64,
+            "--preview-digest",
+            "b" * 64,
+        ],
+    ):
+        parsed = parser.parse_args(arguments)
+        assert parsed.command == "incidents"
+        assert not hasattr(parsed, "token")
+        assert not hasattr(parsed, "repository_key")
+
+
+def test_incident_preview_reads_only_repository_key_and_emits_public_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class PreviewOutbox(_OutboxContext):
+        def __init__(self, path: Path) -> None:
+            assert path == tmp_path / "private" / "incident-outbox.sqlite3"
+
+        def preview(self, fingerprint: str, policy: object, key: bytes, at: object) -> Any:
+            assert fingerprint == "a" * 64
+            assert key == b"k" * 32
+            return SimpleNamespace(
+                digest="b" * 64,
+                report_digest="c" * 64,
+                issue=SimpleNamespace(
+                    title="Public incident",
+                    body="Synthetic public body",
+                    labels=("incident",),
+                    marker=f"<!-- ai-employee-incident:{'d' * 64} -->",
+                ),
+            )
+
+    _configure_incident_command(monkeypatch, tmp_path, PreviewOutbox)
+    reads: list[str] = []
+
+    def read_environment(name: str) -> str | None:
+        reads.append(name)
+        return "k" * 32 if name == "ISSUE62_OPERATOR_KEY" else None
+
+    monkeypatch.setattr(cli.os.environ, "get", read_environment)
+    result = cli._incidents(
+        SimpleNamespace(
+            repo=str(tmp_path),
+            incident_command="preview",
+            fingerprint="a" * 64,
+        ),
+        tmp_path / "fleet.db",
+    )
+
+    assert result == 0
+    assert reads == ["ISSUE62_OPERATOR_KEY"]
+    assert json.loads(capsys.readouterr().out) == {
+        "body": "Synthetic public body",
+        "labels": ["incident"],
+        "marker": f"<!-- ai-employee-incident:{'d' * 64} -->",
+        "preview_digest": "b" * 64,
+        "report_digest": "c" * 64,
+        "title": "Public incident",
+    }
+
+
+def test_published_incident_reconciles_without_key_token_or_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    receipt = SimpleNamespace(fingerprint="a" * 64)
+
+    class PublishedOutbox(_OutboxContext):
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def publication_receipt(self, fingerprint: str, policy: object, at: object) -> Any:
+            assert fingerprint == "a" * 64
+            return receipt
+
+        def publish(self, *_args: object, **_kwargs: object) -> None:
+            pytest.fail("published incident must not be sent again")
+
+    class Record:
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"state": "published", "fingerprint": "a" * 64}
+
+    _configure_incident_command(monkeypatch, tmp_path, PublishedOutbox)
+    monkeypatch.setattr(cli, "SQLiteStore", _StoreContext)
+    monkeypatch.setattr(
+        cli,
+        "record_incident_publication",
+        lambda store, run_id, fingerprint, observed, *, clock: Record(),
+    )
+    monkeypatch.setattr(
+        cli.os.environ,
+        "get",
+        lambda name: pytest.fail(f"secret environment read: {name}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_LazyGitHubIssuesTransport",
+        lambda: pytest.fail("transport construction is forbidden"),
+    )
+
+    result = cli._incidents(
+        SimpleNamespace(
+            repo=str(tmp_path),
+            incident_command="publish",
+            run_id="run-one",
+            fingerprint="a" * 64,
+            preview_digest="b" * 64,
+        ),
+        tmp_path / "fleet.db",
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "fingerprint": "a" * 64,
+        "state": "published",
+    }
+
+
+def test_new_publication_reads_key_then_lazy_token_and_records_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    receipt = SimpleNamespace(fingerprint="a" * 64)
+
+    class ActualTransport:
+        def find_issue_by_marker(self, repository: str, marker: str) -> None:
+            events.append("network")
+            return None
+
+    class PendingOutbox(_OutboxContext):
+        def __init__(self, _path: Path) -> None:
+            self.receipt_calls = 0
+
+        def publication_receipt(self, fingerprint: str, policy: object, at: object) -> Any:
+            self.receipt_calls += 1
+            if self.receipt_calls == 1:
+                raise cli.IncidentError("PUBLICATION_NOT_FOUND")
+            return receipt
+
+        def publish(
+            self,
+            fingerprint: str,
+            preview_digest: str,
+            policy: object,
+            key: bytes,
+            transport: object,
+            at: object,
+        ) -> None:
+            assert key == b"k" * 32
+            events.append("authorized")
+            transport.find_issue_by_marker("owner/repository", "marker")  # type: ignore[attr-defined]
+
+    class Record:
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            return {"state": "published"}
+
+    _configure_incident_command(monkeypatch, tmp_path, PendingOutbox)
+    monkeypatch.setattr(cli, "SQLiteStore", _StoreContext)
+    monkeypatch.setattr(cli, "record_incident_publication", lambda *_args, **_kwargs: Record())
+    monkeypatch.setattr(cli, "GitHubApiClient", lambda token: events.append(f"token:{token}"))
+    monkeypatch.setattr(cli, "GitHubIssuesTransport", lambda _client: ActualTransport())
+
+    def read_environment(name: str) -> str | None:
+        if name == "ISSUE62_OPERATOR_KEY":
+            events.append("key")
+            return "k" * 32
+        if name == "FLEET_GITHUB_ISSUES_TOKEN":
+            events.append("token-read")
+            return "private-token-canary"
+        return None
+
+    monkeypatch.setattr(cli.os.environ, "get", read_environment)
+    result = cli._incidents(
+        SimpleNamespace(
+            repo=str(tmp_path),
+            incident_command="publish",
+            run_id="run-one",
+            fingerprint="a" * 64,
+            preview_digest="b" * 64,
+        ),
+        tmp_path / "fleet.db",
+    )
+
+    assert result == 0
+    assert events == [
+        "key",
+        "authorized",
+        "token-read",
+        "token:private-token-canary",
+        "network",
+    ]
+    assert "private-token-canary" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "failure", [cli.IncidentError("PRIVATE canary"), RuntimeError("PRIVATE canary")]
+)
+def test_incident_command_redacts_all_unclosed_errors(
+    failure: Exception,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli, "discover_project_harness", lambda _root: (_ for _ in ()).throw(failure)
+    )
+    result = cli._incidents(
+        SimpleNamespace(repo=str(tmp_path), incident_command="list"),
+        tmp_path / "fleet.db",
+    )
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert captured.err == "INCIDENT_OPERATION_FAILED\n"
+    assert "canary" not in captured.err

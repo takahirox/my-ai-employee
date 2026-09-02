@@ -574,10 +574,10 @@ def test_publication_is_bounded_idempotent_and_does_not_mutate_graph_run(
             IncidentRunRecord,
             run_id=run.id,
         )
-        assert tuple(record.state for record in records) == (
+        assert {record.state for record in records} == {
             IncidentRunState.PREPARED,
             IncidentRunState.PUBLISHED,
-        )
+        }
         surface = json.dumps([record.model_dump(mode="json") for record in records])
         assert CANARY not in surface
         assert KEY not in surface

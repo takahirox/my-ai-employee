@@ -529,7 +529,10 @@ def _incident_codes(doctor: object, run_id: str) -> tuple[InternalIncidentCode, 
     return tuple(sorted(codes, key=lambda code: code.value))
 
 
-def _policy(harness: ProjectHarnessV2) -> tuple[Policy, frozenset[Failure]]:
+def incident_policy_from_harness(
+    harness: ProjectHarnessV2,
+) -> tuple[Policy, frozenset[Failure]]:
+    """Derive the closed public policy and failure allowlist from a Harness."""
     reporting = harness.incident_reporting
     if reporting.target_repository is None or reporting.repository_key_env is None:
         raise ValueError("enabled incident reporting is incomplete")
@@ -607,7 +610,7 @@ def prepare_graph_run_incidents(
         return ()
 
     try:
-        policy, auto_failures = _policy(harness)
+        policy, auto_failures = incident_policy_from_harness(harness)
     except Exception:
         return _failed_closed(
             store,
