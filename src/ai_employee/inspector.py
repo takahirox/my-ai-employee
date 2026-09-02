@@ -1370,9 +1370,19 @@ def inspect_fleet_runs(
                     "diagnostic_code": ownership.get("diagnostic_code"),
                 }
             )
-            (active if graph_run_is_active else history).append(item)
+            target = active if graph_run_is_active else history
         else:
-            (history if status in _TERMINAL_RUN_STATES else active).append(item)
+            target = history if status in _TERMINAL_RUN_STATES else active
+        if target is history:
+            from .run_explanation import _primary_root_cause, explain_any_run
+
+            primary_root_cause = _primary_root_cause(projection)
+            if projection.get("kind") == "graph_run":
+                explained = explain_any_run(store, run_id, clock=clock)
+                primary_root_cause = explained.get("primary_root_cause") or primary_root_cause
+            if primary_root_cause is not None:
+                item["primary_root_cause"] = primary_root_cause
+        target.append(item)
     active.sort(key=lambda item: (not item["requires_attention"], str(item["run_id"])))
     history.sort(key=lambda item: str(item["run_id"]), reverse=True)
     return {"active": active, "history": history}

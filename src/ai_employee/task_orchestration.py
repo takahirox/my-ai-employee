@@ -137,6 +137,17 @@ _OWNED_TERMINAL_GRAPH_STATES = frozenset(
 )
 
 
+_PROTOCOL_PREFLIGHT_CORRECTION_REASON = "ACCEPTED_PROTOCOL_PREFLIGHT_CORRECTION"
+_PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES = frozenset(
+    {
+        StableFailureCode.PATCH_PREFLIGHT_FAILED.value,
+        StableFailureCode.WORKER_PROTOCOL_ERROR.value,
+        StableFailureCode.WORKER_EMPTY_OUTPUT.value,
+        StableFailureCode.WORKER_STRUCTURED_OUTPUT_MISSING.value,
+    }
+)
+
+
 class RunOwnershipLost(RuntimeError):
     """The caller no longer holds authority for the graph execution."""
 
@@ -1485,11 +1496,18 @@ class TaskOrchestrator:
                         "node_evidence_v2", record.evidence_id, NodeEvidenceRecord
                     )
         loop_counts: dict[tuple[str, LoopAction], int] = defaultdict(int)
+        correction_counts: dict[str, int] = defaultdict(int)
         for transition in self.store.list_records(
             "loop_transition_v2", LoopTransitionRecord, run_id=run_id
         ):
             if transition.node_id is not None:
-                loop_counts[(transition.node_id, transition.action)] += 1
+                if (
+                    transition.action is LoopAction.REPAIR
+                    and transition.reason_code == _PROTOCOL_PREFLIGHT_CORRECTION_REASON
+                ):
+                    correction_counts[transition.node_id] += 1
+                else:
+                    loop_counts[(transition.node_id, transition.action)] += 1
         repair_feedback_by_node: dict[str, tuple[Digest, ...]] = {}
         repair_goal_by_node: dict[str, str] = {}
         for node_id, record in records.items():
@@ -1508,7 +1526,10 @@ class TaskOrchestrator:
                     repair_goal_by_node[node_id] = self._task_review_repair_goal(
                         nodes[node_id], repair.evidence_digests
                     )
-                elif repair.reason_code == "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+                elif repair.reason_code in {
+                    "ACCEPTED_NODE_EVALUATION_FEEDBACK",
+                    _PROTOCOL_PREFLIGHT_CORRECTION_REASON,
+                }:
                     repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
                         nodes[node_id], repair.evidence_digests
                     )
@@ -1854,9 +1875,7 @@ class TaskOrchestrator:
                         goal=repair_goal_by_node.get(node_id, node.objective or node.name),
                         task_kind=graph_run.goal.task_kind,
                         processes_authorized=graph_run.goal.processes_authorized,
-                        completion_criteria=tuple(
-                            item.description for item in node.completion_criteria
-                        ),
+                        completion_criteria=node.completion_criteria,
                         required_capabilities=node.required_capabilities,
                         accepted_plan_digest=graph_digest,
                         node_id=node.id,
@@ -1915,6 +1934,49 @@ class TaskOrchestrator:
                             records[node_id],
                             status="failed",
                             failure_code=StableFailureCode.CONTEXT_INSUFFICIENT.value,
+                        )
+                        continue
+                    contract_failure = _worker_request_contract_failure(node, request)
+                    if contract_failure is not None or not self._pre_dispatch_bindings_are_valid(
+                        graph_run,
+                        node,
+                        request,
+                        route,
+                        predecessors[node_id],
+                    ):
+                        diagnostic = WorkerBoundaryDiagnostic(
+                            id=identifier("worker-boundary-diagnostic"),
+                            run_id=request.run_id,
+                            created_at=self.clock(),
+                            adapter=route.selected_strategy.backend,
+                            stage="pre_dispatch",
+                            code=(StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value),
+                            graph_run_id=run_id,
+                            node_id=node.id,
+                            accepted_graph_revision_digest=graph_digest,
+                            generation=node.generation,
+                            attempt=node.attempt,
+                            worker_request_id=request.id,
+                            worker_request_digest=_required_digest(request.content_digest),
+                            exception_message=(
+                                contract_failure
+                                or (
+                                    "pre-dispatch bindings contradict accepted run authority; "
+                                    "recreate the route and worker request from the persisted task "
+                                    "and effective policy"
+                                )
+                            ),
+                            duration_seconds=0.0,
+                            configured_timeout_seconds=node.resource_budget.wall_seconds,
+                            effective_timeout_seconds=timeout_profile.effective_timeout_seconds,
+                        )
+                        self.store.put("worker_boundary_diagnostic_v2", diagnostic, run_id=run_id)
+                        records[node_id] = self._advance(
+                            records[node_id],
+                            status="failed",
+                            failure_code=(
+                                StableFailureCode.WORKER_DISPATCH_CONTRACT_CONTRADICTION.value
+                            ),
                         )
                         continue
                     records[node_id] = self._advance(
@@ -2018,7 +2080,9 @@ class TaskOrchestrator:
                             run_id=run_id,
                         )
                 for future, active_item in tuple(active.items()):
-                    if future.done() or future in watchdog_signals:
+                    # `done()` can flip after `wait` returns at the deadline; only the
+                    # completed snapshot is authoritative for this scheduler iteration.
+                    if future in completed or future in watchdog_signals:
                         continue
                     active_node_id, active_node, active_request, *_middle, started_at = active_item
                     if observed_at < (
@@ -2468,7 +2532,14 @@ class TaskOrchestrator:
                                 }
                             )
                         ):
-                            repair_count = loop_counts[(node_id, LoopAction.REPAIR)]
+                            protocol_correction = (
+                                current.failure_code in _PROTOCOL_PREFLIGHT_CORRECTION_FAILURE_CODES
+                            )
+                            repair_count = (
+                                correction_counts[node_id]
+                                if protocol_correction
+                                else loop_counts[(node_id, LoopAction.REPAIR)]
+                            )
                             repair_limit = graph_run.max_repairs
                             remaining = cast(
                                 Mapping[str, int | float], reservation.remaining_budgets
@@ -2480,7 +2551,11 @@ class TaskOrchestrator:
                                     run_id=run_id,
                                     created_at=now(),
                                     action=LoopAction.REPAIR,
-                                    reason_code="ACCEPTED_NODE_EVALUATION_FEEDBACK",
+                                    reason_code=(
+                                        _PROTOCOL_PREFLIGHT_CORRECTION_REASON
+                                        if protocol_correction
+                                        else "ACCEPTED_NODE_EVALUATION_FEEDBACK"
+                                    ),
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
                                     attempt=node.attempt,
@@ -2492,7 +2567,10 @@ class TaskOrchestrator:
                                     limit=repair_limit,
                                 )
                                 self._save_loop_transition(transition)
-                                loop_counts[(node_id, LoopAction.REPAIR)] += 1
+                                if protocol_correction:
+                                    correction_counts[node_id] += 1
+                                else:
+                                    loop_counts[(node_id, LoopAction.REPAIR)] += 1
                                 repair_feedback_by_node[node_id] = feedback
                                 repair_goal_by_node[node_id] = self._node_evaluation_repair_goal(
                                     node, feedback
@@ -3246,7 +3324,9 @@ class TaskOrchestrator:
             for item in self.store.list_records(
                 "loop_transition_v2", LoopTransitionRecord, run_id=run_id
             )
-            if item.action is LoopAction.REPAIR and item.node_id == node.id
+            if item.action is LoopAction.REPAIR
+            and item.node_id == node.id
+            and item.reason_code != _PROTOCOL_PREFLIGHT_CORRECTION_REASON
         )
         replay = self.replay(run_id)
         prior = next((item for item in replay.nodes if item.node_id == node.id), None)
@@ -3909,6 +3989,13 @@ class TaskOrchestrator:
         evidence_by_node: dict[str, NodeEvidenceRecord],
         graph_digest: str,
     ) -> None:
+        try:
+            persisted_request = self.store.get("worker_request_v2", request.id, WorkerRequest)
+        except KeyError:
+            raise ValueError("worker request criterion binding is absent or stale") from None
+        if persisted_request != request or request.completion_criteria != node.completion_criteria:
+            raise ValueError("worker request criterion binding is absent or stale")
+
         worker_result = result.worker_result
         patch = result.node_patch
         result_acceptance = result.result_acceptance
@@ -4264,6 +4351,63 @@ class TaskOrchestrator:
             tuple(_required_digest(record.evidence_digest) for record in predecessors),
         )
 
+    def _pre_dispatch_bindings_are_valid(
+        self,
+        graph_run: GraphRunRecord,
+        node: Node,
+        request: WorkerRequest,
+        route: NodeRouteRecord,
+        dependency_ids: tuple[str, ...],
+    ) -> bool:
+        try:
+            persisted_run = self.store.get("graph_run_v2", graph_run.id, GraphRunRecord)
+            persisted_request = self.store.get("worker_request_v2", request.id, WorkerRequest)
+            persisted_route = self.store.get("node_route_v2", route.id, NodeRouteRecord)
+        except (KeyError, ValueError):
+            return False
+
+        expected_facts = self._routing_facts(
+            node,
+            dependency_ids,
+            self._deterministic_node_assessment(graph_run.id, node),
+            graph_run.effective_policy_digest,
+            graph_run.harness_digest,
+        )
+        required = set(expected_facts.required_capabilities)
+        available = set(graph_run.available_capabilities) - set(
+            graph_run.execution_policy.denied_capabilities
+        )
+        return not (
+            persisted_run != graph_run
+            or persisted_request != request
+            or persisted_route != route
+            or request.graph_run_id != graph_run.id
+            or request.node_id != node.id
+            or request.accepted_plan_digest != graph_run.accepted_graph_revision_digest
+            or request.accepted_graph_revision_digest != graph_run.accepted_graph_revision_digest
+            or request.generation != node.generation
+            or request.attempt != node.attempt
+            or request.task_kind != graph_run.goal.task_kind
+            or request.processes_authorized != graph_run.goal.processes_authorized
+            or request.harness_digest != graph_run.harness_digest
+            or request.effective_policy_digest != graph_run.effective_policy_digest
+            or request.required_capabilities != expected_facts.required_capabilities
+            or route.run_id != graph_run.id
+            or route.node_id != node.id
+            or route.accepted_graph_revision_digest != graph_run.accepted_graph_revision_digest
+            or route.generation != node.generation
+            or route.attempt != node.attempt
+            or route.effective_policy_digest != graph_run.effective_policy_digest
+            or route.harness_digest != graph_run.harness_digest
+            or route.routing_facts != expected_facts
+            or route.assessment.run_id != graph_run.id
+            or route.assessment.required_capabilities != expected_facts.required_capabilities
+            or not required <= set(route.selected_strategy.capabilities)
+            or not required <= available
+            or (request.task_kind == GoalTaskKind.NON_MUTATING and "edit_intent" in required)
+            or (not request.processes_authorized and "process" in required)
+        )
+
     def _worker_context_is_valid(
         self,
         node: Node,
@@ -4289,8 +4433,7 @@ class TaskOrchestrator:
             and request.task_kind == manifest.task_kind
             and request.processes_authorized == manifest.processes_authorized
             and canonical_digest(request.completion_criteria) == manifest.completion_criteria_digest
-            and request.completion_criteria
-            == tuple(item.description for item in node.completion_criteria)
+            and request.completion_criteria == node.completion_criteria
             and request.required_capabilities
             == node.required_capabilities
             == manifest.required_capabilities
@@ -4414,7 +4557,10 @@ class TaskOrchestrator:
                 and evaluation.accepted_graph_revision_digest
                 == repair.accepted_graph_revision_digest
             )
-        if len(feedback) < 2 or repair.reason_code != "ACCEPTED_NODE_EVALUATION_FEEDBACK":
+        if len(feedback) < 2 or repair.reason_code not in {
+            "ACCEPTED_NODE_EVALUATION_FEEDBACK",
+            _PROTOCOL_PREFLIGHT_CORRECTION_REASON,
+        }:
             return False
         history = self.store.list_records(
             "node_execution_v2", NodeExecutionRecord, run_id=request.graph_run_id
@@ -4865,6 +5011,47 @@ class TaskOrchestrator:
         if not self.store.put_owned_graph_run(owner, run, observed_at=observed_at):
             self._record_owner_fence("write", observed_at)
             raise RunOwnershipLost("only the authoritative owner can update the run")
+
+
+def _worker_request_contract_failure(node: Node, request: WorkerRequest) -> str | None:
+    if request.completion_criteria != node.completion_criteria:
+        return (
+            "worker request completion criteria do not preserve the accepted node contract; "
+            "rebuild the request from the persisted graph revision"
+        )
+    capabilities = set(request.required_capabilities)
+    for criterion in request.completion_criteria:
+        if isinstance(criterion, str):
+            return (
+                "worker request completion criteria omit typed evidence requirements; "
+                "persist and dispatch the accepted CompletionCriterion records"
+            )
+        if not criterion.mandatory:
+            continue
+        patch_required = "workspace_patch" in criterion.required_artifact_ids
+        if patch_required and request.task_kind == GoalTaskKind.NON_MUTATING:
+            return (
+                f"criterion {criterion.id} requires workspace_patch evidence, but the "
+                "non-mutating task contract cannot produce a workspace patch; select a "
+                "mutating edit_intent contract"
+            )
+        if patch_required and "edit_intent" not in capabilities:
+            return (
+                f"criterion {criterion.id} requires workspace_patch evidence, but the node "
+                "lacks the edit_intent capability; add it to the accepted node contract"
+            )
+        if criterion.source == "accepted_non_mutating_result" and (
+            request.task_kind != GoalTaskKind.NON_MUTATING
+            or criterion.id != f"criterion-{node.id}"
+            or criterion.description != "the node-bound worker result is accepted"
+            or criterion.required_artifact_ids
+        ):
+            return (
+                f"criterion {criterion.id} selects accepted_non_mutating_result evidence, "
+                "but its task/result binding is incompatible with that reserved source; "
+                "use the canonical node-bound non-mutating result criterion"
+            )
+    return None
 
 
 def _evaluate_criteria(

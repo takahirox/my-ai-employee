@@ -151,9 +151,17 @@ class LocalProcessExecutor:
             elif timed_out:
                 failure = self._failure(StableFailureCode.TIMEOUT, "process timed out")
                 status = "failed"
-            elif stdout_exceeded:
+            elif stdout_exceeded or stderr_exceeded:
+                exceeded_stream = (
+                    "stdout and stderr"
+                    if stdout_exceeded and stderr_exceeded
+                    else "stdout"
+                    if stdout_exceeded
+                    else "stderr"
+                )
                 failure = self._failure(
-                    StableFailureCode.BUDGET_EXCEEDED, "process output exceeded its byte budget"
+                    StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED,
+                    f"process {exceeded_stream} exceeded its configured byte limit",
                 )
                 status = "failed"
             elif process.returncode not in request.expected_exit_codes:
@@ -182,10 +190,21 @@ class LocalProcessExecutor:
                         "policy_digest": decision.effective_policy_digest,
                         "stdout_bytes": stdout_observed,
                         "stderr_bytes": stderr_observed,
+                        "stdout_limit_bytes": request.stdout_bytes,
+                        "stderr_limit_bytes": request.stderr_bytes,
                         "stdout_retained_bytes": len(stdout),
                         "stderr_retained_bytes": len(stderr),
                         "stdout_truncated": stdout_exceeded,
                         "stderr_truncated": stderr_exceeded,
+                        "output_limit_stream": (
+                            "stdout_and_stderr"
+                            if stdout_exceeded and stderr_exceeded
+                            else "stdout"
+                            if stdout_exceeded
+                            else "stderr"
+                            if stderr_exceeded
+                            else None
+                        ),
                         "process_group_cleanup": cleanup,
                     }
                 ),
@@ -234,17 +253,10 @@ class LocalProcessExecutor:
             elapsed = time.monotonic() - started
             cancelled = cancellation.cancelled()
             timed_out = elapsed >= timeout
-            if stdout_exceeded and not cancelled and not timed_out and process.poll() is None:
-                try:
-                    process.wait(timeout=0.05)
-                except subprocess.TimeoutExpired:
-                    outcome = self._terminate_group(process)
-                    if cleanup == "not_required" or outcome != "already_exited":
-                        cleanup = outcome
-            elif cancelled or timed_out:
-                outcome = self._terminate_group(process)
-                if cleanup == "not_required" or outcome != "already_exited":
-                    cleanup = outcome
+            if (
+                stdout_exceeded or stderr_exceeded or cancelled or timed_out
+            ) and cleanup == "not_required":
+                cleanup = self._terminate_group(process)
             for key, _events in selector.select(timeout=0.05):
                 buffer, limit = key.data
                 chunk = os.read(key.fd, 64 * 1024)
@@ -282,7 +294,13 @@ class LocalProcessExecutor:
             if leader_exited:
                 return "sigkill_confirmed"
             process.wait(timeout=self.terminate_grace_seconds)
-            return "sigterm_confirmed"
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return "sigterm_confirmed"
+            except PermissionError:
+                return "already_exited"
+            return "sigkill_confirmed"
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
@@ -290,6 +308,14 @@ class LocalProcessExecutor:
         except ProcessLookupError:
             return "already_exited"
         except PermissionError:
+            if leader_exited or process.poll() is not None:
+                return "already_exited"
+            try:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                return "already_exited"
             raise _ProcessGroupCleanupError(
                 "process group cleanup could not be confirmed"
             ) from None

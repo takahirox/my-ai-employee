@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -55,7 +56,7 @@ from ai_employee.orchestration import (
 )
 from ai_employee.run_explanation import explain_any_run
 from ai_employee.runtime import DeterministicRuntime
-from ai_employee.serialization import canonical_digest
+from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.services_v2 import AtomicArtifactStore, GitWorkspaceManager
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import (
@@ -222,7 +223,11 @@ class BoundProcessExecutor:
             failure=StableFailure(code=self.code, message="bounded worker failure"),
             exit_code=7,
             duration_seconds=0.25,
-            resource_usage={"stdout_bytes": 17, "stderr_bytes": 23},
+            resource_usage={
+                "stdout_bytes": 17,
+                "stderr_bytes": 23,
+                "process_group_cleanup": "sigterm_confirmed",
+            },
             stdout_artifact_digest="1" * 64,
             stderr_artifact_digest="2" * 64,
         )
@@ -297,6 +302,26 @@ def worker_request(goal: str = "make a bounded change") -> WorkerRequest:
         effective_policy_digest=ZERO,
         remaining_budgets={"worker_turns": 1},
     )
+
+
+def test_worker_request_preserves_legacy_string_criterion_digest() -> None:
+    legacy = WorkerRequest(
+        id="legacy-criterion-request",
+        run_id="legacy-criterion-run",
+        created_at=NOW,
+        goal="read a historical request",
+        completion_criteria=("the historical criterion passed",),
+        accepted_plan_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=ZERO,
+        remaining_budgets={"worker_turns": 1},
+    )
+    payload = json.loads(canonical_json(legacy.model_dump()))
+    restored = WorkerRequest.model_validate_json(canonical_json(payload))
+
+    assert payload["completion_criteria"] == ["the historical criterion passed"]
+    assert restored == legacy
+    assert restored.content_digest == legacy.content_digest
 
 
 def builtin_policy(run_id: str) -> PolicyLayer:
@@ -1238,11 +1263,11 @@ def test_cli_worker_does_not_split_header_shaped_hunk_content() -> None:
     ),
 )
 def test_cli_worker_rejects_unsafe_or_unrecognized_headerless_paths(patch: str) -> None:
-    with pytest.raises(ValueError, match="header-less unified diff"):
+    with pytest.raises(ValueError, match="edit-intent diff is invalid; correct section 1"):
         _validate_worker_envelope(_edit_envelope(patch, ("safe.txt",)))
 
 
-def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> None:
+def test_codex_adapter_classifies_headerless_rename_as_invalid_edit_diff() -> None:
     output = json.loads(_edit_envelope("--- a/old.txt\n+++ b/new.txt\n", ("old.txt", "new.txt")))
     output.update({"assistant_note": "", "usage_json": "{}"})
     executor = SuccessfulExecutor()
@@ -1267,7 +1292,102 @@ def test_codex_adapter_classifies_headerless_rename_as_malformed_envelope() -> N
     assert result.failure is not None
     assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
     assert result.boundary_diagnostic is not None
-    assert result.boundary_diagnostic.code == "WORKER_ENVELOPE_MALFORMED"
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("patch", "paths"),
+    (
+        (
+            "diff --git a/created.txt b/created.txt\n"
+            "new file mode 100644\n"
+            "--- dev/null\n"
+            "+++ b/created.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+created\n",
+            ("created.txt",),
+        ),
+        (
+            "diff --git a/actual.txt b/actual.txt\n"
+            "--- a/actual.txt\n"
+            "+++ b/actual.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n",
+            ("declared.txt",),
+        ),
+    ),
+)
+def test_codex_adapter_rejects_invalid_edit_diff_before_action_dispatch(
+    patch: str,
+    paths: tuple[str, ...],
+) -> None:
+    output = json.loads(_edit_envelope(patch, paths))
+    output.update({"assistant_note": "", "usage_json": "{}"})
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(  # type: ignore[method-assign]
+        id="invalid-diff-process",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+    channel = Channel()
+
+    result = CodexCliWorkerAdapter(
+        executor,
+        lambda _digest: json.dumps(output).encode(),
+        allow_worker,
+        run_id="run-1",
+    ).propose(worker_request(), channel)  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.WORKER_PROTOCOL_ERROR
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+    assert channel.submissions == 0
+    assert "created\n" not in result.boundary_diagnostic.exception_message
+    assert "before" not in result.boundary_diagnostic.exception_message
+
+
+def test_scripted_adapter_rejects_noncanonical_dev_null_before_action_dispatch() -> None:
+    patch = (
+        "diff --git a/created.txt b/created.txt\n"
+        "new file mode 100644\n"
+        "--- dev/null\n"
+        "+++ b/created.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+private-body-canary\n"
+    )
+    channel = Channel()
+    edit = EditIntentRequest(
+        id="invalid-edit",
+        run_id="run-1",
+        created_at=NOW,
+        paths=("created.txt",),
+        summary="Exercise pre-dispatch validation.",
+        unified_diff=patch,
+    )
+    proposal = ActionProposal(
+        id="invalid-proposal",
+        run_id="run-1",
+        created_at=NOW,
+        worker_id="worker-1",
+        kind=ActionKind.EDIT_INTENT,
+        payload=edit,
+        reason="Verify the invalid diff cannot reach mediation.",
+    )
+    envelope = WorkerProposalEnvelope(proposals=(proposal,))
+    result = ScriptedWorkerAdapter([envelope]).propose(worker_request(), channel)  # type: ignore[arg-type]
+
+    assert result.status == "failed"
+    assert result.boundary_diagnostic is not None
+    assert result.boundary_diagnostic.code == "EDIT_INTENT_DIFF_INVALID"
+    assert "private-body-canary" not in result.boundary_diagnostic.exception_message
+    assert channel.submissions == 0
 
 
 _HEADERLESS_TWO_FILE_PATCH = (
@@ -1359,6 +1479,15 @@ def test_headerless_sections_reject_base_mismatch_through_workspace_manager(
 
     assert result.failure is not None
     assert result.failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+    details = result.failure.details
+    assert isinstance(details, Mapping)
+    assert details["cause"] == "stale_workspace_baseline"
+    assert details["captured_source_head"] == snapshot.head_commit
+    assert details["captured_base_tree"] == snapshot.base_tree
+    assert details["workspace_digest"] == snapshot.content_digest
+    assert details["file_count"] == 2
+    assert details["hunk_count"] == 2
+    assert "not the base" not in json.dumps(dict(details))
     isolated = Path(snapshot.isolated_worktree)
     assert (isolated / "first.txt").read_text() == "before one\n"
     assert (isolated / "second.txt").read_text() == "before two\n"
@@ -1853,6 +1982,7 @@ def test_cli_worker_expands_flattened_markdown_new_file_diff() -> None:
         (StableFailureCode.CANCELLED, "cancelled"),
         (StableFailureCode.SPAWN_FAILED, "failed"),
         (StableFailureCode.PROCESS_FAILED, "failed"),
+        (StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED, "failed"),
         (StableFailureCode.POLICY_DENIED, "failed"),
         (StableFailureCode.APPROVAL_REQUIRED, "failed"),
     ),
@@ -1866,6 +1996,8 @@ def test_cli_worker_preserves_process_failure_and_diagnostics(
         allow_worker,
         run_id="run-1",
         timeout_seconds=30.0,
+        stdout_limit_bytes=16,
+        stderr_limit_bytes=16,
     ).propose(worker_request(), Channel())  # type: ignore[arg-type]
 
     assert result.status == status
@@ -1880,6 +2012,11 @@ def test_cli_worker_preserves_process_failure_and_diagnostics(
     assert diagnostic.configured_timeout_seconds == 30.0
     assert diagnostic.effective_timeout_seconds == 12.0
     assert (diagnostic.stdout_bytes, diagnostic.stderr_bytes) == (17, 23)
+    assert result.resource_usage["stdout_limit_bytes"] == 16
+    assert result.resource_usage["stderr_limit_bytes"] == 16
+    assert result.resource_usage["output_limit_stream"] == "stdout_and_stderr"
+    assert result.resource_usage["process_group_cleanup"] == "sigterm_confirmed"
+    assert {"stdout_body", "stderr_body"}.isdisjoint(diagnostic.model_dump())
 
 
 @pytest.mark.parametrize(
@@ -2675,3 +2812,108 @@ def test_offline_work_run_applies_typed_edit_only_in_isolated_worktree(
         actions = store.list_records("action_result_v2", ExecutionResult, run_id=run.id)
         assert len(actions) == 1
         assert actions[0].request_digest == edit.content_digest
+        assert not any(
+            item.kind == "workspace_preflight_failed" for item in store.work_events(run.id)
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "preflight_case",
+        "expected_code",
+        "expected_cause",
+        "tracked_count",
+        "untracked_count",
+    ),
+    (
+        ("tracked", "SOURCE_WORKTREE_DIRTY", "dirty_source_worktree", 1, 0),
+        ("untracked", "SOURCE_WORKTREE_DIRTY", "dirty_source_worktree", 0, 1),
+        ("stale", "PATCH_PREFLIGHT_FAILED", "source_head_mismatch", 0, 0),
+    ),
+)
+def test_workspace_preflight_fails_closed_before_worker_dispatch(
+    tmp_path: Path,
+    preflight_case: str,
+    expected_code: str,
+    expected_cause: str,
+    tracked_count: int,
+    untracked_count: int,
+) -> None:
+    repository = tmp_path / "preflight-repo"
+    repository.mkdir()
+    subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "fleet@example.invalid"),
+        check=True,
+    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True)
+    source = repository / "file.txt"
+    source.write_text("base\n")
+    subprocess.run(("git", "-C", str(repository), "add", "file.txt"), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    requested_head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    canary = f"private-{preflight_case}-canary"
+    private_path = repository / "private-untracked.txt"
+    if preflight_case == "untracked":
+        private_path.write_text(canary)
+    else:
+        source.write_text(f"{canary}\n")
+        if preflight_case == "stale":
+            subprocess.run(("git", "-C", str(repository), "commit", "-qam", "advance"), check=True)
+    captured_head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    dispatches: list[str] = []
+
+    def worker_factory(
+        snapshot: WorkspaceSnapshot | None, _cancellation: object
+    ) -> ScriptedWorkerAdapter:
+        if snapshot is not None:
+            dispatches.append(snapshot.id)
+        return ScriptedWorkerAdapter([WorkerProposalEnvelope()])
+
+    artifacts = AtomicArtifactStore(tmp_path / "preflight-artifacts")
+    with SQLiteStore(tmp_path / "preflight.db") as store:
+        coordinator = WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            GitWorkspaceManager(tmp_path / "preflight-workspaces", artifacts),
+            worker_factory,  # type: ignore[arg-type]
+            lambda _snapshot: SuccessfulExecutor(),  # type: ignore[return-value]
+            lambda descriptor: artifacts.open_verified(descriptor).read(),
+            (builtin_policy(f"work-{preflight_case}"),),
+        )
+        run = coordinator.start(
+            "change file safely",
+            str(repository),
+            requested_head,
+            worker_name="scripted",
+            run_id=f"work-{preflight_case}",
+        )
+        view = inspect_work_run(store, run.id)
+
+    assert run.status == "failed"
+    assert run.failure_code == expected_code
+    assert dispatches == []
+    assert view["workspace"] == []
+    assert view["worker"]["results"] == []
+    diagnostic = next(
+        item for item in view["events"] if item["kind"] == "workspace_preflight_failed"
+    )["details"]
+    assert diagnostic["stable_failure_code"] == expected_code
+    facts = diagnostic["facts"]
+    assert facts["cause"] == expected_cause
+    assert facts["captured_source_head"] == captured_head
+    assert facts["requested_base_commit"] == requested_head
+    assert facts["tracked_file_count"] == tracked_count
+    assert facts["untracked_file_count"] == untracked_count
+    assert facts["file_count"] == tracked_count + untracked_count
+    assert facts["hunk_count"] == 0
+    assert canary not in json.dumps(diagnostic)
+    assert "private-untracked.txt" not in json.dumps(diagnostic)
+    if preflight_case == "untracked":
+        assert private_path.read_text() == canary
+    else:
+        assert source.read_text() == f"{canary}\n"

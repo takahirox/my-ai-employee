@@ -720,6 +720,8 @@ def _authoritative_node_result(
         raise ValueError("inner work run has stale graph/node/attempt bindings")
     if store.get("worker_request_v2", request.id, WorkerRequest) != request:
         raise ValueError("exact worker request was not persisted")
+    if request.completion_criteria != node.completion_criteria:
+        raise ValueError("worker request criteria are stale or mismatched")
     if run.worker_result_id is None:
         raise ValueError("inner work run has no worker result")
     worker_result = store.get("worker_result_v2", run.worker_result_id, WorkerResult)

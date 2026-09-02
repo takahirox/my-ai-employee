@@ -16,7 +16,11 @@ from ai_employee.domain.v2 import (
 )
 from ai_employee.inspector import inspect_any_run, inspect_fleet_runs
 from ai_employee.orchestration import WorkRun
-from ai_employee.run_explanation import _explain_graph_run, explain_any_run
+from ai_employee.run_explanation import (
+    _explain_graph_run,
+    _primary_root_cause,
+    explain_any_run,
+)
 from ai_employee.serialization import canonical_json
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import NodeExecutionRecord
@@ -98,6 +102,165 @@ def test_work_explanation_includes_policy_denial_as_a_failure_cause(tmp_path: Pa
             },
             {"stage": "run", "reason_code": "POLICY_DENIED"},
         ]
+
+
+def test_primary_root_cause_prefers_boundary_diagnostic_and_caps_heartbeats() -> None:
+    heartbeats = [
+        {
+            "node_id": "node-a",
+            "generation": 2,
+            "attempt": 1,
+            "sequence": sequence,
+            "elapsed_seconds": float(sequence * 10),
+            "remaining_seconds": float(50 - sequence * 10),
+            "stdout_bytes": sequence,
+            "stderr_bytes": sequence + 1,
+            "no_observable_progress": True,
+            "hard_timeout_reached": sequence == 4,
+        }
+        for sequence in range(5)
+    ]
+    projection = {
+        "state": "failed",
+        "generation": 2,
+        "run": {"failure_code": "NODE_EXECUTION_FAILED"},
+        "node_history": [
+            {
+                "node_id": "node-a",
+                "generation": 2,
+                "attempt": 1,
+                "sequence": 7,
+                "status": "failed",
+                "failure_code": "NODE_EXECUTION_FAILED",
+            }
+        ],
+        "child_worker_outcomes": {
+            "diagnostics": [
+                {
+                    "id": "timeout-diagnostic",
+                    "code": "CANCELLED",
+                    "stage": "process",
+                    "node_id": "node-a",
+                    "generation": 2,
+                    "attempt": 1,
+                    "configured_timeout_seconds": 60.0,
+                    "effective_timeout_seconds": 45.0,
+                    "stdout_bytes": 123,
+                    "stderr_bytes": 45,
+                    "stdout_limit_bytes": 1_000,
+                    "stderr_limit_bytes": 2_000,
+                    "process_group_cleanup": "confirmed",
+                }
+            ]
+        },
+        "node_watchdogs": [
+            {
+                "node_id": "node-a",
+                "generation": 2,
+                "attempt": 1,
+                "outcome": "cleanup_confirmed",
+            }
+        ],
+        "worker_attempt_heartbeats": heartbeats,
+    }
+
+    cause = _primary_root_cause(projection)
+
+    assert cause is not None
+    assert cause["code"] == "TIMEOUT"
+    assert cause["stage"] == "watchdog"
+    assert (cause["node_id"], cause["generation"], cause["attempt"]) == (
+        "node-a",
+        2,
+        1,
+    )
+    assert cause["configured_timeout_seconds"] == 60.0
+    assert cause["effective_timeout_seconds"] == 45.0
+    assert cause["stdout_bytes"] == 123
+    assert cause["stderr_bytes"] == 45
+    assert cause["watchdog"] == {
+        "signal_sent": True,
+        "cleanup_outcome": "cleanup_confirmed",
+    }
+    assert cause["wrapper_context"] == {
+        "status": "failed",
+        "code": "NODE_EXECUTION_FAILED",
+    }
+    assert cause["no_progress_heartbeat_count"] == 5
+    assert cause["omitted_no_progress_heartbeat_count"] == 2
+    assert [item["sequence"] for item in cause["recent_no_progress_heartbeats"]] == [2, 3, 4]
+    assert projection["worker_attempt_heartbeats"] == heartbeats
+
+
+@pytest.mark.parametrize(
+    ("projection", "expected_code", "expected_stage"),
+    (
+        (
+            {
+                "state": "failed",
+                "generation": 0,
+                "run": {
+                    "node_id": "workspace-node",
+                    "failure_code": "SOURCE_WORKTREE_DIRTY",
+                },
+                "events": [
+                    {
+                        "kind": "workspace_preflight_failed",
+                        "details": {
+                            "stable_failure_code": "SOURCE_WORKTREE_DIRTY",
+                            "message": "bounded safe message",
+                            "facts": {
+                                "cause": "dirty_source_worktree",
+                                "intentionally_withheld_path": "must-not-project",
+                            },
+                        },
+                    }
+                ],
+            },
+            "SOURCE_WORKTREE_DIRTY",
+            "workspace_preflight",
+        ),
+        (
+            {
+                "state": "failed",
+                "generation": 1,
+                "run": {"failure_code": "NODE_EXECUTION_FAILED"},
+                "nodes": [
+                    {
+                        "node_id": "dispatch-node",
+                        "generation": 1,
+                        "attempt": 0,
+                        "status": "failed",
+                        "failure_code": "NODE_EXECUTION_FAILED",
+                    }
+                ],
+                "worker_boundary_diagnostics": [
+                    {
+                        "code": "WORKER_DISPATCH_CONTRACT_CONTRADICTION",
+                        "stage": "pre_dispatch",
+                        "node_id": "dispatch-node",
+                        "generation": 1,
+                        "attempt": 0,
+                        "exception_message": "safe but not needed in History",
+                    }
+                ],
+            },
+            "WORKER_DISPATCH_CONTRACT_CONTRADICTION",
+            "pre_dispatch",
+        ),
+    ),
+)
+def test_primary_root_cause_uses_preflight_records_without_payload_leakage(
+    projection: dict[str, object], expected_code: str, expected_stage: str
+) -> None:
+    cause = _primary_root_cause(projection)
+
+    assert cause is not None
+    assert cause["code"] == expected_code
+    assert cause["stage"] == expected_stage
+    serialized = canonical_json(cause)
+    assert "must-not-project" not in serialized
+    assert "exception_message" not in serialized
 
 
 def test_unknown_run_is_not_reconstructed_or_created(tmp_path: Path) -> None:

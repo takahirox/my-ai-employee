@@ -525,6 +525,75 @@ def test_retry_and_repair_have_independent_budgets(tmp_path: Path) -> None:
     assert replay.loop_transitions[1].consumed == 1
 
 
+def test_protocol_correction_does_not_consume_semantic_repair_budget(
+    tmp_path: Path,
+) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        if request.attempt == 0:
+            return _result(request, "blocked").model_copy(
+                update={"failure_code": StableFailureCode.WORKER_PROTOCOL_ERROR.value}
+            )
+        if request.attempt == 1:
+            return _result(request, "blocked").model_copy(
+                update={"failure_code": StableFailureCode.VERIFICATION_FAILED.value}
+            )
+        return _result(request, "satisfied")
+
+    with SQLiteStore(tmp_path / "protocol-semantic.db") as store:
+        orchestrator, run = _run(store, graph, goal, runner, run_id="closed-loop-protocol-semantic")
+        replay = orchestrator.replay("closed-loop-protocol-semantic")
+
+    assert run.status == "completed"
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.REPAIR,
+        LoopAction.PASS,
+    ]
+    assert [item.reason_code for item in replay.loop_transitions] == [
+        "ACCEPTED_PROTOCOL_PREFLIGHT_CORRECTION",
+        "ACCEPTED_NODE_EVALUATION_FEEDBACK",
+        "NODE_EVALUATION_PASS",
+    ]
+    assert [item.consumed for item in replay.loop_transitions] == [1, 1, 0]
+
+
+def test_preflight_correction_terminates_at_its_own_bound(
+    tmp_path: Path,
+) -> None:
+    goal, graph, _node = _inputs(max_repairs=1)
+
+    def runner(
+        _bound_node: Node,
+        request: WorkerRequest,
+        _selected: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        return _result(request, "blocked").model_copy(
+            update={"failure_code": StableFailureCode.PATCH_PREFLIGHT_FAILED.value}
+        )
+
+    with SQLiteStore(tmp_path / "preflight-exhausted.db") as store:
+        orchestrator, run = _run(
+            store, graph, goal, runner, run_id="closed-loop-preflight-exhausted"
+        )
+        replay = orchestrator.replay("closed-loop-preflight-exhausted")
+
+    assert run.status == "failed"
+    assert [item.action for item in replay.loop_transitions] == [
+        LoopAction.REPAIR,
+        LoopAction.ESCALATE,
+    ]
+    assert replay.loop_transitions[0].reason_code == ("ACCEPTED_PROTOCOL_PREFLIGHT_CORRECTION")
+    exhausted = replay.loop_transitions[-1]
+    assert exhausted.reason_code == "REPAIR_BUDGET_EXHAUSTED"
+    assert exhausted.consumed == exhausted.limit == 1
+
+
 def test_non_repairable_evaluation_selects_terminal_fail(tmp_path: Path) -> None:
     goal, graph, _node = _inputs()
 

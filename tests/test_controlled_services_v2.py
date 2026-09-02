@@ -180,44 +180,119 @@ def test_process_executor_filters_environment_and_bounds_output(tmp_path: Path) 
     noisy = ProcessRequest.model_validate(noisy.model_dump(), strict=True)
     failed = executor.execute(noisy, allow(noisy.content_digest or ""), NeverCancelled())
     assert failed.failure is not None
-    assert failed.failure.code.value == "BUDGET_EXCEEDED"
+    assert failed.failure.code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+    assert failed.failure.message == "process stdout exceeded its configured byte limit"
+    assert failed.resource_usage["stdout_bytes"] == 5
+    assert failed.resource_usage["stderr_bytes"] == 0
+    assert failed.resource_usage["stdout_limit_bytes"] == 4
+    assert failed.resource_usage["stderr_limit_bytes"] == 100
+    assert failed.resource_usage["stdout_retained_bytes"] == 4
+    assert failed.resource_usage["output_limit_stream"] == "stdout"
+    assert failed.resource_usage["process_group_cleanup"] in {
+        "already_exited",
+        "sigterm_confirmed",
+        "sigkill_confirmed",
+    }
 
 
-@pytest.mark.parametrize("stderr_size", (3, 4, 5, 17))
-def test_process_executor_truncates_diagnostic_stderr_without_failing_valid_stdout(
-    tmp_path: Path,
-    stderr_size: int,
-) -> None:
+def test_process_executor_accepts_output_exactly_at_both_limits(tmp_path: Path) -> None:
     store = AtomicArtifactStore(tmp_path / "artifacts")
     executor = LocalProcessExecutor((tmp_path,), store)
     request = ProcessRequest(
-        id=f"stderr-{stderr_size}",
+        id="bounded-output",
         run_id="run-stderr",
         created_at=NOW,
-        argv=(
-            "/bin/sh",
-            "-c",
-            f"printf valid; printf '%0{stderr_size}d' 0 >&2",
-        ),
+        argv=("/bin/sh", "-c", "printf good; printf info >&2"),
         timeout_seconds=10.0,
-        stdout_bytes=100,
+        stdout_bytes=4,
         stderr_bytes=4,
-        purpose="retain bounded diagnostics without losing valid output",
+        purpose="accept successful output exactly at both configured limits",
     )
 
     result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
 
     assert result.status == "succeeded"
+    assert result.resource_usage["stdout_bytes"] == 4
+    assert result.resource_usage["stderr_bytes"] == 4
+    assert result.resource_usage["stdout_truncated"] is False
+    assert result.resource_usage["stderr_truncated"] is False
+    assert result.resource_usage["process_group_cleanup"] == "not_required"
+
+
+def test_process_executor_fails_closed_on_stderr_only_overflow_and_confirms_cleanup(
+    tmp_path: Path,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.5)
+    request = ProcessRequest(
+        id="stderr-overflow",
+        run_id="run-stderr",
+        created_at=NOW,
+        argv=(
+            "/bin/sh",
+            "-c",
+            "trap 'printf term > stderr-terminated; exit 0' TERM; "
+            "while :; do printf 12345 >&2; done",
+        ),
+        timeout_seconds=10.0,
+        stdout_bytes=4,
+        stderr_bytes=4,
+        purpose="fail closed on stderr-only overflow and confirm process cleanup",
+    )
+
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+    assert result.failure.message == "process stderr exceeded its configured byte limit"
+    assert result.resource_usage["stdout_bytes"] == 0
+    assert result.resource_usage["stderr_bytes"] > 4
+    assert result.resource_usage["stdout_limit_bytes"] == 4
+    assert result.resource_usage["stderr_limit_bytes"] == 4
+    assert result.resource_usage["stderr_retained_bytes"] == 4
+    assert result.resource_usage["output_limit_stream"] == "stderr"
+    assert result.resource_usage["process_group_cleanup"] == "sigterm_confirmed"
+    assert (tmp_path / "stderr-terminated").read_text() == "term"
     assert result.stderr_artifact_digest is not None
     descriptor = executor.output_descriptor(result.stderr_artifact_digest)
     descriptor_path = (
         store.content_root / descriptor.artifact_digest[:2] / descriptor.artifact_digest
     )
-    assert len(descriptor_path.read_bytes()) == min(stderr_size, 4)
-    assert result.resource_usage["stderr_bytes"] == stderr_size
-    assert result.resource_usage["stderr_retained_bytes"] == min(stderr_size, 4)
-    assert result.resource_usage["stderr_truncated"] is (stderr_size > 4)
-    assert result.resource_usage["stdout_truncated"] is False
+    assert len(descriptor_path.read_bytes()) == 4
+
+
+def test_stderr_overflow_kills_term_ignoring_descendant_after_leader_exit(
+    tmp_path: Path,
+) -> None:
+    store = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor((tmp_path,), store, terminate_grace_seconds=0.5)
+    request = ProcessRequest(
+        id="stderr-overflow-descendant",
+        run_id="run-stderr-descendant",
+        created_at=NOW,
+        argv=(
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; "
+            "(trap '' TERM; touch descendant-ready; while :; do :; done) & "
+            "while [ ! -f descendant-ready ]; do :; done; "
+            "while :; do printf 12345 >&2; done",
+        ),
+        timeout_seconds=10.0,
+        stdout_bytes=4,
+        stderr_bytes=4,
+        purpose="confirm output overflow cleans a TERM-ignoring descendant group",
+    )
+
+    result = executor.execute(request, allow(request.content_digest or ""), NeverCancelled())
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+    assert result.duration_seconds < 2.0
+    assert result.resource_usage["output_limit_stream"] == "stderr"
+    assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
 
 
 def test_process_output_descriptor_requires_exact_provenance_when_digest_repeats(
