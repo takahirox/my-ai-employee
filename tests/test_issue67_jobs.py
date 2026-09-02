@@ -269,6 +269,11 @@ def test_repository_filter_keeps_global_job_failure_without_leaking_children(
                 "generation": 0,
                 "goal": {"statement": f"Goal for {run_id}"},
                 "graph_acceptance": None,
+                "attention": (
+                    [{"kind": "run", "condition": "hidden failure"}] if run_id == "child-b" else []
+                ),
+                "attention_count": 1 if run_id == "child-b" else 0,
+                "attention_available": True,
             }
 
         monkeypatch.setattr("ai_employee.inspector.inspect_any_run", projection)
@@ -284,3 +289,7 @@ def test_repository_filter_keeps_global_job_failure_without_leaking_children(
     }
     assert job["aggregate_scope"] == "global_job"
     assert [child["run_id"] for child in job["child_graph_runs"]] == ["child-a"]
+    assert job["attention"] == []
+    assert job["attention_count"] == 0
+    assert job["requires_attention"] is False
+    assert "child-b" not in repr(job)

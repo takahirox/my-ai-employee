@@ -1446,6 +1446,31 @@ def inspect_fleet_runs(
                 visible["current_status"] = latest.get("status")
                 visible["visible_child_count"] = len(children)
                 visible["aggregate_scope"] = "global_job"
+                visible["phase"] = (
+                    f"{len(children)} visible child Graph Run(s); "
+                    f"current: {visible['current_status']}"
+                )
+                visible_attention = [
+                    {**fact, "run_id": child["run_id"]}
+                    for child in children
+                    for fact in _as_dicts(child.get("attention"))
+                ]
+                visible["attention"] = visible_attention
+                visible["attention_count"] = sum(
+                    int(child.get("attention_count") or 0) for child in children
+                )
+                visible["attention_available"] = all(
+                    child.get("attention_available", True) is not False for child in children
+                )
+                visible["requires_attention"] = any(
+                    bool(child.get("requires_attention")) for child in children
+                )
+                visible_timestamps = [
+                    str(child["last_updated_at"])
+                    for child in children
+                    if isinstance(child.get("last_updated_at"), str)
+                ]
+                visible["last_updated_at"] = max(visible_timestamps) if visible_timestamps else None
                 repositories = {
                     str(child["repository"])
                     for child in children

@@ -138,6 +138,17 @@ class LocalProcessExecutor:
                     timed_out,
                     cleanup,
                 ) = self._capture(process, request, cancellation, started, timeout)
+            except BaseException as error:
+                try:
+                    self._terminate_group(process)
+                except _ProcessGroupCleanupError as cleanup_error:
+                    raise cleanup_error from error
+                finally:
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    if process.stderr is not None:
+                        process.stderr.close()
+                raise
             finally:
                 if stdin_handle is not None:
                     stdin_handle.close()
