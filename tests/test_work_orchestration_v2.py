@@ -14,6 +14,9 @@ from ai_employee.domain import (
     CompletionCriterion,
     ExecutionStrategy,
     GoalTaskKind,
+    Node,
+    NodeKind,
+    OutputContract,
     RoutingMode,
     SemanticAmbiguity,
     SemanticReasoningClass,
@@ -47,6 +50,7 @@ from ai_employee.domain.v2 import (
     WorkspaceRequest,
     WorkspaceSnapshot,
 )
+from ai_employee.graph_execution import _authoritative_node_result
 from ai_employee.inspector import inspect_work_run
 from ai_employee.orchestration import (
     WorkCoordinator,
@@ -276,7 +280,7 @@ class FakeWorkspace:
         generated_paths: tuple[str, ...] = (),
         harness_digest: str | None = None,
     ) -> ArtifactDescriptor:
-        assert snapshot is self.snapshot
+        assert snapshot == self.snapshot
         self.capture_count += 1
         body = self.patch if self.capture_count == 1 else self.subsequent_patch
         digest = sha256(body).hexdigest()
@@ -290,6 +294,7 @@ class FakeWorkspace:
             logical_kind="workspace_patch",
             producer_action_id=snapshot.id,
             source={
+                "base_tree": snapshot.base_tree,
                 "workspace_digest": snapshot.content_digest,
                 "generated_paths": generated_paths,
                 "harness_digest": harness_digest,
@@ -2637,6 +2642,14 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         process_request_id=verification.id,
         process_request_digest=verification.content_digest or ZERO,
     )
+    completion_criteria = (
+        CompletionCriterion(
+            id="criterion-test",
+            description="the exact candidate passes tests",
+            verification_requirement_ids=("test",),
+            required_artifact_ids=("workspace_patch",),
+        ),
+    )
     request = WorkerRequest(
         id="accepted-mutation-request",
         run_id=run_id,
@@ -2649,6 +2662,7 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
         remaining_budgets={"worker_turns": 1},
+        completion_criteria=completion_criteria,
     )
     with SQLiteStore(tmp_path / "mutation.db") as store:
         coordinator = WorkCoordinator(
@@ -2669,14 +2683,7 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         )
         run = coordinator.execute_node(
             request,
-            (
-                CompletionCriterion(
-                    id="criterion-test",
-                    description="the exact candidate passes tests",
-                    verification_requirement_ids=("test",),
-                    required_artifact_ids=("workspace_patch",),
-                ),
-            ),
+            completion_criteria,
             str(tmp_path),
             "a" * 40,
             worker_name="scripted",
@@ -2694,6 +2701,20 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         )
         facts = event["details"]["facts"]
         explanation = _explain_work_run(inspect_work_run(store, run.id))
+        authoritative = _authoritative_node_result(
+            coordinator,
+            Node(
+                id="fix",
+                kind=NodeKind.FUNCTION,
+                name="fix",
+                objective="make an exactly verified change",
+                output_contract=OutputContract(id="mutation-contract"),
+                required_capabilities=("edit_intent", "process"),
+                completion_criteria=completion_criteria,
+            ),
+            request,
+            run,
+        )
 
     assert run.status == "failed"
     assert run.failure_code == StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
@@ -2705,6 +2726,7 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
     assert facts["changed_paths_truncated"] is False
     assert explanation["primary_root_cause"]["code"] == "VERIFICATION_WORKSPACE_MUTATED"
     assert explanation["primary_root_cause"]["stage"] == "verification_workspace"
+    assert authoritative.failure_code == "VERIFICATION_WORKSPACE_MUTATED"
 
 
 def _complete_coordinator_run(

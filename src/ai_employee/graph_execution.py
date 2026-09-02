@@ -824,14 +824,6 @@ def _authoritative_node_result(
         and run.status == "failed"
         and run.failure_code == StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
     )
-    if verification_workspace_mutated:
-        return NodeExecutionResult(
-            worker_result=worker_result,
-            criterion_evidence=(),
-            workspace_id=run.workspace_id,
-            result_acceptance=result_acceptance,
-            failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
-        )
     if writing:
         binding_configuration_valid = _node_verification_configuration_is_valid(
             run.id,
@@ -898,7 +890,9 @@ def _authoritative_node_result(
         and run.failure_code == StableFailureCode.VERIFICATION_FAILED.value
     )
     if (
-        run.status != expected_status and not repairable_verification_failure
+        run.status != expected_status
+        and not repairable_verification_failure
+        and not verification_workspace_mutated
     ) or worker_result.status != "succeeded":
         raise ValueError("inner work run did not reach its authoritative terminal state")
     descriptors = tuple(
@@ -1045,6 +1039,17 @@ def _authoritative_node_result(
                 harness_digest=request.harness_digest,
             )
         except (OSError, ValueError):
+            if verification_workspace_mutated and not _workspace_mutation_event_is_authoritative(
+                store,
+                run,
+                candidate_patch_digest=patch.artifact_digest,
+                workspace_digest=_required(workspace.content_digest),
+                recaptured_patch_digest=None,
+                recapture_failed=True,
+            ):
+                raise ValueError(
+                    "verification workspace mutation diagnostic is absent or stale"
+                ) from None
             return NodeExecutionResult(
                 worker_result=worker_result,
                 criterion_evidence=(),
@@ -1053,6 +1058,15 @@ def _authoritative_node_result(
                 failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
             )
         if current_patch.artifact_digest != patch.artifact_digest:
+            if verification_workspace_mutated and not _workspace_mutation_event_is_authoritative(
+                store,
+                run,
+                candidate_patch_digest=patch.artifact_digest,
+                workspace_digest=_required(workspace.content_digest),
+                recaptured_patch_digest=current_patch.artifact_digest,
+                recapture_failed=False,
+            ):
+                raise ValueError("verification workspace mutation diagnostic is absent or stale")
             return NodeExecutionResult(
                 worker_result=worker_result,
                 criterion_evidence=(),
@@ -1060,6 +1074,8 @@ def _authoritative_node_result(
                 result_acceptance=result_acceptance,
                 failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
             )
+        if verification_workspace_mutated:
+            raise ValueError("verification workspace mutation classification has no live mismatch")
 
     verification_digests = tuple(
         _required(item.content_digest) for item in authoritative_verification_results
@@ -1155,6 +1171,65 @@ def _required(value: str | None) -> str:
     if value is None:
         raise ValueError("authoritative record is missing its digest")
     return value
+
+
+def _workspace_mutation_event_is_authoritative(
+    store: SQLiteStore,
+    run: WorkRun,
+    *,
+    candidate_patch_digest: Digest,
+    workspace_digest: Digest,
+    recaptured_patch_digest: Digest | None,
+    recapture_failed: bool,
+) -> bool:
+    events = tuple(
+        event
+        for event in store.work_events(run.id)
+        if event.kind == "verification_workspace_mutation_failed"
+    )
+    if len(events) != 1 or events[0].actor != "runtime":
+        return False
+    details = events[0].details
+    if not isinstance(details, Mapping) or details.get("stable_failure_code") != (
+        StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value
+    ):
+        return False
+    facts = details.get("facts")
+    if not isinstance(facts, Mapping):
+        return False
+    paths = facts.get("changed_paths")
+    count = facts.get("changed_path_count")
+    truncated = facts.get("changed_paths_truncated")
+    if (
+        facts.get("candidate_patch_digest") != candidate_patch_digest
+        or facts.get("verification_workspace_digest") != workspace_digest
+        or not isinstance(paths, (list, tuple))
+        or len(paths) > 32
+        or any(
+            not isinstance(path, str)
+            or len(path) > 1_000
+            or any(not character.isprintable() for character in path)
+            for path in paths
+        )
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < len(paths)
+        or not isinstance(truncated, bool)
+        or truncated != (count > len(paths))
+    ):
+        return False
+    if recapture_failed:
+        error_type = facts.get("recapture_error_type")
+        return (
+            recaptured_patch_digest is None
+            and isinstance(error_type, str)
+            and 0 < len(error_type) <= 200
+            and facts.get("recaptured_patch_digest") is None
+        )
+    return (
+        facts.get("recaptured_patch_digest") == recaptured_patch_digest
+        and facts.get("recapture_error_type") is None
+    )
 
 
 def _replay_runner(

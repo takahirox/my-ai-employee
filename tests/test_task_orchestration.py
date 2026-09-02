@@ -38,6 +38,7 @@ from ai_employee.domain.v2 import (
 )
 from ai_employee.graph import GraphValidationError, accept_task_graph
 from ai_employee.inspector import inspect_any_run, inspect_graph_run
+from ai_employee.orchestration import WorkEvent, WorkRun
 from ai_employee.plan_review import (
     PlanReviewAcceptanceBinding,
     PlanReviewAttempt,
@@ -72,6 +73,115 @@ from ai_employee.task_planning import ProposedGraph
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 ZERO = "0" * 64
+
+
+@pytest.mark.parametrize(
+    "criteria",
+    [
+        (),
+        (
+            CompletionCriterion(
+                id="optional-observation",
+                description="optional observation",
+                mandatory=False,
+            ),
+        ),
+    ],
+)
+def test_node_failure_code_forces_fail_and_retains_child_explanation(
+    tmp_path: Path, criteria: tuple[CompletionCriterion, ...]
+) -> None:
+    goal = Goal(
+        id="workspace-mutation-goal",
+        statement="detect verification workspace mutation",
+        completion_criteria=criteria,
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="workspace-mutation-graph",
+        node_id="workspace-mutation-node",
+        required_capabilities=("process",),
+        max_wall_seconds=10.0,
+    )
+
+    database = tmp_path / "workspace-mutation.db"
+    with SQLiteStore(database) as store:
+
+        def mutation_runner(
+            _node: Node,
+            request: WorkerRequest,
+            _strategy_value: ExecutionStrategy,
+        ) -> NodeExecutionResult:
+            child = WorkRun(
+                id=request.run_id,
+                goal=request.goal,
+                repository=str(tmp_path),
+                base_commit="a" * 40,
+                worker="scripted",
+                status="failed",
+                effective_policy_digest="1" * 64,
+                worker_request_digest=request.content_digest,
+                failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
+            )
+            with SQLiteStore(database) as child_store:
+                child_store.save_work_run(child)
+                child_store.append_work_event(
+                    WorkEvent(
+                        id="workspace-mutation-event",
+                        run_id=request.run_id,
+                        sequence=1,
+                        created_at=NOW,
+                        kind="verification_workspace_mutation_failed",
+                        actor="runtime",
+                        details={
+                            "stable_failure_code": "VERIFICATION_WORKSPACE_MUTATED",
+                            "facts": {
+                                "candidate_patch_digest": "2" * 64,
+                                "recaptured_patch_digest": "3" * 64,
+                                "verification_workspace_digest": "4" * 64,
+                                "changed_path_count": 1,
+                                "changed_paths": ("rogue.py",),
+                                "changed_paths_truncated": False,
+                            },
+                        },
+                    )
+                )
+            return NodeExecutionResult(
+                worker_result=WorkerResult(
+                    id="workspace-mutation-worker-result",
+                    run_id=request.run_id,
+                    created_at=NOW,
+                    request_digest=request.content_digest or ZERO,
+                    status="succeeded",
+                    duration_seconds=0.01,
+                ),
+                criterion_evidence=(),
+                workspace_id="workspace-mutation-snapshot",
+                failure_code=StableFailureCode.VERIFICATION_WORKSPACE_MUTATED.value,
+            )
+
+        orchestrator = TaskOrchestrator(store, mutation_runner, (_strategy(),))
+        run = orchestrator.run(
+            goal,
+            graph,
+            ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=10.0),
+            harness_digest=ZERO,
+            effective_policy_digest="1" * 64,
+            run_id="workspace-mutation-run",
+            available_capabilities=("process",),
+        )
+        replay = orchestrator.replay(run.id)
+        explanation = explain_any_run(store, run.id)
+
+    assert run.status == "failed"
+    assert replay.nodes[0].status == "failed"
+    assert replay.nodes[0].failure_code == "VERIFICATION_WORKSPACE_MUTATED"
+    assert replay.nodes[0].work_run_id is not None
+    assert explanation["primary_root_cause"]["code"] == "VERIFICATION_WORKSPACE_MUTATED"
+    assert explanation["primary_root_cause"]["stage"] == "verification_workspace"
+    assert explanation["task_stories"][0]["child_work_runs"][0]["run_id"] == (
+        replay.nodes[0].work_run_id
+    )
 
 
 def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(

@@ -4149,7 +4149,7 @@ class TaskOrchestrator:
                 result.criterion_evidence,
                 result.artifact_descriptors,
             )
-            if worker_result.status == "succeeded"
+            if worker_result.status == "succeeded" and result.failure_code is None
             else EvaluationDecision.FAIL
         )
         evaluation = NodeEvaluatorRecord(
@@ -4190,7 +4190,7 @@ class TaskOrchestrator:
             ),
             workspace_id=result.workspace_id,
             workspace_digest=(None if patch is None else patch.workspace.content_digest),
-            work_run_id=(None if patch is None else patch.workspace.run_id),
+            work_run_id=request.run_id,
             patch_artifact_id=(None if patch is None else patch.patch.id),
             patch_descriptor_digest=(None if patch is None else patch.patch.content_digest),
             patch_digest=(None if patch is None else patch.patch.artifact_digest),
