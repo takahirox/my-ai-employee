@@ -548,6 +548,52 @@ def test_git_workspace_captures_and_promotes_exact_patch(tmp_path: Path) -> None
     assert not isolated.exists()
 
 
+def test_canonical_diff_ignores_only_declared_untracked_generated_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "generated-repo"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "test@example.test"),
+        check=True,
+    )
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Fleet Test"), check=True)
+    (repository / "generated").mkdir()
+    (repository / "generated" / "tracked.txt").write_text("tracked-before\n")
+    (repository / "source.txt").write_text("source-before\n")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-qm", "base"), check=True)
+    head = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    manager = GitWorkspaceManager(
+        tmp_path / "generated-state", AtomicArtifactStore(tmp_path / "generated-artifacts")
+    )
+    snapshot = manager.create(
+        WorkspaceRequest(
+            id="generated-workspace",
+            run_id="run-1",
+            created_at=NOW,
+            repository=str(repository),
+            base_commit=head,
+        )
+    )
+    isolated = Path(snapshot.isolated_worktree)
+    (isolated / "source.txt").write_text("source-after\n")
+    scope = {"generated_paths": ("generated/**",), "harness_digest": "4" * 64}
+    candidate = manager.capture_diff(snapshot, **scope)
+    (isolated / "generated" / "report.json").write_text("{}\n")
+    assert manager.capture_diff(snapshot, **scope).artifact_digest == candidate.artifact_digest
+    assert candidate.source.get("generated_paths") == scope["generated_paths"]
+    assert candidate.source.get("harness_digest") == scope["harness_digest"]
+    (isolated / "generated" / "tracked.txt").write_text("tracked-after\n")
+    assert manager.capture_diff(snapshot, **scope).artifact_digest != candidate.artifact_digest
+    (isolated / "generated" / "tracked.txt").write_text("tracked-before\n")
+    (isolated / "undeclared.txt").write_text("undeclared\n")
+    assert manager.capture_diff(snapshot, **scope).artifact_digest != candidate.artifact_digest
+
+
 def test_git_workspace_rejects_state_root_inside_repository(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()

@@ -6,10 +6,11 @@ import os
 import shutil
 import subprocess
 from collections.abc import Mapping
-from pathlib import Path
+from fnmatch import fnmatchcase
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from ai_employee.domain.base import CanonicalData, freeze_json
+from ai_employee.domain.base import CanonicalData, Digest, freeze_json
 from ai_employee.domain.services_v2 import (
     ArtifactStore,
     Cancellation,
@@ -163,9 +164,16 @@ class GitWorkspaceManager:
             raise ValueError("persisted workspace HEAD changed")
         self._owned.add(path)
 
-    def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor:
+    def capture_diff(
+        self,
+        snapshot: WorkspaceSnapshot,
+        *,
+        generated_paths: tuple[str, ...] = (),
+        harness_digest: Digest | None = None,
+    ) -> ArtifactDescriptor:
+        generated_paths = self._canonical_generated_paths(generated_paths, harness_digest)
         isolated = self._require_owned(snapshot)
-        patch_bytes = self._diff(isolated, snapshot.id)
+        patch_bytes = self._diff(isolated, snapshot.id, generated_paths)
         return self.artifacts.put(
             io.BytesIO(patch_bytes),
             ArtifactPutRequest(
@@ -176,7 +184,12 @@ class GitWorkspaceManager:
                 logical_kind="workspace_patch",
                 producer_action_id=snapshot.id,
                 source=freeze_json(
-                    {"base_tree": snapshot.base_tree, "workspace_digest": snapshot.content_digest}
+                    {
+                        "base_tree": snapshot.base_tree,
+                        "workspace_digest": snapshot.content_digest,
+                        "generated_paths": generated_paths,
+                        "harness_digest": harness_digest,
+                    }
                 ),
             ),
         )
@@ -286,21 +299,47 @@ class GitWorkspaceManager:
             ),
         )
 
-    def _diff(self, worktree: Path, nonce: str) -> bytes:
+    def _diff(self, worktree: Path, nonce: str, generated_paths: tuple[str, ...] = ()) -> bytes:
         index = self._git_path(worktree, "--git-path", "index")
         temporary_index = self.state_root / f"index-{nonce}"
         shutil.copyfile(index, temporary_index)
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(temporary_index)
         try:
-            add = subprocess.run(
-                ("git", "-C", str(worktree), "add", "--intent-to-add", "--", "."),
+            listed = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                ),
                 env=environment,
                 capture_output=True,
                 check=False,
             )
-            if add.returncode:
-                raise ValueError(add.stderr.decode("utf-8", "replace"))
+            if listed.returncode:
+                raise ValueError(listed.stderr.decode("utf-8", "replace"))
+            untracked = tuple(
+                sorted(path for path in listed.stdout.decode("utf-8").split("\0") if path)
+            )
+            included = tuple(
+                path
+                for path in untracked
+                if not any(fnmatchcase(path, pattern) for pattern in generated_paths)
+            )
+            if included:
+                add = subprocess.run(
+                    ("git", "-C", str(worktree), "add", "--intent-to-add", "--", *included),
+                    env=environment,
+                    capture_output=True,
+                    check=False,
+                )
+                if add.returncode:
+                    raise ValueError(add.stderr.decode("utf-8", "replace"))
             patch = subprocess.run(
                 ("git", "-C", str(worktree), "diff", "--binary", "--no-ext-diff", "HEAD", "--"),
                 env=environment,
@@ -322,7 +361,20 @@ class GitWorkspaceManager:
         key = (approval.id, reviewed_patch.artifact_digest)
         if key in self._promotions:
             return self._promotions[key]
-        current_patch = self.capture_diff(snapshot)
+        source = reviewed_patch.source
+        if not isinstance(source, Mapping):
+            raise ValueError("reviewed patch has no canonical diff scope")
+        generated_paths = source.get("generated_paths")
+        harness_digest = source.get("harness_digest")
+        if not isinstance(generated_paths, tuple) or (
+            harness_digest is not None and not isinstance(harness_digest, str)
+        ):
+            raise ValueError("reviewed patch has an invalid canonical diff scope")
+        current_patch = self.capture_diff(
+            snapshot,
+            generated_paths=generated_paths,
+            harness_digest=harness_digest,
+        )
         if current_patch.artifact_digest != reviewed_patch.artifact_digest:
             raise ValueError("reviewed patch no longer matches the isolated workspace")
         if approval.decision != "approved" or approval.expires_at <= now():
@@ -360,7 +412,7 @@ class GitWorkspaceManager:
         if applied.returncode:
             message = applied.stderr.decode("utf-8", "replace")
             raise ValueError(f"patch application failed: {message}")
-        resulting = self._diff(original, approval.id)
+        resulting = self._diff(original, approval.id, generated_paths)
         if sha256_bytes(resulting) != reviewed_patch.artifact_digest:
             raise ValueError("applied diff digest does not match reviewed patch")
         record = PromotionRecord(
@@ -393,6 +445,32 @@ class GitWorkspaceManager:
                 if value != "/dev/null":
                     paths.add(value)
         return paths
+
+    @staticmethod
+    def _canonical_generated_paths(
+        generated_paths: tuple[str, ...], harness_digest: Digest | None
+    ) -> tuple[str, ...]:
+        if len(generated_paths) != len(set(generated_paths)):
+            raise ValueError("generated diff paths must be unique")
+        for value in generated_paths:
+            path = PurePosixPath(value)
+            if (
+                not value
+                or value.startswith("/")
+                or "\\" in value
+                or "\x00" in value
+                or ".." in path.parts
+                or (value != "." and path.as_posix() != value)
+            ):
+                raise ValueError("generated diff paths must be canonical workspace globs")
+        if generated_paths and harness_digest is None:
+            raise ValueError("generated diff paths require an accepted Harness digest")
+        if harness_digest is not None and (
+            len(harness_digest) != 64
+            or any(character not in "0123456789abcdef" for character in harness_digest)
+        ):
+            raise ValueError("canonical diff Harness digest is invalid")
+        return generated_paths
 
     @staticmethod
     def _status_counts(status: bytes) -> tuple[int, int]:

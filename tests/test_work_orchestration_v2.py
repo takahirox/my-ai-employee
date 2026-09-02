@@ -267,7 +267,13 @@ class FakeWorkspace:
         )
         return self.snapshot
 
-    def capture_diff(self, snapshot: WorkspaceSnapshot) -> ArtifactDescriptor:
+    def capture_diff(
+        self,
+        snapshot: WorkspaceSnapshot,
+        *,
+        generated_paths: tuple[str, ...] = (),
+        harness_digest: str | None = None,
+    ) -> ArtifactDescriptor:
         assert snapshot is self.snapshot
         digest = sha256(self.patch).hexdigest()
         self.descriptor = ArtifactDescriptor(
@@ -279,7 +285,11 @@ class FakeWorkspace:
             size_bytes=len(self.patch),
             logical_kind="workspace_patch",
             producer_action_id=snapshot.id,
-            source={"workspace_digest": snapshot.content_digest},
+            source={
+                "workspace_digest": snapshot.content_digest,
+                "generated_paths": generated_paths,
+                "harness_digest": harness_digest,
+            },
             store_locator=f"sha256/{digest[:2]}/{digest}",
         )
         return self.descriptor

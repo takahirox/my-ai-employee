@@ -125,6 +125,7 @@ class WorkRun(BaseModel):
     generation: int = Field(default=0, ge=0)
     plan_only: bool = False
     effective_policy_digest: str
+    harness_digest: str | None = None
     accepted_graph_digest: str | None = None
     node_id: str | None = None
     node_generation: int = Field(default=0, ge=0)
@@ -269,6 +270,7 @@ class WorkCoordinator:
         verification_requests: tuple[ProcessRequest, ...] = (),
         verification_bindings: tuple[NodeVerificationBinding, ...] = (),
         protected_paths: tuple[str, ...] = (".git/**",),
+        generated_paths: tuple[str, ...] = (),
         allowed_processes: tuple[tuple[str, ...], ...] = (),
         artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -303,6 +305,7 @@ class WorkCoordinator:
         self.verification_requests = verification_requests
         self.verification_bindings = verification_bindings
         self.protected_paths = protected_paths
+        self.generated_paths = generated_paths
         self.allowed_processes = allowed_processes
         self.artifact_store = artifact_store
 
@@ -412,6 +415,7 @@ class WorkCoordinator:
             strategy_set=self.strategy_set,
             plan_only=plan_only,
             effective_policy_digest=policy_digest,
+            harness_digest=harness_digest,
             accepted_graph_digest=accepted_graph_digest,
             node_id=node_id,
             node_generation=(0 if _accepted_request is None else _accepted_request.generation),
@@ -910,7 +914,13 @@ class WorkCoordinator:
             )
         patch: ArtifactDescriptor | None = None
         if run.capture_patch:
-            patch = self.workspace.capture_diff(snapshot)
+            if run.harness_digest is None:
+                raise ValueError("patch capture requires the run's accepted Harness digest")
+            patch = self.workspace.capture_diff(
+                snapshot,
+                generated_paths=self.generated_paths,
+                harness_digest=run.harness_digest,
+            )
             self.store.put("artifact_descriptor_v2", patch, run_id=run.id)
             retain((patch,))
             patch_bytes = self.artifact_reader(patch)

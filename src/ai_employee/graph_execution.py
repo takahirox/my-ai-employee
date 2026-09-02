@@ -172,6 +172,7 @@ class GraphExecutionService:
         repository: str,
         base_commit: str,
         max_concurrency: int = 2,
+        generated_paths: Iterable[str] = (),
         routing_mode: RoutingMode = RoutingMode.ADAPTIVE,
         fixed_strategy_id: Identifier | None = None,
         allowed_strategy_ids: Iterable[str] = (),
@@ -204,6 +205,7 @@ class GraphExecutionService:
         self.repository = str(Path(repository).resolve())
         self.base_commit = base_commit
         self.max_concurrency = max_concurrency
+        self.generated_paths = tuple(generated_paths)
         self.routing_mode = routing_mode
         self.fixed_strategy_id = fixed_strategy_id
         self.allowed_strategy_ids = tuple(allowed_strategy_ids)
@@ -308,6 +310,8 @@ class GraphExecutionService:
             repository=self.repository,
             base_commit=self.base_commit,
             effective_policy_digest=effective_policy_digest,
+            harness_digest=harness_digest,
+            generated_paths=self.generated_paths,
             node_patches=tuple(session.node_patches[node.id] for node in writing_nodes),
         )
         composition = self.composer.compose(composition_request, _NeverCancelled())
@@ -974,6 +978,7 @@ def _authoritative_node_result(
         workspace.run_id != request.run_id
         or workspace.head_commit != coordinator.store.get_work_run(run.id).base_commit
         or Path(workspace.original_worktree).resolve() != Path(run.repository).resolve()
+        or run.harness_digest != request.harness_digest
     ):
         raise ValueError("workspace snapshot is not bound to the inner work run")
     if not writing:
@@ -1000,6 +1005,8 @@ def _authoritative_node_result(
             or not isinstance(source, Mapping)
             or source.get("base_tree") != workspace.base_tree
             or source.get("workspace_digest") != workspace.content_digest
+            or source.get("generated_paths") != coordinator.generated_paths
+            or source.get("harness_digest") != request.harness_digest
         ):
             raise ValueError("patch is empty or not bound to the exact workspace")
 
