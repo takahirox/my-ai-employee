@@ -1347,18 +1347,12 @@ def _work(args: argparse.Namespace) -> int:
                     operator_config_digest=timeout_profile.operator_config_digest,
                     rule_version=timeout_profile.rule_version,
                     rule_id=timeout_profile.rule_id,
-                    recommended_timeout_seconds=(
-                        timeout_profile.recommended_timeout_seconds
-                    ),
+                    recommended_timeout_seconds=(timeout_profile.recommended_timeout_seconds),
                     profile_minimum_seconds=timeout_profile.profile_minimum_seconds,
                     adapter_timeout_seconds=timeout_profile.adapter_timeout_seconds,
-                    node_attempt_timeout_seconds=(
-                        timeout_profile.accepted_node_timeout_seconds
-                    ),
+                    node_attempt_timeout_seconds=(timeout_profile.accepted_node_timeout_seconds),
                     policy_timeout_seconds=timeout_profile.policy_timeout_seconds,
-                    remaining_run_timeout_seconds=(
-                        timeout_profile.remaining_run_timeout_seconds
-                    ),
+                    remaining_run_timeout_seconds=(timeout_profile.remaining_run_timeout_seconds),
                     effective_timeout_seconds=timeout_profile.effective_timeout_seconds,
                 )
                 inner_store.put("worker_timeout_authority_v2", timeout_authority, run_id=run_id)

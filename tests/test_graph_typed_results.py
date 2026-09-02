@@ -219,9 +219,7 @@ def _execute(
             completion_criteria=(
                 CompletionCriterion(
                     id=f"criterion-{node_id}",
-                    source=(
-                        "accepted_non_mutating_result" if fallback_criterion else "custom"
-                    ),
+                    source=("accepted_non_mutating_result" if fallback_criterion else "custom"),
                     description="the node-bound worker result is accepted",
                     verification_requirement_ids=(
                         ("external-evidence",) if external_evidence_required else ()
@@ -441,16 +439,12 @@ def test_custom_and_external_criteria_remain_uncovered_without_authority(
 def test_reserved_fallback_rejects_noncanonical_accepted_result_metadata(
     tmp_path: Path,
 ) -> None:
-    _repository, artifacts, _run, replay, _second, _inspected, requests, *_rest = (
-        _execute(tmp_path)
-    )
+    _repository, artifacts, _run, replay, _second, _inspected, requests, *_rest = _execute(tmp_path)
     request = requests["diagnose"]
     worker_result = next(
         item for item in replay.results if item.id == replay.nodes[0].worker_result_id
     )
-    acceptance = next(
-        item for item in replay.result_acceptances if item.node_id == "diagnose"
-    )
+    acceptance = next(item for item in replay.result_acceptances if item.node_id == "diagnose")
     descriptor = replay.nodes[0].artifact_descriptors[0]
     body = artifacts.open_verified(descriptor).read()
     criterion = CompletionCriterion(

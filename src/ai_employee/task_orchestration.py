@@ -1714,9 +1714,7 @@ class TaskOrchestrator:
                     )
                     elapsed_run_seconds = max(
                         0.0,
-                        (
-                            ensure_utc(self.clock()) - run_started_at
-                        ).total_seconds(),
+                        (ensure_utc(self.clock()) - run_started_at).total_seconds(),
                     )
                     remaining_wall_seconds = max(
                         0.0, graph_run.max_wall_seconds - elapsed_run_seconds
@@ -1745,9 +1743,7 @@ class TaskOrchestrator:
                         policy_timeout_seconds=graph_run.execution_policy.max_wall_seconds,
                         remaining_run_timeout_seconds=remaining_wall_seconds,
                     )
-                    self.store.put(
-                        "worker_timeout_profile_v2", timeout_profile, run_id=run_id
-                    )
+                    self.store.put("worker_timeout_profile_v2", timeout_profile, run_id=run_id)
                     denied_authorities = inadequate_authorities(timeout_profile)
                     if denied_authorities:
                         self.store.put(
@@ -1982,9 +1978,7 @@ class TaskOrchestrator:
                         force=future.done(),
                     )
                     if heartbeat is not None:
-                        self.store.put(
-                            "worker_attempt_heartbeat_v2", heartbeat, run_id=run_id
-                        )
+                        self.store.put("worker_attempt_heartbeat_v2", heartbeat, run_id=run_id)
                 if stop_action is None and self.store.control(run_id) == "cancel":
                     stop_action = "cancel"
                     self.store.put(
@@ -2109,7 +2103,9 @@ class TaskOrchestrator:
                                     accepted_graph_revision_digest=graph_digest,
                                     generation=node.generation,
                                     attempt=node.attempt,
-                                    allowance_seconds=timeout_profiles[future].effective_timeout_seconds,
+                                    allowance_seconds=timeout_profiles[
+                                        future
+                                    ].effective_timeout_seconds,
                                     cleanup_grace_seconds=cleanup_grace_seconds,
                                     timeout_profile_digest=timeout_profiles[future].content_digest,
                                     outcome=(
@@ -4562,9 +4558,7 @@ class TaskOrchestrator:
             "artifact_descriptor_v2", ArtifactDescriptor, run_id=request.run_id
         )
         latest_action = max(actions, key=lambda item: (item.created_at, item.id), default=None)
-        latest_artifact = max(
-            artifacts, key=lambda item: (item.created_at, item.id), default=None
-        )
+        latest_artifact = max(artifacts, key=lambda item: (item.created_at, item.id), default=None)
         diffs = tuple(
             item
             for item in artifacts

@@ -37,6 +37,8 @@ def default_operator_worker_supervision() -> WorkerSupervisionPolicy:
             ),
         )
     )
+
+
 DEFAULT_EXECUTABLES: Mapping[WorkerName, str] = {
     "codex_cli": "codex",
     "claude_code_cli": "claude",

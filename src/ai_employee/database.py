@@ -168,15 +168,13 @@ def _validate_source(
         raise ValueError("legacy database contains broken foreign-key relationships")
 
     objects = connection.execute(
-        "SELECT type,name FROM sqlite_master "
-        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+        "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
     ).fetchall()
     tables = {str(row[1]) for row in objects if row[0] == "table"}
     unsupported_objects = [str(row[1]) for row in objects if row[0] not in {"index", "table"}]
     if unsupported_objects:
         raise ValueError(
-            "legacy database contains unsupported schema objects: "
-            + ", ".join(unsupported_objects)
+            "legacy database contains unsupported schema objects: " + ", ".join(unsupported_objects)
         )
     unknown = tables - _TABLE_SPECS.keys()
     if unknown:
@@ -224,9 +222,7 @@ def _validate_source(
                 + ", ".join(sorted(missing_v2))
             )
 
-    ordered_tables = tuple(
-        table for table in (*_BASE_TABLES, *_V2_TABLES) if table in tables
-    )
+    ordered_tables = tuple(table for table in (*_BASE_TABLES, *_V2_TABLES) if table in tables)
     counts = {
         table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
         for table in ordered_tables
@@ -360,9 +356,7 @@ def import_legacy_database(
             }
 
         existed = destination_path.is_file()
-        backup_path = (
-            _backup_destination(destination_path, source_digest) if existed else None
-        )
+        backup_path = _backup_destination(destination_path, source_digest) if existed else None
 
         from .storage import SQLiteStore
 

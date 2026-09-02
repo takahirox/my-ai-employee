@@ -1066,9 +1066,7 @@ def test_cli_rejects_diff_and_promotion_for_completed_patchless_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution = _execute_patchless(tmp_path, "patchless-cli-run")
-    monkeypatch.setattr(
-        cli, "resolve_database_path", lambda *_args, **_kwargs: execution.database
-    )
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: execution.database)
 
     assert cli.main(["diff", execution.run.id]) == 5
     diff_output = json.loads(capsys.readouterr().out)

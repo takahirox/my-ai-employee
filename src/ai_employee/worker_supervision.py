@@ -117,9 +117,7 @@ class WorkerSupervisionPolicy(BaseModel):
         reasoning_class: SemanticReasoningClass,
         scale: int,
     ) -> WorkerTimeoutRule:
-        matches = tuple(
-            item for item in self.rules if item.matches(scope, reasoning_class, scale)
-        )
+        matches = tuple(item for item in self.rules if item.matches(scope, reasoning_class, scale))
         if not matches:
             raise ValueError("operator timeout table has no applicable rule")
         return matches[0]
@@ -309,9 +307,7 @@ def select_node_timeout(
     remaining_run_timeout_seconds: float,
 ) -> WorkerTimeoutProfileRecord:
     scope = SemanticScope.BOUNDED if profile is None else profile.scope
-    reasoning = (
-        SemanticReasoningClass.MECHANICAL if profile is None else profile.reasoning_class
-    )
+    reasoning = SemanticReasoningClass.MECHANICAL if profile is None else profile.reasoning_class
     if not rule.matches(scope, reasoning, scale):
         raise ValueError("selected timeout rule does not match persisted task inputs")
     effective = min(

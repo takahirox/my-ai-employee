@@ -31,9 +31,7 @@ def _digest(path: Path) -> str:
 def test_only_eval_parser_exposes_database_selection() -> None:
     parser = cli.build_parser()
     top_level = next(
-        action
-        for action in parser._actions
-        if isinstance(action, argparse._SubParsersAction)
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     )
     eval_parser = top_level.choices["eval"]
     assert any("--db" in action.option_strings for action in eval_parser._actions)

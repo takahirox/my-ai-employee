@@ -1133,9 +1133,7 @@ def _normalize_headerless_diff_sections(value: str) -> str:
 
     while index < len(lines):
         line = lines[index]
-        hunk_complete = (
-            in_hunk and observed_old == expected_old and observed_new == expected_new
-        )
+        hunk_complete = in_hunk and observed_old == expected_old and observed_new == expected_new
         at_boundary = not in_hunk or hunk_complete
 
         if at_boundary and line.startswith("diff --git "):
@@ -1243,12 +1241,8 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
             normalized.extend(section)
             continue
         first_hunk = hunks[0]
-        old_headers = [
-            index for index, line in enumerate(section) if line.startswith("--- ")
-        ]
-        new_headers = [
-            index for index, line in enumerate(section) if line.startswith("+++ ")
-        ]
+        old_headers = [index for index, line in enumerate(section) if line.startswith("--- ")]
+        new_headers = [index for index, line in enumerate(section) if line.startswith("+++ ")]
         if (
             len(old_headers) != 1
             or len(new_headers) != 1
@@ -1256,10 +1250,7 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
             or new_headers[0] != old_headers[0] + 1
             or _diff_header_value(section[old_headers[0]], "--- ") != f"a/{old_path}"
             or _diff_header_value(section[new_headers[0]], "+++ ") != f"b/{old_path}"
-            or any(
-                line.startswith(("rename from ", "rename to "))
-                for line in section[:first_hunk]
-            )
+            or any(line.startswith(("rename from ", "rename to ")) for line in section[:first_hunk])
         ):
             normalized.extend(section)
             continue
@@ -1267,11 +1258,7 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
         candidate = section.copy()
         section_is_safe = True
         for hunk_number, hunk in enumerate(hunks):
-            next_hunk = (
-                hunks[hunk_number + 1]
-                if hunk_number + 1 < len(hunks)
-                else len(section)
-            )
+            next_hunk = hunks[hunk_number + 1] if hunk_number + 1 < len(hunks) else len(section)
             header_match = re.fullmatch(
                 r"(@@ -)(\d+)(?:,(\d+))?( \+)(\d+)(?:,(\d+))?"
                 r"( @@[^\r\n]*)(\r\n|\n)?",
@@ -1296,14 +1283,10 @@ def _normalize_existing_file_hunk_counts(value: str) -> str:
             if observed_old == expected_old and observed_new == expected_new:
                 continue
             old_count = (
-                f",{observed_old}"
-                if header_match.group(3) is not None or observed_old != 1
-                else ""
+                f",{observed_old}" if header_match.group(3) is not None or observed_old != 1 else ""
             )
             new_count = (
-                f",{observed_new}"
-                if header_match.group(6) is not None or observed_new != 1
-                else ""
+                f",{observed_new}" if header_match.group(6) is not None or observed_new != 1 else ""
             )
             candidate[hunk] = (
                 f"{header_match.group(1)}{header_match.group(2)}{old_count}"

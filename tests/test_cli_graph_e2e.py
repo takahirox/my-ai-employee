@@ -61,9 +61,7 @@ from ai_employee.task_review import TaskReviewDecision
 
 
 @pytest.fixture(autouse=True)
-def _inject_cli_database(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _inject_cli_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FLEET_DB", raising=False)
     monkeypatch.setattr(
         cli, "resolve_database_path", lambda *_args, **_kwargs: tmp_path / "fleet.db"

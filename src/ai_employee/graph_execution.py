@@ -921,7 +921,8 @@ def _authoritative_node_result(
             or accepted_artifact.media_type != typed_result.media_type
             or accepted_artifact.redaction_state != "none"
             or not isinstance(source, Mapping)
-            or set(source) != {
+            or set(source)
+            != {
                 "graph_run_id",
                 "worker_request_digest",
                 "node_id",
