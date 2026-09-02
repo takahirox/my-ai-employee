@@ -223,7 +223,11 @@ class BoundProcessExecutor:
             failure=StableFailure(code=self.code, message="bounded worker failure"),
             exit_code=7,
             duration_seconds=0.25,
-            resource_usage={"stdout_bytes": 17, "stderr_bytes": 23},
+            resource_usage={
+                "stdout_bytes": 17,
+                "stderr_bytes": 23,
+                "process_group_cleanup": "sigterm_confirmed",
+            },
             stdout_artifact_digest="1" * 64,
             stderr_artifact_digest="2" * 64,
         )
@@ -1958,6 +1962,7 @@ def test_cli_worker_expands_flattened_markdown_new_file_diff() -> None:
         (StableFailureCode.CANCELLED, "cancelled"),
         (StableFailureCode.SPAWN_FAILED, "failed"),
         (StableFailureCode.PROCESS_FAILED, "failed"),
+        (StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED, "failed"),
         (StableFailureCode.POLICY_DENIED, "failed"),
         (StableFailureCode.APPROVAL_REQUIRED, "failed"),
     ),
@@ -1971,6 +1976,8 @@ def test_cli_worker_preserves_process_failure_and_diagnostics(
         allow_worker,
         run_id="run-1",
         timeout_seconds=30.0,
+        stdout_limit_bytes=16,
+        stderr_limit_bytes=16,
     ).propose(worker_request(), Channel())  # type: ignore[arg-type]
 
     assert result.status == status
@@ -1984,7 +1991,16 @@ def test_cli_worker_preserves_process_failure_and_diagnostics(
     assert diagnostic.process_result_digest is not None
     assert diagnostic.configured_timeout_seconds == 30.0
     assert diagnostic.effective_timeout_seconds == 12.0
+    assert diagnostic.stdout_limit_bytes == 16
+    assert diagnostic.stderr_limit_bytes == 16
     assert (diagnostic.stdout_bytes, diagnostic.stderr_bytes) == (17, 23)
+    assert diagnostic.output_limit_stream == (
+        "stdout_and_stderr"
+        if code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+        else None
+    )
+    assert diagnostic.process_group_cleanup == "sigterm_confirmed"
+    assert {"stdout_body", "stderr_body"}.isdisjoint(diagnostic.model_dump())
 
 
 @pytest.mark.parametrize(

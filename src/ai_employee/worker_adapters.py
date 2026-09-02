@@ -216,6 +216,8 @@ class CliWorkerAdapter:
         include_response_schema: bool = False,
         cancellation: Cancellation | None = None,
         timeout_seconds: float = 300.0,
+        stdout_limit_bytes: int = 1_000_000,
+        stderr_limit_bytes: int = 1_000_000,
     ) -> None:
         self.executor = executor
         self.output_reader = output_reader
@@ -247,6 +249,15 @@ class CliWorkerAdapter:
         self.include_response_schema = include_response_schema
         self.cancellation = cancellation or _NeverCancelled()
         self.timeout_seconds = timeout_seconds
+        if (
+            isinstance(stdout_limit_bytes, bool)
+            or isinstance(stderr_limit_bytes, bool)
+            or stdout_limit_bytes < 1
+            or stderr_limit_bytes < 1
+        ):
+            raise ValueError("worker output limits must be positive integers")
+        self.stdout_limit_bytes = stdout_limit_bytes
+        self.stderr_limit_bytes = stderr_limit_bytes
 
     def probe(self) -> WorkerAvailability:
         version_invocation = self._execute(
@@ -479,8 +490,8 @@ class CliWorkerAdapter:
             inherit_environment=self.inherit_environment,
             stdin_artifact_digest=stdin_digest,
             timeout_seconds=timeout,
-            stdout_bytes=1_000_000,
-            stderr_bytes=1_000_000,
+            stdout_bytes=self.stdout_limit_bytes,
+            stderr_bytes=self.stderr_limit_bytes,
             budget_class="worker",
             purpose=purpose,
         )
@@ -1790,6 +1801,32 @@ def _output_size(result: ExecutionResult, name: str) -> int:
     return 0
 
 
+def _output_limit_stream(
+    invocation: _ProcessInvocation,
+) -> Literal["stdout", "stderr", "stdout_and_stderr"] | None:
+    stdout_exceeded = (
+        _output_size(invocation.result, "stdout_bytes") > invocation.request.stdout_bytes
+    )
+    stderr_exceeded = (
+        _output_size(invocation.result, "stderr_bytes") > invocation.request.stderr_bytes
+    )
+    if stdout_exceeded and stderr_exceeded:
+        return "stdout_and_stderr"
+    if stdout_exceeded:
+        return "stdout"
+    if stderr_exceeded:
+        return "stderr"
+    return None
+
+
+def _process_group_cleanup(result: ExecutionResult) -> str | None:
+    usage = result.resource_usage
+    value = usage.get("process_group_cleanup") if isinstance(usage, Mapping) else None
+    if isinstance(value, str) and len(value) <= 40:
+        return value
+    return None
+
+
 def _empty_mutating_envelope_failure(
     request: WorkerRequest,
     envelope: WorkerProposalEnvelope,
@@ -1880,8 +1917,19 @@ def _worker_failure(
             None if invocation is None else invocation.request.timeout_seconds
         ),
         effective_timeout_seconds=(None if invocation is None else _effective_timeout(invocation)),
+        stdout_limit_bytes=(None if invocation is None else invocation.request.stdout_bytes),
+        stderr_limit_bytes=(None if invocation is None else invocation.request.stderr_bytes),
         stdout_bytes=0 if process is None else _output_size(process, "stdout_bytes"),
         stderr_bytes=0 if process is None else _output_size(process, "stderr_bytes"),
+        output_limit_stream=(
+            _output_limit_stream(invocation)
+            if code is StableFailureCode.PROCESS_OUTPUT_LIMIT_EXCEEDED
+            and invocation is not None
+            else None
+        ),
+        process_group_cleanup=(
+            None if process is None else _process_group_cleanup(process)
+        ),
         stdout_artifact_digest=None if process is None else process.stdout_artifact_digest,
         stderr_artifact_digest=None if process is None else process.stderr_artifact_digest,
     )
