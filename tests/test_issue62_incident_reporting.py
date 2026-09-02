@@ -628,6 +628,60 @@ def test_existing_marker_updates_occurrences_instead_of_creating(tmp_path: Path)
     assert transport.calls[-1][-1].startswith("Occurrences: 2 of 999;")
 
 
+def test_published_recurrence_returns_to_valid_pending_and_republishes(
+    tmp_path: Path,
+) -> None:
+    clean = report()
+    policy = auto_policy()
+    transport = FakeTransport()
+    with Outbox(outbox_path(tmp_path)) as box:
+        box.enqueue(clean, policy, NOW)
+        first_preview = box.preview(clean.fingerprint, policy, KEY, NOW)
+        first_receipt = box.publish(
+            clean.fingerprint,
+            first_preview.digest,
+            policy,
+            KEY,
+            transport,
+            NOW,
+        )
+
+        box.enqueue(clean, policy, NOW + timedelta(minutes=1))
+        entry = box.list_entries(policy, NOW + timedelta(minutes=1))[0]
+        assert entry.status == "pending"
+        assert entry.occurrence_count == 2
+        assert entry.issue_number is None
+        assert entry.public_url is None
+        assert entry.public_report_digest is None
+        assert entry.authorization_mode is None
+        assert entry.authorization_digest is None
+        assert entry.authorized_at is None
+        assert entry.published_at is None
+
+        second_preview = box.preview(
+            clean.fingerprint,
+            policy,
+            KEY,
+            NOW + timedelta(minutes=1),
+        )
+        second_receipt = box.publish(
+            clean.fingerprint,
+            second_preview.digest,
+            policy,
+            KEY,
+            transport,
+            NOW + timedelta(minutes=1),
+        )
+
+    assert second_receipt == first_receipt
+    assert [call[0] for call in transport.calls] == [
+        "find_issue_by_marker",
+        "create_issue",
+        "find_issue_by_marker",
+        "update_occurrence_summary",
+    ]
+
+
 @pytest.mark.parametrize(
     ("operation", "existing"),
     (

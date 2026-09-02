@@ -842,7 +842,8 @@ class Outbox:
                     "UPDATE incidents SET report_json=?,report_digest=?,status='pending',"
                     "occurrence_count=?,updated_at=?,expires_at=?,preview_digest=NULL,"
                     "preview_report_digest=NULL,approval_digest=NULL,approval_expires_at=NULL,"
-                    "public_report_digest=NULL,authorization_mode=NULL,"
+                    "issue_number=NULL,public_url=NULL,public_report_digest=NULL,"
+                    "authorization_mode=NULL,"
                     "authorization_digest=NULL,authorized_at=NULL,published_at=NULL "
                     "WHERE repository=? AND fingerprint=?",
                     (
