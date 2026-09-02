@@ -25,6 +25,7 @@ from ai_employee.incident_runtime import (
     prepare_graph_run_incidents,
     record_incident_publication,
 )
+from ai_employee.inspector import inspect_graph_run as inspect_graph_projection
 from ai_employee.run_ownership import RunLeaseClosureRecord
 from ai_employee.serialization import project_harness_digest
 from ai_employee.storage import SQLiteStore
@@ -705,3 +706,61 @@ def test_publication_conflict_and_ambiguous_preparation_are_fail_closed(
                 _publication_receipt(prepared),
                 clock=lambda: NOW,
             )
+
+
+def test_inspector_incident_projection_is_closed_sanitized_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_fields = {
+        "state",
+        "internal_incident_code",
+        "error_code",
+        "fingerprint",
+        "report_digest",
+        "preview_digest",
+        "expiry",
+        "issue_number",
+        "public_url",
+        "public_report_digest",
+        "authorization_mode",
+        "authorization_digest",
+        "authorized_at",
+        "published_at",
+    }
+    with SQLiteStore(tmp_path / "inspector.db") as store:
+        run, prepared = _prepare_one(store, tmp_path, monkeypatch, run_id="inspected-run")
+        values = prepared.model_dump(
+            exclude={"id", "content_digest", "created_at"},
+            mode="python",
+        )
+        for index in range(25):
+            record = IncidentRunRecord(
+                id=f"bounded-incident-{index:02d}",
+                created_at=NOW + timedelta(seconds=index + 1),
+                **values,
+            )
+            store.put(INCIDENT_RUN_RECORD_KIND, record, run_id=run.id)
+
+        projection = inspect_graph_projection(store, run.id, clock=lambda: NOW)
+
+    incidents = projection["incident_reporting"]
+    assert isinstance(incidents, list)
+    assert len(incidents) == 20
+    assert all(set(item) == expected_fields for item in incidents)
+    surface = json.dumps(incidents)
+    assert CANARY not in surface
+    assert KEY not in surface
+    for forbidden in (
+        "id",
+        "run_id",
+        "terminal_closure_digest",
+        "harness_digest",
+        "effective_policy_digest",
+        "report_body",
+        "diagnosis",
+        "message",
+        "path",
+        "environment",
+    ):
+        assert all(forbidden not in item for item in incidents)

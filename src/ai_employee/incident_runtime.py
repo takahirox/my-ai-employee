@@ -33,7 +33,6 @@ from .incident_reporting import (
     PublicExceptionClass,
     TerminalState,
 )
-from .inspector import inspect_graph_run
 from .run_ownership import RunLeaseClosureRecord
 from .serialization import canonical_digest, project_harness_digest
 from .storage import SQLiteStore
@@ -548,6 +547,19 @@ def incident_policy_from_harness(
     # Policy owns category authorization; its current public contract has no failure
     # field, so the exact Harness failure allowlist remains enforced at this boundary.
     return policy, frozenset(Failure(value) for value in reporting.auto_failures)
+
+
+def inspect_graph_run(
+    store: SQLiteStore,
+    run_id: str,
+    *,
+    clock: Callable[[], datetime],
+) -> dict[str, object]:
+    """Load Inspector lazily so disabled reporting has no Inspector dependency."""
+
+    from .inspector import inspect_graph_run as inspect
+
+    return inspect(store, run_id, clock=clock)
 
 
 def prepare_graph_run_incidents(
