@@ -539,14 +539,13 @@ def incident_policy_from_harness(
         mode=Mode(reporting.mode),
         repository=reporting.target_repository,
         auto_categories=tuple(Category(value) for value in reporting.auto_categories),
+        auto_failures=tuple(Failure(value) for value in reporting.auto_failures),
         retention_hours=reporting.retention_hours,
         approval_hours=reporting.approval_hours,
         daily_limit=reporting.daily_limit,
         pending_cap=reporting.pending_cap,
     )
-    # Policy owns category authorization; its current public contract has no failure
-    # field, so the exact Harness failure allowlist remains enforced at this boundary.
-    return policy, frozenset(Failure(value) for value in reporting.auto_failures)
+    return policy, frozenset(policy.auto_failures)
 
 
 def inspect_graph_run(

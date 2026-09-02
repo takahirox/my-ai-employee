@@ -73,6 +73,7 @@ def auto_policy(**changes: object) -> Policy:
         "mode": Mode.AUTO,
         "repository": REPOSITORY,
         "auto_categories": (Category.KERNEL,),
+        "auto_failures": (Failure.RUNTIME,),
     }
     values.update(changes)
     return Policy.model_validate(values)
@@ -416,6 +417,12 @@ def test_mode_off_auto_allowlist_pending_cap_and_occurrence_cap(tmp_path: Path) 
                 auto_policy(auto_categories=(Category.STORAGE,)),
                 NOW,
             )
+        with pytest.raises(IncidentError, match=r"^AUTO_FAILURE_DENIED$"):
+            box.enqueue(
+                first,
+                auto_policy(auto_failures=(Failure.OS,)),
+                NOW,
+            )
 
         capped = approval_policy(pending_cap=1)
         box.enqueue(first, capped, NOW)
@@ -477,6 +484,50 @@ def test_approval_digest_mismatch_and_expiry_fail_closed(tmp_path: Path) -> None
                 FakeTransport(),
                 NOW + timedelta(hours=1),
             )
+
+
+def test_current_policy_change_invalidates_old_approval_before_transport(
+    tmp_path: Path,
+) -> None:
+    original = approval_policy(approval_hours=24)
+    narrowed = approval_policy(approval_hours=1)
+    clean = report()
+    transport = FakeTransport()
+    with Outbox(outbox_path(tmp_path)) as box:
+        box.enqueue(clean, original, NOW)
+        preview = box.preview(clean.fingerprint, original, KEY, NOW)
+        old_approval = box.approve(clean.fingerprint, preview.digest, original, NOW)
+
+        with pytest.raises(IncidentError, match=r"^APPROVAL_REQUIRED$"):
+            box.publish(
+                clean.fingerprint,
+                preview.digest,
+                narrowed,
+                KEY,
+                transport,
+                NOW + timedelta(hours=2),
+            )
+        assert transport.calls == []
+
+        new_approval = box.approve(
+            clean.fingerprint,
+            preview.digest,
+            narrowed,
+            NOW + timedelta(hours=2),
+        )
+        assert new_approval != old_approval
+
+
+def test_current_auto_failure_allowlist_applies_to_existing_pending_report(
+    tmp_path: Path,
+) -> None:
+    original = auto_policy()
+    narrowed = auto_policy(auto_failures=(Failure.OS,))
+    clean = report()
+    with Outbox(outbox_path(tmp_path)) as box:
+        box.enqueue(clean, original, NOW)
+        with pytest.raises(IncidentError, match=r"^AUTO_FAILURE_DENIED$"):
+            box.preview(clean.fingerprint, narrowed, KEY, NOW)
 
 
 EXPECTED_COLUMNS = set(
@@ -641,7 +692,10 @@ def test_private_transport_receipt_is_rejected_and_rolled_back(tmp_path: Path) -
 
 
 def test_daily_publication_limit_is_repository_scoped(tmp_path: Path) -> None:
-    policy = auto_policy(daily_limit=1)
+    policy = auto_policy(
+        daily_limit=1,
+        auto_failures=(Failure.RUNTIME, Failure.OS),
+    )
     first = report()
     second = compose(diagnosis(failure=Failure.OS), KEY, "1.2.3", COMMIT, 1, 64)
     with Outbox(outbox_path(tmp_path)) as box:

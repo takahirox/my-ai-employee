@@ -129,6 +129,7 @@ class Policy(BaseModel):
     mode: Mode = Mode.OFF
     repository: str | None = None
     auto_categories: tuple[Category, ...] = ()
+    auto_failures: tuple[Failure, ...] = ()
     retention_hours: int = Field(default=168, ge=1, le=720)
     approval_hours: int = Field(default=24, ge=1, le=168)
     daily_limit: int = Field(default=3, ge=1, le=20)
@@ -142,6 +143,8 @@ class Policy(BaseModel):
             raise ValueError("invalid repository")
         if self.mode is Mode.AUTO and not self.auto_categories:
             raise ValueError("auto allowlist required")
+        if self.mode is Mode.AUTO and not self.auto_failures:
+            raise ValueError("auto failure allowlist required")
         return self
 
 
@@ -514,8 +517,7 @@ def _digest(report: Report) -> str:
 def _authorization(policy: Policy, report_digest: str, preview_digest: str) -> str:
     return canonical_digest(
         {
-            "mode": policy.mode.value,
-            "repository": policy.repository,
+            "policy": policy.model_dump(mode="json"),
             "report_digest": report_digest,
             "preview_digest": preview_digest,
         }
@@ -780,8 +782,11 @@ class Outbox:
             raise IncidentError("REPOSITORY_REQUIRED")
         for segment in policy.repository.split("/"):
             _scan_sink(segment, 100)
-        if policy.mode is Mode.AUTO and report.category not in policy.auto_categories:
-            raise IncidentError("AUTO_CATEGORY_DENIED")
+        if policy.mode is Mode.AUTO:
+            if report.category not in policy.auto_categories:
+                raise IncidentError("AUTO_CATEGORY_DENIED")
+            if report.failure not in policy.auto_failures:
+                raise IncidentError("AUTO_FAILURE_DENIED")
         return policy.repository
 
     def _purge(self, now: datetime) -> int:
@@ -897,13 +902,15 @@ class Outbox:
         return Preview(preview_digest, report_digest, issue)
 
     def approve(self, fingerprint: str, preview_digest: str, policy: Policy, now: datetime) -> str:
-        if policy.mode is not Mode.APPROVAL_REQUIRED or policy.repository is None:
+        if policy.mode is Mode.OFF or policy.repository is None:
             raise IncidentError("APPROVAL_NOT_ALLOWED")
         with self.db:
             self._purge(now)
             row = self._load(policy.repository, fingerprint)
             report = Report.model_validate_json(cast(str, row["report_json"]), strict=True)
             repository = self._repository(policy, report)
+            if policy.mode is not Mode.APPROVAL_REQUIRED:
+                raise IncidentError("APPROVAL_NOT_ALLOWED")
             report_digest = _digest(report)
             if (
                 row["preview_digest"] != preview_digest

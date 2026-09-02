@@ -66,6 +66,7 @@ def _policy(pending_cap: int = 5) -> Policy:
         mode=Mode.AUTO,
         repository="owner/repository",
         auto_categories=(Category.KERNEL,),
+        auto_failures=(Failure.RUNTIME,),
         pending_cap=pending_cap,
     )
 
@@ -97,8 +98,7 @@ def _publish(box: Outbox, report: Report, policy: Policy, now: datetime, number:
     preview_digest = "a" * 64
     authorization_digest = canonical_digest(
         {
-            "mode": policy.mode.value,
-            "repository": repository,
+            "policy": policy.model_dump(mode="json"),
             "report_digest": report_digest,
             "preview_digest": preview_digest,
         }
