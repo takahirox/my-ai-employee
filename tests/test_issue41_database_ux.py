@@ -43,12 +43,17 @@ def test_run_database_override_is_not_a_parser_surface(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     database = tmp_path / "run.db"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("FLEET_DB", raising=False)
     with pytest.raises(SystemExit):
         cli.main(["run", _graph(), "--run-id", "temporary-run", "--db", str(database)])
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "unrecognized arguments: --db" in captured.err
     assert not database.exists()
+    assert not (home / ".fleet").exists()
 
 
 def test_work_rejects_database_environment_before_dispatch(

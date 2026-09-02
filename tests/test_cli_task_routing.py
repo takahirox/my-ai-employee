@@ -65,12 +65,12 @@ def test_work_cli_defaults_to_adaptive_routing() -> None:
     assert not hasattr(args, "model")
 
 
-def test_doctor_cli_is_an_explicit_read_only_run_command() -> None:
-    args = cli.build_parser().parse_args(["doctor", "parent-run", "--db", "fleet.db"])
+def test_doctor_cli_is_an_explicit_read_only_run_command_without_database_override() -> None:
+    args = cli.build_parser().parse_args(["doctor", "parent-run"])
 
     assert args.command == "doctor"
     assert args.run_id == "parent-run"
-    assert args.db == "fleet.db"
+    assert not hasattr(args, "db")
 
 
 @pytest.mark.parametrize(
@@ -470,9 +470,12 @@ exit 0
 
 
 def test_fixed_routing_uses_the_degenerate_authoritative_graph(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: db_path)
     goal = "Inspect the request; implement each change; verify the persisted routing"
 
     result = cli.main(
@@ -483,8 +486,6 @@ def test_fixed_routing_uses_the_degenerate_authoritative_graph(
             str(repository),
             "--operator-config",
             str(operator_config),
-            "--db",
-            str(db_path),
             "--plan-only",
             "--routing-mode",
             "fixed",
@@ -546,6 +547,7 @@ def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: db_path)
 
     def criterion(name: str) -> CompletionCriterion:
         return CompletionCriterion(id=f"criterion-{name}", description=f"{name} is complete")
@@ -633,8 +635,6 @@ def test_adaptive_planning_uses_graph_authority_at_max_concurrency_one(
             str(repository),
             "--operator-config",
             str(operator_config),
-            "--db",
-            str(db_path),
             "--plan-only",
             "--max-concurrency",
             "1",
@@ -670,6 +670,7 @@ def test_adaptive_planner_failure_is_closed_and_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: db_path)
 
     def failed_plan(
         self: CliProposedGraphPlanner,
@@ -701,8 +702,6 @@ def test_adaptive_planner_failure_is_closed_and_stable(
             str(repository),
             "--operator-config",
             str(operator_config),
-            "--db",
-            str(db_path),
         ]
     )
 

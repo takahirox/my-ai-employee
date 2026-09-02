@@ -283,7 +283,9 @@ def test_terminal_child_nonterminal_parent_is_not_active(tmp_path: Path) -> None
 
 
 def test_cli_recovery_is_explicit_and_idempotent(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "cli-recovery.db"
     with SQLiteStore(database) as store:
@@ -291,7 +293,9 @@ def test_cli_recovery_is_explicit_and_idempotent(
         store.put("graph_run_v2", run, run_id=run.id)
         assert store.acquire_run_owner(_owner(run, acquired_at=NOW)) is None
 
-    argv = ["recover", "cli-recovery-run", "--db", str(database)]
+    monkeypatch.delenv("FLEET_DB", raising=False)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
+    argv = ["recover", "cli-recovery-run"]
     assert cli.main(argv) == 0
     assert '"recovery":"recovered"' in capsys.readouterr().out
     assert cli.main(argv) == 0

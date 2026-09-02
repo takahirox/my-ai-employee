@@ -95,7 +95,7 @@ def test_import_preserves_relationships_permissions_wal_and_is_idempotent(
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
     assert _digest(source) == before
     with SQLiteStore(destination) as store:
-        context = store.run_repository("legacy-run")
+        context = store.repository_for_run("legacy-run")
         assert context is not None
         assert context["repository"] == str(repository.resolve())
         assert str(store._connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"

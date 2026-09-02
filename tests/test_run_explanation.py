@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ai_employee import cli
 from ai_employee.cli import build_parser, main
 from ai_employee.domain.v2 import (
     DecisionOutcome,
@@ -44,12 +45,12 @@ def _bind_graph_child(store: SQLiteStore, work_run_id: str) -> None:
     )
 
 
-def test_explain_cli_is_a_distinct_read_only_command() -> None:
-    args = build_parser().parse_args(("explain", "run-1", "--db", "fleet.db"))
+def test_explain_cli_is_a_distinct_read_only_command_without_database_override() -> None:
+    args = build_parser().parse_args(("explain", "run-1"))
 
     assert args.command == "explain"
     assert args.run_id == "run-1"
-    assert args.db == "fleet.db"
+    assert not hasattr(args, "db")
 
 
 def test_work_explanation_includes_policy_denial_as_a_failure_cause(tmp_path: Path) -> None:
@@ -166,7 +167,9 @@ def test_graph_owned_child_work_run_remains_visible_by_persisted_node_binding(
     ),
 )
 def test_historical_standalone_work_run_is_hidden_from_operational_commands(
-    tmp_path: Path, command: tuple[str, ...]
+    tmp_path: Path,
+    command: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "historical.db"
     run = WorkRun(
@@ -182,8 +185,10 @@ def test_historical_standalone_work_run_is_hidden_from_operational_commands(
     with SQLiteStore(database) as store:
         store.save_work_run(run)
 
+    monkeypatch.delenv("FLEET_DB", raising=False)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
     with pytest.raises(KeyError, match=run.id):
-        main((*command, "--db", str(database)))
+        main(command)
 
     with SQLiteStore(database) as store:
         assert store.get_work_run(run.id) == run
