@@ -10,13 +10,13 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -245,15 +245,6 @@ def _load_check_artifact(data: bytes, family: str) -> ProtocolCheckArtifact:
     if data != (canonical_json(artifact) + "\n").encode("utf-8"):
         raise ValueError(f"{family} artifact is malformed or not canonical JSON")
     return artifact
-
-
-def _contained(root: Path, relative: str) -> Path:
-    candidate = (root / relative).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("declared artifact path escapes the output root") from exc
-    return candidate
 
 
 def _validate_argv_template(
@@ -552,19 +543,127 @@ def _directory_flags() -> int:
 
 
 def _open_directory(path: Path | str, parent: int | None = None) -> int:
+    relative = os.fspath(path)
+    if parent is not None and PurePosixPath(relative).parts != (relative,):
+        raise ValueError("protocol directory traversal is not allowed")
     try:
         descriptor = os.open(path, _directory_flags(), dir_fd=parent)
     except OSError as exc:
         raise ValueError("protocol directory was replaced or is unsafe") from exc
-    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+    status = os.fstat(descriptor)
+    if not stat.S_ISDIR(status.st_mode):
         os.close(descriptor)
         raise ValueError("protocol directory is not a directory")
+    if parent is not None:
+        try:
+            named_status = os.stat(path, dir_fd=parent, follow_symlinks=False)
+        except OSError as exc:
+            os.close(descriptor)
+            raise ValueError("protocol directory was replaced or is unsafe") from exc
+        if not stat.S_ISDIR(named_status.st_mode) or (named_status.st_dev, named_status.st_ino) != (
+            status.st_dev,
+            status.st_ino,
+        ):
+            os.close(descriptor)
+            raise ValueError("protocol directory identity changed while opening")
     return descriptor
 
 
 def _identity(descriptor: int) -> tuple[int, int]:
     status = os.fstat(descriptor)
     return status.st_dev, status.st_ino
+
+
+def _open_artifact_parent(
+    root: int, components: tuple[str, ...]
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    identities: list[tuple[int, int]] = []
+    with contextlib.ExitStack() as opened:
+        current = os.dup(root)
+        opened.callback(os.close, current)
+        for name in components:
+            created = False
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=current)
+                created = True
+            except FileExistsError:
+                pass
+            child = _open_directory(name, current)
+            opened.callback(os.close, child)
+            if created:
+                os.fsync(child)
+                os.fsync(current)
+            identities.append(_identity(child))
+            current = child
+        return os.dup(current), tuple(identities)
+
+
+def _require_name_absent(parent: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError("protocol destination could not be inspected safely") from exc
+    raise FileExistsError(f"refusing to overwrite protocol artifacts: {name}")
+
+
+def _create_staging_directory(parent: int, protocol_id: str) -> tuple[str, int]:
+    for _ in range(128):
+        name = f".{protocol_id}-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+        except FileExistsError:
+            continue
+        try:
+            return name, _open_directory(name, parent)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.rmdir(name, dir_fd=parent)
+            raise
+    raise FileExistsError("could not allocate a unique protocol staging directory")
+
+
+def _verify_published_path(
+    *,
+    root_path: Path,
+    root_identity: tuple[int, int],
+    parent_components: tuple[str, ...],
+    parent_identities: tuple[tuple[int, int], ...],
+    final_name: str,
+    final_identity: tuple[int, int],
+) -> None:
+    with contextlib.ExitStack() as opened:
+        current = _open_directory(root_path)
+        opened.callback(os.close, current)
+        if _identity(current) != root_identity:
+            raise ValueError("published protocol output root identity changed")
+        for name, expected_identity in zip(parent_components, parent_identities, strict=True):
+            current = _open_directory(name, current)
+            opened.callback(os.close, current)
+            if _identity(current) != expected_identity:
+                raise ValueError("published protocol ancestry changed")
+        final = _open_directory(final_name, current)
+        opened.callback(os.close, final)
+        if _identity(final) != final_identity:
+            raise ValueError("published protocol directory identity changed")
+
+
+def _discard_staging_directory(
+    parent: int, name: str, descriptor: int, expected_identity: tuple[int, int]
+) -> None:
+    os.fchmod(descriptor, 0o700)
+    for artifact_name in os.listdir(descriptor):
+        os.unlink(artifact_name, dir_fd=descriptor)
+    try:
+        named_stage = _open_directory(name, parent)
+    except ValueError:
+        return
+    try:
+        if _identity(named_stage) == expected_identity:
+            os.rmdir(name, dir_fd=parent)
+    finally:
+        os.close(named_stage)
 
 
 def _read_regular(directory: int, name: str) -> bytes:
@@ -642,6 +741,31 @@ def _rename_noreplace(parent: int, source: str, destination: str) -> None:
     if error == errno.EEXIST:
         raise FileExistsError(f"refusing to overwrite protocol artifacts: {destination}")
     raise OSError(error, os.strerror(error))
+
+
+def _rollback_publication(
+    parent: int,
+    final_name: str,
+    stage_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        _rename_noreplace(parent, final_name, stage_name)
+        named_stage = _open_directory(stage_name, parent)
+        try:
+            if _identity(named_stage) != expected_identity:
+                raise RuntimeError("restored staging directory identity changed")
+        finally:
+            os.close(named_stage)
+        try:
+            os.stat(final_name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("published destination still exists after rollback")
+        os.fsync(parent)
+    except BaseException as exc:
+        raise RuntimeError("published protocol rollback could not be proven") from exc
 
 
 def _validate_evaluator_templates(task: TaskIdentity) -> None:
@@ -821,144 +945,157 @@ def collect_protocol(
     if not repository.is_dir():
         raise ValueError("repository must be an existing directory")
     output_root = output_root.resolve(strict=True)
-    if not output_root.is_dir():
-        raise ValueError("output root must be an existing directory")
     command_relative = PurePosixPath(protocol.artifacts)
-    final_command = _contained(output_root, protocol.artifacts)
-    final_directory = final_command.parent
-    if final_directory.exists():
-        raise FileExistsError(f"refusing to overwrite protocol artifacts: {final_directory}")
-    isolation = _establish_network_isolation(repository)
-    final_directory.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{protocol.id}-", dir=final_directory.parent))
-    parent_descriptor = _open_directory(final_directory.parent)
-    stage_descriptor = _open_directory(stage)
-    stage_identity = _identity(stage_descriptor)
-    published = False
-    try:
-        original_argv, argv = _resolve_argv(
-            arm_command,
-            replacements={
-                "{task}": str(task_path),
-                "{repository}": str(repository),
-                "{output}": str(stage),
-                "{protocol}": protocol.id,
-            },
-            placeholders=_PRODUCER_PLACEHOLDERS,
-            repository=repository,
-            label="arm",
+    directory_parts = command_relative.parent.parts
+    if not directory_parts:
+        raise FileExistsError(f"refusing to overwrite protocol artifacts: {output_root}")
+    parent_components = directory_parts[:-1]
+    final_name = directory_parts[-1]
+    final_command = output_root.joinpath(*command_relative.parts)
+    with contextlib.ExitStack() as descriptors:
+        root_descriptor = _open_directory(output_root)
+        descriptors.callback(os.close, root_descriptor)
+        root_identity = _identity(root_descriptor)
+        isolation = _establish_network_isolation(repository)
+        parent_descriptor, parent_identities = _open_artifact_parent(
+            root_descriptor, parent_components
         )
-        _validate_execution_contract(protocol, argv)
-        stdout, stderr, started_at, ended_at, exit_code = _run(
-            argv,
-            repository,
-            timeout,
-            network,
-            isolation=isolation.backend,
-        )
-        if exit_code != 0:
-            raise ValueError(f"arm command exited with {exit_code}")
-        draft_bytes = _read_draft(stage_descriptor)
-        draft = load_result_bundle(draft_bytes)
-        _validate_draft_bundle(protocol, task, draft)
-        bundle, outputs = _evaluate_checks(
-            task_path=task_path,
-            task=task,
-            repository=repository,
-            protocol=protocol,
-            draft=draft,
-            timeout=timeout,
-            network=network,
-            isolation=isolation.backend,
-        )
-        if set(os.listdir(stage_descriptor)) != {"result-bundle.json"}:
-            raise ValueError("staging artifacts changed after validation")
-        os.unlink("result-bundle.json", dir_fd=stage_descriptor)
-        for name, data in sorted(outputs.items()):
-            _write_regular(stage_descriptor, name, data)
-        content_digests = {name: _digest(value) for name, value in sorted(outputs.items())}
-        command_record = {
-            "argv": argv,
-            "arm_command": original_argv,
-            "content_digests": content_digests,
-            "cwd": str(repository),
-            "ended_at": ended_at,
-            "execution_argv": _wrapped_argv(isolation.backend, argv),
-            "exit_code": exit_code,
-            "format": "fleet-productivity-command/1",
-            "isolation": {
-                "backend": isolation.backend.name,
-                "probe": isolation.probe,
-                "profile_digest": isolation.backend.profile_digest,
-                "wrapper_argv": isolation.backend.wrapper_argv,
-            },
-            "manifest_digest": _digest(manifest_bytes),
-            "manifest_path": str(manifest_path),
-            "network": network,
-            "protocol": protocol,
-            "protocol_digest": canonical_digest(protocol),
-            "result_bundle_content_digest": bundle.bundle_digest,
-            "started_at": started_at,
-            "stderr_digest": _digest(stderr),
-            "stdout_digest": _digest(stdout),
-            "task": task,
-            "task_digest": _digest(task_bytes),
-            "task_path": str(task_path),
-            "timeout_seconds": timeout,
-        }
-        command_bytes = (canonical_json(command_record) + "\n").encode("utf-8")
-        _write_regular(stage_descriptor, command_relative.name, command_bytes)
-        expected = {**outputs, command_relative.name: command_bytes}
-        if set(os.listdir(stage_descriptor)) != set(expected):
-            raise ValueError("staging artifact set changed before publication")
-        for name, data in sorted(expected.items()):
-            if _read_regular(stage_descriptor, name) != data:
-                raise ValueError(f"artifact changed before publication: {name}")
-        os.fchmod(stage_descriptor, 0o500)
-        os.fsync(stage_descriptor)
-        named_stage = _open_directory(stage.name, parent_descriptor)
+        descriptors.callback(os.close, parent_descriptor)
+        _require_name_absent(parent_descriptor, final_name)
+        stage_name, stage_descriptor = _create_staging_directory(parent_descriptor, protocol.id)
+        descriptors.callback(os.close, stage_descriptor)
+        stage_identity = _identity(stage_descriptor)
+        stage = output_root.joinpath(*parent_components, stage_name)
+        published = False
         try:
-            if _identity(named_stage) != stage_identity:
-                raise ValueError("protocol staging directory identity changed")
-        finally:
-            os.close(named_stage)
-        _rename_noreplace(parent_descriptor, stage.name, final_directory.name)
-        published = True
-        final_descriptor = _open_directory(final_directory.name, parent_descriptor)
-        try:
-            if _identity(final_descriptor) != stage_identity:
-                raise ValueError("published protocol directory identity changed")
-            if set(os.listdir(final_descriptor)) != set(expected):
-                raise ValueError("published artifact set changed")
+            original_argv, argv = _resolve_argv(
+                arm_command,
+                replacements={
+                    "{task}": str(task_path),
+                    "{repository}": str(repository),
+                    "{output}": str(stage),
+                    "{protocol}": protocol.id,
+                },
+                placeholders=_PRODUCER_PLACEHOLDERS,
+                repository=repository,
+                label="arm",
+            )
+            _validate_execution_contract(protocol, argv)
+            stdout, stderr, started_at, ended_at, exit_code = _run(
+                argv,
+                repository,
+                timeout,
+                network,
+                isolation=isolation.backend,
+            )
+            if exit_code != 0:
+                raise ValueError(f"arm command exited with {exit_code}")
+            draft_bytes = _read_draft(stage_descriptor)
+            draft = load_result_bundle(draft_bytes)
+            _validate_draft_bundle(protocol, task, draft)
+            bundle, outputs = _evaluate_checks(
+                task_path=task_path,
+                task=task,
+                repository=repository,
+                protocol=protocol,
+                draft=draft,
+                timeout=timeout,
+                network=network,
+                isolation=isolation.backend,
+            )
+            if set(os.listdir(stage_descriptor)) != {"result-bundle.json"}:
+                raise ValueError("staging artifacts changed after validation")
+            os.unlink("result-bundle.json", dir_fd=stage_descriptor)
+            for name, data in sorted(outputs.items()):
+                _write_regular(stage_descriptor, name, data)
+            content_digests = {name: _digest(value) for name, value in sorted(outputs.items())}
+            command_record = {
+                "argv": argv,
+                "arm_command": original_argv,
+                "content_digests": content_digests,
+                "cwd": str(repository),
+                "ended_at": ended_at,
+                "execution_argv": _wrapped_argv(isolation.backend, argv),
+                "exit_code": exit_code,
+                "format": "fleet-productivity-command/1",
+                "isolation": {
+                    "backend": isolation.backend.name,
+                    "probe": isolation.probe,
+                    "profile_digest": isolation.backend.profile_digest,
+                    "wrapper_argv": isolation.backend.wrapper_argv,
+                },
+                "manifest_digest": _digest(manifest_bytes),
+                "manifest_path": str(manifest_path),
+                "network": network,
+                "protocol": protocol,
+                "protocol_digest": canonical_digest(protocol),
+                "result_bundle_content_digest": bundle.bundle_digest,
+                "started_at": started_at,
+                "stderr_digest": _digest(stderr),
+                "stdout_digest": _digest(stdout),
+                "task": task,
+                "task_digest": _digest(task_bytes),
+                "task_path": str(task_path),
+                "timeout_seconds": timeout,
+            }
+            command_bytes = (canonical_json(command_record) + "\n").encode("utf-8")
+            _write_regular(stage_descriptor, command_relative.name, command_bytes)
+            expected = {**outputs, command_relative.name: command_bytes}
+            if set(os.listdir(stage_descriptor)) != set(expected):
+                raise ValueError("staging artifact set changed before publication")
             for name, data in sorted(expected.items()):
-                if _read_regular(final_descriptor, name) != data:
-                    raise ValueError(f"published artifact changed: {name}")
-            os.fsync(final_descriptor)
+                if _read_regular(stage_descriptor, name) != data:
+                    raise ValueError(f"artifact changed before publication: {name}")
+            os.fchmod(stage_descriptor, 0o500)
+            os.fsync(stage_descriptor)
+            named_stage = _open_directory(stage_name, parent_descriptor)
+            try:
+                if _identity(named_stage) != stage_identity:
+                    raise ValueError("protocol staging directory identity changed")
+            finally:
+                os.close(named_stage)
+            _rename_noreplace(parent_descriptor, stage_name, final_name)
+            published = True
+            final_descriptor = _open_directory(final_name, parent_descriptor)
+            try:
+                if _identity(final_descriptor) != stage_identity:
+                    raise ValueError("published protocol directory identity changed")
+                if set(os.listdir(final_descriptor)) != set(expected):
+                    raise ValueError("published artifact set changed")
+                for name, data in sorted(expected.items()):
+                    if _read_regular(final_descriptor, name) != data:
+                        raise ValueError(f"published artifact changed: {name}")
+                os.fsync(final_descriptor)
+            finally:
+                os.close(final_descriptor)
+            os.fsync(parent_descriptor)
+            _verify_published_path(
+                root_path=output_root,
+                root_identity=root_identity,
+                parent_components=parent_components,
+                parent_identities=parent_identities,
+                final_name=final_name,
+                final_identity=stage_identity,
+            )
+            return final_command
         except BaseException:
-            _rename_noreplace(parent_descriptor, final_directory.name, stage.name)
-            published = False
+            if published:
+                _rollback_publication(
+                    parent_descriptor,
+                    final_name,
+                    stage_name,
+                    stage_identity,
+                )
+                published = False
             raise
         finally:
-            os.close(final_descriptor)
-        os.fsync(parent_descriptor)
-        return final_command
-    finally:
-        if not published:
-            os.fchmod(stage_descriptor, 0o700)
-            for name in os.listdir(stage_descriptor):
-                os.unlink(name, dir_fd=stage_descriptor)
-            try:
-                named_stage = _open_directory(stage.name, parent_descriptor)
-            except ValueError:
-                pass
-            else:
-                try:
-                    if _identity(named_stage) == stage_identity:
-                        os.rmdir(stage.name, dir_fd=parent_descriptor)
-                finally:
-                    os.close(named_stage)
-        os.close(stage_descriptor)
-        os.close(parent_descriptor)
+            if not published:
+                _discard_staging_directory(
+                    parent_descriptor,
+                    stage_name,
+                    stage_descriptor,
+                    stage_identity,
+                )
 
 
 def build_parser() -> argparse.ArgumentParser:

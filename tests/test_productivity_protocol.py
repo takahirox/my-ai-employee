@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -281,6 +282,76 @@ def test_collect_protocol_rechecks_after_atomic_publication(
     with pytest.raises(ValueError, match="published artifact changed"):
         _collect(tmp_path)
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+def test_collect_protocol_rejects_detached_publication_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = productivity_protocol._rename_noreplace
+    detached = tmp_path / "detached-artifacts"
+    replaced = False
+
+    def replace_parent(parent: int, source: str, destination: str) -> None:
+        nonlocal replaced
+        if destination == "codex-direct" and not replaced:
+            (tmp_path / "artifacts").rename(detached)
+            (tmp_path / "artifacts").mkdir()
+            replaced = True
+        original(parent, source, destination)
+
+    monkeypatch.setattr(productivity_protocol, "_rename_noreplace", replace_parent)
+    with pytest.raises(ValueError, match="ancestry changed"):
+        _collect(tmp_path)
+    assert replaced
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+    assert not (detached / "codex-direct").exists()
+
+
+def test_collect_protocol_rolls_back_parent_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = os.fsync
+    injected = False
+
+    def fail_publication_parent(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            and "codex-direct" in os.listdir(descriptor)
+        ):
+            injected = True
+            raise OSError("injected publication-parent fsync failure")
+        original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_publication_parent)
+    with pytest.raises(OSError, match="injected publication-parent fsync failure"):
+        _collect(tmp_path)
+    assert injected
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
+def test_collect_protocol_fsyncs_created_ancestry_and_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = os.fsync
+    directory_fsyncs: list[tuple[int, int]] = []
+
+    def record_directory_fsync(descriptor: int) -> None:
+        status = os.fstat(descriptor)
+        if stat.S_ISDIR(status.st_mode):
+            directory_fsyncs.append((status.st_dev, status.st_ino))
+        original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_directory_fsync)
+    command_path = _collect(tmp_path)
+    published_status = command_path.parent.stat()
+    parent_status = command_path.parent.parent.stat()
+    root_status = tmp_path.stat()
+    published_identity = (published_status.st_dev, published_status.st_ino)
+    assert directory_fsyncs.count(published_identity) >= 2
+    assert directory_fsyncs[-1] == (parent_status.st_dev, parent_status.st_ino)
+    assert (root_status.st_dev, root_status.st_ino) in directory_fsyncs
 
 
 @pytest.mark.parametrize(

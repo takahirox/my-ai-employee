@@ -265,12 +265,17 @@ Only after every command and binding validates does the runner add canonical
 `command.json` metadata and atomically rename the staging directory to the declared destination.
 Collection is supported only where Linux procfs, child-subreaper containment, `renameat2` with
 `RENAME_NOREPLACE`, and no-follow directory descriptors are available. The collector pins the
-original staging and publication-parent inode identities, reads and writes bounded regular files
-relative to those descriptors, rejects symlink or hard-linked artifacts, and terminates and reaps
-the launched process group plus observed and reparented descendants before validation. Every file
-and staging directory is fsynced before publication; the parent directory is fsynced afterward.
-The published directory identity and exact bytes are checked again after the atomic rename, with a
-no-replace rollback if concurrent mutation is detected. Missing primitives fail closed.
+output root before creating parents, walks and creates each artifact-parent component relative to
+no-follow directory descriptors, and creates staging relative to the pinned publication parent.
+It reads and writes bounded regular files relative to pinned descriptors, rejects symlink or
+hard-linked artifacts, and terminates and reaps the launched process group plus observed and
+reparented descendants before validation. Each newly created parent and its containing directory,
+every file, and the staging directory are fsynced before publication; the publication parent is
+fsynced afterward. Before returning, the collector reopens the complete named ancestry beneath the
+same output-root inode and proves that the final name still identifies the published staging inode.
+Any failure after the no-replace rename rolls the directory back relative to the pinned parent and
+fsyncs that rollback; an unprovable rollback is reported explicitly. Missing primitives fail
+closed.
 It records original and resolved payload argv separately from the fully wrapped execution argv,
 plus the isolation backend, exact wrapper argv, a null profile digest for the Linux namespace
 backend, and the successful probe's payload/execution argv, socket-denial result,
