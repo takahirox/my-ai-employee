@@ -286,6 +286,68 @@ def test_collect_protocol_rejects_producer_task_replacement(tmp_path: Path) -> N
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
 
 
+def test_collect_protocol_rejects_evaluator_replacement(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
+    evaluator = tmp_path / "evaluator.py"
+    evaluator.write_bytes(PRODUCER.read_bytes())
+    task_path = _task(
+        tmp_path / "task.json",
+        acceptance_evaluator=(
+            sys.executable,
+            str(evaluator),
+            "evaluator",
+            "--task",
+            "{task}",
+            "--repository",
+            "{repository}",
+            "--trial",
+            "{trial}",
+            "--protocol",
+            "{protocol}",
+            "--check",
+            "acceptance",
+            "--mode",
+            "passed",
+        ),
+    )
+    replacement_script = (
+        "import os, subprocess, sys\n"
+        "producer, evaluator, task, repository, output, protocol, manifest = sys.argv[1:]\n"
+        "result = subprocess.call((sys.executable, producer, '--task', task, "
+        "'--repository', repository, '--output', output, '--protocol', protocol, "
+        "'--manifest', manifest, '--mode', 'valid'))\n"
+        "with open(evaluator + '.replacement', 'w') as stream:\n"
+        "    stream.write('raise SystemExit(99)\\n')\n"
+        "os.replace(evaluator + '.replacement', evaluator)\n"
+        "raise SystemExit(result)\n"
+    )
+    with pytest.raises(ValueError, match="evaluator authority input identity changed"):
+        collect_protocol(
+            manifest_path=manifest,
+            protocol_id="codex-direct",
+            task_path=task_path,
+            repository=repository,
+            output_root=tmp_path,
+            timeout=10,
+            network="disabled",
+            arm_command=(
+                sys.executable,
+                "-c",
+                replacement_script,
+                str(PRODUCER),
+                str(evaluator),
+                "{task}",
+                "{repository}",
+                "{output}",
+                "{protocol}",
+                str(manifest),
+            ),
+        )
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
 @pytest.mark.parametrize("mode", ("replace-stage", "symlink-output"))
 def test_collect_protocol_rejects_replaced_or_linked_stage(tmp_path: Path, mode: str) -> None:
     with pytest.raises(ValueError, match=r"replaced|unsafe|identity"):

@@ -94,6 +94,19 @@ class _PinnedFile:
         return f"/proc/self/fd/{self.descriptor}"
 
 
+@dataclass(frozen=True)
+class _PinnedEvaluator:
+    inputs: tuple[tuple[int, _PinnedFile], ...]
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        return tuple(item.descriptor for _, item in self.inputs)
+
+    @property
+    def content_digests(self) -> tuple[Digest, ...]:
+        return tuple(item.content_digest for _, item in self.inputs)
+
+
 def _wrapped_argv(backend: _IsolationBackend, payload_argv: tuple[str, ...]) -> tuple[str, ...]:
     return (*backend.wrapper_argv, *payload_argv)
 
@@ -198,6 +211,7 @@ class ProtocolCheckRecord(SchemaModelV2):
     authority: str = Field(min_length=1, max_length=1_000)
     evaluator_argv: tuple[str, ...] = Field(min_length=1)
     evaluator_executable: str = Field(min_length=1, max_length=4_096)
+    evaluator_input_digests: tuple[Digest, ...] = Field(min_length=1)
     exit_code: int
     observation_digest: Digest
     disposition: CheckDisposition
@@ -388,6 +402,68 @@ def _resolve_argv(
             raise ValueError(f"{label} executable is not a regular file")
         resolved[0] = str(discovered_path)
     return original, tuple(resolved)
+
+
+def _pin_evaluator_inputs(
+    task: TaskIdentity,
+    repository: Path,
+    descriptors: contextlib.ExitStack,
+) -> tuple[dict[tuple[str, str], _PinnedEvaluator], tuple[_PinnedFile, ...]]:
+    pinned_by_path: dict[Path, _PinnedFile] = {}
+    evaluators: dict[tuple[str, str], _PinnedEvaluator] = {}
+    for family, checks in (
+        ("acceptance", task.acceptance_criteria),
+        ("regression", task.regression_checks),
+    ):
+        for check in checks:
+            original, resolved = _resolve_argv(
+                check.evaluator_argv,
+                replacements={
+                    "{task}": "task-authority",
+                    "{repository}": str(repository),
+                    "{trial}": "trial-authority",
+                    "{protocol}": "protocol-authority",
+                },
+                placeholders=_EVALUATOR_PLACEHOLDERS,
+                repository=repository,
+                label=f"{family} evaluator {check.id}",
+            )
+            if "-m" in original[1:]:
+                raise ValueError(f"{family} evaluator {check.id} may not load an unpinned module")
+            indexed: list[tuple[int, _PinnedFile]] = []
+            for index, item in enumerate(original):
+                candidate: Path | None = None
+                if index == 0:
+                    candidate = Path(resolved[0])
+                elif item not in _EVALUATOR_PLACEHOLDERS:
+                    literal = Path(item)
+                    if literal.is_absolute() or "/" in item:
+                        candidate = (
+                            literal
+                            if literal.is_absolute()
+                            else Path(os.path.abspath(repository / literal))
+                        )
+                        if not candidate.is_file():
+                            raise ValueError(
+                                f"{family} evaluator {check.id} authority input is missing"
+                            )
+                    else:
+                        repository_candidate = repository / literal
+                        if repository_candidate.is_file():
+                            candidate = Path(os.path.abspath(repository_candidate))
+                if candidate is None:
+                    continue
+                pinned = pinned_by_path.get(candidate)
+                if pinned is None:
+                    pinned, _ = _pin_regular_file(
+                        candidate,
+                        label=f"{family} evaluator {check.id} authority input",
+                    )
+                    pinned_by_path[candidate] = pinned
+                    descriptors.callback(os.close, pinned.descriptor)
+                indexed.append((index, pinned))
+            evaluators[(family, check.id)] = _PinnedEvaluator(inputs=tuple(indexed))
+    return evaluators, tuple(pinned_by_path.values())
 
 
 def _validate_execution_contract(
@@ -919,6 +995,7 @@ def _evaluate_checks(
     timeout: float,
     network: str,
     isolation: _IsolationBackend,
+    evaluator_pins: Mapping[tuple[str, str], _PinnedEvaluator],
 ) -> tuple[ResultBundle, dict[str, bytes]]:
     records: dict[str, list[ProtocolCheckRecord]] = {"acceptance": [], "regression": []}
     dispositions: dict[tuple[str, str, str], CheckDisposition] = {}
@@ -940,14 +1017,19 @@ def _evaluate_checks(
                     repository=repository,
                     label=f"{family} evaluator {check.id}",
                 )
+                pinned = evaluator_pins[(family, check.id)]
+                execution_argv = list(argv)
+                for index, authority_input in pinned.inputs:
+                    execution_argv[index] = authority_input.execution_path
+                executed = tuple(execution_argv)
                 stdout, stderr, _, _, exit_code = _run(
-                    argv,
+                    executed,
                     repository,
                     timeout,
                     network,
                     isolation=isolation,
                     observation_limit=_MAX_OBSERVATION_BYTES,
-                    pass_fds=(task_descriptor,),
+                    pass_fds=(task_descriptor, *pinned.pass_fds),
                 )
                 disposition = CheckDisposition.PASSED if exit_code == 0 else CheckDisposition.FAILED
                 dispositions[(result.id, family, check.id)] = disposition
@@ -956,8 +1038,9 @@ def _evaluate_checks(
                         trial_id=result.id,
                         check_id=check.id,
                         authority=check.authority,
-                        evaluator_argv=argv,
-                        evaluator_executable=argv[0],
+                        evaluator_argv=executed,
+                        evaluator_executable=executed[0],
+                        evaluator_input_digests=pinned.content_digests,
                         exit_code=exit_code,
                         observation_digest=_digest(stdout + stderr),
                         disposition=disposition,
@@ -1053,6 +1136,7 @@ def collect_protocol(
         descriptors.callback(os.close, pinned_task.descriptor)
         task, _ = _load_task_bytes(task_bytes)
         _validate_evaluator_templates(task)
+        evaluator_pins, evaluator_sources = _pin_evaluator_inputs(task, repository, descriptors)
         root_descriptor = _open_directory(output_root)
         descriptors.callback(os.close, root_descriptor)
         root_identity = _identity(root_descriptor)
@@ -1089,6 +1173,8 @@ def collect_protocol(
                 isolation=isolation.backend,
             )
             _verify_pinned_source(pinned_task, label="task input")
+            for source in evaluator_sources:
+                _verify_pinned_source(source, label="evaluator authority input")
             if exit_code != 0:
                 raise ValueError(f"arm command exited with {exit_code}")
             draft_bytes = _read_draft(stage_descriptor)
@@ -1104,7 +1190,10 @@ def collect_protocol(
                 timeout=timeout,
                 network=network,
                 isolation=isolation.backend,
+                evaluator_pins=evaluator_pins,
             )
+            for source in evaluator_sources:
+                _verify_pinned_source(source, label="evaluator authority input")
             if set(os.listdir(stage_descriptor)) != {"result-bundle.json"}:
                 raise ValueError("staging artifacts changed after validation")
             os.unlink("result-bundle.json", dir_fd=stage_descriptor)
