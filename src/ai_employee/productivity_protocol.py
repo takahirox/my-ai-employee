@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -79,6 +80,18 @@ class _IsolationBackend:
 class _NetworkIsolation:
     backend: _IsolationBackend
     probe: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class _PinnedFile:
+    source: Path
+    descriptor: int
+    identity: tuple[int, int, int, int, int]
+    content_digest: Digest
+
+    @property
+    def execution_path(self) -> str:
+        return f"/proc/self/fd/{self.descriptor}"
 
 
 def _wrapped_argv(backend: _IsolationBackend, payload_argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -229,13 +242,94 @@ def load_protocol_manifest(path: Path) -> tuple[ProtocolManifest, bytes]:
     return ProtocolManifest.model_validate_json(raw, strict=True), raw
 
 
-def _load_task(path: Path) -> tuple[TaskIdentity, bytes]:
-    raw = path.read_bytes()
+def _load_task_bytes(raw: bytes) -> tuple[TaskIdentity, bytes]:
     _reject_duplicate_keys(raw)
     task = loads_model(raw, TaskIdentity)
     if raw != (canonical_json(task) + "\n").encode("utf-8"):
         raise ValueError("task input must be canonical JSON with one trailing newline")
     return task, raw
+
+
+def _load_task(path: Path) -> tuple[TaskIdentity, bytes]:
+    return _load_task_bytes(path.read_bytes())
+
+
+def _pin_regular_file(path: Path, *, label: str) -> tuple[_PinnedFile, bytes]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    source_descriptor = os.open(path, flags)
+    try:
+        status = os.fstat(source_descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        data = _read_descriptor(source_descriptor, label=label)
+        identity = _file_identity(status)
+    finally:
+        os.close(source_descriptor)
+    memfd_create = getattr(os, "memfd_create", None)
+    if memfd_create is None:
+        raise ValueError("secure protocol collection requires sealed memfd support")
+    descriptor = memfd_create(label, 0x0001 | 0x0002)
+    try:
+        offset = 0
+        while offset < len(data):
+            offset += os.write(descriptor, data[offset:])
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        fcntl.fcntl(descriptor, 1033, 0x000F)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return (
+        _PinnedFile(
+            source=path,
+            descriptor=descriptor,
+            identity=identity,
+            content_digest=_digest(data),
+        ),
+        data,
+    )
+
+
+def _verify_pinned_source(pinned: _PinnedFile, *, label: str) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(pinned.source, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} identity changed during producer execution") from exc
+    try:
+        status = os.fstat(descriptor)
+        data = _read_descriptor(descriptor, label=label)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or _file_identity(status) != pinned.identity
+        or _digest(data) != pinned.content_digest
+    ):
+        raise ValueError(f"{label} identity changed during producer execution")
+
+
+def _file_identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _read_descriptor(descriptor: int, *, label: str) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) <= _MAX_ARTIFACT_BYTES:
+        chunk = os.read(descriptor, min(64 * 1024, _MAX_ARTIFACT_BYTES + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if len(data) > _MAX_ARTIFACT_BYTES:
+        raise ValueError(f"{label} exceeds configured byte limit")
+    return bytes(data)
 
 
 def _load_check_artifact(data: bytes, family: str) -> ProtocolCheckArtifact:
@@ -422,6 +516,7 @@ def _run(
     *,
     isolation: _IsolationBackend,
     observation_limit: int | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[bytes, bytes, str, str, int]:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number")
@@ -441,6 +536,7 @@ def _run(
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            pass_fds=pass_fds,
             start_new_session=True,
         )
         deadline = time.monotonic() + timeout
@@ -815,6 +911,7 @@ def _validate_draft_bundle(
 def _evaluate_checks(
     *,
     task_path: Path,
+    task_descriptor: int,
     task: TaskIdentity,
     repository: Path,
     protocol: ProtocolDefinition,
@@ -850,6 +947,7 @@ def _evaluate_checks(
                     network,
                     isolation=isolation,
                     observation_limit=_MAX_OBSERVATION_BYTES,
+                    pass_fds=(task_descriptor,),
                 )
                 disposition = CheckDisposition.PASSED if exit_code == 0 else CheckDisposition.FAILED
                 dispositions[(result.id, family, check.id)] = disposition
@@ -939,8 +1037,6 @@ def collect_protocol(
     if network != protocol.network:
         raise ValueError("caller and protocol network policies do not match")
     task_path = task_path.resolve(strict=True)
-    task, task_bytes = _load_task(task_path)
-    _validate_evaluator_templates(task)
     repository = repository.resolve(strict=True)
     if not repository.is_dir():
         raise ValueError("repository must be an existing directory")
@@ -953,6 +1049,10 @@ def collect_protocol(
     final_name = directory_parts[-1]
     final_command = output_root.joinpath(*command_relative.parts)
     with contextlib.ExitStack() as descriptors:
+        pinned_task, task_bytes = _pin_regular_file(task_path, label="task input")
+        descriptors.callback(os.close, pinned_task.descriptor)
+        task, _ = _load_task_bytes(task_bytes)
+        _validate_evaluator_templates(task)
         root_descriptor = _open_directory(output_root)
         descriptors.callback(os.close, root_descriptor)
         root_identity = _identity(root_descriptor)
@@ -988,13 +1088,15 @@ def collect_protocol(
                 network,
                 isolation=isolation.backend,
             )
+            _verify_pinned_source(pinned_task, label="task input")
             if exit_code != 0:
                 raise ValueError(f"arm command exited with {exit_code}")
             draft_bytes = _read_draft(stage_descriptor)
             draft = load_result_bundle(draft_bytes)
             _validate_draft_bundle(protocol, task, draft)
             bundle, outputs = _evaluate_checks(
-                task_path=task_path,
+                task_path=Path(pinned_task.execution_path),
+                task_descriptor=pinned_task.descriptor,
                 task=task,
                 repository=repository,
                 protocol=protocol,

@@ -246,6 +246,46 @@ def test_collect_protocol_rejects_untrusted_producer_outputs(
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
 
 
+def test_collect_protocol_rejects_producer_task_replacement(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
+    task_path = _task(tmp_path / "task.json")
+    replacement_script = (
+        "import os, subprocess, sys\n"
+        "producer, task, repository, output, protocol, manifest = sys.argv[1:]\n"
+        "result = subprocess.call((sys.executable, producer, '--task', task, "
+        "'--repository', repository, '--output', output, '--protocol', protocol, "
+        "'--manifest', manifest, '--mode', 'valid'))\n"
+        "with open(task + '.replacement', 'wb') as stream:\n"
+        "    stream.write(b'{}\\n')\n"
+        "os.replace(task + '.replacement', task)\n"
+        "raise SystemExit(result)\n"
+    )
+    with pytest.raises(ValueError, match="task input identity changed"):
+        collect_protocol(
+            manifest_path=manifest,
+            protocol_id="codex-direct",
+            task_path=task_path,
+            repository=repository,
+            output_root=tmp_path,
+            timeout=10,
+            network="disabled",
+            arm_command=(
+                sys.executable,
+                "-c",
+                replacement_script,
+                str(PRODUCER),
+                "{task}",
+                "{repository}",
+                "{output}",
+                "{protocol}",
+                str(manifest),
+            ),
+        )
+    assert not (tmp_path / "artifacts" / "codex-direct").exists()
+
+
 @pytest.mark.parametrize("mode", ("replace-stage", "symlink-output"))
 def test_collect_protocol_rejects_replaced_or_linked_stage(tmp_path: Path, mode: str) -> None:
     with pytest.raises(ValueError, match=r"replaced|unsafe|identity"):
