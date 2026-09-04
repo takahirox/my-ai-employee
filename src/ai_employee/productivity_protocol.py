@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import secrets
 import shutil
 import signal
@@ -67,6 +68,19 @@ else:
     raise SystemExit(97)
 """
 _NETWORK_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = (
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint),
+    )
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = (("length", ctypes.c_ushort), ("filter", ctypes.POINTER(_SockFilter)))
 
 
 @dataclass(frozen=True)
@@ -584,6 +598,35 @@ def _terminate_tree(
     raise ValueError("protocol process-tree cleanup could not be confirmed")
 
 
+def _install_socket_seccomp() -> None:
+    syscall_numbers = {
+        "x86_64": (41, 42, 53),
+        "amd64": (41, 42, 53),
+        "aarch64": (198, 203, 199),
+        "arm64": (198, 203, 199),
+    }.get(platform.machine().lower())
+    if syscall_numbers is None:
+        raise OSError(errno.ENOTSUP, "unsupported architecture for socket seccomp")
+    instructions = [_SockFilter(0x20, 0, 0, 0)]
+    for number in syscall_numbers:
+        instructions.extend(
+            (
+                _SockFilter(0x15, 0, 1, number),
+                _SockFilter(0x06, 0, 0, 0x00050000 | errno.EPERM),
+            )
+        )
+    instructions.append(_SockFilter(0x06, 0, 0, 0x7FFF0000))
+    filters = (_SockFilter * len(instructions))(*instructions)
+    program = _SockFprog(len(instructions), filters)
+    library = ctypes.CDLL(None, use_errno=True)
+    if library.prctl(38, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if library.prctl(22, 2, ctypes.byref(program), 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def _run(
     argv: tuple[str, ...],
     repository: Path,
@@ -597,8 +640,14 @@ def _run(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number")
     _require_secure_runtime()
-    environment = os.environ.copy()
-    environment["FLEET_PRODUCTIVITY_NETWORK"] = network
+    environment = {
+        "FLEET_PRODUCTIVITY_NETWORK": network,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+    if "PYTHONPATH" in os.environ:
+        environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
     started_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     baseline = _process_snapshot()
     _set_subreaper(True)
@@ -613,6 +662,7 @@ def _run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             pass_fds=pass_fds,
+            preexec_fn=_install_socket_seccomp,
             start_new_session=True,
         )
         deadline = time.monotonic() + timeout

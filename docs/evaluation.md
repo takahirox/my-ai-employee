@@ -239,6 +239,9 @@ isolation wrapper. The run is rejected unless the wrapped probe reports an OS so
 successful connection, malformed evidence, wrapper failure, or timeout is never treated as an
 offline result. The successfully probed immutable wrapper prefix is then applied to the producer
 and every evaluator subprocess.
+Each child additionally installs a no-new-privileges seccomp filter that rejects `socket`,
+`socketpair`, and `connect`, including AF_UNIX, and receives only a minimal deterministic
+environment. Unsupported syscall architectures fail closed.
 
 The untrusted producer must create exactly one regular file in `{output}`:
 

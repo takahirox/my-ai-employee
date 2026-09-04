@@ -348,6 +348,47 @@ def test_collect_protocol_rejects_evaluator_replacement(tmp_path: Path) -> None:
     assert not (tmp_path / "artifacts" / "codex-direct").exists()
 
 
+def test_collect_protocol_denies_unix_domain_sockets(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
+    task_path = _task(tmp_path / "task.json")
+    probe_script = (
+        "import errno, os, socket, sys\n"
+        "producer, task, repository, output, protocol, manifest = sys.argv[1:]\n"
+        "try:\n"
+        "    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "except OSError as error:\n"
+        "    assert error.errno == errno.EPERM\n"
+        "else:\n"
+        "    raise SystemExit(91)\n"
+        "os.execv(sys.executable, (sys.executable, producer, '--task', task, "
+        "'--repository', repository, '--output', output, '--protocol', protocol, "
+        "'--manifest', manifest, '--mode', 'valid'))\n"
+    )
+    command_path = collect_protocol(
+        manifest_path=manifest,
+        protocol_id="codex-direct",
+        task_path=task_path,
+        repository=repository,
+        output_root=tmp_path,
+        timeout=10,
+        network="disabled",
+        arm_command=(
+            sys.executable,
+            "-c",
+            probe_script,
+            str(PRODUCER),
+            "{task}",
+            "{repository}",
+            "{output}",
+            "{protocol}",
+            str(manifest),
+        ),
+    )
+    assert command_path.is_file()
+
+
 @pytest.mark.parametrize("mode", ("replace-stage", "symlink-output"))
 def test_collect_protocol_rejects_replaced_or_linked_stage(tmp_path: Path, mode: str) -> None:
     with pytest.raises(ValueError, match=r"replaced|unsafe|identity"):
