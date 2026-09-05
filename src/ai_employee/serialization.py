@@ -57,6 +57,9 @@ def project_harness_digest(harness: BaseModel) -> str:
     """Digest Harness v2 while preserving disabled review-field compatibility."""
 
     payload = harness.model_dump(mode="python", by_alias=True, exclude_none=False)
+    worker = payload.get("worker")
+    if isinstance(worker, dict) and worker.get("isolated_workspace_tools") is False:
+        worker.pop("isolated_workspace_tools")
     verification = payload.get("verification")
     if isinstance(verification, dict):
         review = verification.get("review")
@@ -71,6 +74,8 @@ def operator_config_digest(config: BaseModel) -> str:
     """Digest operator config without serializing disabled review opt-in defaults."""
 
     payload = config.model_dump(mode="python", by_alias=True, exclude_none=False)
+    if payload.get("isolated_worker") is None:
+        payload.pop("isolated_worker", None)
     promotion = payload.get("promotion_auto_approval")
     if isinstance(promotion, dict) and promotion.get("mode") == "manual":
         payload.pop("promotion_auto_approval")

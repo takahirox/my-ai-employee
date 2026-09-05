@@ -327,6 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work.add_argument("--plan-only", action="store_true")
     work.add_argument(
+        "--acceptance-file",
+        help="request-specific criteria JSON referencing declared inline Python Harness checks",
+    )
+    work.add_argument(
         "--task-kind",
         choices=("mutating", "non_mutating"),
         default="mutating",
@@ -1124,6 +1128,7 @@ def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
+    from .goal_acceptance import attach_goal_checks, harness_for_goal
     from .orchestration import WorkCoordinator, bind_service_decision
 
     resume_run: GraphRunRecord | None = getattr(args, "resume_graph_run", None)
@@ -1158,6 +1163,12 @@ def _work(args: argparse.Namespace) -> int:
             if resume_run is None
             else resume_run.goal
         )
+        acceptance_file = getattr(args, "acceptance_file", None)
+        if acceptance_file:
+            if resume_run is not None:
+                raise ValueError("resume cannot replace accepted Goal criteria")
+            goal = attach_goal_checks(goal, acceptance_file)
+        harness = harness_for_goal(harness, goal)
     except ValueError:
         print(
             canonical_json(
@@ -1316,6 +1327,16 @@ def _work(args: argparse.Namespace) -> int:
         if selected_strategy is None
         else operator_config.worker_command(cast(WorkerName, selected_strategy.backend))
     )
+    if operator_config.isolated_worker is not None:
+        from .isolated_execution import validate_isolated_contract
+
+        validate_isolated_contract(
+            harness,
+            routing=args.routing_mode,
+            backend="" if selected_strategy is None else selected_strategy.backend,
+            task_kind=goal.task_kind,
+            processes_authorized=goal.processes_authorized,
+        )
     assessment_command = (
         None
         if assessment_strategy is None
@@ -1363,8 +1384,15 @@ def _work(args: argparse.Namespace) -> int:
                 job_goal=getattr(args, "job_goal", None),
             )
 
-        def executor_for(root: Path) -> LocalProcessExecutor:
-            return LocalProcessExecutor(
+        def executor_for(root: Path, *, candidate: bool = False) -> LocalProcessExecutor:
+            from .isolated_execution import DockerProcessExecutor
+
+            executor_type = (
+                DockerProcessExecutor
+                if candidate and operator_config.isolated_worker
+                else LocalProcessExecutor
+            )
+            executor = executor_type(
                 (root,),
                 artifacts,
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
@@ -1372,7 +1400,14 @@ def _work(args: argparse.Namespace) -> int:
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
-        def write_prompt(value: bytes, bound_run_id: str, bound_store: SQLiteStore) -> str:
+            if isinstance(executor, DockerProcessExecutor):
+                assert operator_config.isolated_worker is not None
+                executor.profile = operator_config.isolated_worker
+            return executor
+
+        def write_prompt(
+            value: bytes, bound_run_id: str, bound_store: SQLiteStore, kind: str = "worker_request"
+        ) -> str:
             descriptor = artifacts.put(
                 io.BytesIO(value),
                 ArtifactPutRequest(
@@ -1380,7 +1415,7 @@ def _work(args: argparse.Namespace) -> int:
                     run_id=bound_run_id,
                     created_at=now(),
                     media_type="application/json",
-                    logical_kind="worker_request",
+                    logical_kind=kind,
                     producer_action_id=bound_run_id,
                     source=freeze_json({"bounded": True}),
                 ),
@@ -1668,6 +1703,28 @@ def _work(args: argparse.Namespace) -> int:
             timeout_seconds: float,
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
+            if operator_config.isolated_worker is not None:
+                from .isolated_execution import IsolatedCodexWorker
+
+                if snapshot is None:
+                    # Probe does not export any host repository files.
+                    root = workspace_root / "not-yet-created"
+                if bound_worker_name != "codex_cli" or not bound_model or not bound_effort:
+                    raise ValueError("isolated worker requires an explicit Codex model and effort")
+                return IsolatedCodexWorker(
+                    root,
+                    operator_config.isolated_worker,
+                    model=bound_model,
+                    effort=bound_effort,
+                    cancellation=cancellation,
+                    seconds=timeout_seconds,
+                    commands=tuple(command.argv for command in harness.commands.values()),
+                    persist=lambda value, kind: write_prompt(
+                        value, bound_run_id, bound_store, kind
+                    ),
+                    generated_paths=harness.paths.generated,
+                    on_usage_limit=lambda: bound_store.request_control(run_id, "cancel"),
+                )
             command = operator_config.worker_command(bound_worker_name)
             adapter_type = {
                 "codex_cli": CodexCliWorkerAdapter,
@@ -1854,7 +1911,7 @@ def _work(args: argparse.Namespace) -> int:
                         bound_store=inner_store,
                         timeout_seconds=timeout_authority.effective_timeout_seconds,
                     ),
-                    lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                    lambda snapshot: executor_for(Path(snapshot.isolated_worktree), candidate=True),
                     lambda descriptor: artifacts.open_verified(descriptor).read(),
                     (policy,),
                     task_assessment=node_assessment,
@@ -1872,7 +1929,7 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     installer_factory=lambda snapshot: ProjectLocalInstaller(
                         snapshot.isolated_worktree,
-                        executor_for(Path(snapshot.isolated_worktree)),
+                        executor_for(Path(snapshot.isolated_worktree), candidate=True),
                         artifacts,
                         network_mediated=harness.network.mode.value != "disabled",
                     ),
@@ -1900,7 +1957,7 @@ def _work(args: argparse.Namespace) -> int:
                 store,
                 workspace,
                 harness,
-                lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                lambda snapshot: executor_for(Path(snapshot.isolated_worktree), candidate=True),
                 decide_parent_process,
                 browser_services_factory=lambda snapshot, cancellation: (
                     PlaywrightBrowserEvaluationServices(
@@ -2308,7 +2365,9 @@ def _graph_promotion_evidence(
     semantic_evidence = goal_evaluation.evidence_digests[len(deterministic_prefix) :]
     if run.repository is None:
         raise ValueError("graph repository authority is missing")
-    harness = discover_project_harness(run.repository)
+    from .goal_acceptance import harness_for_goal
+
+    harness = harness_for_goal(discover_project_harness(run.repository), run.goal)
     accepted_semantic_findings: tuple[str, ...] = ()
     if harness.verification.review.parent_semantic_review:
         semantic_set = set(semantic_evidence)
@@ -2472,7 +2531,9 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
             )
             if len(acceptances) != 1:
                 raise ValueError("accepted graph authority is missing or ambiguous")
-            harness = discover_project_harness(run.repository)
+            from .goal_acceptance import harness_for_goal
+
+            harness = harness_for_goal(discover_project_harness(run.repository), run.goal)
             operator_config = load_operator_config(run.operator_config_path)
             exact_replay = validate_exact_parent_evidence_store(
                 store,

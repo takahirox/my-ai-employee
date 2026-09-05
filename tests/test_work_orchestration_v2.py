@@ -1077,7 +1077,7 @@ def test_codex_prompt_describes_edit_transport() -> None:
     assert "edit_intent" in prompt["transport_instruction"]
     assert "existing_lock" in prompt["transport_instruction"]
     assert "non_mutating_result" in prompt["transport_instruction"]
-    assert "copy every supplied binding exactly" in prompt["transport_instruction"]
+    assert "no runtime binding fields" in prompt["transport_instruction"]
     assert "diff --git" in prompt["transport_instruction"]
     assert "never use *** Begin Patch" in prompt["transport_instruction"]
 
@@ -2198,6 +2198,18 @@ def test_work_coordinator_accepts_bound_typed_result_with_authoritative_budget(
             duration_seconds=0.01,
             non_mutating_result=typed,
         )
+        active = WorkRun(
+            id=request.run_id,
+            goal=request.goal,
+            repository=str(tmp_path),
+            base_commit=ZERO,
+            worker="scripted",
+            effective_policy_digest=ZERO,
+            status="running",
+            worker_request_digest=request.content_digest,
+            worker_result_id=result.id,
+        )
+        store.save_work_run(active)
         accepted = coordinator._accept_non_mutating_result(request, result, 0)
 
         missing_budget_request = WorkerRequest(
@@ -2217,6 +2229,13 @@ def test_work_coordinator_accepts_bound_typed_result_with_authoritative_budget(
                 "request_digest": missing_budget_request.content_digest,
                 "non_mutating_result": missing_budget_typed,
             }
+        )
+        store.save_work_run(
+            active.model_copy(
+                update={
+                    "worker_request_digest": missing_budget_request.content_digest,
+                }
+            )
         )
         rejected = coordinator._accept_non_mutating_result(
             missing_budget_request, missing_budget_result, 0
@@ -2357,7 +2376,7 @@ def test_bound_probe_failure_persists_an_exact_failed_worker_result(tmp_path: Pa
         accepted_graph_revision_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
-        remaining_budgets={"worker_turns": 1, "wall_seconds": 2.0},
+        remaining_budgets={"worker_turns": 1, "wall_seconds": 2.0, "artifact_bytes": 100_000},
     )
     with SQLiteStore(tmp_path / "probe-failure.db") as store:
         coordinator = WorkCoordinator(

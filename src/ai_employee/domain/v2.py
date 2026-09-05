@@ -141,6 +141,12 @@ def _digest_content(value: object) -> object:
             if isinstance(value, DigestedRecordV2)
             else set()
         )
+        # Disabled isolation is additive configuration, not a historical record mutation.
+        if (
+            getattr(type(value), "schema_name", None) == "harness_worker"
+            and getattr(value, "isolated_workspace_tools", None) is False
+        ):
+            excluded.add("isolated_workspace_tools")
         return {
             name: _digest_content(getattr(value, name))
             for name in type(value).model_fields

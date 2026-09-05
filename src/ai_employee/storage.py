@@ -915,6 +915,54 @@ class SQLiteStore:
             raise RuntimeError("SQLite did not return a v2 event sequence")
         return int(cursor.lastrowid)
 
+    def commit_typed_result_acceptance(self, acceptance: Any, event: Any) -> None:
+        """Commit typed acceptance, descriptor and its reason as one fenced decision.
+
+        Artifact bytes are written beforehand: a crash may leave orphan bytes but
+        cannot leave authoritative acceptance without its descriptor and event.
+        This transaction does not claim atomicity for external execution.
+        """
+        self.migrate_v2()
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            run = self.get_work_run(acceptance.run_id)
+            if (
+                run.worker_request_digest != acceptance.worker_request_digest
+                or run.worker_result_id != acceptance.worker_result_id
+                or run.status != "running"
+                or self.control(acceptance.run_id) is not None
+            ):
+                raise ValueError("typed acceptance no longer belongs to an active invocation")
+            previous = self.work_events(acceptance.run_id)
+            from .serialization import canonical_digest
+
+            if (
+                event.run_id != acceptance.run_id
+                or event.result_digest != acceptance.content_digest
+                or event.kind != f"typed_result_{acceptance.status}"
+                or event.sequence != len(previous) + 1
+                or event.previous_event_digest
+                != (canonical_digest(previous[-1]) if previous else None)
+            ):
+                raise ValueError("typed acceptance event has stale or contradictory bindings")
+            records = [("non_mutating_result_acceptance_v2", acceptance)]
+            if acceptance.artifact is not None:
+                records.append(("artifact_descriptor_v2", acceptance.artifact))
+            for kind, record in records:
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) VALUES(?,?,?,?,?)",
+                    (kind, record.id, acceptance.run_id, 1, canonical_json(record)),
+                )
+            connection.execute(
+                "INSERT INTO work_events_v2(event_id,run_id,payload) VALUES(?,?,?)",
+                (event.id, event.run_id, canonical_json(event)),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
     def work_events(self, run_id: str) -> tuple[Any, ...]:
         from .orchestration import WorkEvent
 
