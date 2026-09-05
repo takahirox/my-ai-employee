@@ -1,0 +1,379 @@
+{
+  "cadence": {
+    "expensive": ["weekly-sunday-03:00-utc", "every-release-candidate", "material-control-change"],
+    "per_pr": "every-pull-request"
+  },
+  "format": "fleet-productivity-protocols/2",
+  "protocols": [
+    {
+      "artifacts": "artifacts/ablation-no-planning/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-planning", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "planning",
+      "evidence": ["artifacts/ablation-no-planning/acceptance.json", "artifacts/ablation-no-planning/regression.json", "artifacts/ablation-no-planning/result-bundle.json"],
+      "id": "ablation-no-planning",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": false, "repair": true, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": ["planning"],
+        "id": "ablation-no-planning",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/ablation-no-repair/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-repair", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "repair",
+      "evidence": ["artifacts/ablation-no-repair/acceptance.json", "artifacts/ablation-no-repair/regression.json", "artifacts/ablation-no-repair/result-bundle.json"],
+      "id": "ablation-no-repair",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": false, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": ["repair"],
+        "id": "ablation-no-repair",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/ablation-no-review/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-no-review", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "review",
+      "evidence": ["artifacts/ablation-no-review/acceptance.json", "artifacts/ablation-no-review/regression.json", "artifacts/ablation-no-review/result-bundle.json"],
+      "id": "ablation-no-review",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": false, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": ["review"],
+        "id": "ablation-no-review",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/ablation-serial/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "ablation-serial", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "maximum-parallelism",
+      "evidence": ["artifacts/ablation-serial/acceptance.json", "artifacts/ablation-serial/regression.json", "artifacts/ablation-serial/result-bundle.json"],
+      "id": "ablation-serial",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 1, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": ["parallelism"],
+        "id": "ablation-serial",
+        "kind": "fleet_ablation",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/claude-direct/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "claude-direct", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "direct-claude-adapter",
+      "evidence": ["artifacts/claude-direct/acceptance.json", "artifacts/claude-direct/regression.json", "artifacts/claude-direct/result-bundle.json"],
+      "id": "claude-direct",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "claude",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"anthropic","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["claude-direct","claude-fleet"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "857296d3436cb4ea841ca840a842c09ad4a945f4b452d26a4c4970e329dd86c0",
+        "disabled_components": [],
+        "id": "claude-direct",
+        "kind": "direct_agent",
+        "schema_version": "2",
+        "worker": "claude"
+      }]
+    },
+    {
+      "artifacts": "artifacts/claude-fleet/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "claude-fleet", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "fleet-orchestration",
+      "evidence": ["artifacts/claude-fleet/acceptance.json", "artifacts/claude-fleet/regression.json", "artifacts/claude-fleet/result-bundle.json"],
+      "id": "claude-fleet",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"anthropic","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["claude-direct","claude-fleet"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "857296d3436cb4ea841ca840a842c09ad4a945f4b452d26a4c4970e329dd86c0",
+        "disabled_components": [],
+        "id": "claude-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "claude"
+      }]
+    },
+    {
+      "artifacts": "artifacts/codex-direct/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "codex-direct", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "direct-codex-adapter",
+      "evidence": ["artifacts/codex-direct/acceptance.json", "artifacts/codex-direct/regression.json", "artifacts/codex-direct/result-bundle.json"],
+      "id": "codex-direct",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "codex",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": [],
+        "id": "codex-direct",
+        "kind": "direct_agent",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/codex-fleet/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "codex-fleet", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "fleet-orchestration",
+      "evidence": ["artifacts/codex-fleet/acceptance.json", "artifacts/codex-fleet/regression.json", "artifacts/codex-fleet/result-bundle.json"],
+      "id": "codex-fleet",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"codex","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["codex-direct","codex-fleet","ablation-no-planning","ablation-no-review","ablation-no-repair","ablation-serial"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "4f0bcc94a1854de95b8a698a1c750791ef89045de37f40ceaebc350d47727683",
+        "disabled_components": [],
+        "id": "codex-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    },
+    {
+      "artifacts": "artifacts/native-swe-bench/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "native-swe-bench", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "native-record-projection",
+      "evidence": ["artifacts/native-swe-bench/acceptance.json", "artifacts/native-swe-bench/regression.json", "artifacts/native-swe-bench/result-bundle.json"],
+      "id": "native-swe-bench",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "swe-bench",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"operator-declared","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["native-swe-bench","unused-control"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "a838f4b12e5fc8d700ca8b3e29ab0492e362992811de6dfa51f4374d4d6e7223",
+        "disabled_components": [],
+        "id": "native-swe-bench",
+        "kind": "oss_adapter",
+        "schema_version": "2",
+        "worker": "offline-import"
+      }]
+    },
+    {
+      "artifacts": "artifacts/oss-comparator/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "oss-comparator", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "generic-oss-adapter",
+      "evidence": ["artifacts/oss-comparator/acceptance.json", "artifacts/oss-comparator/regression.json", "artifacts/oss-comparator/result-bundle.json"],
+      "id": "oss-comparator",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "generic-oss",
+        "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"operator-declared","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["oss-comparator","unused-control"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "cc53d317a614c240f9323ca35c039e0f319b461dc52c5b78bdb1d485adf6b49b",
+        "disabled_components": [],
+        "id": "oss-comparator",
+        "kind": "oss_adapter",
+        "schema_version": "2",
+        "worker": "operator-supplied"
+      }]
+    },
+    {
+      "artifacts": "artifacts/randomized-real-ab/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "randomized-real-ab", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "predeclared-randomized-order",
+      "evidence": ["artifacts/randomized-real-ab/acceptance.json", "artifacts/randomized-real-ab/regression.json", "artifacts/randomized-real-ab/result-bundle.json"],
+      "id": "randomized-real-ab",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [
+        {
+          "adapter": "randomized-real",
+          "arm_config": {"maximum_parallelism": 1, "planning": false, "repair": false, "review": false, "schema_version": "2"},
+          "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+          "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+          "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"operator-declared","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["real-direct","real-fleet"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+          "fairness_config_digest": "d94919aec5e0e40e4a267d14318ed2ab5f30bd719b43f62df9a8022af2f31845",
+          "disabled_components": [],
+          "id": "real-direct",
+          "kind": "direct_agent",
+          "schema_version": "2",
+          "worker": "codex"
+        },
+        {
+          "adapter": "randomized-real",
+          "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+          "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+          "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+          "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"operator-declared","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["real-direct","real-fleet"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+          "fairness_config_digest": "d94919aec5e0e40e4a267d14318ed2ab5f30bd719b43f62df9a8022af2f31845",
+          "disabled_components": [],
+          "id": "real-fleet",
+          "kind": "fleet",
+          "schema_version": "2",
+          "worker": "codex"
+        }
+      ]
+    },
+    {
+      "artifacts": "artifacts/release-regression/command.json",
+      "command": [
+        "python", "-m", "ai_employee.productivity_protocol",
+        "--protocol", "release-regression", "--task", "<canonical-task.json>",
+        "--repository", "<checkout>", "--output-root", "<artifact-root>",
+        "--timeout", "<seconds>", "--network", "disabled", "--",
+        "<producer-executable>", "--task", "{task}", "--repository", "{repository}",
+        "--output", "{output}", "--protocol", "{protocol}"
+      ],
+      "controlled_delta": "compatible-release-candidate",
+      "evidence": ["artifacts/release-regression/acceptance.json", "artifacts/release-regression/regression.json", "artifacts/release-regression/result-bundle.json"],
+      "id": "release-regression",
+      "network": "disabled",
+      "schema_version": "2",
+      "treatments": [{
+        "adapter": "fleet",
+        "arm_config": {"maximum_parallelism": 4, "planning": true, "repair": true, "review": true, "schema_version": "2"},
+        "environment": {"cache_policy":"cold","dependency_lock_digest":"0000000000000000000000000000000000000000000000000000000000000000","executable":"<producer-executable>","executable_version":"<producer-version>","machine_digest":"1111111111111111111111111111111111111111111111111111111111111111","network_mode":"disabled","sandbox_mode":"operator-declared","schema_version":"2"},
+        "environment_digest": "6dbf8648771685ecf731ff00cd3d8be1232d70911dde3de5de9c27d6d0a7fd44",
+        "fairness_config": {"budgets":{"cost_limit":100.0,"input_tokens":100000,"output_tokens":20000,"schema_version":"2","wall_seconds":3600.0},"context_digest":"3333333333333333333333333333333333333333333333333333333333333333","model_name":"<model-name>","model_provider":"operator-declared","model_version":"<model-version>","pricing":{"currency":"USD","input_per_million":0.0,"output_per_million":0.0,"schema_version":"2","subscription_allocation":"operator-declared"},"prompt_digest":"2222222222222222222222222222222222222222222222222222222222222222","randomized_order":["release-fleet","release-control"],"reasoning_effort":"operator-declared","schema_version":"2","stopping":{"maximum_attempts":3,"maximum_repairs":2,"maximum_retries":2,"schema_version":"2","terminal_conditions":["accepted","cancelled","checks-failed","execution-failed","timed-out"]},"tools":["edit_intent","process"]},
+        "fairness_config_digest": "58b69d8201e4afeb21d681b4553dbab8af5d8104fa0e7840de01950421529ca2",
+        "disabled_components": [],
+        "id": "release-fleet",
+        "kind": "fleet",
+        "schema_version": "2",
+        "worker": "codex"
+      }]
+    }
+  ],
+  "schema_version": "2",
+  "verification": {
+    "diff_check": ["git", "diff", "--check"],
+    "lint": ["uv", "run", "--offline", "ruff", "check", "."],
+    "test": ["uv", "run", "--offline", "pytest", "-q"],
+    "typecheck": ["uv", "run", "--offline", "mypy"]
+  }
+}

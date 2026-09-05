@@ -111,6 +111,7 @@ from .plan_review import (
     PlanReviewGateError,
     plan_review_schema_json,
 )
+from .productivity_cli import run_productivity
 from .project import (
     discover_project,
     discover_project_harness,
@@ -203,6 +204,27 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--operator-config")
     evaluate.add_argument("--db", default=".fleet/evals.db")
     evaluate.add_argument("--json", action="store_true")
+
+    productivity = commands.add_parser(
+        "productivity", help="combine, validate, or report productivity result bundles"
+    )
+    productivity_commands = productivity.add_subparsers(dest="productivity_command", required=True)
+    productivity_combine = productivity_commands.add_parser(
+        "combine", help="combine canonical one-arm result bundles"
+    )
+    productivity_combine.add_argument("bundles", nargs="+")
+    productivity_combine.add_argument("--output", required=True)
+    productivity_validate = productivity_commands.add_parser(
+        "validate", help="validate one canonical result bundle"
+    )
+    productivity_validate.add_argument("bundle")
+    productivity_report = productivity_commands.add_parser(
+        "report", help="aggregate and report one canonical result bundle"
+    )
+    productivity_report.add_argument("bundle")
+    productivity_report.add_argument("--direct-arm", help="exact direct-agent arm ID")
+    productivity_report.add_argument("--fleet-arm", help="exact complete-Fleet arm ID")
+    productivity_report.add_argument("--format", dest="output_format", default="json")
 
     inspect = commands.add_parser("inspect", help="inspect a persisted run")
     inspect.add_argument("run_id")
@@ -367,6 +389,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "eval":
         return _eval(args)
+    if args.command == "productivity":
+        try:
+            return run_productivity(args)
+        except (OSError, ValueError) as error:
+            parser.error(f"productivity: {error}")
     try:
         reject_database_environment()
     except ValueError as error:
