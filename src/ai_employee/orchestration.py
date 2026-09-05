@@ -500,6 +500,22 @@ class WorkCoordinator:
         for layer in self.policy_layers:
             self.store.put("policy_layer_v2", layer, run_id=run.id)
         self._event(run.id, "run_created", "runtime", policy_digest=policy_digest)
+        if _accepted_request is not None and _accepted_request.task_kind.value == "non_mutating":
+            budgets = _accepted_request.remaining_budgets
+            artifact_bytes = budgets.get("artifact_bytes") if isinstance(budgets, Mapping) else None
+            if type(artifact_bytes) is not int or artifact_bytes <= 0:
+                self.store.put("worker_request_v2", _accepted_request, run_id=run.id)
+                self._event(
+                    run.id,
+                    "worker_contract_preflight_rejected",
+                    "runtime",
+                    request_digest=_accepted_request.content_digest,
+                    details={
+                        "stable_failure_code": "ARTIFACT_BUDGET_INVALID",
+                        "required_field": "remaining_budgets.artifact_bytes",
+                    },
+                )
+                return self._update(run, status="failed", failure_code="ARTIFACT_BUDGET_INVALID")
         cancellation = _Cancellation(self.store, run.id)
         adapter = self.worker_factory(None, cancellation)
         availability = adapter.probe()
@@ -842,8 +858,6 @@ class WorkCoordinator:
                 artifact = self.artifact_store.put(io.BytesIO(payload), put_request)
             except ValueError:
                 failure_code = StableFailureCode.TYPED_RESULT_OVERSIZED
-            else:
-                self.store.put("artifact_descriptor_v2", artifact, run_id=request.run_id)
 
         acceptance = NonMutatingResultAcceptance(
             id=identifier("typed-result-acceptance"),
@@ -865,15 +879,11 @@ class WorkCoordinator:
             artifact=artifact,
             failure_code=failure_code,
         )
-        self.store.put(
-            "non_mutating_result_acceptance_v2",
-            acceptance,
-            run_id=request.run_id,
-        )
         self._event(
             request.run_id,
             f"typed_result_{acceptance.status}",
             "runtime",
+            atomic_acceptance=acceptance,
             request_digest=request.content_digest,
             result_digest=acceptance.content_digest,
             artifact_digests=(() if artifact is None else (artifact.artifact_digest,)),
@@ -1579,7 +1589,15 @@ class WorkCoordinator:
         self._event(updated.id, "run_status", "runtime", details={"status": updated.status})
         return updated
 
-    def _event(self, run_id: str, kind: str, actor: WorkActor, **values: object) -> None:
+    def _event(
+        self,
+        run_id: str,
+        kind: str,
+        actor: WorkActor,
+        *,
+        atomic_acceptance: NonMutatingResultAcceptance | None = None,
+        **values: object,
+    ) -> None:
         previous = self.store.work_events(run_id)
         prior_digest = canonical_digest(previous[-1]) if previous else None
         event = WorkEvent.model_validate(
@@ -1594,7 +1612,10 @@ class WorkCoordinator:
                 **values,
             }
         )
-        self.store.append_work_event(event)
+        if atomic_acceptance is None:
+            self.store.append_work_event(event)
+        else:
+            self.store.commit_typed_result_acceptance(atomic_acceptance, event)
 
 
 def _declared_criterion_evidence(
