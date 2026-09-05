@@ -32,7 +32,7 @@ The task starts from:
 
 ```python
 def normalize_label(value):
-    return value.strip().lower().replace(' ', '-')
+    return value.strip().lower().replace(" ", "-")
 ```
 
 The requested correction collapses runs of spaces, tabs and newlines to a single
