@@ -1072,7 +1072,8 @@ def _evaluate_checks(
                 pinned = evaluator_pins[(family, check.id)]
                 execution_argv = list(argv)
                 for index, authority_input in pinned.inputs:
-                    execution_argv[index] = authority_input.execution_path
+                    if index != 0:
+                        execution_argv[index] = authority_input.execution_path
                 executed = tuple(execution_argv)
                 stdout, stderr, _, _, exit_code = _run(
                     executed,

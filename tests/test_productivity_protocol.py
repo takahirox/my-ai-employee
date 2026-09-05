@@ -280,7 +280,7 @@ def test_collect_protocol_rejects_producer_task_replacement(tmp_path: Path) -> N
         "'--repository', repository, '--output', output, '--protocol', protocol, "
         "'--manifest', manifest, '--mode', 'valid'))\n"
         "with open(task + '.replacement', 'wb') as stream:\n"
-        "    stream.write(b'{}\\n')\n"
+        "    stream.write(bytes((123, 125, 10)))\n"
         "os.replace(task + '.replacement', task)\n"
         "raise SystemExit(result)\n"
     )

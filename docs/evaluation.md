@@ -283,10 +283,10 @@ Any failure after the no-replace rename rolls the directory back relative to the
 fsyncs that rollback; an unprovable rollback is reported explicitly. Missing primitives fail
 closed.
 Before producer execution, canonical task bytes and each explicitly named evaluator executable or
-script are copied into sealed Linux memfds. The collector revalidates their named source identities
-and bytes after the producer exits, passes only inherited `/proc/self/fd` paths to evaluators, and
-records the authority-input content digests. Module-style evaluators that could import an unpinned
-repository harness are rejected.
+script are copied into sealed Linux memfds. Executables are resolved to non-symlink real paths,
+content-bound, and revalidated around evaluation; scripts and task data are consumed only through
+inherited `/proc/self/fd` paths. The collector records every authority-input content digest.
+Module-style evaluators that could import an unpinned repository harness are rejected.
 It records original and resolved payload argv separately from the fully wrapped execution argv,
 plus the isolation backend, exact wrapper argv, a null profile digest for the Linux namespace
 backend, and the successful probe's payload/execution argv, socket-denial result,
