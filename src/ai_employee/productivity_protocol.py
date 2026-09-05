@@ -467,6 +467,7 @@ def _pin_evaluator_inputs(
                             candidate = Path(os.path.abspath(repository_candidate))
                 if candidate is None:
                     continue
+                candidate = candidate.resolve(strict=True)
                 pinned = pinned_by_path.get(candidate)
                 if pinned is None:
                     pinned, _ = _pin_regular_file(
