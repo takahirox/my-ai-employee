@@ -1046,6 +1046,7 @@ def _evaluate_checks(
     network: str,
     isolation: _IsolationBackend,
     evaluator_pins: Mapping[tuple[str, str], _PinnedEvaluator],
+    collection_started: float,
 ) -> tuple[ResultBundle, dict[str, bytes]]:
     records: dict[str, list[ProtocolCheckRecord]] = {"acceptance": [], "regression": []}
     dispositions: dict[tuple[str, str, str], CheckDisposition] = {}
@@ -1109,6 +1110,7 @@ def _evaluate_checks(
         for family, artifact in artifacts.items()
     }
     digests = {family: _digest(outputs[f"{family}.json"]) for family in artifacts}
+    observed_wall = max(0.0, time.monotonic() - collection_started)
     final_results: list[TrialResult] = []
     for result in draft.results:
         updates: dict[str, object] = {}
@@ -1130,12 +1132,19 @@ def _evaluate_checks(
                 item.disposition is CheckDisposition.PASSED for item in outcomes
             )
             updates[f"{family}_outcomes"] = outcomes
+        updates["metrics"] = result.metrics.model_copy(
+            update={
+                "wall_seconds": observed_wall,
+                "time_to_accepted_seconds": observed_wall if all_passed else None,
+                "compute_seconds": observed_wall,
+                "critical_path_seconds": observed_wall,
+            }
+        )
         if not all_passed:
             updates.update(
                 terminal_outcome=TerminalOutcome.CHECKS_FAILED,
                 failure_classification=FailureClassification.ASSERTION,
                 process_exit_code=0,
-                metrics=result.metrics.model_copy(update={"time_to_accepted_seconds": None}),
             )
         values = result.model_dump(mode="python")
         values.update(updates)
@@ -1169,6 +1178,11 @@ def collect_protocol(
     protocol = selected[0]
     if network != protocol.network:
         raise ValueError("caller and protocol network policies do not match")
+    wall_budget = min(item.fairness_config.budgets.wall_seconds for item in protocol.treatments)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > wall_budget:
+        raise ValueError(
+            "collector timeout must be positive and within every treatment wall budget"
+        )
     task_path = task_path.resolve(strict=True)
     repository = repository.resolve(strict=True)
     if not repository.is_dir():
@@ -1215,6 +1229,7 @@ def collect_protocol(
                 label="arm",
             )
             _validate_execution_contract(protocol, argv)
+            collection_started = time.monotonic()
             stdout, stderr, started_at, ended_at, exit_code = _run(
                 argv,
                 repository,
@@ -1241,6 +1256,7 @@ def collect_protocol(
                 network=network,
                 isolation=isolation.backend,
                 evaluator_pins=evaluator_pins,
+                collection_started=collection_started,
             )
             for source in evaluator_sources:
                 _verify_pinned_source(source, label="evaluator authority input")

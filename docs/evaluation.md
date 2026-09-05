@@ -250,7 +250,10 @@ The untrusted producer must create exactly one regular file in `{output}`:
 Producer-supplied claim artifacts are rejected. After the producer exits zero, the collector runs
 each predeclared evaluator through the same isolation wrapper without a shell and bounds its
 combined stdout and stderr to 1,000,000 bytes. Exit zero alone derives `passed`;
-every other exit derives `failed`. The collector
+every other exit derives `failed`. The collector measures wall time from producer launch through
+completion of all independent checks using a monotonic clock, overwrites producer-supplied wall,
+time-to-accepted, compute, and critical-path durations, and rejects caller timeouts or observed
+runs above any predeclared treatment wall budget. The collector
 then creates canonical `fleet-productivity-check-artifact/2` acceptance and regression records with
 the trial and check identities, authority, resolved evaluator argv and executable, exit code,
 observation digest, and derived disposition. It rebuilds every final `CheckOutcome` so its evidence

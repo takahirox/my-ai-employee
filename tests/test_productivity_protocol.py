@@ -209,10 +209,32 @@ def test_collect_protocol_crosses_process_boundary_and_atomically_records(tmp_pa
     assert record["disposition"] == "passed"
     assert record["evaluator_executable"] == record["evaluator_argv"][0]
     bundle = load_result_bundle((artifact_directory / "result-bundle.json").read_bytes())
+    measured = bundle.results[0].metrics
+    assert measured.wall_seconds != 2
+    assert measured.time_to_accepted_seconds == measured.wall_seconds
+    assert measured.compute_seconds == measured.wall_seconds
+    assert measured.critical_path_seconds == measured.wall_seconds
     assert (
         bundle.results[0].acceptance_outcomes[0].evidence_digest
         == hashlib.sha256((artifact_directory / "acceptance.json").read_bytes()).hexdigest()
     )
+
+
+def test_collect_protocol_rejects_timeout_above_declared_budget(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    manifest = _manifest(tmp_path / "protocols.json")
+    with pytest.raises(ValueError, match="within every treatment wall budget"):
+        collect_protocol(
+            manifest_path=manifest,
+            protocol_id="codex-direct",
+            task_path=_task(tmp_path / "task.json"),
+            repository=repository,
+            output_root=tmp_path,
+            timeout=3601,
+            network="disabled",
+            arm_command=_command(manifest),
+        )
 
 
 def test_collect_protocol_derives_failed_checks_from_evaluator_exit(tmp_path: Path) -> None:
