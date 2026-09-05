@@ -54,7 +54,23 @@ def test_mutable_image_tag_is_rejected() -> None:
         IsolatedWorkerProfile(image="python:latest")
 
 
-def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(tmp_path, monkeypatch):
+def test_native_exec_selects_permissions_via_config_not_sandbox_only_flag():
+    from ai_employee.isolated_execution import codex_isolated_exec_args
+
+    args = codex_isolated_exec_args("fixed-test-model", "low")
+    assert "--permission-profile" not in args
+    assert 'default_permissions="fleet-isolated"' in args
+    assert "--sandbox" not in args
+    assert "features.multi_agent=false" in args
+    assert 'web_search="disabled"' in args
+    assert args.index("--ignore-user-config") > args.index("exec")
+    assert args[-1] == "-"
+
+
+@pytest.mark.parametrize("stderr_only", [False, True])
+def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
+    tmp_path, monkeypatch, stderr_only
+):
     from ai_employee import isolated_execution
     from tests.test_work_orchestration_v2 import Channel, worker_request
 
@@ -76,6 +92,8 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(tmp
                 return 0, b"", b""
             if argv[1] == "sandbox":
                 return 0, b"", b""
+            if stderr_only:
+                return 1, b"", b"You have hit your usage limit."
             kwargs["observe"]({"type": "turn.failed", "error": {"message": "usage_limit_reached"}})
             pytest.fail("usage limit must terminate the invocation")
 
@@ -102,9 +120,37 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(tmp
     assert result.proposals == () and result.usage is None
 
 
+def test_missing_explicit_auth_stops_before_container_or_artifact_creation(tmp_path, monkeypatch):
+    from ai_employee import isolated_execution
+    from tests.test_work_orchestration_v2 import Channel, worker_request
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("missing auth must not start a container or persist a model prompt")
+
+    monkeypatch.setattr(isolated_execution, "DockerCandidate", forbidden)
+    adapter = isolated_execution.IsolatedCodexWorker(
+        tmp_path,
+        IsolatedWorkerProfile(image="sha256:" + "0" * 64),
+        model="fixed-test-model",
+        effort="low",
+        cancellation=Cancellation(),
+        seconds=2.0,
+        commands=(),
+        persist=forbidden,
+    )
+    request = worker_request().model_copy(update={"remaining_budgets": {"artifact_bytes": 100_000}})
+    result = adapter.propose(request, Channel())
+    assert result.failure and "auth_file" in result.failure.message
+    assert result.proposals == ()
+
+
 @docker_test
 def test_real_codex_cli_flags_are_supported_without_model_or_credentials(tmp_path):
-    from ai_employee.isolated_execution import CODEX_SANDBOX_PROBE, codex_isolated_permission_args
+    from ai_employee.isolated_execution import (
+        CODEX_SANDBOX_PROBE,
+        codex_isolated_exec_args,
+        codex_isolated_permission_args,
+    )
 
     with DockerCandidate(
         IsolatedWorkerProfile(image=IMAGE),
@@ -112,7 +158,9 @@ def test_real_codex_cli_flags_are_supported_without_model_or_credentials(tmp_pat
         seconds=45,
         cancellation=Cancellation(),
     ) as candidate:
-        code, stdout, stderr = candidate.run(("codex", "exec", "--ignore-user-config", "--help"))
+        code, stdout, stderr = candidate.run(
+            (*codex_isolated_exec_args("fixed-test-model", "low")[:-1], "--help")
+        )
         assert code == 0, stderr.decode()
         assert b"--ephemeral" in stdout and b"--sandbox" in stdout and b"--json" in stdout
         code, stdout, stderr = candidate.run(("codex", "sandbox", "--help"))
@@ -148,6 +196,13 @@ def test_real_isolated_edit_run_observe_repair_and_git_capture(tmp_path: Path) -
     root = repository(tmp_path)
     profile = IsolatedWorkerProfile(image=IMAGE)
     with DockerCandidate(profile, root, seconds=45, cancellation=Cancellation()) as candidate:
+        config = json.loads(candidate._docker("inspect", candidate.name))[0]
+        host = config["HostConfig"]
+        assert host["PidsLimit"] == profile.pids_limit
+        assert host["Memory"] == profile.memory_mb * 1024**2
+        assert host["NanoCpus"] == int(profile.cpus * 1_000_000_000)
+        assert "no-new-privileges" in host["SecurityOpt"]
+        assert host["NetworkMode"] == "none" and not host.get("Binds")
         first, _, _ = candidate.run(
             ("python", "-I", "-c", "exec(open('solution.py').read()); assert value()==42")
         )
@@ -172,6 +227,30 @@ def test_real_isolated_edit_run_observe_repair_and_git_capture(tmp_path: Path) -
         subprocess.run(["docker", "inspect", name], capture_output=True, check=False).returncode
         != 0
     )
+
+
+@docker_test
+def test_model_gateway_rejects_non_provider_connect_without_external_request(tmp_path):
+    auth = tmp_path / "dummy-auth.json"
+    auth.write_text("{}")
+    profile = IsolatedWorkerProfile(image=IMAGE, auth_file=str(auth))
+    with DockerCandidate(
+        profile, repository(tmp_path), seconds=45, cancellation=Cancellation()
+    ) as candidate:
+        code, _, stderr = candidate.run(
+            (
+                "python",
+                "-I",
+                "-c",
+                "import os,socket,urllib.parse; "
+                "p=urllib.parse.urlsplit(os.environ['HTTPS_PROXY']); "
+                "s=socket.create_connection((p.hostname,p.port),timeout=3); "
+                "s.sendall(b'CONNECT example.invalid:443 HTTP/1.1\\r\\n"
+                "Host: example.invalid:443\\r\\n\\r\\n'); "
+                "assert b'403' in s.recv(1024).split(b'\\r\\n')[0]; s.close()",
+            )
+        )
+        assert code == 0, stderr.decode()
 
 
 @docker_test

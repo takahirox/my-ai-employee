@@ -29,6 +29,19 @@ from .services_v2._common import identifier, now
 from .services_v2.process import LocalProcessExecutor
 
 
+def _reports_usage_limit(detail: str) -> bool:
+    return any(
+        marker in detail.lower()
+        for marker in (
+            "usage_limit",
+            "usage limit",
+            "rate_limit",
+            "rate limit",
+            "insufficient_quota",
+        )
+    )
+
+
 def codex_isolated_permission_args() -> tuple[str, ...]:
     """One profile for native execution and its credential-free OS preflight."""
     return (
@@ -40,6 +53,29 @@ def codex_isolated_permission_args() -> tuple[str, ...]:
         "permissions.fleet-isolated.network.enabled=false",
         "-c",
         'permissions.fleet-isolated.filesystem={"/home/fleet/.codex/auth.json"="deny"}',
+    )
+
+
+def codex_isolated_exec_args(model: str, effort: str) -> tuple[str, ...]:
+    """exec selects profiles via config; --permission-profile is sandbox-only."""
+    return (
+        "codex",
+        "exec",
+        "-c",
+        'default_permissions="fleet-isolated"',
+        *codex_isolated_permission_args()[2:],
+        "--ignore-user-config",
+        "--ephemeral",
+        "--json",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        'web_search="disabled"',
+        "-m",
+        model,
+        "-c",
+        f"model_reasoning_effort={json.dumps(effort)}",
+        "-",
     )
 
 
@@ -274,17 +310,7 @@ class IsolatedCodexWorker:
                         }
                     )
                 if kind in {"error", "turn.failed"}:
-                    detail = json.dumps(event).lower()
-                    usage_limit = any(
-                        marker in detail
-                        for marker in (
-                            "usage_limit",
-                            "usage limit",
-                            "rate_limit",
-                            "rate limit",
-                            "insufficient_quota",
-                        )
-                    )
+                    usage_limit = _reports_usage_limit(json.dumps(event))
                     if usage_limit:
                         self.on_usage_limit()
                     raise RuntimeError(
@@ -319,20 +345,14 @@ class IsolatedCodexWorker:
                 )
                 if code:
                     raise ValueError("ISOLATION_PREFLIGHT_FAILED: native permissions unavailable")
-                argv = (
-                    "codex",
-                    "exec",
-                    "--ignore-user-config",
-                    "--ephemeral",
-                    "--json",
-                    *codex_isolated_permission_args(),
-                    "-m",
-                    self.model,
-                    "-c",
-                    f"model_reasoning_effort={json.dumps(self.effort)}",
-                    "-",
-                )
+                argv = codex_isolated_exec_args(self.model, self.effort)
                 code, stdout, stderr = candidate.run(argv, stdin=prompt, observe=observe)
+                # Startup failures can report allowance exhaustion only on stderr,
+                # without a JSON terminal event. Stop graph repair in that case too.
+                if code and _reports_usage_limit(stderr.decode(errors="replace")):
+                    usage_limit = True
+                    self.on_usage_limit()
+                    raise RuntimeError("USAGE_LIMIT: stopped without reset or purchase")
                 # Native free-form logs may echo scoped credentials; persist normalized activity.
                 stdout_digest = self.persist(
                     canonical_json(
