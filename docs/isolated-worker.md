@@ -100,6 +100,14 @@ The experimental runtime uses `seccomp=unconfined` for nested Codex sandbox comp
 Docker/host-kernel integrity is therefore an explicit trust assumption, not a claim of
 VM-grade containment. Do not run it against hostile tenants on a shared privileged host.
 
+Docker's default AppArmor policy on the Ubuntu CI runner denies bubblewrap's nested
+mount setup (`Failed to make / slave: Permission denied`). That deployment is
+**unsupported** for native iteration: preflight stops before the worker runs. CI
+asserts this refusal explicitly while exercising the x86-64 admission guard; local
+Docker Desktop/Linux arm64 exercises the positive native path. No host AppArmor
+setting is disabled and no privileged fallback is provided. Do not assume all
+Linux Docker installations can run this profile merely because the guard works.
+
 An explicitly delegated auth file is copied into the disposable worker's
 temporary home. Do not point it at broad ordinary host credentials without reviewing
 that delegation: the worker user can read this file. It is absent from independent

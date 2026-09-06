@@ -12,6 +12,7 @@ import pytest
 from ai_employee.isolated_worker import DockerCandidate, IsolatedWorkerProfile, candidate_archive
 
 IMAGE = os.environ.get("FLEET_TEST_DOCKER_IMAGE")
+NATIVE_UNAVAILABLE = os.environ.get("FLEET_TEST_EXPECT_NATIVE_UNAVAILABLE") == "1"
 docker_test = pytest.mark.skipif(not IMAGE, reason="explicit offline Docker integration opt-in")
 
 
@@ -260,7 +261,10 @@ def test_real_codex_cli_flags_are_supported_without_model_or_credentials(tmp_pat
                 CODEX_SANDBOX_PROBE,
             )
         )
-        assert code == 0, sandbox_help + stderr.decode()
+        if NATIVE_UNAVAILABLE:
+            assert code != 0 and b"Permission denied" in stderr
+        else:
+            assert code == 0, sandbox_help + stderr.decode()
 
 
 @docker_test
@@ -485,6 +489,16 @@ def test_cli_native_iteration_and_fresh_independent_verification(
         ]
     )
     emitted = json.loads(capsys.readouterr().out)
+    if NATIVE_UNAVAILABLE:
+        assert result != 0 and emitted["status"] == "failed"
+        assert seen == []  # No scripted model or independent check was invoked.
+        with SQLiteStore(database) as store:
+            results = store.list_records("worker_result_v2", WorkerResult)
+            assert len(results) == 1
+            assert results[0].failure and "ISOLATION_PREFLIGHT_FAILED" in results[0].failure.message
+            assert not results[0].proposals
+        assert (root / "c.txt").read_text() == "c-before\n"
+        return
     assert result == 0 and emitted["status"] == "ready_to_promote", emitted
     assert (root / "c.txt").read_text() == "c-before\n"
     assert len(set(seen)) >= 2  # worker and independent checks use different containers

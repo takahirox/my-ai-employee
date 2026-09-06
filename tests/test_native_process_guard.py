@@ -9,7 +9,13 @@ from ai_employee.isolated_worker import (
     IsolatedWorkerProfile,
     NativeProcessBudgetExceeded,
 )
-from tests.test_issue81_isolation import IMAGE, Cancellation, docker_test, repository
+from tests.test_issue81_isolation import (
+    IMAGE,
+    NATIVE_UNAVAILABLE,
+    Cancellation,
+    docker_test,
+    repository,
+)
 
 
 @docker_test
@@ -170,7 +176,10 @@ def test_real_codex_sandbox_runs_under_guard_without_model(tmp_path):
             ),
             process_limit=16,
         )
-        assert code == 0, stderr.decode()
+        if NATIVE_UNAVAILABLE:
+            assert code != 0 and b"Permission denied" in stderr
+        else:
+            assert code == 0, stderr.decode()
         assert 1 <= candidate.native_process_usage["admitted"] <= 16
 
 
