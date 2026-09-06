@@ -87,3 +87,41 @@ Model-free tests validate the file contract, protected public fixture, cleanup
 target validation and normal Harness schema. Full Docker/real-model twelve-task
 validation is a separate explicit phase; passing unit tests alone is not evidence
 of benchmark success.
+
+## Initial native connection validation (2026-09-06)
+
+The fixed twelve-task run `employee-native-v1-20260906` completed: four successes,
+eight failures, no Harbor exceptions or unscorable trials. Data tasks were 3/3,
+research 1/3, coding 0/3 and API 0/3. This is an **integration diagnostic**, not a
+fair product-capability score or a comparison with historical single/team runs.
+
+Evaluated product commit: `b64b808`; benchmark commit: `3230575` (pre-existing task
+corrections preserved separately at `4fad7ae`). The worker image was
+`sha256:d71061257e875361e1bf9baf2f0c2db51c0fb88828c33d53b00ee97ee3783993`
+(Linux arm64, Codex 0.144.4). Source implementation digest:
+`f886f07ea03f3a543c2702b08386e12030066467b8993e12fc9ec6972e9032ff`.
+The task/verifier image was
+`sha256:2446176326e8dfdf83d730bd9bafc696799d75f13fa5b469ea8adea672d50010`;
+its historical embedded Fleet installation was not invoked.
+
+All eight failures returned Fleet status `failed` without a worker failure record;
+no accepted candidate was exported. The original controller omitted the graph's
+stable failure code and removed its private DB after confirmed cleanup, so the
+exact per-trial rejection causes cannot be recovered from those saved summaries.
+Do not attribute every failure to the model or to a single inferred cause.
+
+A subsequent credential-free reproduction found a controller Harness defect:
+the public check imports its adjacent `execution.py`, creating bytecode under
+protected `.fleet/public-checks/`. A native worker running this advertised check
+therefore causes its otherwise valid candidate to be rejected. A real-orchestration
+Docker regression failed before the fix and passed after disabling bytecode with
+`python -I -B`; the public check contents and protected-path policy are unchanged.
+Responses now retain `stable_code` for future diagnosis. These are **post-run fixes**:
+the original model run has not been repeated and its grades remain unchanged.
+
+All twelve controller cleanups were confirmed, and no Fleet candidate containers
+or networks remained. No reset ticket, allowance purchase, model fallback or automatic
+score-improving rerun was used. Token usage was observed; cost remains unknown.
+See the benchmark's `examples/employee-native-v1.json` and validation document for
+the sanitized complete results. Private profiles, auth paths and native traces are
+not published.

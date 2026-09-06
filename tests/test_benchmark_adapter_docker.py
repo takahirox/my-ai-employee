@@ -93,14 +93,17 @@ def test_controller_crash_cleanup_removes_only_ledger_resources(tmp_path, gatewa
     adapter.cleanup(tmp_path)  # Idempotent recovery.
 
 
+@pytest.mark.parametrize("worker_runs_check", [False, True])
 def test_product_adapter_through_real_orchestration_with_scripted_native_worker(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, worker_runs_check
 ):
     request = public_request(tmp_path)
     request["settings"]["isolated_worker"]["image"] = IMAGE
     (tmp_path / "dummy-auth.json").write_text("{}")
     (tmp_path / "public-checks/smoke.py").write_text(
-        "import ast,json\nfrom pathlib import Path\n"
+        "import ast,json,sys\nfrom pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).parent))\n"
+        "import execution\n"
         "ast.parse(Path('src/example.py').read_text())\n"
         "json.loads(Path('output/result.json').read_text())\n"
     )
@@ -119,7 +122,14 @@ def test_product_adapter_through_real_orchestration_with_scripted_native_worker(
                 "-c",
                 "from pathlib import Path; Path('/app/src/example.py').write_text('value = 1\\n'); "
                 "Path('/app/output').mkdir(exist_ok=True); "
-                "Path('/app/output/result.json').write_text('{}')",
+                "Path('/app/output/result.json').write_text('{}'); "
+                + (
+                    "import subprocess; subprocess.run("
+                    + repr(adapter.make_harness(180.0)["commands"]["smoke"]["argv"])
+                    + ", check=True)"
+                    if worker_runs_check
+                    else "pass"
+                ),
             ),
             process_limit=kwargs["process_limit"],
         )

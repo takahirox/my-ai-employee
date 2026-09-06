@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,20 @@ def test_harness_has_only_public_structural_checks():
     assert harness.paths.writable == ("src/**", "output/**")
     assert "public-checks/smoke.py" in harness.commands["smoke"].argv[-1]
     assert "/tests" not in json.dumps(value)
+
+
+def test_public_check_does_not_create_protected_bytecode(tmp_path):
+    checks = tmp_path / ".fleet/public-checks"
+    checks.mkdir(parents=True)
+    (checks / "execution.py").write_text("value = 1\n")
+    (checks / "smoke.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).parent))\n"
+        "from execution import value\nassert value == 1\n"
+    )
+    argv = adapter.make_harness(180.0)["commands"]["smoke"]["argv"]
+    subprocess.run([sys.executable, *argv[1:]], cwd=tmp_path, check=True, capture_output=True)
+    assert not list(checks.rglob("*.pyc"))
 
 
 def test_ledger_is_explicit_absolute_and_not_exported(tmp_path):
@@ -173,7 +189,11 @@ def test_product_connection_uses_private_state_and_only_returns_candidate(
             pass
         print(
             json.dumps(
-                {"run_id": "fixture", "status": "ready_to_promote" if successful else "failed"}
+                {
+                    "run_id": "fixture",
+                    "status": "ready_to_promote" if successful else "failed",
+                    "stable_code": None if successful else "NODE_EXECUTION_FAILED",
+                }
             )
         )
         return 0 if successful else 1
@@ -191,6 +211,7 @@ def test_product_connection_uses_private_state_and_only_returns_candidate(
     result = adapter.run(request, tmp_path)
     assert result["outcome"] == "completed"  # not a score, including the failed attempt
     assert result["usage"] == {}
+    assert result["details"]["stable_code"] == (None if successful else "NODE_EXECUTION_FAILED")
     assert (tmp_path / "workspace/src/example.py").read_text() == f"value = {int(successful)}\n"
     assert not (tmp_path / "workspace/.fleet").exists()
     assert (tmp_path / "workspace/input/public.txt").read_text() == "public fixture"

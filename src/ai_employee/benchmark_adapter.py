@@ -84,6 +84,7 @@ def make_harness(seconds: float) -> dict[str, Any]:
                 "argv": [
                     "python",
                     "-I",
+                    "-B",
                     "-c",
                     "import runpy; "
                     "runpy.run_path('.fleet/public-checks/smoke.py',run_name='__main__')",
@@ -240,6 +241,7 @@ def run(request: dict[str, Any], control: Path) -> dict[str, Any]:
         }
         details = {
             "status": emitted.get("status"),
+            "stable_code": emitted.get("stable_code"),
             "exit_code": exit_code,
             "worker_results": len(workers),
             "runtime_image": profile.image,
