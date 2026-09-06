@@ -78,7 +78,9 @@ These are fragments, not replacements for routing, commands, paths or acceptance
 definitions. The reproducible [paired benchmark](issue-81-comparison.md#reproduction)
 constructs a complete fixture and writes private JSON results. It is distinct from
 the generic pocket-agent-bench suite: that suite's existing `fleet-single` adapter
-runs proposal mode inside Harbor and does not yet select this Docker host adapter.
+runs proposal mode inside Harbor and does not select this Docker host adapter.
+The new [product-owned benchmark controller](benchmark-adapter.md) connects the
+generic public-workspace protocol to this path without changing tasks or graders.
 Do not mount a Docker socket inside a benchmark task container to connect them.
 
 For this milestone the Harness must be offline, use only declared `python`/`python3`

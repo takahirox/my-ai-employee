@@ -31,6 +31,7 @@ class IsolatedWorkerProfile(BaseModel):
     native_process_limit: int = Field(default=512, ge=1, le=1000)
     workspace_mb: int = Field(default=256, ge=16, le=4096)
     auth_file: str | None = None
+    resource_ledger: str | None = None
 
     @field_validator("image")
     @classmethod
@@ -39,7 +40,7 @@ class IsolatedWorkerProfile(BaseModel):
             raise ValueError("isolation requires an already-built immutable Docker image ID")
         return value
 
-    @field_validator("auth_file")
+    @field_validator("auth_file", "resource_ledger")
     @classmethod
     def _absolute_auth_file(cls, value: str | None) -> str | None:
         if value is not None and (not Path(value).is_absolute() or "\x00" in value):
@@ -135,6 +136,24 @@ class DockerCandidate:
         self.proxy: str | None = None
         self.native_process_usage: dict[str, object] = {}
 
+    def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
+        """Operator-only crash-recovery ledger; never copied into the worker."""
+        if self.profile.resource_ledger is None:
+            return
+        descriptor = os.open(
+            self.profile.resource_ledger,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(
+                descriptor,
+                (json.dumps({"kind": kind, "name": name, "state": state}) + "\n").encode(),
+            )
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _docker(self, *args: str, data: bytes | None = None) -> bytes:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0 or self.cancellation.cancelled():
@@ -151,6 +170,10 @@ class DockerCandidate:
                 f"Docker operation {args[0]} failed: "
                 + result.stderr.decode(errors="replace")[:1000]
             )
+        if args[0] in ("create", "run") and "--name" in args:
+            self._record_resource("container", args[args.index("--name") + 1], "created")
+        elif args[:2] == ("network", "create"):
+            self._record_resource("network", args[-1], "created")
         return result.stdout
 
     def __enter__(self) -> DockerCandidate:
@@ -161,6 +184,7 @@ class DockerCandidate:
             if self.profile.auth_file:
                 self._start_model_gateway()
             self.created = True  # Also own cleanup if create's reply times out.
+            self._record_resource("container", self.name)
             self._docker(
                 "create",
                 "--init",
@@ -487,7 +511,9 @@ class DockerCandidate:
 
         self.network = self.name + "-network"
         self.proxy = self.name + "-proxy"
+        self._record_resource("network", self.network)
         self._docker("network", "create", "--internal", self.network)
+        self._record_resource("container", self.proxy)
         self._docker(
             "run",
             "-d",
