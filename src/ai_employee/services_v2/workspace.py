@@ -299,7 +299,14 @@ class GitWorkspaceManager:
             ),
         )
 
-    def _diff(self, worktree: Path, nonce: str, generated_paths: tuple[str, ...] = ()) -> bytes:
+    def _diff(
+        self,
+        worktree: Path,
+        nonce: str,
+        generated_paths: tuple[str, ...] = (),
+        *,
+        base: str = "HEAD",
+    ) -> bytes:
         index = self._git_path(worktree, "--git-path", "index")
         temporary_index = self.state_root / f"index-{nonce}"
         shutil.copyfile(index, temporary_index)
@@ -341,7 +348,7 @@ class GitWorkspaceManager:
                 if add.returncode:
                     raise ValueError(add.stderr.decode("utf-8", "replace"))
             patch = subprocess.run(
-                ("git", "-C", str(worktree), "diff", "--binary", "--no-ext-diff", "HEAD", "--"),
+                ("git", "-C", str(worktree), "diff", "--binary", "--no-ext-diff", base, "--"),
                 env=environment,
                 capture_output=True,
                 check=False,

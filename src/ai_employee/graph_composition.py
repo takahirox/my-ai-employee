@@ -444,10 +444,26 @@ class GraphPatchComposer:
                     StableFailureCode.INTEGRITY_FAILED,
                     f"node patch {node_id} failed artifact verification: {error}",
                 ) from error
+            from .services_v2.workspace import GitWorkspaceManager
+            from .workspace_lineage import composition_increment
+
+            ancestors: frozenset[str] = frozenset()
+            if isinstance(self.workspace, GitWorkspaceManager):
+                try:
+                    increment = composition_increment(
+                        self.store, self.workspace, graph, item, by_node
+                    )
+                    if increment is not None:
+                        incremental_body, ancestors = increment
+                        body = incremental_body.decode("utf-8")
+                except (KeyError, OSError, ValueError) as error:
+                    raise _CompositionRejected(
+                        StableFailureCode.INTEGRITY_FAILED, str(error)
+                    ) from error
             paths = _patch_paths(body)
             for path in paths:
                 owner = seen_paths.get(path)
-                if owner is not None:
+                if owner is not None and owner not in ancestors:
                     raise _CompositionRejected(
                         StableFailureCode.WORKSPACE_CONFLICT,
                         f"node patches {owner} and {node_id} overlap at {path}",
