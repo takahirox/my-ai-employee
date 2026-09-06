@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,27 @@ def test_public_check_does_not_create_protected_bytecode(tmp_path):
     argv = adapter.make_harness(180.0)["commands"]["smoke"]["argv"]
     subprocess.run([sys.executable, *argv[1:]], cwd=tmp_path, check=True, capture_output=True)
     assert not list(checks.rglob("*.pyc"))
+
+
+@pytest.mark.parametrize(
+    "path,excluded",
+    [
+        ("src/__pycache__/solution.cpython-312.pyc", True),
+        ("src/pkg/nested/__pycache__/module.cpython-312.pyc", True),
+        ("output/__pycache__/script.cpython-312.pyc", True),
+        ("output/pkg/__pycache__/module.cpython-312.pyc", True),
+        ("src/solution.py", False),
+        ("output/result.json", False),
+        ("src/__pycache__/source.py", False),
+        ("src/fixture.pyc", False),
+        ("input/__pycache__/fixture.pyc", False),
+        (".fleet/public-checks/__pycache__/execution.pyc", False),
+        (".git/__pycache__/fixture.pyc", False),
+    ],
+)
+def test_generated_patterns_only_cover_writable_python_bytecode(path, excluded):
+    harness = ProjectHarnessV2.model_validate_json(json.dumps(adapter.make_harness(180.0)))
+    assert any(fnmatchcase(path, pattern) for pattern in harness.paths.generated) is excluded
 
 
 def test_ledger_is_explicit_absolute_and_not_exported(tmp_path):

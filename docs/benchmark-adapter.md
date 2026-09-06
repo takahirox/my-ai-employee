@@ -14,6 +14,13 @@ smoke check, copied verbatim. Actual scoring stays in the separate benchmark ver
 Only the captured, Fleet-accepted candidate's `src/` and `output/` are materialized
 into the disposable snapshot. No user repository promotion takes place.
 
+The product Harness declares only untracked `__pycache__/*.pyc` files below `src/`
+and `output/` (including nested packages) as generated outputs. Normal Python
+imports may create these binary caches; they must not enter the text-edit proposal.
+Tracked cache modifications remain captured and validated. Source files, result
+artifacts and all changes under protected `input/`, `.fleet/` or `.git/` are not
+excluded. This is not general binary-edit support or a relaxation of path checks.
+
 ## Runtime and local configuration
 
 Build `docker/isolated-worker.Dockerfile`, record its immutable image ID, and use

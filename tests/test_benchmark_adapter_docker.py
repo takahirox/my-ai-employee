@@ -121,6 +121,8 @@ def test_product_adapter_through_real_orchestration_with_scripted_native_worker(
                 "-I",
                 "-c",
                 "from pathlib import Path; Path('/app/src/example.py').write_text('value = 1\\n'); "
+                "import py_compile; py_compile.compile('/app/src/example.py', doraise=True); "
+                "assert list(Path('/app/src/__pycache__').glob('*.pyc')); "
                 "Path('/app/output').mkdir(exist_ok=True); "
                 "Path('/app/output/result.json').write_text('{}'); "
                 + (
@@ -142,5 +144,46 @@ def test_product_adapter_through_real_orchestration_with_scripted_native_worker(
         assert len(invocations) == 1
         assert (tmp_path / "workspace/src/example.py").read_text() == "value = 1\n"
         assert (tmp_path / "workspace/output/result.json").read_text() == "{}"
+        assert not list((tmp_path / "workspace").rglob("*.pyc"))
     finally:
         adapter.cleanup(tmp_path)
+
+
+@pytest.mark.parametrize("delete_tracked", [False, True])
+def test_capture_excludes_only_untracked_writable_bytecode(tmp_path, delete_tracked):
+    root = repository(tmp_path)
+    tracked = root / "src/__pycache__/tracked.pyc"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_bytes(b"original\x00")
+    subprocess.run(["git", "-C", str(root), "add", "src"], check=True)
+    profile = IsolatedWorkerProfile(image=IMAGE)
+    with DockerCandidate(
+        profile, root, seconds=40, cancellation=SimpleNamespace(cancelled=lambda: False)
+    ) as candidate:
+        code, _, _ = candidate.run_guarded(
+            (
+                "python",
+                "-I",
+                "-c",
+                "from pathlib import Path; "
+                "paths=['src/__pycache__/tracked.pyc', 'src/__pycache__/new.pyc', "
+                "'src/pkg/__pycache__/new.pyc', 'output/__pycache__/new.pyc', "
+                "'output/pkg/__pycache__/new.pyc', 'input/__pycache__/new.pyc', "
+                "'.fleet/__pycache__/new.pyc', 'src/__pycache__/keep.py']; "
+                "[(Path(p).parent.mkdir(parents=True,exist_ok=True), "
+                "Path(p).write_bytes(b'changed\\x00')) for p in paths]; "
+                + ("Path(paths[0]).unlink()" if delete_tracked else "pass"),
+            ),
+            process_limit=4,
+        )
+        assert code == 0
+        paths, _ = candidate.capture(
+            tuple(adapter.make_harness(180.0)["paths"].get("generated", ()))
+        )
+        assert set(paths) == {
+            "src/__pycache__/tracked.pyc",
+            "input/__pycache__/new.pyc",
+            ".fleet/__pycache__/new.pyc",
+            "src/__pycache__/keep.py",
+        }
+    assert tracked.read_bytes() == b"original\x00"
