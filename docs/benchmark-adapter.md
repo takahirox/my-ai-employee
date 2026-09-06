@@ -132,3 +132,25 @@ score-improving rerun was used. Token usage was observed; cost remains unknown.
 See the benchmark's `examples/employee-native-v1.json` and validation document for
 the sanitized complete results. Private profiles, auth paths and native traces are
 not published.
+
+## Bytecode-capture follow-up (2026-09-06)
+
+The full `employee-native-v2-20260906` rerun at product `07ae94e` passed 11/12 tasks.
+Its remaining `code-intervals` failure was traced to a runtime-captured binary Git
+patch for an untracked `src/__pycache__/*.pyc` file. The text-path validator recognized
+only `src/solution.py`, causing `INVALID_REQUEST` and then `NODE_EXECUTION_FAILED`.
+This was not a malformed model-authored diff. The actual saved proposal reproduced
+the mismatch without invoking a model or changing its original grade.
+
+Product `a70741f` adds the narrow generated-cache policy described above. Deterministic
+Docker tests create real bytecode and exercise normal Fleet acceptance; they fail
+before this fix and pass after it. Capture tests also preserve tracked changes and
+deletions and keep protected paths visible to validation; CI runs that regression
+without model credentials.
+
+The targeted `employee-cache-fix-20260906` run then passed `code-intervals` through
+both Fleet acceptance and the unchanged independent grader. It used one attempt,
+the same recorded task/worker images, `gpt-5.6-luna`, effort low and 180 agent-seconds.
+This is **one targeted pass**, not a fresh 12/12 run; the earlier 11/12 result remains
+unchanged. No reset ticket, purchase, fallback, repeated attempt or grader modification
+was used. Costs remain unknown; private diagnostic state stays local.
