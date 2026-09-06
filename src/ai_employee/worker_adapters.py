@@ -35,6 +35,7 @@ from .domain.v2 import (
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
+from .worker_attribution import attribute_read_only_payload, model_read_only_schema
 
 
 class _NeverCancelled:
@@ -347,6 +348,30 @@ class CliWorkerAdapter:
                 retryable=failure.retryable,
                 status=process.status,
             )
+        if (
+            invocation.request.run_id != request.run_id
+            or process.run_id != request.run_id
+            or process.request_digest != invocation.request.content_digest
+        ):
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_BOUNDARY_ERROR,
+                "worker process result does not match its originating invocation",
+                adapter=self.adapter,
+                stage="process",
+                diagnostic_code="WORKER_PROCESS_BINDING_INVALID",
+            )
+        if self.cancellation.cancelled():
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.CANCELLED,
+                "worker was cancelled before response acceptance",
+                adapter=self.adapter,
+                stage="process",
+                status="cancelled",
+            )
         if process.stdout_artifact_digest is None:
             return _worker_failure(
                 request,
@@ -381,6 +406,13 @@ class CliWorkerAdapter:
                 isinstance(decoded_payload, dict)
                 and decoded_payload.get("non_mutating_result") is not None
             )
+            typed_payload = (
+                decoded_payload.get("non_mutating_result")
+                if isinstance(decoded_payload, dict)
+                else None
+            )
+            if isinstance(typed_payload, dict) and typed_payload.get("schema_version") == "3":
+                payload = attribute_read_only_payload(payload, request)
             envelope = _validate_worker_envelope(payload)
             _validate_edit_intent_diffs(envelope)
         except _WorkerProtocolDiagnostic as error:
@@ -906,8 +938,10 @@ def _bounded_prompt(
             "claims about their contents; inspect content only on demand through existing "
             "read-only paths and remain within the supplied budgets. Every proposal and nested "
             "request must use the supplied run_id. For a "
-            "non-mutating diagnosis or research task, return non_mutating_result with the exact "
-            "supplied non_mutating_result_binding values and keep proposals empty. The "
+            "non-mutating diagnosis or research task, return non_mutating_result using wire "
+            "schema_version 3 with only logical_kind, media_type, content, summary, findings "
+            "and evidence_refs; keep proposals empty. Fleet attaches runtime identity from "
+            "this invocation. Do not echo IDs, timestamps, digests, generations or attempts. The "
             "non_mutating_result.evidence_refs array may contain only digest values listed in "
             "allowed_evidence.sources; each value is a 64-character lowercase SHA-256 digest. "
             "Put human-readable file paths and line locations in content or findings, never in "
@@ -937,8 +971,8 @@ def _bounded_prompt(
             "characters for line boundaries; do not "
             "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
             "content digests locally. For a read-only deliverable, return non_mutating_result "
-            "instead of an edit proposal, copy every supplied binding exactly, and keep proposals "
-            "empty."
+            "instead of an edit proposal using wire version 3 (no runtime binding fields), "
+            "and keep proposals empty."
         )
     value = canonical_json(payload).encode()
     if len(value) > 64_000:
@@ -1236,6 +1270,9 @@ def _unauthorized_evidence_error(unauthorized: tuple[str, ...]) -> ValueError:
 
 def _envelope_schema() -> dict[str, object]:
     schema = WorkerProposalEnvelope.model_json_schema()
+    schema["properties"]["non_mutating_result"] = {
+        "anyOf": [model_read_only_schema(), {"type": "null"}]
+    }
     _constrain_evidence_ref_schemas(schema)
     return schema
 
@@ -1695,56 +1732,6 @@ def worker_proposal_schema_json() -> bytes:
 
     edit_proposal_schema = proposal_schema("edit_intent", edit_payload_schema)
     install_proposal_schema = proposal_schema("install", install_payload_schema)
-    result_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            **identity_properties,
-            "graph_run_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "worker_request_digest": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "node_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "accepted_graph_revision_digest": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "generation": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
-            "attempt": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
-            "logical_kind": {"type": "string", "enum": ["diagnosis", "research"]},
-            "media_type": {
-                "type": "string",
-                "enum": ["text/plain", "text/markdown"],
-            },
-            "content": {"type": "string", "minLength": 1, "maxLength": 64_000},
-            "summary": {
-                "anyOf": [
-                    {"type": "string", "minLength": 1, "maxLength": 4_000},
-                    {"type": "null"},
-                ]
-            },
-            "findings": {
-                "type": "array",
-                "maxItems": 64,
-                "items": {"type": "string", "minLength": 1, "maxLength": 4_000},
-            },
-            "evidence_refs": {
-                "type": "array",
-                "maxItems": 64,
-                "items": {"type": "string", "pattern": DIGEST_PATTERN},
-            },
-        },
-        "required": [
-            *identity_properties,
-            "graph_run_id",
-            "worker_request_digest",
-            "node_id",
-            "accepted_graph_revision_digest",
-            "generation",
-            "attempt",
-            "logical_kind",
-            "media_type",
-            "content",
-            "summary",
-            "findings",
-            "evidence_refs",
-        ],
-        "additionalProperties": False,
-    }
     schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -1754,7 +1741,7 @@ def worker_proposal_schema_json() -> bytes:
                 "items": {"anyOf": [edit_proposal_schema, install_proposal_schema]},
             },
             "non_mutating_result": {
-                "anyOf": [result_schema, {"type": "null"}],
+                "anyOf": [model_read_only_schema(), {"type": "null"}],
             },
             "assistant_note": {"type": "string"},
             "usage_json": {"type": "string"},

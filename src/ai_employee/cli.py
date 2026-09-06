@@ -327,6 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work.add_argument("--plan-only", action="store_true")
     work.add_argument(
+        "--acceptance-file",
+        help="request-specific criteria JSON referencing declared inline Python Harness checks",
+    )
+    work.add_argument(
         "--task-kind",
         choices=("mutating", "non_mutating"),
         default="mutating",
@@ -1124,6 +1128,7 @@ def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
+    from .goal_acceptance import attach_goal_checks, harness_for_goal
     from .orchestration import WorkCoordinator, bind_service_decision
 
     resume_run: GraphRunRecord | None = getattr(args, "resume_graph_run", None)
@@ -1158,6 +1163,12 @@ def _work(args: argparse.Namespace) -> int:
             if resume_run is None
             else resume_run.goal
         )
+        acceptance_file = getattr(args, "acceptance_file", None)
+        if acceptance_file:
+            if resume_run is not None:
+                raise ValueError("resume cannot replace accepted Goal criteria")
+            goal = attach_goal_checks(goal, acceptance_file)
+        harness = harness_for_goal(harness, goal)
     except ValueError:
         print(
             canonical_json(
@@ -2308,7 +2319,9 @@ def _graph_promotion_evidence(
     semantic_evidence = goal_evaluation.evidence_digests[len(deterministic_prefix) :]
     if run.repository is None:
         raise ValueError("graph repository authority is missing")
-    harness = discover_project_harness(run.repository)
+    from .goal_acceptance import harness_for_goal
+
+    harness = harness_for_goal(discover_project_harness(run.repository), run.goal)
     accepted_semantic_findings: tuple[str, ...] = ()
     if harness.verification.review.parent_semantic_review:
         semantic_set = set(semantic_evidence)
@@ -2472,7 +2485,9 @@ def _promote_graph(store: SQLiteStore, run: GraphRunRecord, patch_digest: str) -
             )
             if len(acceptances) != 1:
                 raise ValueError("accepted graph authority is missing or ambiguous")
-            harness = discover_project_harness(run.repository)
+            from .goal_acceptance import harness_for_goal
+
+            harness = harness_for_goal(discover_project_harness(run.repository), run.goal)
             operator_config = load_operator_config(run.operator_config_path)
             exact_replay = validate_exact_parent_evidence_store(
                 store,
