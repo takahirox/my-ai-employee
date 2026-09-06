@@ -58,6 +58,7 @@ class LocalProcessExecutor:
         stdin_resolver: Callable[[str], BinaryIO] | None = None,
         maximum_processes: int = 1,
         terminate_grace_seconds: float = 1.0,
+        stdout_storage_filter: Callable[[ProcessRequest, bytes], bytes] | None = None,
     ) -> None:
         if maximum_processes < 1:
             raise ValueError("maximum_processes must be positive")
@@ -68,6 +69,7 @@ class LocalProcessExecutor:
         self.secret_resolver = secret_resolver
         self.stdin_resolver = stdin_resolver
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.stdout_storage_filter = stdout_storage_filter
         self._slots = threading.BoundedSemaphore(maximum_processes)
         self._output_descriptors: dict[tuple[str, str, str], ArtifactDescriptor] = {}
 
@@ -153,6 +155,8 @@ class LocalProcessExecutor:
                 if stdin_handle is not None:
                     stdin_handle.close()
             execution_id = identifier("execution")
+            if self.stdout_storage_filter is not None:
+                stdout = self.stdout_storage_filter(request, stdout)
             stdout_digest = self._store_output(request, execution_id, stdout, "process_stdout")
             stderr_digest = self._store_output(request, execution_id, stderr, "process_stderr")
             status: Literal["succeeded", "failed", "cancelled", "indeterminate"]

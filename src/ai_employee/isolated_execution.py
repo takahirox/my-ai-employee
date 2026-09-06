@@ -30,6 +30,7 @@ from .isolated_worker import (
     IsolatedWorkerProfile,
     NativeProcessBudgetExceeded,
 )
+from .prompt_transport import prompt_json
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
 from .services_v2.process import LocalProcessExecutor
@@ -246,6 +247,8 @@ class IsolatedCodexWorker:
         persist: Callable[[bytes, str], str],
         generated_paths: tuple[str, ...] = (),
         on_usage_limit: Callable[[], None] = lambda: None,
+        usage_recorder: Callable[[WorkerRequest, Mapping[str, object], float, str], None]
+        | None = None,
     ) -> None:
         self.root, self.profile, self.model, self.effort = root, profile, model, effort
         self.cancellation, self.seconds, self.commands, self.persist = (
@@ -255,6 +258,7 @@ class IsolatedCodexWorker:
             persist,
         )
         self.generated_paths, self.on_usage_limit = generated_paths, on_usage_limit
+        self.usage_recorder = usage_recorder
 
     def probe(self) -> WorkerAvailability:
         # Actual OS/backend validation occurs inside propose before a model is started.
@@ -278,6 +282,9 @@ class IsolatedCodexWorker:
         usage_limit = False
         native_process_usage: dict[str, object] = {}
         artifact_bytes = 0
+        model_invoked = False
+        model_duration = 0.0
+        invocation_status = "failed"
         try:
             if request.task_kind is not GoalTaskKind.MUTATING or not request.processes_authorized:
                 raise ValueError("isolated iteration requires authorized mutating processes")
@@ -307,7 +314,7 @@ class IsolatedCodexWorker:
                 raise NativeProcessBudgetExceeded(
                     "BUDGET_EXCEEDED: native and verification process reservations are required"
                 )
-            prompt = canonical_json(
+            prompt = prompt_json(
                 {
                     "protocol": "fleet-isolated-candidate/1",
                     "request": request,
@@ -338,15 +345,20 @@ class IsolatedCodexWorker:
                     )
                 usage = event.get("usage")
                 if kind == "turn.completed" and isinstance(usage, dict):
-                    native_usage.update(
-                        {
-                            name: value
-                            for name, value in usage.items()
-                            if name in {"input_tokens", "cached_input_tokens", "output_tokens"}
-                            and type(value) is int
-                            and value >= 0
-                        }
-                    )
+                    for name in (
+                        "input_tokens",
+                        "cached_input_tokens",
+                        "output_tokens",
+                        "reasoning_output_tokens",
+                        "cache_write_tokens",
+                    ):
+                        value = usage.get(name)
+                        previous = native_usage.get(name, 0)
+                        native_usage[name] = (
+                            previous + value
+                            if type(value) is int and value >= 0 and type(previous) is int
+                            else None
+                        )
                 if kind in {"error", "turn.failed"}:
                     usage_limit = _reports_usage_limit(json.dumps(event))
                     if usage_limit:
@@ -396,7 +408,9 @@ class IsolatedCodexWorker:
                     raise ValueError("ISOLATION_PREFLIGHT_FAILED: process admission unavailable")
                 argv = codex_isolated_exec_args(self.model, self.effort)
                 candidate.native_process_usage = {}
+                model_started = time.monotonic()
                 try:
+                    model_invoked = True
                     code, stdout, stderr = candidate.run_guarded(
                         argv,
                         process_limit=self.profile.native_process_limit,
@@ -404,6 +418,7 @@ class IsolatedCodexWorker:
                         observe=observe,
                     )
                 finally:
+                    model_duration = time.monotonic() - model_started
                     native_process_usage.update(candidate.native_process_usage)
                 # Startup failures can report allowance exhaustion only on stderr,
                 # without a JSON terminal event. Stop graph repair in that case too.
@@ -458,6 +473,7 @@ class IsolatedCodexWorker:
                 expected_artifact_kinds=("workspace_patch",),
             )
             mediated_channel.submit(proposal)
+            invocation_status = "succeeded"
             return WorkerResult(
                 id=identifier("worker-result"),
                 run_id=request.run_id,
@@ -479,6 +495,7 @@ class IsolatedCodexWorker:
                     }
                 ),
             )
+
         except (OSError, ValueError, RuntimeError, TimeoutError) as error:
             failure_code = (
                 StableFailureCode.CANCELLED
@@ -512,3 +529,11 @@ class IsolatedCodexWorker:
                     }
                 ),
             )
+        finally:
+            if model_invoked and self.usage_recorder is not None:
+                self.usage_recorder(
+                    request,
+                    native_usage,
+                    model_duration,
+                    "cancelled" if self.cancellation.cancelled() else invocation_status,
+                )

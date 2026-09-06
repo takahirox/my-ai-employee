@@ -663,6 +663,7 @@ def test_parent_observer_receives_only_exact_patch_and_body_free_other_descripto
 
     assert candidate_reads == [request.candidate_descriptor]
     prompt = json.loads(prompts[0])
+    assert prompts[0].index(b'"rubric":') < prompts[0].index(b'"request":')
     assert prompt["protocol"] == "fleet-parent-semantic-review/2"
     rules = " ".join(prompt["rubric"]["rules"])
     assert "unjustified structural complexity" in rules

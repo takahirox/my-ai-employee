@@ -26,6 +26,8 @@ from .domain.v2 import (
     SchemaModelV2,
 )
 from .engineering_guidance import COMMENT_REVIEW_GUIDANCE, SIMPLICITY_REVIEW_GUIDANCE
+from .model_usage import codex_payload
+from .prompt_transport import prompt_json
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import _strict_schema
@@ -630,7 +632,7 @@ class CliParentSemanticReviewer:
             candidate_patch = candidate.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValueError("parent semantic-review candidate patch is not UTF-8") from error
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-parent-semantic-review/2",
                 "instruction": (
@@ -731,6 +733,7 @@ class CliParentSemanticReviewer:
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--ignore-rules",
@@ -774,6 +777,8 @@ class CliParentSemanticReviewer:
         )
 
     def _extract_payload(self, output: str) -> str:
+        if self.strategy.backend == "codex_cli":
+            return codex_payload(output)
         if self.strategy.backend == "claude_code_cli":
             wrapper = json.loads(output)
             if isinstance(wrapper, dict) and "structured_output" in wrapper:

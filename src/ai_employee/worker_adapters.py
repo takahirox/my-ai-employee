@@ -33,6 +33,8 @@ from .domain.v2 import (
     authoritative_worker_evidence_digests,
 )
 from .engineering_guidance import COMMENT_GUIDANCE, SIMPLICITY_GUIDANCE
+from .model_usage import codex_payload
+from .prompt_transport import prompt_json
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
@@ -581,7 +583,7 @@ class CliTaskAssessmentAdapter:
         goal: str,
         deterministic: TaskAssessment,
     ) -> SemanticTaskProfile:
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-semantic-task-assessment/2",
                 "instruction": (
@@ -652,6 +654,7 @@ class CliTaskAssessmentAdapter:
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--sandbox",
@@ -690,6 +693,8 @@ class CliTaskAssessmentAdapter:
         )
 
     def _extract_payload(self, output: str) -> str:
+        if self.strategy.backend == "codex_cli":
+            return codex_payload(output)
         if self.strategy.backend == "claude_code_cli":
             wrapper = json.loads(output)
             if isinstance(wrapper, dict) and "structured_output" in wrapper:
@@ -721,6 +726,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--sandbox",
@@ -745,6 +751,8 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
 
     def _extract_payload(self, output: str) -> str:
         """Decode the small Codex-compatible transport into the domain envelope."""
+
+        output = codex_payload(output)
 
         wrapper = json.loads(output)
         if not isinstance(wrapper, dict):
@@ -977,7 +985,7 @@ def _bounded_prompt(
             "instead of an edit proposal using wire version 3 (no runtime binding fields), "
             "and keep proposals empty."
         )
-    value = canonical_json(payload).encode()
+    value = prompt_json(payload).encode()
     if len(value) > 64_000:
         raise ValueError("bounded worker request exceeds 64000 bytes")
     return value

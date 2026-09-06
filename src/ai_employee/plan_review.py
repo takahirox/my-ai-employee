@@ -22,6 +22,8 @@ from .domain.v2 import (
     SchemaModelV2,
 )
 from .engineering_guidance import SIMPLICITY_REVIEW_GUIDANCE
+from .model_usage import codex_payload
+from .prompt_transport import prompt_json
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import ProposedGraph, _strict_schema
@@ -467,7 +469,7 @@ class CliPlanReviewer:
         if max_nodes < 1 or max_wall_seconds <= 0:
             raise ValueError("plan-review bounds must be positive")
         allowed = tuple(dict.fromkeys(available_capabilities))
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-plan-review/2",
                 "instruction": (
@@ -590,6 +592,7 @@ class CliPlanReviewer:
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--sandbox",
@@ -628,6 +631,8 @@ class CliPlanReviewer:
         )
 
     def _extract_payload(self, output: str) -> str:
+        if self.strategy.backend == "codex_cli":
+            return codex_payload(output)
         if self.strategy.backend == "claude_code_cli":
             wrapper = json.loads(output)
             if isinstance(wrapper, dict) and "structured_output" in wrapper:
