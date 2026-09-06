@@ -95,6 +95,14 @@ def make_harness(seconds: float) -> dict[str, Any]:
         "paths": {
             "writable": ["src/**", "output/**"],
             "protected": ["input/**", ".git/**", ".fleet/**"],
+            # Only untracked bytecode is generated output; capture still includes
+            # tracked mutations and changes outside these writable cache paths.
+            "generated": [
+                "src/__pycache__/*.pyc",
+                "src/**/__pycache__/*.pyc",
+                "output/__pycache__/*.pyc",
+                "output/**/__pycache__/*.pyc",
+            ],
         },
         "verification": {"required": ["smoke"], "review": {"required": False}},
         "worker": {
