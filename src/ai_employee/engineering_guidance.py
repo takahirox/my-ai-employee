@@ -1,5 +1,65 @@
 """Shared engineering guidance; never execution or acceptance authority."""
 
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_MINIMAL_SUFFICIENT = ContextVar("minimal_sufficient_guidance", default=True)
+
+
+@contextmanager
+def guidance_scope(enabled: bool) -> Iterator[None]:
+    token = _MINIMAL_SUFFICIENT.set(enabled)
+    try:
+        yield
+    finally:
+        _MINIMAL_SUFFICIENT.reset(token)
+
+
+def configured_instruction(value: str) -> str:
+    """Ablate preferences only, never Goal data, acceptance or mandatory scope guards."""
+    if _MINIMAL_SUFFICIENT.get():
+        return value
+    return (
+        value.replace(SIMPLICITY_GUIDANCE, "")
+        .replace(
+            "shortest bounded dependency DAG sufficient for the entire accepted Goal; "
+            "minimal_sufficient is the default.",
+            "bounded dependency DAG sufficient for the entire accepted Goal.",
+        )
+        .replace(
+            "Use minimal_sufficient as the default: propose the smallest change "
+            "sufficient for the supplied node goal and accepted plan, prefer existing "
+            "mechanisms, stay within both, and omit optional follow-on work.",
+            "Propose changes satisfying the supplied node goal and accepted plan within "
+            "their accepted scope.",
+        )
+        .replace(
+            "Do not add speculative framework, abstraction, extension point, "
+            "optimization, cleanup, or unrelated refactor work. ",
+            "",
+        )
+    )
+
+
+def configured_rubric(rubric: Mapping[str, object]) -> dict[str, object]:
+    result = dict(rubric)
+    rules = result.get("rules")
+    if not _MINIMAL_SUFFICIENT.get() and isinstance(rules, tuple):
+        result["rules"] = tuple(rule for rule in rules if rule != SIMPLICITY_REVIEW_GUIDANCE)
+    return result
+
+
+INVESTIGATION_GUIDANCE = (
+    "Before committing to implementation details, inspect relevant repository code and "
+    "existing tests with authorized tools within the current task's time, process and scope "
+    "bounds. Relate observed facts to the accepted criteria, then implement and verify. "
+    "Do not infer low risk from a small task or missing information. Preserve any required "
+    "comprehensive investigation. If findings require new scope, authority, missing criteria "
+    "or consequential design decisions, stop with concrete findings for supported escalation "
+    "or replanning; do not silently widen the task, revise acceptance, or switch models. "
+)
+
 SIMPLICITY_GUIDANCE = (
     "Simplicity is a positive engineering objective. Among approaches satisfying the same "
     "current requirements with comparable correctness, safety and maintainability, prefer "

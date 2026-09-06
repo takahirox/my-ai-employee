@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextvars import copy_context
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -116,9 +117,19 @@ class _ExecutionSession:
         self.repository = repository
         self.base_commit = base_commit
         self.node_patches: dict[str, NodePatchArtifact] = {}
+        self._context = copy_context()
         self._lock = Lock()
 
     def run_node(
+        self,
+        node: Node,
+        request: WorkerRequest,
+        strategy: ExecutionStrategy,
+    ) -> NodeExecutionResult:
+        # Worker threads retain the run's explicit experimental prompt configuration.
+        return self._context.copy().run(self._run_node, node, request, strategy)
+
+    def _run_node(
         self,
         node: Node,
         request: WorkerRequest,

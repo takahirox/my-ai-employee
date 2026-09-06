@@ -122,6 +122,7 @@ class HarnessReview(HarnessModel):
     required: bool = True
     independent_task_review: bool = False
     parent_semantic_review: bool = False
+    plan_review: bool = False
     block_severities: tuple[Literal["critical", "high", "medium", "low"], ...] = (
         "critical",
         "high",
@@ -131,7 +132,9 @@ class HarnessReview(HarnessModel):
     def _review_policy_is_canonical(self) -> Self:
         if len(self.block_severities) != len(set(self.block_severities)):
             raise ValueError("review blocking severities must be unique")
-        if (self.independent_task_review or self.parent_semantic_review) and not self.required:
+        if (
+            self.independent_task_review or self.parent_semantic_review or self.plan_review
+        ) and not self.required:
             raise ValueError("AI review requires the review gate")
         if self.parent_semantic_review and not self.block_severities:
             raise ValueError("parent semantic review requires blocking severities")

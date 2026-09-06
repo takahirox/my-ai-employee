@@ -13,9 +13,10 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal, cast
 
 from . import __version__
@@ -179,9 +180,12 @@ from .worker_supervision import WorkerTimeoutProfileRecord
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .corpus_cli import add_corpus_parser
+
     parser = argparse.ArgumentParser(prog="fleet", description="My AI Employee fleet runtime")
     parser.add_argument("--version", action="version", version=f"fleet {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+    add_corpus_parser(commands)
 
     demo = commands.add_parser("demo", help="run the deterministic offline demonstration")
     demo.add_argument("--run-id", default=None)
@@ -287,6 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     work = commands.add_parser("work", help="create a mediated v0.2 work run")
     work.add_argument("goal")
+    work.add_argument("--task-fixture", help="explicit private History input; always plans afresh")
+    work.add_argument(
+        "--minimal-sufficient",
+        choices=("on", "off"),
+        default="on",
+        help="experimental guidance ablation; never disables scope or safety controls",
+    )
     work.add_argument("--run-id", help="explicit unique Graph Run ID")
     work.add_argument(
         "--job-id",
@@ -300,11 +311,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     work.add_argument("--repo", default=".")
-    work.add_argument(
+    routing_options = work.add_mutually_exclusive_group()
+    routing_options.add_argument(
         "--routing-mode",
+        # Python 3.11's exclusion check distinguishes values by identity from the default.
+        type=RoutingMode,
         choices=("fixed", "adaptive"),
         default="adaptive",
         help="Graph strategy selection mode (default: adaptive)",
+    )
+    routing_options.add_argument(
+        "--profile",
+        choices=("lightweight", "adaptive"),
+        help="explicit orchestration profile; lightweight requires --strategy",
     )
     work.add_argument("--strategy", help="exact strategy ID for fixed routing")
     work.add_argument(
@@ -393,6 +412,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "eval":
         return _eval(args)
+    if args.command == "corpus":
+        from .corpus_cli import run_corpus
+
+        return run_corpus(args)
     if args.command == "productivity":
         try:
             return run_productivity(args)
@@ -1128,9 +1151,15 @@ def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
+    from .engineering_guidance import guidance_scope
+    from .execution_profile import choose_profile, observe_profile
     from .goal_acceptance import attach_goal_checks, harness_for_goal
     from .orchestration import WorkCoordinator, bind_service_decision
 
+    started = monotonic()
+    requested_profile = getattr(args, "profile", None)
+    if requested_profile is not None:
+        args.routing_mode = "fixed" if requested_profile == "lightweight" else "adaptive"
     resume_run: GraphRunRecord | None = getattr(args, "resume_graph_run", None)
     repository = Path(args.repo).resolve()
     requested_run_id = getattr(args, "run_id", None)
@@ -1163,6 +1192,21 @@ def _work(args: argparse.Namespace) -> int:
             if resume_run is None
             else resume_run.goal
         )
+        task_fixture = None
+        if getattr(args, "task_fixture", None):
+            from .history_corpus import load_task, verify_environment
+
+            if resume_run is not None:
+                raise ValueError("resume cannot replace original task inputs")
+            task_fixture = load_task(Path(args.task_fixture))
+            verify_environment(task_fixture.environment)
+            original = task_fixture.start.goal
+            if original.statement != args.goal or original.task_kind != goal.task_kind:
+                raise ValueError("fixture does not match the requested Goal")
+            restored_criteria = {item.id: item for item in original.completion_criteria}
+            if any(restored_criteria.get(item.id) != item for item in goal.completion_criteria):
+                raise ValueError("fixture cannot weaken mandatory Harness criteria")
+            goal = original.model_copy(update={"id": goal.id})
         acceptance_file = getattr(args, "acceptance_file", None)
         if acceptance_file:
             if resume_run is not None:
@@ -1184,6 +1228,8 @@ def _work(args: argparse.Namespace) -> int:
         return 2
     if resume_run is not None and project_harness_digest(harness) != resume_run.harness_digest:
         raise ValueError("Project Harness changed since the graph was accepted")
+    if args.routing_mode == "fixed" and harness.verification.review.plan_review:
+        raise ValueError("Harness requires plan review; select --profile adaptive")
     capabilities: list[str] = []
     if goal.task_kind is GoalTaskKind.MUTATING:
         capabilities.append("edit_intent")
@@ -1205,6 +1251,18 @@ def _work(args: argparse.Namespace) -> int:
     if resume_run is not None and operator_config_path is None:
         raise ValueError("authoritative operator configuration cannot be durably recovered")
     operator_config = load_operator_config(operator_config_path)
+    if task_fixture is not None:
+        from .history_corpus import _git
+
+        if (
+            operator_config_digest(operator_config)
+            != operator_config_digest(task_fixture.start.operator_config)
+            or project_harness_digest(harness) != project_harness_digest(task_fixture.start.harness)
+            or _git(repository, "rev-parse", "HEAD").decode().strip()
+            != task_fixture.start.base_commit
+            or _git(repository, "status", "--porcelain=v2", "--untracked-files=all")
+        ):
+            raise ValueError("fixture repository or configuration differs from the exact baseline")
     if (
         resume_run is not None
         and operator_config_digest(operator_config) != resume_run.operator_config_digest
@@ -1376,6 +1434,7 @@ def _work(args: argparse.Namespace) -> int:
     with (
         SQLiteStore(db_path) as store,
         _PreAcceptanceOutcomeGuard(store, run_id, goal) as pre_acceptance,
+        ExitStack() as profile_scope,
     ):
         if resume_run is None:
             pre_acceptance.claim(
@@ -1383,6 +1442,23 @@ def _work(args: argparse.Namespace) -> int:
                 job_id=getattr(args, "job_id", None),
                 job_goal=getattr(args, "job_goal", None),
             )
+        profile_observation = profile_scope.enter_context(
+            observe_profile(
+                store,
+                choose_profile(
+                    run_id,
+                    harness,
+                    operator_config_digest(operator_config),
+                    RoutingMode(args.routing_mode),
+                    args.strategy,
+                    minimal_sufficient=getattr(args, "minimal_sufficient", "on") == "on",
+                ),
+                started=started,
+            )
+        )
+        profile_scope.enter_context(
+            guidance_scope(profile_observation.profile.minimal_sufficient_guidance)
+        )
 
         def executor_for(
             root: Path,
@@ -1500,7 +1576,31 @@ def _work(args: argparse.Namespace) -> int:
             required_approvals=required_approvals,
         )
         if resume_run is None:
+            if (
+                task_fixture is not None
+                and policy.content_digest != task_fixture.start.policy.content_digest
+            ):
+                raise ValueError("fixture policy differs from the current execution authority")
             store.put("policy_layer_v2", policy, run_id=run_id)
+            from .history_corpus import capture_start
+
+            capture_start(store, run_id, repository, goal, harness, operator_config, policy)
+            if task_fixture is not None:
+                from .history_corpus import CorpusTrialBinding
+
+                store.put_once(
+                    "corpus_trial_binding_v2",
+                    CorpusTrialBinding(
+                        id="corpus-trial-" + run_id,
+                        run_id=run_id,
+                        created_at=now(),
+                        fixture_digest=task_fixture.content_digest or "",
+                        logical_task_digest=task_fixture.logical_task_digest,
+                        environment_digest=canonical_digest(task_fixture.environment),
+                        execution_profile_digest=profile_observation.profile.content_digest or "",
+                    ),
+                    run_id=run_id,
+                )
         else:
             persisted_layers = tuple(
                 layer
@@ -1719,7 +1819,9 @@ def _work(args: argparse.Namespace) -> int:
                     available_capabilities=tuple(capabilities),
                     effective_policy_digest=effective_policy_digest,
                     harness_digest=harness_digest,
-                    max_nodes=16,
+                    max_nodes=16
+                    if task_fixture is None
+                    else task_fixture.execution_policy.max_nodes,
                     max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
                 )
             except ValueError:
@@ -1856,6 +1958,7 @@ def _work(args: argparse.Namespace) -> int:
                 strategy: ExecutionStrategy,
             ) -> WorkCoordinator:
                 inner_store = SQLiteStore(db_path)
+                profile_observation.record("before_first_worker", store=inner_store)
                 profiles = tuple(
                     item
                     for item in inner_store.list_records(
@@ -2123,6 +2226,8 @@ def _work(args: argparse.Namespace) -> int:
                         (
                             resume_run.execution_policy
                             if resume_run is not None
+                            else task_fixture.execution_policy
+                            if task_fixture is not None
                             else ExecutionPolicy(
                                 max_nodes=16,
                                 max_attempts=32,
@@ -2783,6 +2888,13 @@ def _resume_work(store: SQLiteStore, run: object) -> int:
 
 
 def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
+    from .execution_profile import ExecutionProfile
+
+    try:
+        profile = store.get("execution_profile_v2", "profile-" + run.id, ExecutionProfile)
+        minimal_sufficient = "on" if profile.minimal_sufficient_guidance else "off"
+    except KeyError:
+        minimal_sufficient = "on"
     if run.status not in {"planned", "paused"} or run.repository is None:
         raise ValueError("only an authoritative planned or paused graph can start")
     return _work(
@@ -2802,6 +2914,7 @@ def _resume_graph(store: SQLiteStore, run: GraphRunRecord) -> int:
             non_interactive=True,
             json=True,
             resume_graph_run=run,
+            minimal_sufficient=minimal_sufficient,
         )
     )
 

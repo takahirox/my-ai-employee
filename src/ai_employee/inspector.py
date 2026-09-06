@@ -50,6 +50,7 @@ from .domain.v2 import (
     WorkerResult,
     WorkspaceSnapshot,
 )
+from .execution_profile import inspect_profile
 from .graph_composition import GraphPatchCompositionRecord
 from .graph_evaluation import (
     ParentCandidateEvaluationRecord,
@@ -692,6 +693,7 @@ def inspect_graph_run(
         "schema_version": "2",
         "run_id": run.id,
         "kind": "graph_run",
+        "execution_profile": inspect_profile(store, run_id),
         "state": run.status,
         "workspace_lineage": {
             "inputs": [
@@ -1684,6 +1686,9 @@ def _attach_repository_context(
     store: SQLiteStore, run_id: str, projection: dict[str, Any]
 ) -> dict[str, Any]:
     projection["ai_usage"] = inspect_usage(store, (run_id,))
+    profile = inspect_profile(store, run_id)
+    if profile is not None:
+        projection["execution_profile"] = profile
     run = _as_dict(projection.get("run"))
     status = str(projection.get("state") or "not_recorded")
     attention = _attention_facts(projection, run, status, _latest_node_facts(projection))

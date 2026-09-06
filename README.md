@@ -331,6 +331,8 @@ approval. Host-global installation remains denied.
   productivity reporting boundary
 - [Productivity evaluation protocol](docs/evaluation.md) for same-worker direct-versus-Fleet
   trials, ablations, offline benchmark imports, canonical bundles, and regression comparison
+- [Explicit lightweight/adaptive profiles](docs/execution-profiles.md) and
+  [private History-derived corpus trials](docs/history-corpus.md)
 - [Project Harness guide](docs/project-harness.md) and
   [example profile](examples/project/.fleet/project.yaml)
 - [OpenAI Agents SDK and TAKT influences](docs/influences.md)

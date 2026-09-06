@@ -67,6 +67,8 @@ def project_harness_digest(harness: BaseModel) -> str:
             review.pop("independent_task_review")
         if isinstance(review, dict) and review.get("parent_semantic_review") is False:
             review.pop("parent_semantic_review")
+        if isinstance(review, dict) and review.get("plan_review") is False:
+            review.pop("plan_review")
     return canonical_digest(payload)
 
 
