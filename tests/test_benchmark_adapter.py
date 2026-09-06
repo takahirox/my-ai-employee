@@ -30,8 +30,28 @@ def test_ledger_is_explicit_absolute_and_not_exported(tmp_path):
         profile, tmp_path, seconds=2, cancellation=SimpleNamespace(cancelled=lambda: False)
     )
     candidate._record_resource("container", candidate.name)
-    assert json.loads(ledger.read_text()) == {"kind": "container", "name": candidate.name}
+    assert json.loads(ledger.read_text()) == {
+        "kind": "container",
+        "name": candidate.name,
+        "state": "intent",
+    }
     assert ledger.stat().st_mode & 0o777 == 0o600
+
+
+def test_interrupted_create_never_reports_cleanup_confirmed(tmp_path, monkeypatch):
+    name = "fleet-candidate-" + "b" * 32
+    (tmp_path / "resources.jsonl").write_text(
+        json.dumps({"kind": "container", "name": name, "state": "intent"})
+    )
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1, stderr=f"No such container: {name}".encode()
+        ),
+    )
+    with pytest.raises(RuntimeError, match="creation was interrupted"):
+        adapter.cleanup(tmp_path)
 
 
 def test_cleanup_only_exact_owned_resources_and_in_correct_order(tmp_path, monkeypatch):
@@ -71,6 +91,29 @@ def test_adapter_protocol_cleanup_without_model_or_credentials(tmp_path):
     )
     assert adapter.main(["--request", str(request), "--response", str(response)]) == 0
     assert json.loads(response.read_text())["outcome"] == "cleaned"
+
+
+@pytest.mark.parametrize("missing_resource", [True, False])
+def test_cleanup_distinguishes_missing_network_from_missing_daemon(
+    tmp_path, monkeypatch, missing_resource
+):
+    name = "fleet-candidate-" + "a" * 32 + "-network"
+    (tmp_path / "resources.jsonl").write_text(json.dumps({"kind": "network", "name": name}))
+    error = (
+        f"Error response from daemon: network {name} not found"
+        if missing_resource
+        else "docker.sock: No such file or directory"
+    )
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=1, stderr=error.encode()),
+    )
+    if missing_resource:
+        adapter.cleanup(tmp_path)
+    else:
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            adapter.cleanup(tmp_path)
 
 
 def test_adapter_does_not_run_outside_control_directory(tmp_path):

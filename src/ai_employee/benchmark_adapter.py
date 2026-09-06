@@ -16,7 +16,9 @@ import math
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from . import cli
 from .domain.v2 import WorkerResult
@@ -44,6 +46,7 @@ def cleanup(control: Path) -> None:
     if ledger.is_symlink() or ledger.stat().st_size > 100_000:
         raise ValueError("invalid resource ledger")
     resources = [json.loads(line) for line in ledger.read_text().splitlines()]
+    latest = {}
     for item in resources:
         pattern = r"fleet-candidate-[0-9a-f]{32}" + (
             r"-network" if item.get("kind") == "network" else r"(?:-proxy)?"
@@ -52,17 +55,28 @@ def cleanup(control: Path) -> None:
             pattern, item.get("name", "")
         ):
             raise ValueError("invalid owned resource name")
+        if item.get("state", "created") not in ("intent", "created"):
+            raise ValueError("invalid resource lifecycle state")
+        latest[(item["kind"], item["name"])] = item
     # Containers first, then their networks. Never enumerate or prune other workloads.
-    for item in sorted(resources, key=lambda r: r["kind"] == "network"):
+    for item in sorted(latest.values(), key=lambda r: r["kind"] == "network"):
         args = ["docker", item["kind"], "rm"]
         if item["kind"] == "container":
             args.append("-f")
         result = subprocess.run([*args, item["name"]], capture_output=True, timeout=15)
-        if result.returncode and b"No such" not in result.stderr:
+        error = result.stderr.decode(errors="replace").lower()
+        missing = f"no such {item['kind']}: {item['name']}" in error or (
+            item["kind"] == "network" and f"network {item['name']} not found" in error
+        )
+        if result.returncode and not missing:
             raise RuntimeError("Owned benchmark resource cleanup was not confirmed")
+    if any(item.get("state") == "intent" for item in latest.values()):
+        # A killed Docker client may leave a create request in flight in the daemon.
+        # Absence at one instant is not sufficient evidence of completed cleanup.
+        raise RuntimeError("Resource creation was interrupted; retain ledger for operator recovery")
 
 
-def make_harness(seconds: float) -> dict:
+def make_harness(seconds: float) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "commands": {
@@ -102,7 +116,7 @@ def git(root: Path, *args: str, data: bytes | None = None) -> bytes:
 
 
 def regular_files(root: Path) -> dict[str, bytes]:
-    result = {}
+    result: dict[str, bytes] = {}
     total = 0
     for path in root.rglob("*"):
         if path.is_symlink():
@@ -118,7 +132,7 @@ def regular_files(root: Path) -> dict[str, bytes]:
     return result
 
 
-def run(request: dict, control: Path) -> dict:
+def run(request: dict[str, Any], control: Path) -> dict[str, Any]:
     workspace = checked_directory(request["workspace"], control)
     checks = checked_directory(request["public_checks"], control)
     seconds = request["seconds"]
@@ -218,7 +232,7 @@ def run(request: dict, control: Path) -> dict:
     with SQLiteStore(database) as store:
         workers = store.list_records("worker_result_v2", WorkerResult)
         quota = any(w.failure and "USAGE_LIMIT" in w.failure.message for w in workers)
-        usage_rows = [dict(w.usage) for w in workers if w.usage]
+        usage_rows = [dict(w.usage) for w in workers if isinstance(w.usage, Mapping)]
         usage = {
             key: sum(row[key] for row in usage_rows)
             for key in ("input_tokens", "cached_input_tokens", "output_tokens")
@@ -282,7 +296,7 @@ def run(request: dict, control: Path) -> dict:
     return {"protocol": PROTOCOL, "outcome": "completed", "usage": usage, "details": details}
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--response", required=True, type=Path)
@@ -295,6 +309,7 @@ def main(argv=None) -> int:
     control = checked_directory(request["control_dir"])
     if args.response.parent.resolve() != control or args.response.exists():
         raise ValueError("response must be a new file in the private control directory")
+    response: dict[str, Any]
     if request.get("operation") == "cleanup":
         cleanup(control)
         response = {"protocol": PROTOCOL, "outcome": "cleaned"}

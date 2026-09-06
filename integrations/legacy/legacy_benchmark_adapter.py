@@ -1,4 +1,4 @@
-"""Historical proposal-mode adapter; optional pocket-agent-bench dependency."""
+"""Historical proposal-mode adapter, outside the installed product package."""
 
 import json
 import shlex

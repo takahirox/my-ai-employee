@@ -73,9 +73,15 @@ and normalized status for independent grading. Usage-limit failures are differen
 they report `usage_limit` and stop subsequent model calls. No reset tickets, purchase,
 automatic allowance expansion, provider change or fallback model is implemented.
 
-The copied `legacy_benchmark_adapter.py` and `fleet_wrapper.py` are historical
+The copied `integrations/legacy/legacy_benchmark_adapter.py` and adjacent
+`fleet_wrapper.py` are historical
 proposal-mode integration sources for old runtime snapshots, not the new execution
 path. They must not be used with a current Fleet CLI as if they selected #81.
+
+Crash recovery records both creation intent and acknowledged creation. If the
+controller is interrupted while Docker creation is still in flight, cleanup does
+not claim success based on a momentary absence: it retains the ledger and requires
+operator recovery. An unconfirmed cleanup stops subsequent benchmark model calls.
 
 Model-free tests validate the file contract, protected public fixture, cleanup
 target validation and normal Harness schema. Full Docker/real-model twelve-task

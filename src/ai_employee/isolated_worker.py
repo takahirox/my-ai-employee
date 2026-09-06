@@ -136,7 +136,7 @@ class DockerCandidate:
         self.proxy: str | None = None
         self.native_process_usage: dict[str, object] = {}
 
-    def _record_resource(self, kind: str, name: str) -> None:
+    def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
         """Operator-only crash-recovery ledger; never copied into the worker."""
         if self.profile.resource_ledger is None:
             return
@@ -146,7 +146,10 @@ class DockerCandidate:
             0o600,
         )
         try:
-            os.write(descriptor, (json.dumps({"kind": kind, "name": name}) + "\n").encode())
+            os.write(
+                descriptor,
+                (json.dumps({"kind": kind, "name": name, "state": state}) + "\n").encode(),
+            )
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -167,6 +170,10 @@ class DockerCandidate:
                 f"Docker operation {args[0]} failed: "
                 + result.stderr.decode(errors="replace")[:1000]
             )
+        if args[0] in ("create", "run") and "--name" in args:
+            self._record_resource("container", args[args.index("--name") + 1], "created")
+        elif args[:2] == ("network", "create"):
+            self._record_resource("network", args[-1], "created")
         return result.stdout
 
     def __enter__(self) -> DockerCandidate:

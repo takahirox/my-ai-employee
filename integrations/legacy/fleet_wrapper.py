@@ -1,5 +1,5 @@
 #!/usr/local/bin/python
-"""Preserve Fleet's structured final response while collecting native usage."""
+"""Historical wrapper: preserve the structured response and collect native usage."""
 
 import json
 import os
