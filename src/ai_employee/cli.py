@@ -314,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     routing_options = work.add_mutually_exclusive_group()
     routing_options.add_argument(
         "--routing-mode",
+        # Python 3.11's exclusion check distinguishes values by identity from the default.
+        type=RoutingMode,
         choices=("fixed", "adaptive"),
         default="adaptive",
         help="Graph strategy selection mode (default: adaptive)",

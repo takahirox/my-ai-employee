@@ -97,10 +97,16 @@ def test_profile_persistence_resume_mismatch_and_read_only_projection(tmp_path):
         assert partial["timing_complete"] is False
 
 
-def test_profile_and_routing_override_are_mutually_exclusive():
+@pytest.mark.parametrize("routing_mode", ["fixed", "adaptive"])
+@pytest.mark.parametrize("profile", ["lightweight", "adaptive"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_profile_and_routing_override_are_mutually_exclusive(routing_mode, profile, reverse):
+    options = [("--profile", profile), ("--routing-mode", routing_mode)]
+    if reverse:
+        options.reverse()
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(
-            ["work", "fix", "--profile", "lightweight", "--routing-mode", "adaptive"]
+            ["work", "fix", *(value for pair in options for value in pair)]
         )
 
 
