@@ -62,9 +62,73 @@ def test_native_exec_selects_permissions_via_config_not_sandbox_only_flag():
     assert 'default_permissions="fleet-isolated"' in args
     assert "--sandbox" not in args
     assert "features.multi_agent=false" in args
+    assert "features.shell_snapshot=false" in args
     assert 'web_search="disabled"' in args
     assert args.index("--ignore-user-config") > args.index("exec")
     assert args[-1] == "-"
+
+
+def test_native_graph_reserves_checks_and_disallows_fleet_retry():
+    from ai_employee.domain import CompletionCriterion, Goal, GoalTaskKind
+    from ai_employee.task_orchestration import one_node_graph
+
+    goal = Goal(
+        id="goal",
+        statement="fix",
+        task_kind=GoalTaskKind.MUTATING,
+        completion_criteria=(
+            CompletionCriterion(
+                id="check", description="test", verification_requirement_ids=("test", "regression")
+            ),
+        ),
+    )
+    graph = one_node_graph(
+        goal,
+        graph_id="graph",
+        node_id="node",
+        required_capabilities=("edit_intent",),
+        native_processes=16,
+        max_processes=20,
+    )
+    assert graph.nodes[0].resource_budget.processes == 18
+    assert graph.budget.max_processes == 18  # plus two independent parent checks
+    assert graph.budget.max_attempts == graph.budget.max_worker_turns == 1
+    assert graph.budget.max_repairs == 0
+    with pytest.raises(ValueError, match="exceed process policy"):
+        one_node_graph(
+            goal,
+            graph_id="graph",
+            node_id="node",
+            required_capabilities=("edit_intent",),
+            native_processes=16,
+            max_processes=19,
+        )
+
+
+@pytest.mark.parametrize("processes", [None, 0, 16, "18", True])
+def test_missing_native_reservation_never_starts_model(tmp_path, monkeypatch, processes):
+    from ai_employee import isolated_execution
+    from tests.test_work_orchestration_v2 import Channel, worker_request
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("no container or prompt before reserved native budget")
+
+    monkeypatch.setattr(isolated_execution, "DockerCandidate", forbidden)
+    adapter = isolated_execution.IsolatedCodexWorker(
+        tmp_path,
+        IsolatedWorkerProfile(image="sha256:" + "0" * 64, auth_file="/explicit/dummy.json"),
+        model="fixed-test-model",
+        effort="low",
+        cancellation=Cancellation(),
+        seconds=2.0,
+        commands=(),
+        persist=forbidden,
+    )
+    request = worker_request().model_copy(
+        update={"remaining_budgets": {"artifact_bytes": 100_000, "processes": processes}}
+    )
+    result = adapter.propose(request, Channel())
+    assert result.failure.code.value == "BUDGET_EXCEEDED" and not result.proposals
 
 
 @pytest.mark.parametrize("stderr_only", [False, True])
@@ -78,7 +142,7 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
 
     class FakeCandidate:
         def __init__(self, *args, **kwargs):
-            pass
+            self.native_process_usage = {}
 
         def __enter__(self):
             return self
@@ -100,6 +164,12 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
         def capture(self, *args):
             pytest.fail("never submit a candidate after a usage limit")
 
+        def run_guarded(self, argv, **kwargs):
+            if argv[0] == "python":
+                self.native_process_usage = {"admitted": 2}
+                return 0, b"", b""
+            return self.run(argv, **kwargs)
+
     monkeypatch.setattr(isolated_execution, "DockerCandidate", FakeCandidate)
     adapter = isolated_execution.IsolatedCodexWorker(
         tmp_path,
@@ -112,7 +182,9 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
         persist=lambda *_: "0" * 64,
         on_usage_limit=lambda: stopped.append(True),
     )
-    request = worker_request().model_copy(update={"remaining_budgets": {"artifact_bytes": 100_000}})
+    request = worker_request().model_copy(
+        update={"remaining_budgets": {"artifact_bytes": 100_000, "processes": 514}}
+    )
     result = adapter.propose(request, Channel())
     assert result.failure.code.value == "BUDGET_EXCEEDED"
     assert "USAGE_LIMIT" in result.failure.message
@@ -307,6 +379,7 @@ def test_cli_native_iteration_and_fresh_independent_verification(
     harness["commands"] = {"parent-test": {"argv": check}}
     harness["worker"]["isolated_workspace_tools"] = True
     harness["budgets"]["wall_seconds"] = 120.0
+    harness["budgets"]["processes"] = 600
     path.write_text(json.dumps(harness))
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run(
@@ -330,6 +403,7 @@ def test_cli_native_iteration_and_fresh_independent_verification(
     config["isolated_worker"] = {"image": IMAGE, "auth_file": str(auth)}
     operator.write_text(json.dumps(config))
     original = DockerCandidate.run
+    original_guarded = DockerCandidate.run_guarded
     seen: list[str] = []
 
     def scripted_native(self, argv, **kwargs):
@@ -382,6 +456,19 @@ def test_cli_native_iteration_and_fresh_independent_verification(
         return 0, b"scripted", b""
 
     monkeypatch.setattr(DockerCandidate, "run", scripted_native)
+
+    def scripted_guarded(self, argv, **kwargs):
+        if argv[:2] == ("codex", "exec"):
+            self.native_process_usage = {
+                "admitted": 4,
+                "limit": kwargs["process_limit"],
+                "cleanup": "confirmed",
+                "denied": False,
+            }
+            return scripted_native(self, argv, **kwargs)
+        return original_guarded(self, argv, **kwargs)
+
+    monkeypatch.setattr(DockerCandidate, "run_guarded", scripted_guarded)
     result = cli.main(
         [
             "work",

@@ -24,7 +24,11 @@ from ai_employee.isolated_execution import (
     _reports_usage_limit,
     codex_isolated_permission_args,
 )
-from ai_employee.isolated_worker import DockerCandidate, IsolatedWorkerProfile
+from ai_employee.isolated_worker import (
+    DockerCandidate,
+    IsolatedWorkerProfile,
+    NativeProcessBudgetExceeded,
+)
 from ai_employee.serialization import canonical_json
 from ai_employee.services_v2._common import identifier, now
 from ai_employee.services_v2.process import LocalProcessExecutor
@@ -93,6 +97,7 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
     stopped = False
     transport_usage = []
     transport_activity = []
+    transport_processes = []
     cli_version = None
 
     class ComparisonExecutor(LocalProcessExecutor):
@@ -150,6 +155,8 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
                         "-c",
                         "features.multi_agent=false",
                         "-c",
+                        "features.shell_snapshot=false",
+                        "-c",
                         'web_search="disabled"',
                     ]
                     assert self.stdin_resolver and request.stdin_artifact_digest
@@ -192,9 +199,23 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
                                 stopped = True
                                 raise RuntimeError("USAGE_LIMIT: entire comparison stopped")
 
-                    code, _, native_stderr = candidate.run(
-                        ("codex", *args), stdin=prompt, observe=observe
+                    remaining = profile.native_process_limit - sum(
+                        item["admitted"] for item in transport_processes
                     )
+                    try:
+                        if remaining < 1:
+                            raise NativeProcessBudgetExceeded("comparison admissions exhausted")
+                        code, _, native_stderr = candidate.run_guarded(
+                            ("codex", *args),
+                            process_limit=remaining,
+                            stdin=prompt,
+                            observe=observe,
+                        )
+                    except NativeProcessBudgetExceeded:
+                        code, native_stderr = 125, b""
+                    finally:
+                        if candidate.native_process_usage:
+                            transport_processes.append(candidate.native_process_usage)
                     if code and _reports_usage_limit(native_stderr.decode(errors="replace")):
                         stopped = True
                         raise RuntimeError("USAGE_LIMIT: entire comparison stopped")
@@ -225,7 +246,11 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
                 failure=None
                 if code == 0
                 else StableFailure(
-                    code=StableFailureCode.PROCESS_FAILED,
+                    code=(
+                        StableFailureCode.BUDGET_EXCEEDED
+                        if code == 125
+                        else StableFailureCode.PROCESS_FAILED
+                    ),
                     message=f"comparison worker exited with code {code}",
                 ),
                 duration_seconds=time.monotonic() - started,
@@ -251,7 +276,7 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
                 "allowed_strategy_ids": ["comparison"],
                 "isolated_workspace_tools": True,
             },
-            "budgets": {"wall_seconds": 240.0, "processes": 40, "worker_turns": 1},
+            "budgets": {"wall_seconds": 240.0, "processes": 600, "worker_turns": 1},
         }
         (root / ".fleet/project.json").write_text(json.dumps(harness))
         for args in (
@@ -342,6 +367,7 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
             "arm": arm,
             "model": MODEL,
             "effort": "low",
+            "shell_snapshot": False,
             "runtime_image": IMAGE,
             "cli_version": cli_version,
             "source_tree": tree,
@@ -361,6 +387,12 @@ def test_paired_real_model_comparison(tmp_path, monkeypatch, capsys):
             "independent_verification_statuses": [v.status for v in verifications],
             "worker_adapter_seconds": [w.duration_seconds for w in workers],
             "usage_limit": stopped,
+            "native_processes": (
+                [w.resource_usage.get("native_processes") for w in native]
+                if arm == "isolated"
+                else list(transport_processes)
+            ),
+            "native_process_limit_per_arm": profile.native_process_limit,
         }
         rows.append(row)
         write_report(output / "comparison.json", rows)

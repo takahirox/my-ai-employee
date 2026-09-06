@@ -1,4 +1,69 @@
-# Isolated worker comparison: first real-model pair
+# Isolated worker comparisons
+
+## Final bounded profile (2026-09-06)
+
+Both arms completed the same whitespace repair with the aggregate admission guard
+enabled. Each observed a real failed command, corrected the candidate, and passed
+all four independent checks. No original source was promoted or modified.
+
+| Measurement | Proposal | Isolated |
+| --- | --- | --- |
+| Fleet status | ready_to_promote | ready_to_promote |
+| Independent checks | 4/4 | 4/4 |
+| Worker invocations | 1 | 1 |
+| Native process admissions / cap | 129 / 512 | 170 / 512 |
+| Completed local command exit codes | 1, 0, 0 | 1, 0, 0, 0 |
+| End-to-end seconds | 40.664 | 28.501 |
+| Worker adapter seconds | 33.727 | 23.747 |
+| Input tokens (including cached) | 48,781 | 54,482 |
+| Cached input tokens | 40,960 | 39,936 |
+| Output tokens | 1,276 | 591 |
+| In-run human interventions | 0 | 0 |
+| Human active time / monetary cost | unavailable | unavailable |
+
+The model (`gpt-5.6-luna`, low), immutable runtime/CLI, task, initial tree and
+acceptance checks are as described below. Both now disable shell snapshots and
+have an enforced **total 512 native admissions per arm**, plus four independently
+guarded verifier processes. The Harness explicitly declares 600 processes and
+240 seconds. The isolated graph permits one invocation (local repairs inside it),
+reserves 514 processes, and leaves two for parent checks. The legacy proposal graph
+retains its repair semantics; the comparison transport shares its 512 admissions
+across any invocations. Each observed arm used one invocation. Control-plane
+container setup, Git capture, and model-free probes are not native admissions;
+their time is included in wall supervision. Live PID caps also bound threads.
+
+Candidate artifact digests:
+
+- Proposal: `d4bd416824e863620717e25d73db0d35b455a1a4ef947268796a68e82b0dc106`
+- Isolated: `360067b5fc67a979d982af7bea0eb9a7cf9a2f03cc7fbed915d7c5f183740990`
+
+This is an exploratory implementation check, not an unbiased performance estimate.
+The final configuration was chosen after failures below; no superiority claim or
+success-rate pooling across configurations is justified. Authenticated experiments
+used the same model without allowance resets, purchases, or provider/model changes.
+No token/cost cap is claimed. Full, normalized final rows and the earlier failures
+are in [the shareable report](issue-81-budget-comparison.json); raw databases remain private.
+
+### Retained budget-calibration failures
+
+| Configuration | Proposal | Isolated | What changed next |
+| --- | --- | --- | --- |
+| Cap 32, shell snapshots on | failed | budget exceeded | Model-free startup measurement |
+| Cap 128, shell snapshots on | budget exceeded | budget exceeded | Disabled identical snapshot setting in both arms |
+| Cap 128, shell snapshots off | budget exceeded | budget exceeded | Sized a useful native/helper-process allowance |
+| Cap 512, shell snapshots off | accepted | accepted | Final profile; no further model run |
+
+The first proposal failure escaped the test transport as an execution exception,
+so that row has no completed worker accounting. Later comparison failures are
+returned as typed budget failures with final admissions. Missing token totals for
+interrupted invocations are **unknown**, not zero or evidence of no model usage.
+The 32/128 failures do not indicate Usage Limit; they are local process-admission
+limits. A no-auth, network-disabled five-second startup probe counted 52 admissions
+with snapshots and 26 without (including its timeout helper). A three-command shell
+control counted exactly five processes including its Python and shell launchers.
+This establishes the count is not a textual command count or a concurrent PID cap.
+
+## Earlier unguarded experiment (retained)
 
 ## Outcome
 
@@ -8,8 +73,9 @@ independent verification results (acceptance and regression at node and parent
 levels). Neither arm promoted changes into the source repository.
 
 This is a one-task, one-pair feasibility observation, **not evidence of general
-productivity superiority**. #81 remains open because aggregate native process/tool
-budget semantics and stronger credential separation still need resolution.
+productivity superiority**. At the time of this earlier experiment, aggregate native
+process/tool budget enforcement was missing. The bounded experiment above supersedes
+that limitation; delegated-credential/container trust assumptions remain explicit.
 
 ## Controlled setup
 
@@ -127,13 +193,13 @@ credential-free independent verification, CPU/memory/live-PID limits, direct-net
 denial, rejection of non-provider CONNECT destinations, and timeout/cancellation
 cleanup. Both real-model arms preserve the original source.
 
-Remaining limitations are material:
+The following assessment describes the earlier experiment, not the final guard:
 
 - `Harness.processes` currently reserves Fleet-mediated checks; the successful
   isolated request reserved 2 such processes but also reported 3 native commands.
   Docker's 128 live-PID ceiling does not bound cumulative native command launches.
-  A shared aggregate tool/process budget is therefore **not implemented**. Do not
-  present the existing Harness count as an aggregate native-command cap.
+  An aggregate budget was **not implemented in that version**. The final profile
+  reserves and enforces native admissions; the old count remains historical evidence.
 - Tokens are available at turn completion and recorded; a hard preemptive aggregate
   token/cost cap is not implemented. There is no measured monetary cost in this pair.
 - A separate auth file is not inherently a least-privilege token. It delegates the
@@ -143,4 +209,5 @@ Remaining limitations are material:
   `seccomp=unconfined` remains a container/kernel trust assumption for the nested
   sandbox. This is not a hostile multi-tenant execution service.
 
-Keep the profile experimental and opt-in; do not close #81 on this experiment alone.
+The supported profile remains opt-in and limited to fixed Codex/offline Python tasks.
+Its current guarantees and restrictions are described in [the profile](isolated-worker.md).

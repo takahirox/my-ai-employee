@@ -1453,7 +1453,22 @@ def _work(args: argparse.Namespace) -> int:
             process_shell_allowed=False,
             install_ecosystems=harness.install.ecosystems,
             max_wall_seconds=1800.0,
-            max_processes=40,
+            max_processes=(
+                40
+                if operator_config.isolated_worker is None
+                else operator_config.isolated_worker.native_process_limit
+                + 2
+                * max(
+                    1,
+                    len(
+                        {
+                            requirement
+                            for criterion in goal.completion_criteria
+                            for requirement in criterion.verification_requirement_ids
+                        }
+                    ),
+                )
+            ),
             max_worker_turns=1,
             max_download_bytes=harness.budgets.download_bytes,
             max_artifact_bytes=harness.budgets.artifact_bytes,
@@ -2037,6 +2052,17 @@ def _work(args: argparse.Namespace) -> int:
                     node_id=f"node-{run_id}",
                     required_capabilities=tuple(capabilities),
                     max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    native_processes=(
+                        operator_config.isolated_worker.native_process_limit
+                        if operator_config.isolated_worker is not None
+                        else 0
+                    ),
+                    max_processes=min(
+                        harness.budgets.processes,
+                        policy.max_processes
+                        if policy.max_processes is not None
+                        else harness.budgets.processes,
+                    ),
                 )
             try:
                 graph_run, incident_records = _execute_graph_run_with_incident_reporting(

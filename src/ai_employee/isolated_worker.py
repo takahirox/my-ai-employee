@@ -28,6 +28,7 @@ class IsolatedWorkerProfile(BaseModel):
     cpus: float = Field(default=2.0, gt=0, le=16, allow_inf_nan=False)
     memory_mb: int = Field(default=2048, ge=256, le=16384)
     pids_limit: int = Field(default=128, ge=16, le=1024)
+    native_process_limit: int = Field(default=512, ge=1, le=1000)
     workspace_mb: int = Field(default=256, ge=16, le=4096)
     auth_file: str | None = None
 
@@ -103,6 +104,14 @@ def candidate_archive(root: Path, limit: int, *, include_untracked: bool = False
     return output.getvalue()
 
 
+class IsolatedBudgetExceeded(RuntimeError):
+    """An enforced isolated resource budget has been exhausted."""
+
+
+class NativeProcessBudgetExceeded(IsolatedBudgetExceeded):
+    """No further native work or candidate submission is authorized."""
+
+
 class DockerCandidate:
     """One owner-controlled lifecycle; never silently fall back to host execution."""
 
@@ -124,6 +133,7 @@ class DockerCandidate:
         self.created = False
         self.network: str | None = None
         self.proxy: str | None = None
+        self.native_process_usage: dict[str, object] = {}
 
     def _docker(self, *args: str, data: bytes | None = None) -> bytes:
         remaining = self.deadline - time.monotonic()
@@ -332,7 +342,9 @@ class DockerCandidate:
                             continue
                         key.data.extend(data)
                         if len(stdout) + len(stderr) > self.output_limit:
-                            raise ValueError("isolated execution output budget exceeded")
+                            raise IsolatedBudgetExceeded(
+                                "isolated execution output budget exceeded"
+                            )
                         if observe and key.fileobj is process.stdout:
                             pending.extend(data)
                             while b"\n" in pending:
@@ -356,6 +368,74 @@ class DockerCandidate:
             input_file.close()
             process.stdout.close()
             process.stderr.close()
+
+    def run_guarded(
+        self,
+        argv: tuple[str, ...],
+        *,
+        process_limit: int,
+        stdin: bytes = b"",
+        observe: Callable[[dict[str, object]], None] | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        """Admit cumulative native process creation before the syscall executes.
+
+        The report is not trusted until the supervisor has stopped/reaped all task
+        processes. Its root-owned inode/directory cannot be replaced by the worker.
+        Supervisor failure never authorizes candidate capture.
+        """
+        from .native_process_guard import PROCESS_GUARD_SOURCE
+
+        if type(process_limit) is not int or process_limit < 1:
+            raise ValueError("native execution requires a positive reserved process budget")
+        directory = "/tmp/fleet-control-" + uuid.uuid4().hex
+        report = directory + "/usage.json"
+        self._docker(
+            "exec",
+            self.name,
+            "python",
+            "-I",
+            "-c",
+            "import os,sys; os.mkdir(sys.argv[1],0o711); "
+            "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o666); "
+            "os.fchmod(fd,0o666); os.close(fd)",
+            directory,
+            report,
+        )
+        guard_code, stdout, stderr = self.run(
+            ("python", "-I", "-c", PROCESS_GUARD_SOURCE, str(process_limit), report, *argv),
+            stdin=stdin,
+            observe=observe,
+        )
+        if guard_code not in (0, 125):
+            raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: no candidate accepted")
+        usage = json.loads(
+            self._docker(
+                "exec",
+                self.name,
+                "python",
+                "-I",
+                "-c",
+                "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[:4096])",
+                report,
+            )
+        )
+        if (
+            not isinstance(usage, dict)
+            or usage.get("cleanup") != "confirmed"
+            or usage.get("guard_error") is not False
+            or usage.get("limit") != process_limit
+            or type(usage.get("admitted")) is not int
+            or not 1 <= usage["admitted"] <= process_limit
+            or type(usage.get("root_exit")) is not int
+            or usage.get("denied") is not (guard_code == 125)
+        ):
+            raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: invalid final accounting")
+        self.native_process_usage = usage
+        if guard_code == 125:
+            raise NativeProcessBudgetExceeded(
+                "BUDGET_EXCEEDED: native process admissions exhausted"
+            )
+        return usage["root_exit"], stdout, stderr
 
     def quiesce(self) -> None:
         # PID 1 and Git authority are uid 0. All candidate/worker descendants are uid 1000.
@@ -399,7 +479,7 @@ class DockerCandidate:
         )
         patch = self._git("diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", "HEAD")
         if len(patch) > self.output_limit:
-            raise ValueError("captured patch exceeds artifact budget")
+            raise IsolatedBudgetExceeded("captured patch exceeds artifact budget")
         return paths, patch
 
     def _start_model_gateway(self) -> None:

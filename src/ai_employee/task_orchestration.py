@@ -750,10 +750,14 @@ def one_node_graph(
     node_id: Identifier,
     required_capabilities: tuple[Identifier, ...] = (),
     max_wall_seconds: float = 3600.0,
+    native_processes: int = 0,
+    max_processes: int | None = None,
 ) -> Graph:
     """Represent the compatibility path as the degenerate accepted task DAG."""
 
     writing = goal.task_kind is GoalTaskKind.MUTATING and "edit_intent" in required_capabilities
+    if native_processes < 0 or (native_processes and not writing):
+        raise ValueError("native process reservations require a mutating edit task")
     verification_processes = max(
         1,
         len(
@@ -775,6 +779,15 @@ def one_node_graph(
             description="the node-bound worker result is accepted",
         ),
     )
+    attempt_processes = verification_processes + native_processes
+    # Native corrections happen inside one invocation. Do not start a second
+    # invocation after a native limit/failure; reserve independent parent checks too.
+    attempts = 1 if native_processes else 2
+    if native_processes and (
+        max_processes is None
+        or attempt_processes * attempts + verification_processes > max_processes
+    ):
+        raise ValueError("isolated native and verification reservations exceed process policy")
     node = Node(
         id=node_id,
         kind=NodeKind.FUNCTION,
@@ -784,20 +797,20 @@ def one_node_graph(
         required_capabilities=required_capabilities,
         completion_criteria=criteria,
         resource_budget=NodeResourceBudget(
-            processes=verification_processes if writing else 1,
+            processes=attempt_processes if writing else 1,
             wall_seconds=max_wall_seconds / 2 if writing else max_wall_seconds,
         ),
     )
     budget = (
         Budget(
-            max_attempts=2,
-            max_repairs=1,
-            max_loop_iterations=2,
+            max_attempts=attempts,
+            max_repairs=attempts - 1,
+            max_loop_iterations=attempts,
             max_nodes=1,
             max_wall_seconds=max_wall_seconds,
-            max_worker_turns=2,
-            max_processes=verification_processes * 2,
-            max_artifact_bytes=2_000_000,
+            max_worker_turns=attempts,
+            max_processes=attempt_processes * attempts,
+            max_artifact_bytes=1_000_000 * attempts,
         )
         if writing
         else Budget(max_attempts=1, max_nodes=1, max_wall_seconds=max_wall_seconds)

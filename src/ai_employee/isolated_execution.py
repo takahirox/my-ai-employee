@@ -23,7 +23,12 @@ from .domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
-from .isolated_worker import DockerCandidate, IsolatedWorkerProfile
+from .isolated_worker import (
+    DockerCandidate,
+    IsolatedBudgetExceeded,
+    IsolatedWorkerProfile,
+    NativeProcessBudgetExceeded,
+)
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
 from .services_v2.process import LocalProcessExecutor
@@ -69,6 +74,8 @@ def codex_isolated_exec_args(model: str, effort: str) -> tuple[str, ...]:
         "--json",
         "-c",
         "features.multi_agent=false",
+        "-c",
+        "features.shell_snapshot=false",
         "-c",
         'web_search="disabled"',
         "-m",
@@ -164,7 +171,8 @@ class DockerProcessExecutor(LocalProcessExecutor):
                 output_limit=request.stdout_bytes + request.stderr_bytes,
                 include_untracked=True,
             ) as candidate:
-                code, stdout, stderr = candidate.run(request.argv)
+                code, stdout, stderr = candidate.run_guarded(request.argv, process_limit=1)
+                process_usage = candidate.native_process_usage
             if len(stdout) > request.stdout_bytes or len(stderr) > request.stderr_bytes:
                 raise ValueError("isolated process output exceeded its per-stream budget")
             execution_id = identifier("execution")
@@ -197,6 +205,7 @@ class DockerProcessExecutor(LocalProcessExecutor):
                         "container_cleanup": "confirmed",
                         "stdout_bytes": len(stdout),
                         "stderr_bytes": len(stderr),
+                        "native_processes": process_usage,
                     }
                 ),
             )
@@ -210,6 +219,8 @@ class DockerProcessExecutor(LocalProcessExecutor):
                     else StableFailureCode.INVALID_REQUEST
                 )
             )
+            if isinstance(error, IsolatedBudgetExceeded):
+                failure_code = StableFailureCode.BUDGET_EXCEEDED
             return self._result(
                 request,
                 started,
@@ -264,6 +275,8 @@ class IsolatedCodexWorker:
         activity: list[dict[str, object]] = []
         stdout_digest = stderr_digest = None
         usage_limit = False
+        native_process_usage: dict[str, object] = {}
+        artifact_bytes = 0
         try:
             if request.task_kind is not GoalTaskKind.MUTATING or not request.processes_authorized:
                 raise ValueError("isolated iteration requires authorized mutating processes")
@@ -273,6 +286,25 @@ class IsolatedCodexWorker:
             if artifact_limit < 1 or not self.profile.auth_file:
                 raise ValueError(
                     "isolated worker requires artifact budget and an explicit scoped auth_file"
+                )
+            process_budget = request.remaining_budgets.get("processes")
+            verification_processes = max(
+                1,
+                len(
+                    {
+                        requirement
+                        for criterion in request.completion_criteria
+                        if not isinstance(criterion, str)
+                        for requirement in criterion.verification_requirement_ids
+                    }
+                ),
+            )
+            if (
+                type(process_budget) is not int
+                or process_budget < self.profile.native_process_limit + verification_processes
+            ):
+                raise NativeProcessBudgetExceeded(
+                    "BUDGET_EXCEEDED: native and verification process reservations are required"
                 )
             prompt = canonical_json(
                 {
@@ -287,6 +319,9 @@ class IsolatedCodexWorker:
                     "No network except configured model transport.",
                 }
             ).encode()
+            if len(prompt) >= artifact_limit:
+                raise IsolatedBudgetExceeded("isolated request exceeds reserved artifact budget")
+            artifact_bytes = len(prompt)
             self.persist(prompt, "worker_request")
 
             def observe(event: dict[str, object]) -> None:
@@ -345,8 +380,28 @@ class IsolatedCodexWorker:
                 )
                 if code:
                     raise ValueError("ISOLATION_PREFLIGHT_FAILED: native permissions unavailable")
+                code, _, _ = candidate.run_guarded(
+                    (
+                        "python",
+                        "-I",
+                        "-c",
+                        "import os; p=os.fork(); os._exit(0) if p==0 else os.waitpid(p,0)",
+                    ),
+                    process_limit=2,
+                )
+                if code or candidate.native_process_usage.get("admitted") != 2:
+                    raise ValueError("ISOLATION_PREFLIGHT_FAILED: process admission unavailable")
                 argv = codex_isolated_exec_args(self.model, self.effort)
-                code, stdout, stderr = candidate.run(argv, stdin=prompt, observe=observe)
+                candidate.native_process_usage = {}
+                try:
+                    code, stdout, stderr = candidate.run_guarded(
+                        argv,
+                        process_limit=self.profile.native_process_limit,
+                        stdin=prompt,
+                        observe=observe,
+                    )
+                finally:
+                    native_process_usage.update(candidate.native_process_usage)
                 # Startup failures can report allowance exhaustion only on stderr,
                 # without a JSON terminal event. Stop graph repair in that case too.
                 if code and _reports_usage_limit(stderr.decode(errors="replace")):
@@ -354,21 +409,29 @@ class IsolatedCodexWorker:
                     self.on_usage_limit()
                     raise RuntimeError("USAGE_LIMIT: stopped without reset or purchase")
                 # Native free-form logs may echo scoped credentials; persist normalized activity.
-                stdout_digest = self.persist(
-                    canonical_json(
-                        {
-                            "activity": activity,
-                            "usage": native_usage,
-                            "exit_code": code,
-                            "stdout_bytes": len(stdout),
-                            "stderr_bytes": len(stderr),
-                        }
-                    ).encode(),
-                    "worker_activity",
-                )
+                activity_bytes = canonical_json(
+                    {
+                        "activity": activity,
+                        "usage": native_usage,
+                        "exit_code": code,
+                        "stdout_bytes": len(stdout),
+                        "stderr_bytes": len(stderr),
+                    }
+                ).encode()
+                if artifact_bytes + len(activity_bytes) > artifact_limit:
+                    raise IsolatedBudgetExceeded(
+                        "isolated activity exceeds reserved artifact budget"
+                    )
+                artifact_bytes += len(activity_bytes)
+                stdout_digest = self.persist(activity_bytes, "worker_activity")
                 if code:
                     raise RuntimeError(f"native worker exited with code {code}; no automatic retry")
                 paths, patch = candidate.capture(self.generated_paths)
+                if artifact_bytes + len(patch) > artifact_limit:
+                    raise IsolatedBudgetExceeded(
+                        "isolated candidate exceeds reserved artifact budget"
+                    )
+                artifact_bytes += len(patch)
             if self.cancellation.cancelled():
                 raise TimeoutError("isolated execution cancelled before candidate submission")
             if not paths or not patch:
@@ -408,6 +471,8 @@ class IsolatedCodexWorker:
                         "image": self.profile.image,
                         "container_cleanup": "confirmed",
                         "local_activity": activity,
+                        "native_processes": native_process_usage,
+                        "artifact_payload_bytes": artifact_bytes,
                     }
                 ),
             )
@@ -421,7 +486,7 @@ class IsolatedCodexWorker:
                     else StableFailureCode.WORKER_PROTOCOL_ERROR
                 )
             )
-            if usage_limit:
+            if usage_limit or isinstance(error, IsolatedBudgetExceeded):
                 failure_code = StableFailureCode.BUDGET_EXCEEDED
             return WorkerResult(
                 id=identifier("worker-result"),
@@ -434,5 +499,13 @@ class IsolatedCodexWorker:
                 stdout_artifact_digest=stdout_digest,
                 stderr_artifact_digest=stderr_digest,
                 usage=freeze_json(native_usage or None),
-                resource_usage=freeze_json({"local_activity": activity}),
+                resource_usage=freeze_json(
+                    {
+                        "isolation": self.profile.backend,
+                        "image": self.profile.image,
+                        "local_activity": activity,
+                        "native_processes": native_process_usage,
+                        "artifact_payload_bytes": artifact_bytes,
+                    }
+                ),
             )

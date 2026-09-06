@@ -28,3 +28,19 @@ jobs:
       - run: .venv/bin/mypy src
       - run: .venv/bin/pytest -q
       - run: .venv/bin/python -m build
+
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv sync --extra dev --python "3.12"
+      # Build context contains only the runtime recipe, never source/authentication.
+      - run: docker build -f docker/isolated-worker.Dockerfile -t fleet-isolation-test docker
+      - name: Credential-free kernel and native sandbox integration
+        run: |
+          export FLEET_TEST_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' fleet-isolation-test)
+          .venv/bin/pytest tests/test_issue81_isolation.py tests/test_native_process_guard.py -q
