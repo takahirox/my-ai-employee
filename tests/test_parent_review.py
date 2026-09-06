@@ -664,6 +664,9 @@ def test_parent_observer_receives_only_exact_patch_and_body_free_other_descripto
     assert candidate_reads == [request.candidate_descriptor]
     prompt = json.loads(prompts[0])
     assert prompt["protocol"] == "fleet-parent-semantic-review/2"
+    rules = " ".join(prompt["rubric"]["rules"])
+    assert "unjustified structural complexity" in rules
+    assert "Do not block a correct task for comment-style preference" in rules
     assert prompt["request"]["candidate_patch"] == candidate.decode()
     for descriptor in prompt["request"]["artifact_descriptors"]:
         assert set(descriptor) == {

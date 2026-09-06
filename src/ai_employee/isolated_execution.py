@@ -23,6 +23,7 @@ from .domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
+from .engineering_guidance import COMMENT_GUIDANCE, SIMPLICITY_GUIDANCE
 from .isolated_worker import (
     DockerCandidate,
     IsolatedBudgetExceeded,
@@ -316,7 +317,9 @@ class IsolatedCodexWorker:
                     "Fleet captures Git changes and independently verifies them. Never change "
                     "acceptance checks, .git, permissions or budgets. Never redeem usage-reset "
                     "tickets or purchase extra usage. Stop if allowance is exhausted. "
-                    "No network except configured model transport.",
+                    "No network except configured model transport. "
+                    + SIMPLICITY_GUIDANCE
+                    + COMMENT_GUIDANCE,
                 }
             ).encode()
             if len(prompt) >= artifact_limit:

@@ -14,6 +14,7 @@ from .domain import ExecutionStrategy, Goal, Graph, RoutingMode, TaskAssessment
 from .domain.base import Digest, Identifier
 from .domain.services_v2 import ProcessExecutor
 from .domain.v2 import DecisionOutcome, DigestedRecordV2, PolicyDecision, ProcessRequest
+from .engineering_guidance import SIMPLICITY_GUIDANCE
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
@@ -290,7 +291,10 @@ class CliProposedGraphPlanner:
                     "multi-node graph keep composition-only checks at parent scope. For editing "
                     "nodes, bind completion evidence to the workspace_patch artifact and use only "
                     "the exact Goal verification IDs; do not invent command IDs. "
-                    "Return only the supplied strict JSON schema."
+                    "Return only the supplied strict JSON schema. "
+                    + SIMPLICITY_GUIDANCE
+                    + "Justify DAG nodes and edges by real dependencies, useful parallelism, "
+                    "isolation or verification needs, not apparent sophistication."
                 ),
                 "categorical_rubric": SEMANTIC_PROFILE_RUBRIC,
                 "goal": goal,

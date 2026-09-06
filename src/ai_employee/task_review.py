@@ -24,6 +24,7 @@ from .domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
+from .engineering_guidance import COMMENT_REVIEW_GUIDANCE, SIMPLICITY_REVIEW_GUIDANCE
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import _strict_schema
@@ -388,6 +389,8 @@ TASK_REVIEW_RUBRIC = {
     "finding_types": tuple(item.value for item in TaskReviewFindingType),
     "severities": tuple(item.value for item in TaskReviewSeverity),
     "rules": (
+        SIMPLICITY_REVIEW_GUIDANCE,
+        COMMENT_REVIEW_GUIDANCE,
         "Report only semantic concerns grounded in the supplied immutable inputs.",
         "Use observed only for facts directly supported by cited evidence or artifacts.",
         "Use inferred or uncertain for concerns not established by deterministic evidence.",

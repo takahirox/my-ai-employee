@@ -21,6 +21,7 @@ from .domain.v2 import (
     ProcessRequest,
     SchemaModelV2,
 )
+from .engineering_guidance import SIMPLICITY_REVIEW_GUIDANCE
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import ProposedGraph, _strict_schema
@@ -184,6 +185,7 @@ PLAN_REVIEW_RUBRIC = {
     "finding_types": tuple(item.value for item in PlanReviewFindingType),
     "impacts": tuple(item.value for item in PlanReviewImpact),
     "rules": (
+        SIMPLICITY_REVIEW_GUIDANCE,
         "Report only findings grounded in the supplied Goal and ProposedGraph.",
         "Treat justified breadth explicitly required by the Goal as necessary scope.",
         "Minimality cannot remove correctness, safety, compatibility, required error "

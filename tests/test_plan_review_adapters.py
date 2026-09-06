@@ -123,6 +123,7 @@ def test_reviewer_process_is_fresh_bounded_and_receives_only_declared_context() 
     assert len(prompts) == len(executor.requests) == 1
     prompt = json.loads(prompts[0])
     assert prompt["protocol"] == "fleet-plan-review/2"
+    assert any("unjustified structural complexity" in rule for rule in prompt["rubric"]["rules"])
     assert prompt["goal"] == goal.model_dump(mode="json")  # type: ignore[union-attr]
     assert prompt["proposed_graph"] == proposal.graph.model_dump(mode="json")
     assert prompt["available_capabilities"] == ["process"]

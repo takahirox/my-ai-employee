@@ -440,6 +440,10 @@ def test_worker_prompt_binds_run_schema_and_scoped_scratch() -> None:
     instruction = payloads[0]["instruction"]
     assert instruction == payloads[1]["instruction"]
     assert "minimal_sufficient as the default" in instruction
+    assert "Simplicity is a positive engineering objective" in instruction
+    assert "not a smallest-diff rule" in instruction
+    assert "non-obvious WHY" in instruction
+    assert "required public API, schema and protocol documentation" in instruction
     assert "prefer existing mechanisms" in instruction
     assert "explicit in the supplied node goal" in instruction
     assert "do not infer it from importance, security relevance" in instruction

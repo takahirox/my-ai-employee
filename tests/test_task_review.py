@@ -163,6 +163,10 @@ def test_task_reviewer_receives_exact_bounded_payload_after_opt_in() -> None:
     assert len(prompts) == len(executor.requests) == 1
     prompt = json.loads(prompts[0])
     assert prompt["protocol"] == "fleet-task-result-review/2"
+    rules = " ".join(prompt["rubric"]["rules"])
+    assert "unjustified structural complexity" in rules
+    assert "Missing artifact bodies are not evidence of a defect" in rules
+    assert "Do not block a correct task for comment-style preference" in rules
     assert prompt["request"]["worker_request"]["content_digest"] == (request.worker_request_digest)
     assert prompt["request"]["worker_result"]["content_digest"] == (request.worker_result_digest)
     assert prompt["request"]["artifact_descriptors"] == []
