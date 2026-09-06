@@ -51,7 +51,7 @@ from .domain.evaluation import (
     ObservationManifest,
 )
 from .domain.policy_v2 import NetworkMode, PolicyLayer, PolicyLayerKind, PolicyResolver
-from .domain.services_v2 import Cancellation, WorkerAdapter
+from .domain.services_v2 import Cancellation, ProcessExecutor, WorkerAdapter
 from .domain.v2 import (
     AcceptanceLedger,
     ActionKind,
@@ -1384,8 +1384,14 @@ def _work(args: argparse.Namespace) -> int:
                 job_goal=getattr(args, "job_goal", None),
             )
 
-        def executor_for(root: Path, *, candidate: bool = False) -> LocalProcessExecutor:
+        def executor_for(
+            root: Path,
+            *,
+            candidate: bool = False,
+            model_backend: str | None = None,
+        ) -> LocalProcessExecutor:
             from .isolated_execution import DockerProcessExecutor
+            from .model_usage import filter_model_stdout
 
             executor_type = (
                 DockerProcessExecutor
@@ -1398,6 +1404,11 @@ def _work(args: argparse.Namespace) -> int:
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
                 inherited_environment={"HOME": str(Path.home()), "USER": getpass.getuser()},
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
+                stdout_storage_filter=(
+                    (lambda request, data: filter_model_stdout(model_backend, request, data))
+                    if model_backend is not None
+                    else None
+                ),
             )
 
             if isinstance(executor, DockerProcessExecutor):
@@ -1430,6 +1441,20 @@ def _work(args: argparse.Namespace) -> int:
         def read_output(digest: str) -> bytes:
             path = artifacts.root / "sha256" / digest[:2] / digest
             return path.read_bytes()
+
+        def model_executor_for(root: Path, strategy: ExecutionStrategy) -> ProcessExecutor:
+            from .model_usage import UsageRecordingExecutor
+
+            return UsageRecordingExecutor(
+                executor_for(root, model_backend=strategy.backend),
+                store,
+                read_output,
+                graph_run_id=run_id,
+                backend=strategy.backend,
+                model=strategy.model,
+                effort=strategy.effort,
+                configuration_digest=operator_config_digest(operator_config),
+            )
 
         required_approvals = tuple(
             operation
@@ -1527,7 +1552,7 @@ def _work(args: argparse.Namespace) -> int:
                 cast(WorkerName, task_reviewer_strategy.backend)
             )
             task_reviewer = CliTaskResultReviewer(
-                executor_for(review_directory),
+                model_executor_for(review_directory, task_reviewer_strategy),
                 read_output,
                 decide_worker_process,
                 run_id=run_id,
@@ -1551,7 +1576,7 @@ def _work(args: argparse.Namespace) -> int:
                 cast(WorkerName, parent_reviewer_strategy.backend)
             )
             parent_reviewer = CliParentSemanticReviewer(
-                executor_for(review_directory),
+                model_executor_for(review_directory, parent_reviewer_strategy),
                 read_output,
                 lambda descriptor: artifacts.open_verified(descriptor).read(),
                 decide_worker_process,
@@ -1577,7 +1602,7 @@ def _work(args: argparse.Namespace) -> int:
                 schema.write_bytes(semantic_assessment_schema_json())
                 assessment_schema_path = str(schema)
             semantic_assessor = CliTaskAssessmentAdapter(
-                executor_for(assessment_directory),
+                model_executor_for(assessment_directory, assessment_strategy),
                 read_output,
                 decide_worker_process,
                 run_id=run_id,
@@ -1665,7 +1690,7 @@ def _work(args: argparse.Namespace) -> int:
                 reviewer_schema_path = None
             try:
                 graph_planner = CliProposedGraphPlanner(
-                    executor_for(assessment_directory),
+                    model_executor_for(assessment_directory, planner_strategy),
                     read_output,
                     decide_worker_process,
                     run_id=run_id,
@@ -1678,7 +1703,7 @@ def _work(args: argparse.Namespace) -> int:
                     planner_routing=planner_routing,
                 )
                 plan_reviewer = CliPlanReviewer(
-                    executor_for(assessment_directory),
+                    model_executor_for(assessment_directory, planner_strategy),
                     read_output,
                     decide_worker_process,
                     run_id=run_id,
@@ -1720,6 +1745,7 @@ def _work(args: argparse.Namespace) -> int:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
             if operator_config.isolated_worker is not None:
                 from .isolated_execution import IsolatedCodexWorker
+                from .model_usage import record_native_usage
 
                 if snapshot is None:
                     # Probe does not export any host repository files.
@@ -1739,6 +1765,17 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     generated_paths=harness.paths.generated,
                     on_usage_limit=lambda: bound_store.request_control(run_id, "cancel"),
+                    usage_recorder=lambda request, usage, duration, status: record_native_usage(
+                        bound_store,
+                        run_id,
+                        operator_config_digest(operator_config),
+                        bound_model,
+                        bound_effort,
+                        request,
+                        usage,
+                        duration,
+                        status,
+                    ),
                 )
             command = operator_config.worker_command(bound_worker_name)
             adapter_type = {
@@ -1758,8 +1795,19 @@ def _work(args: argparse.Namespace) -> int:
                 schema = schema_directory / "proposal-envelope.json"
                 schema.write_bytes(worker_proposal_schema_json())
                 output_schema_path = str(schema)
+            from .model_usage import UsageRecordingExecutor
+
             return adapter_type(
-                executor_for(root),
+                UsageRecordingExecutor(
+                    executor_for(root, model_backend=bound_worker_name),
+                    bound_store,
+                    read_output,
+                    graph_run_id=run_id,
+                    backend=bound_worker_name,
+                    model=bound_model,
+                    effort=bound_effort,
+                    configuration_digest=operator_config_digest(operator_config),
+                ),
                 read_output,
                 decide_worker_process,
                 run_id=bound_run_id,

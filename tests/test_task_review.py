@@ -162,6 +162,7 @@ def test_task_reviewer_receives_exact_bounded_payload_after_opt_in() -> None:
     assert result.request_digest == request.content_digest
     assert len(prompts) == len(executor.requests) == 1
     prompt = json.loads(prompts[0])
+    assert prompts[0].index(b'"rubric":') < prompts[0].index(b'"request":')
     assert prompt["protocol"] == "fleet-task-result-review/2"
     rules = " ".join(prompt["rubric"]["rules"])
     assert "unjustified structural complexity" in rules

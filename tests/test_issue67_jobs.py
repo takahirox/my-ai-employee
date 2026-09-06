@@ -258,6 +258,21 @@ def test_repository_filter_keeps_global_job_failure_without_leaking_children(
             job_goal="Complete work in both repositories",
         )
         store.claim_run_id("child-b", repository_b, job_id="cross-repository-job")
+        from ai_employee.model_usage import record_native_usage
+        from tests.test_work_orchestration_v2 import worker_request
+
+        for child in ("child-a", "child-b"):
+            record_native_usage(
+                store,
+                child,
+                "3" * 64,
+                "model-for-" + child,
+                "low",
+                worker_request(),
+                {"input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 1},
+                1.0,
+                "succeeded",
+            )
         repository_a_id = store.repository_for_run("child-a")["repository_id"]  # type: ignore[index]
 
         def projection(_store, run_id: str, **_kwargs):  # type: ignore[no-untyped-def]
@@ -280,6 +295,9 @@ def test_repository_filter_keeps_global_job_failure_without_leaking_children(
         filtered = inspect_fleet_runs(store, repository_id=repository_a_id)
 
     job = filtered["history"][0]
+    assert job["ai_usage"]["invocations"] == 1
+    assert job["ai_usage"]["metrics"]["input_tokens"]["total"] == 10
+    assert "model-for-child-b" not in str(job["ai_usage"])
     assert job["overall_status"] == "failed"
     assert job["progress"] == {
         "completed": 1,

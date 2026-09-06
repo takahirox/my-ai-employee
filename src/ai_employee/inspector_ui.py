@@ -475,6 +475,10 @@ or evaluators.</div>
 </div>
 <div id="summary" class="summary">
 </div>
+<details id="ai-usage">
+<summary>AI usage (recorded calls)</summary>
+<pre id="ai-usage-details"></pre>
+</details>
 <section id="warning-summary" class="run-warning-summary hidden" aria-live="polite">
 </section>
 <div class="tabs" role="tablist">
@@ -888,6 +892,13 @@ remaining.length+
 ' · next: '+
 story.current_state.next_action:'');
 renderRevision();
+const usage=raw.ai_usage;
+const metric=name=>usage?.metrics?.[name]?.total??'unavailable';
+$('#ai-usage-details').textContent=usage?
+'Calls: '+usage.invocations+' · Input: '+metric('input_tokens')+
+' · Cached input: '+metric('cached_input_tokens')+' · Output: '+metric('output_tokens')+
+' · Cost USD ('+usage.cost_kind+'): '+metric('cost_usd')+'\n'+
+JSON.stringify(usage.by_stage,null,2):'Usage was not recorded for this history.';
 renderWarningSummary();
 renderGraph();
 if(selectedTask&&

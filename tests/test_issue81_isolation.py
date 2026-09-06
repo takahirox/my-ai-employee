@@ -141,6 +141,7 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
 
     calls, stopped, closed = [], [], []
     prompts = []
+    usage_records = []
 
     class FakeCandidate:
         def __init__(self, *args, **kwargs):
@@ -183,6 +184,7 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
         commands=(),
         persist=lambda data, kind: (prompts.append((data, kind)), "0" * 64)[1],
         on_usage_limit=lambda: stopped.append(True),
+        usage_recorder=lambda *args: usage_records.append(args),
     )
     request = worker_request().model_copy(
         update={"remaining_budgets": {"artifact_bytes": 100_000, "processes": 514}}
@@ -192,6 +194,11 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
     assert "USAGE_LIMIT" in result.failure.message
     assert stopped == [True] and closed == [True] and len(calls) == 3
     assert result.proposals == () and result.usage is None
+    assert len(usage_records) == 1
+    assert usage_records[0][0] is request
+    assert usage_records[0][1] == {}
+    assert usage_records[0][2] >= 0
+    assert usage_records[0][3] == "failed"
     import json
 
     prompt = json.loads(next(data for data, kind in prompts if kind == "worker_request"))

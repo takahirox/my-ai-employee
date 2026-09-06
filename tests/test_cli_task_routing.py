@@ -313,6 +313,8 @@ def _capture_planner_prompt(
     )
 
     assert len(captured) == 1
+    assert captured[0].startswith(b'{"protocol":"fleet-proposed-graph/2","instruction":')
+    assert captured[0].index(b'"response_schema":') < captured[0].index(b'"goal":')
     return json.loads(captured[0]), proposal
 
 

@@ -15,6 +15,8 @@ from .domain.base import Digest, Identifier
 from .domain.services_v2 import ProcessExecutor
 from .domain.v2 import DecisionOutcome, DigestedRecordV2, PolicyDecision, ProcessRequest
 from .engineering_guidance import SIMPLICITY_GUIDANCE
+from .model_usage import codex_payload
+from .prompt_transport import prompt_json
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
@@ -252,7 +254,7 @@ class CliProposedGraphPlanner:
         max_wall_seconds: float,
     ) -> ProposedGraph:
         allowed = tuple(dict.fromkeys(available_capabilities))
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-proposed-graph/2",
                 "instruction": (
@@ -397,7 +399,7 @@ class CliProposedGraphPlanner:
             raise PlanReviewValidationError(issues)
 
         allowed = tuple(dict.fromkeys(available_capabilities))
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-proposed-graph-revision/2",
                 "instruction": (
@@ -515,6 +517,7 @@ class CliProposedGraphPlanner:
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--sandbox",
@@ -555,6 +558,8 @@ class CliProposedGraphPlanner:
         raise ValueError("unsupported graph-planning strategy backend")
 
     def _extract_payload(self, output: str) -> str:
+        if self.strategy.backend == "codex_cli":
+            return codex_payload(output)
         if self.strategy.backend == "claude_code_cli":
             wrapper = json.loads(output)
             if isinstance(wrapper, dict) and "structured_output" in wrapper:

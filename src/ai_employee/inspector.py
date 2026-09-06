@@ -58,6 +58,7 @@ from .graph_evaluation import (
 from .incident_runtime import INCIDENT_RUN_RECORD_KIND, IncidentRunRecord
 from .inspector_ui import INDEX as _INDEX
 from .jobs import JobGraphRunRecord, JobRecord
+from .model_usage import inspect_usage
 from .parent_review import (
     ParentSemanticRepairRequest,
     ParentSemanticReviewDecision,
@@ -1364,6 +1365,7 @@ def _group_parent_jobs(
         successful_count = sum(status == "completed" for status in normalized_statuses)
         terminal_count = sum(status in _JOB_TERMINAL_CHILD_STATES for status in normalized_statuses)
         job_summary: dict[str, Any] = {
+            "ai_usage": inspect_usage(store, (str(child["run_id"]) for child in children)),
             "kind": "job",
             "job_id": job.id,
             "goal": job.goal,
@@ -1441,6 +1443,9 @@ def inspect_fleet_runs(
                 if not children:
                     continue
                 visible = {**item, "child_graph_runs": children}
+                visible["ai_usage"] = inspect_usage(
+                    store, (str(child["run_id"]) for child in children)
+                )
                 latest = children[-1]
                 visible["current_run_id"] = latest.get("run_id")
                 visible["current_status"] = latest.get("status")
@@ -1588,6 +1593,11 @@ def inspect_fleet_runs(
         )
         item = {
             **context,
+            **(
+                {"ai_usage": projection["ai_usage"]}
+                if projection.get("ai_usage") is not None
+                else {}
+            ),
             "goal": goal_statement,
             "status": displayed_status,
             "generation": projection.get("generation"),
@@ -1658,6 +1668,7 @@ def inspect_fleet_runs(
 def _attach_repository_context(
     store: SQLiteStore, run_id: str, projection: dict[str, Any]
 ) -> dict[str, Any]:
+    projection["ai_usage"] = inspect_usage(store, (run_id,))
     run = _as_dict(projection.get("run"))
     status = str(projection.get("state") or "not_recorded")
     attention = _attention_facts(projection, run, status, _latest_node_facts(projection))

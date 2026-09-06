@@ -25,6 +25,8 @@ from .domain.v2 import (
     WorkerResult,
 )
 from .engineering_guidance import COMMENT_REVIEW_GUIDANCE, SIMPLICITY_REVIEW_GUIDANCE
+from .model_usage import codex_payload
+from .prompt_transport import prompt_json
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .task_planning import _strict_schema
@@ -446,7 +448,7 @@ class CliTaskResultReviewer:
     def review(self, request: TaskReviewRequest) -> TaskReviewResult:
         if request.run_id != self.run_id or request.reviewer_strategy != self.strategy:
             raise ValueError("task-review request is bound to another reviewer or run")
-        prompt = canonical_json(
+        prompt = prompt_json(
             {
                 "protocol": "fleet-task-result-review/2",
                 "instruction": (
@@ -542,6 +544,7 @@ class CliTaskResultReviewer:
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--json",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--ignore-rules",
@@ -585,6 +588,8 @@ class CliTaskResultReviewer:
         )
 
     def _extract_payload(self, output: str) -> str:
+        if self.strategy.backend == "codex_cli":
+            return codex_payload(output)
         if self.strategy.backend == "claude_code_cli":
             wrapper = json.loads(output)
             if isinstance(wrapper, dict) and "structured_output" in wrapper:
