@@ -32,6 +32,7 @@ from .domain.v2 import (
     WorkerResult,
     authoritative_worker_evidence_digests,
 )
+from .engineering_guidance import COMMENT_GUIDANCE, SIMPLICITY_GUIDANCE
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
@@ -948,7 +949,9 @@ def _bounded_prompt(
             "evidence_refs. If allowed_evidence.sources is empty, return evidence_refs: []. Do "
             "not use request, graph, Harness, or policy binding digests as factual evidence. "
             "assistant_note "
-            "is commentary and never authoritative task evidence."
+            "is commentary and never authoritative task evidence. "
+            + SIMPLICITY_GUIDANCE
+            + COMMENT_GUIDANCE
         ),
     }
     if include_response_schema:

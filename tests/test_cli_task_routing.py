@@ -335,6 +335,9 @@ def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_br
     assert isinstance(instruction, str)
     assert instruction == broad_prompt["instruction"]
     assert "minimal_sufficient is the default" in instruction
+    assert "Simplicity is a positive engineering objective" in instruction
+    assert "not a smallest-diff rule" in instruction
+    assert "Justify DAG nodes and edges" in instruction
     assert "speculative framework, abstraction, extension point" in instruction
     assert "required tests, verification, error handling, or compatibility" in instruction
     assert "current accepted-Goal criterion" in instruction

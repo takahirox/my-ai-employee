@@ -140,6 +140,7 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
     from tests.test_work_orchestration_v2 import Channel, worker_request
 
     calls, stopped, closed = [], [], []
+    prompts = []
 
     class FakeCandidate:
         def __init__(self, *args, **kwargs):
@@ -180,7 +181,7 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
         cancellation=Cancellation(),
         seconds=2.0,
         commands=(),
-        persist=lambda *_: "0" * 64,
+        persist=lambda data, kind: (prompts.append((data, kind)), "0" * 64)[1],
         on_usage_limit=lambda: stopped.append(True),
     )
     request = worker_request().model_copy(
@@ -191,6 +192,12 @@ def test_usage_limit_stops_graph_without_retry_reset_or_candidate_submission(
     assert "USAGE_LIMIT" in result.failure.message
     assert stopped == [True] and closed == [True] and len(calls) == 3
     assert result.proposals == () and result.usage is None
+    import json
+
+    prompt = json.loads(next(data for data, kind in prompts if kind == "worker_request"))
+    assert "Simplicity is a positive engineering objective" in prompt["instructions"]
+    assert "non-obvious WHY" in prompt["instructions"]
+    assert "Never redeem usage-reset tickets" in prompt["instructions"]
 
 
 def test_missing_explicit_auth_stops_before_container_or_artifact_creation(tmp_path, monkeypatch):
