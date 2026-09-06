@@ -43,6 +43,7 @@ dev = [
 
 [project.scripts]
 fleet = "ai_employee.cli:main"
+fleet-bench = "ai_employee.benchmark_adapter:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
