@@ -23,8 +23,9 @@ Prompt-capture regression tests cover all six entry points, including the native
 worker. These tests establish delivery of the guidance and retention of existing
 authority rules; they do not establish a measured improvement in model output.
 
-For behavioral comparisons, use the existing productivity evaluation's ablation
-arms with the same task, starting commit, acceptance/regression checks, model,
+For behavioral comparisons, use [private corpus trials](history-corpus.md) with
+`--minimal-sufficient on` and `off`, following the productivity evaluation protocol.
+Hold the same task, starting commit, acceptance/regression checks, model,
 effort, budgets and attempts. Freeze the code revision and prompt digests in each
 arm. Do not change the grader to reward smaller output. Use these paired cases:
 

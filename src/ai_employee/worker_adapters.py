@@ -32,7 +32,7 @@ from .domain.v2 import (
     WorkerResult,
     authoritative_worker_evidence_digests,
 )
-from .engineering_guidance import COMMENT_GUIDANCE, SIMPLICITY_GUIDANCE
+from .engineering_guidance import COMMENT_GUIDANCE, INVESTIGATION_GUIDANCE, SIMPLICITY_GUIDANCE
 from .model_usage import codex_payload
 from .prompt_transport import prompt_json
 from .routing import SEMANTIC_PROFILE_RUBRIC
@@ -960,6 +960,7 @@ def _bounded_prompt(
             "is commentary and never authoritative task evidence. "
             + SIMPLICITY_GUIDANCE
             + COMMENT_GUIDANCE
+            + INVESTIGATION_GUIDANCE
         ),
     }
     if include_response_schema:

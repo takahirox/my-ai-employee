@@ -23,7 +23,7 @@ from .domain.v2 import (
     WorkerRequest,
     WorkerResult,
 )
-from .engineering_guidance import COMMENT_GUIDANCE, SIMPLICITY_GUIDANCE
+from .engineering_guidance import COMMENT_GUIDANCE, INVESTIGATION_GUIDANCE, SIMPLICITY_GUIDANCE
 from .isolated_worker import (
     DockerCandidate,
     IsolatedBudgetExceeded,
@@ -326,7 +326,8 @@ class IsolatedCodexWorker:
                     "tickets or purchase extra usage. Stop if allowance is exhausted. "
                     "No network except configured model transport. "
                     + SIMPLICITY_GUIDANCE
-                    + COMMENT_GUIDANCE,
+                    + COMMENT_GUIDANCE
+                    + INVESTIGATION_GUIDANCE,
                 }
             ).encode()
             if len(prompt) >= artifact_limit:

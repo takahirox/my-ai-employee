@@ -479,6 +479,10 @@ or evaluators.</div>
 <summary>AI usage (recorded calls)</summary>
 <pre id="ai-usage-details"></pre>
 </details>
+<details id="execution-profile">
+<summary>Execution profile and preparation</summary>
+<pre id="execution-profile-details"></pre>
+</details>
 <section id="warning-summary" class="run-warning-summary hidden" aria-live="polite">
 </section>
 <div class="tabs" role="tablist">
@@ -899,6 +903,8 @@ $('#ai-usage-details').textContent=usage?
 ' · Cached input: '+metric('cached_input_tokens')+' · Output: '+metric('output_tokens')+
 ' · Cost USD ('+usage.cost_kind+'): '+metric('cost_usd')+'\n'+
 JSON.stringify(usage.by_stage,null,2):'Usage was not recorded for this history.';
+$('#execution-profile-details').textContent=raw.execution_profile?
+JSON.stringify(raw.execution_profile,null,2):'Execution profile was not recorded for this history.';
 renderWarningSummary();
 renderGraph();
 if(selectedTask&&

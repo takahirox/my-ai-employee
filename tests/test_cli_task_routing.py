@@ -478,10 +478,14 @@ exit 0
     return repository, operator_config, tmp_path / "fleet.db"
 
 
+@pytest.mark.parametrize(
+    "routing_argument", [("--routing-mode", "fixed"), ("--profile", "lightweight")]
+)
 def test_fixed_routing_uses_the_degenerate_authoritative_graph(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
+    routing_argument: tuple[str, str],
 ) -> None:
     repository, operator_config, db_path = _write_routing_fixture(tmp_path)
     monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: db_path)
@@ -496,8 +500,7 @@ def test_fixed_routing_uses_the_degenerate_authoritative_graph(
             "--operator-config",
             str(operator_config),
             "--plan-only",
-            "--routing-mode",
-            "fixed",
+            *routing_argument,
             "--strategy",
             "sol",
             "--max-concurrency",
@@ -515,6 +518,19 @@ def test_fixed_routing_uses_the_degenerate_authoritative_graph(
         )[0]
         with pytest.raises(KeyError):
             store.get_work_run(emitted["run_id"])
+        from ai_employee.execution_profile import inspect_profile
+
+        profile = inspect_profile(store, emitted["run_id"])
+        assert profile["choice"]["profile"] == "lightweight"
+        assert profile["choice"]["fixed_strategy_id"] == "sol"
+        assert profile["choice"]["risk_inference"] == "not_inferred_from_profile"
+        assert {
+            stage["stage"]
+            for stage in profile["choice"]["stages"]
+            if stage["disposition"] == "omitted"
+        } >= {"planning", "goal_assessment", "node_assessment"}
+        assert len(profile["timings"]) == 2  # start/end only; plan-only never starts a worker
+        assert profile["human_active_seconds"] is None
 
     assert graph_run.status == "planned"
     assert len(acceptance.accepted_revision.graph.nodes) == 1
