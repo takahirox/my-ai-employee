@@ -119,6 +119,7 @@ from .worker_supervision import (
     WorkerBudgetPreflightRecord,
     WorkerTimeoutProfileRecord,
 )
+from .workspace_lineage import WorkspaceInputRecord, WorkspaceOutputRecord
 
 
 class _ActionResultRecord(RootModel[ExecutionResult | DownloadResult | InstallResult]):
@@ -692,6 +693,20 @@ def inspect_graph_run(
         "run_id": run.id,
         "kind": "graph_run",
         "state": run.status,
+        "workspace_lineage": {
+            "inputs": [
+                _json_model(item)
+                for item in store.list_records(
+                    "workspace_input_v2", WorkspaceInputRecord, run_id=run_id
+                )
+            ],
+            "outputs": [
+                _json_model(item)
+                for item in store.list_records(
+                    "workspace_output_v2", WorkspaceOutputRecord, run_id=run_id
+                )
+            ],
+        },
         "generation": run.generation,
         "execution_attempt": run.execution_attempt,
         "run_ownership": run_ownership,

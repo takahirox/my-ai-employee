@@ -128,6 +128,9 @@ class _ExecutionSession:
         try:
             if coordinator.selected_strategy != strategy:
                 raise ValueError("node coordinator is not bound to the routed strategy")
+            from .workspace_lineage import materialize_node_inputs
+
+            materialize_node_inputs(coordinator, request)
             run = coordinator.execute_node(
                 request,
                 node.completion_criteria,

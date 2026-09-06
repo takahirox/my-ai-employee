@@ -275,8 +275,9 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     )
 
     class Adapter:
-        def __init__(self, node_id: str) -> None:
+        def __init__(self, node_id: str, snapshot: object = None) -> None:
             self.node_id = node_id
+            self.snapshot = snapshot
 
         def probe(self) -> WorkerAvailability:
             return WorkerAvailability(
@@ -296,6 +297,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             else:
                 with lock:
                     assert finished == {"a", "b"}
+                assert self.snapshot is not None
+                root = Path(self.snapshot.isolated_worktree)  # type: ignore[attr-defined]
+                assert (root / "a.txt").read_text() == "a-after\n"
+                assert (root / "b.txt").read_text() == "b-after\n"
             patch = (
                 f"diff --git a/{self.node_id}.txt b/{self.node_id}.txt\n"
                 f"--- a/{self.node_id}.txt\n"
@@ -379,7 +384,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             inner,
             DeterministicRuntime({}, store=inner),
             workspace,
-            lambda _snapshot, _cancellation: Adapter(selected_node.id),
+            lambda snapshot, _cancellation: Adapter(selected_node.id, snapshot),
             lambda snapshot: Executor(selected_node.id, snapshot),
             lambda descriptor: artifacts.open_verified(descriptor).read(),
             (policy,),
@@ -698,6 +703,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             by_node[name].evidence_digest for name in ("a", "b")
         )
         inspected = inspect_graph_run(store, run.id)
+        assert len(inspected["workspace_lineage"]["inputs"]) == 1
+        assert len(inspected["workspace_lineage"]["outputs"]) == 1
+        assert inspected["workspace_lineage"]["inputs"][0]["node_id"] == "c"
+        assert {
+            item["node_id"] for item in inspected["workspace_lineage"]["inputs"][0]["sources"]
+        } == {"a", "b"}
         explanation = explain_any_run(store, run.id)
         assert len(inspected["parent_acceptance"]) == (
             0 if parent_verification_succeeds is None else 1
