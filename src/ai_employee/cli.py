@@ -1327,6 +1327,16 @@ def _work(args: argparse.Namespace) -> int:
         if selected_strategy is None
         else operator_config.worker_command(cast(WorkerName, selected_strategy.backend))
     )
+    if operator_config.isolated_worker is not None:
+        from .isolated_execution import validate_isolated_contract
+
+        validate_isolated_contract(
+            harness,
+            routing=args.routing_mode,
+            backend="" if selected_strategy is None else selected_strategy.backend,
+            task_kind=goal.task_kind,
+            processes_authorized=goal.processes_authorized,
+        )
     assessment_command = (
         None
         if assessment_strategy is None
@@ -1374,8 +1384,15 @@ def _work(args: argparse.Namespace) -> int:
                 job_goal=getattr(args, "job_goal", None),
             )
 
-        def executor_for(root: Path) -> LocalProcessExecutor:
-            return LocalProcessExecutor(
+        def executor_for(root: Path, *, candidate: bool = False) -> LocalProcessExecutor:
+            from .isolated_execution import DockerProcessExecutor
+
+            executor_type = (
+                DockerProcessExecutor
+                if candidate and operator_config.isolated_worker
+                else LocalProcessExecutor
+            )
+            executor = executor_type(
                 (root,),
                 artifacts,
                 executable_paths=tuple(dict.fromkeys(executable_paths)),
@@ -1383,7 +1400,14 @@ def _work(args: argparse.Namespace) -> int:
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
             )
 
-        def write_prompt(value: bytes, bound_run_id: str, bound_store: SQLiteStore) -> str:
+            if isinstance(executor, DockerProcessExecutor):
+                assert operator_config.isolated_worker is not None
+                executor.profile = operator_config.isolated_worker
+            return executor
+
+        def write_prompt(
+            value: bytes, bound_run_id: str, bound_store: SQLiteStore, kind: str = "worker_request"
+        ) -> str:
             descriptor = artifacts.put(
                 io.BytesIO(value),
                 ArtifactPutRequest(
@@ -1391,7 +1415,7 @@ def _work(args: argparse.Namespace) -> int:
                     run_id=bound_run_id,
                     created_at=now(),
                     media_type="application/json",
-                    logical_kind="worker_request",
+                    logical_kind=kind,
                     producer_action_id=bound_run_id,
                     source=freeze_json({"bounded": True}),
                 ),
@@ -1429,7 +1453,22 @@ def _work(args: argparse.Namespace) -> int:
             process_shell_allowed=False,
             install_ecosystems=harness.install.ecosystems,
             max_wall_seconds=1800.0,
-            max_processes=40,
+            max_processes=(
+                40
+                if operator_config.isolated_worker is None
+                else operator_config.isolated_worker.native_process_limit
+                + 2
+                * max(
+                    1,
+                    len(
+                        {
+                            requirement
+                            for criterion in goal.completion_criteria
+                            for requirement in criterion.verification_requirement_ids
+                        }
+                    ),
+                )
+            ),
             max_worker_turns=1,
             max_download_bytes=harness.budgets.download_bytes,
             max_artifact_bytes=harness.budgets.artifact_bytes,
@@ -1679,6 +1718,28 @@ def _work(args: argparse.Namespace) -> int:
             timeout_seconds: float,
         ) -> WorkerAdapter:
             root = repository if snapshot is None else Path(snapshot.isolated_worktree)
+            if operator_config.isolated_worker is not None:
+                from .isolated_execution import IsolatedCodexWorker
+
+                if snapshot is None:
+                    # Probe does not export any host repository files.
+                    root = workspace_root / "not-yet-created"
+                if bound_worker_name != "codex_cli" or not bound_model or not bound_effort:
+                    raise ValueError("isolated worker requires an explicit Codex model and effort")
+                return IsolatedCodexWorker(
+                    root,
+                    operator_config.isolated_worker,
+                    model=bound_model,
+                    effort=bound_effort,
+                    cancellation=cancellation,
+                    seconds=timeout_seconds,
+                    commands=tuple(command.argv for command in harness.commands.values()),
+                    persist=lambda value, kind: write_prompt(
+                        value, bound_run_id, bound_store, kind
+                    ),
+                    generated_paths=harness.paths.generated,
+                    on_usage_limit=lambda: bound_store.request_control(run_id, "cancel"),
+                )
             command = operator_config.worker_command(bound_worker_name)
             adapter_type = {
                 "codex_cli": CodexCliWorkerAdapter,
@@ -1865,7 +1926,7 @@ def _work(args: argparse.Namespace) -> int:
                         bound_store=inner_store,
                         timeout_seconds=timeout_authority.effective_timeout_seconds,
                     ),
-                    lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                    lambda snapshot: executor_for(Path(snapshot.isolated_worktree), candidate=True),
                     lambda descriptor: artifacts.open_verified(descriptor).read(),
                     (policy,),
                     task_assessment=node_assessment,
@@ -1883,7 +1944,7 @@ def _work(args: argparse.Namespace) -> int:
                     ),
                     installer_factory=lambda snapshot: ProjectLocalInstaller(
                         snapshot.isolated_worktree,
-                        executor_for(Path(snapshot.isolated_worktree)),
+                        executor_for(Path(snapshot.isolated_worktree), candidate=True),
                         artifacts,
                         network_mediated=harness.network.mode.value != "disabled",
                     ),
@@ -1911,7 +1972,7 @@ def _work(args: argparse.Namespace) -> int:
                 store,
                 workspace,
                 harness,
-                lambda snapshot: executor_for(Path(snapshot.isolated_worktree)),
+                lambda snapshot: executor_for(Path(snapshot.isolated_worktree), candidate=True),
                 decide_parent_process,
                 browser_services_factory=lambda snapshot, cancellation: (
                     PlaywrightBrowserEvaluationServices(
@@ -1991,6 +2052,17 @@ def _work(args: argparse.Namespace) -> int:
                     node_id=f"node-{run_id}",
                     required_capabilities=tuple(capabilities),
                     max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    native_processes=(
+                        operator_config.isolated_worker.native_process_limit
+                        if operator_config.isolated_worker is not None
+                        else 0
+                    ),
+                    max_processes=min(
+                        harness.budgets.processes,
+                        policy.max_processes
+                        if policy.max_processes is not None
+                        else harness.budgets.processes,
+                    ),
                 )
             try:
                 graph_run, incident_records = _execute_graph_run_with_incident_reporting(

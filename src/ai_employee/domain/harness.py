@@ -244,6 +244,7 @@ class HarnessWorker(HarnessModel):
     allowed_strategy_ids: tuple[str, ...] = ()
     adaptive_routing: bool = False
     local_backend: bool = False
+    isolated_workspace_tools: bool = False
 
     @field_validator("allowed_strategy_ids")
     @classmethod

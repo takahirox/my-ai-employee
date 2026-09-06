@@ -19,6 +19,7 @@ from pydantic import (
 
 from .domain import ExecutionStrategy, RoutingMode
 from .domain.base import FrozenDict, Identifier
+from .isolated_worker import IsolatedWorkerProfile
 from .worker_supervision import WorkerSupervisionPolicy, WorkerTimeoutRule
 
 WorkerName = Literal["codex_cli", "claude_code_cli", "ollama_cli"]
@@ -308,6 +309,7 @@ class OperatorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[1] = 1
+    isolated_worker: IsolatedWorkerProfile | None = None
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
     routing: OperatorRoutingConfig | None = Field(default_factory=default_operator_routing_config)
     promotion_auto_approval: PromotionAutoApprovalConfig = PromotionAutoApprovalConfig()

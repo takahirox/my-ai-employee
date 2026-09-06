@@ -50,9 +50,8 @@ the original acceptance input cannot weaken them. A changed Harness digest block
 4. Shared checks alone can pass an incorrect task-specific result. An explicitly
    accepted Goal file adds frozen, executable checks without weakening shared checks
    or treating a model's assertions as evidence (#83).
-
-Native filesystem capture and isolated worker iteration are tracked separately in
-#81; they are not included in this contract/acceptance change.
+5. Native filesystem capture avoids asking a model to serialize a patch in the new
+   opt-in isolation mode. The legacy parser and all genuine rejection checks remain.
 
 ## Classification and false-rejection metric
 

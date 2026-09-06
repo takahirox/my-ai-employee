@@ -206,6 +206,7 @@ def test_disabled_task_review_preserves_pre_issue7_operator_digest() -> None:
     config = OperatorConfig()
     old_payload = config.model_dump(mode="python")
     old_payload.pop("promotion_auto_approval")
+    old_payload.pop("isolated_worker")
     routing = old_payload["routing"]
     assert isinstance(routing, dict)
     routing.pop("default_task_reviewer_strategy")
