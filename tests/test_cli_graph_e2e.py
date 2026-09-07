@@ -56,6 +56,7 @@ from ai_employee.task_orchestration import (
     NodeSemanticAssessmentRecord,
     PreAcceptanceGraphRunOutcomeRecord,
     TaskGraphAcceptance,
+    TaskOrchestrator,
 )
 from ai_employee.task_planning import ProposedGraph
 from ai_employee.task_review import TaskReviewDecision
@@ -730,8 +731,25 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
             operator_config_path=run.operator_config_path,
             strategy_set=run.strategy_set,
         )
-        recovered_run = recovery_service._recover_policy_approval_pointer(crashed_run)
+        # Recovery constructs a candidate; the live owner alone publishes its pointer.
+        recovery_owner = TaskOrchestrator(
+            store,
+            lambda *_args: None,
+            run.execution_strategies,  # type: ignore[arg-type,return-value]
+        )
+        verifying_run = crashed_run.model_copy(
+            update={
+                "status": "verifying",
+                "execution_attempt": crashed_run.execution_attempt + 1,
+            }
+        )
+        recovery_owner._acquire_run_owner(verifying_run)
+        recovery_owner._save_run(verifying_run)
+        recovered_run = recovery_service._recover_policy_approval_pointer(verifying_run)
         assert recovered_run is not None
+        assert store.get("graph_run_v2", run_id, GraphRunRecord) == verifying_run
+        recovery_owner._save_run(recovered_run)
+        assert store.current_run_owner(run_id)["status"] == "closed"
         assert recovered_run.status == "ready_to_promote"
         assert recovered_run.parent_evaluation_digest == evaluation.content_digest
         approval = store.get(

@@ -111,3 +111,19 @@ operational database,
 changes policy, downloads benchmarks, or promotes work. Metric families remain separate so cost,
 latency, or orchestration cannot silently override authoritative quality or human effort. See the
 [productivity evaluation protocol](evaluation.md) for experiment design and retention rules.
+
+### Owned parent verification and reviewer control
+
+Writing graphs remain in the nonterminal `verifying` state while composing and
+checking the parent candidate. The same execution owner remains live through that
+stage; only its fenced final write can publish `ready_to_promote` and close the
+lease. Parent repair preparation acquires a fresh fenced maintenance attempt
+before changing durable repair state. Replay performs no stage work.
+
+CLI task, parent, and plan reviewers poll the currently bound runtime control via
+the existing ProcessExecutor cancellation interface. Polling renews the owner's
+lease and observes cancellation; a late response is checked again before it can
+be accepted. Adapters must poll Cancellation during blocking work, as required by
+the process service contract. A pause drains an already-running node and its task
+review, preserving its verified result for resume, but stops parent composition or
+verification before promotion readiness. Cancellation never accepts a late PASS.

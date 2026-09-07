@@ -77,7 +77,9 @@ class RunLeaseClosureRecord(DigestedRecordV2):
     owner_record_digest: Digest
     final_heartbeat_digest: Digest
     closed_at: UtcTimestamp
-    terminal_graph_status: Literal["cancelled", "completed", "failed", "interrupted", "paused"]
+    terminal_graph_status: Literal[
+        "cancelled", "completed", "ready_to_promote", "failed", "interrupted", "paused"
+    ]
     reason: str = Field(min_length=1, max_length=200)
 
     @model_validator(mode="after")

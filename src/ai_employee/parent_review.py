@@ -30,6 +30,7 @@ from .model_usage import codex_payload
 from .prompt_transport import prompt_json
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_control import StageCancellation
 from .task_planning import _strict_schema
 from .worker_adapters import cli_inherit_environment
 
@@ -578,11 +579,6 @@ PARENT_SEMANTIC_REVIEW_RUBRIC = {
 }
 
 
-class _NeverCancelled:
-    def cancelled(self) -> bool:
-        return False
-
-
 class CliParentSemanticReviewer:
     """Fresh tool-disabled observer of one exact composed patch."""
 
@@ -700,7 +696,7 @@ class CliParentSemanticReviewer:
             or decision.outcome is not DecisionOutcome.ALLOW
         ):
             raise ValueError("parent semantic-review policy did not allow the exact request")
-        process_result = self.executor.execute(process_request, decision, _NeverCancelled())
+        process_result = self.executor.execute(process_request, decision, StageCancellation())
         if (
             process_result.run_id != self.run_id
             or process_result.request_digest != process_request.content_digest
