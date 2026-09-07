@@ -810,6 +810,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
                 0 if isinstance(proposal, dict) and proposal.get("kind") == "install" else 1
             )
         )
+        created_at = now().isoformat()
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 raise ValueError("Codex proposal entries must be JSON objects")
@@ -817,11 +818,13 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             # These are new records, not references to existing actions. Allocate once at
             # ingress; persistence/replay retain the attributed IDs and their digests.
             proposal["id"] = identifier("proposal")
+            proposal["created_at"] = created_at
             proposal["worker_id"] = self.adapter
             proposal["run_id"] = self.run_id
             payload = proposal.get("payload")
             if isinstance(payload, dict):
                 payload["id"] = identifier("request")
+                payload["created_at"] = created_at
                 payload["run_id"] = self.run_id
         usage_json = wrapper["usage_json"]
         if not isinstance(usage_json, str):
@@ -1012,14 +1015,13 @@ def _bounded_prompt(
         payload["transport_instruction"] = (
             "The supplied output schema accepts edit_intent proposals and existing_lock install "
             "proposals only. Put each proposed repository patch directly in proposals with all "
-            "schema fields populated. Omit proposal and payload IDs; Fleet allocates those "
-            "locally. Request an existing_lock install when repository-local "
+            "schema fields populated. Omit IDs, created_at, run_id and worker_id; Fleet assigns "
+            "that metadata locally. Request an existing_lock install when repository-local "
             "dependencies are required for verification. That install must use manifest_path "
             "package.json, lock_path package-lock.json, manager_executable tools/fleet-npm, argv "
             "[ci, --ignore-scripts], target node_modules, network_required true, lifecycle_scripts "
             "false, and expected_mutations []; Fleet will execute it before edit proposals. Use "
-            "the "
-            "supplied run_id for both the proposal and payload run_id. Set assistant_note "
+            "an assistant_note "
             "directly; use an empty string when there is no note. Encode a usage object as JSON "
             "text in usage_json, using {} when no usage is available. For NEW nonempty text "
             "files, prefer files: [{path, content}] in the edit_intent payload instead of "
@@ -1756,8 +1758,6 @@ def worker_proposal_schema_json() -> bytes:
 
     identity_properties: dict[str, object] = {
         "schema_version": {"type": "string", "enum": ["2"]},
-        "run_id": {"type": "string"},
-        "created_at": {"type": "string"},
     }
     edit_payload_schema: dict[str, object] = {
         "type": "object",
@@ -1818,7 +1818,6 @@ def worker_proposal_schema_json() -> bytes:
             "type": "object",
             "properties": {
                 **identity_properties,
-                "worker_id": {"type": "string"},
                 "kind": {"type": "string", "enum": [kind]},
                 "payload": payload_schema,
                 "reason": {"type": "string"},
@@ -1832,7 +1831,6 @@ def worker_proposal_schema_json() -> bytes:
             },
             "required": [
                 *identity_properties,
-                "worker_id",
                 "kind",
                 "payload",
                 "reason",
