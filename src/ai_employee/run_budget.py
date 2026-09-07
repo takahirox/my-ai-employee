@@ -223,15 +223,31 @@ def wall_budget_scope(
     starts = store.list_records("run_wall_start_v2", RunWallStart, run_id=run_id)
     if not starts:
         _import_legacy_usage(store, run_id, limit, observed_at)
+    # Read both halves from one snapshot while another invocation may be settling.
+    with store.transaction() as connection:
+        connection.execute("BEGIN")
         starts = store.list_records("run_wall_start_v2", RunWallStart, run_id=run_id)
-    finishes = store.list_records("run_wall_finish_v2", RunWallFinish, run_id=run_id)
+        finishes = store.list_records("run_wall_finish_v2", RunWallFinish, run_id=run_id)
     if any(item.run_id != run_id for item in (*starts, *finishes)):
         raise ValueError("wall-time accounting belongs to another run")
     by_start: dict[str, RunWallFinish] = {}
+    normal_digests: dict[str, str | None] = {}
     for finish in finishes:
-        if finish.start_digest in by_start:
-            raise ValueError("wall-time history contains duplicate completion receipts")
-        by_start[finish.start_digest] = finish
+        limit = min(limit, finish.limit_seconds)
+        if not finish.recovered_interval:
+            if finish.start_digest in normal_digests and (
+                normal_digests[finish.start_digest] != finish.content_digest
+            ):
+                raise ValueError("wall-time history contains conflicting completion receipts")
+            normal_digests[finish.start_digest] = finish.content_digest
+        previous = by_start.get(finish.start_digest)
+        # Older releases could race normal completion with crash recovery.
+        # Charge the conservative maximum once, never add overlapping intervals.
+        by_start[finish.start_digest] = (
+            finish
+            if previous is None
+            else max((previous, finish), key=lambda item: item.active_seconds)
+        )
     prior = 0.0
     for record in starts:
         limit = min(limit, record.limit_seconds)
@@ -240,7 +256,6 @@ def wall_budget_scope(
             # An unclosed interval is charged until recovery, never reset. Once
             # recovered its duration is frozen, so a later pause does not accrue it again.
             elapsed = max(0.0, (observed_at - record.started_at).total_seconds())
-            prior += elapsed
             owner = store.current_run_owner(run_id)
             live = (
                 owner is not None
@@ -248,20 +263,24 @@ def wall_budget_scope(
                 and observed_at < ensure_utc(owner["expires_at"])
             )
             if not live:
-                store.put_once(
-                    "run_wall_finish_v2",
-                    RunWallFinish(
-                        id="run-wall-recovered-" + (record.content_digest or ""),
-                        run_id=run_id,
-                        created_at=observed_at,
-                        graph_run_id=run_id,
-                        start_digest=record.content_digest or "",
-                        limit_seconds=record.limit_seconds,
-                        active_seconds=elapsed,
-                        recovered_interval=True,
-                    ),
+                recovered = RunWallFinish(
+                    id="run-wall-recovered-" + (record.content_digest or ""),
                     run_id=run_id,
+                    created_at=observed_at,
+                    graph_run_id=run_id,
+                    start_digest=record.content_digest or "",
+                    limit_seconds=record.limit_seconds,
+                    active_seconds=elapsed,
+                    recovered_interval=True,
                 )
+                store.put_once("run_wall_finish_v2", recovered, run_id=run_id)
+                # Concurrent recoveries share one key. A late normal finalizer
+                # retains its own receipt so longer observed work is never lost.
+                recovered = store.get("run_wall_finish_v2", recovered.id, RunWallFinish)
+                if recovered.start_digest != record.content_digest or recovered.run_id != run_id:
+                    raise ValueError("wall-time settlement has stale bindings")
+                elapsed = recovered.active_seconds
+            prior += elapsed
         else:
             limit = min(limit, completed.limit_seconds)
             prior += completed.active_seconds
@@ -287,7 +306,7 @@ def wall_budget_scope(
     finally:
         _CURRENT.reset(token)
         finish = RunWallFinish(
-            id="run-wall-finish-" + uuid4().hex,
+            id="run-wall-finish-" + (record.content_digest or ""),
             run_id=run_id,
             created_at=utc_clock(),
             graph_run_id=run_id,

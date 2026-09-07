@@ -266,32 +266,34 @@ class LocalProcessExecutor:
         stdout_exceeded = stderr_exceeded = cancelled = timed_out = False
         stdout_observed = stderr_observed = 0
         cleanup = "not_required"
-        while selector.get_map():
-            elapsed = time.monotonic() - started
-            cancelled = cancellation.cancelled()
-            timed_out = elapsed >= timeout
-            if (
-                stdout_exceeded or stderr_exceeded or cancelled or timed_out
-            ) and cleanup == "not_required":
-                cleanup = self._terminate_group(process)
-            for key, _events in selector.select(timeout=0.05):
-                buffer, limit = key.data
-                chunk = os.read(key.fd, 64 * 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                available = max(0, limit - len(buffer))
-                buffer.extend(chunk[:available])
-                if key.fileobj is process.stdout:
-                    stdout_observed += len(chunk)
-                    stdout_exceeded = stdout_exceeded or len(chunk) > available
-                else:
-                    stderr_observed += len(chunk)
-                    stderr_exceeded = stderr_exceeded or len(chunk) > available
-            if process.poll() is not None and not selector.get_map():
-                break
-        process.wait()
-        selector.close()
+        try:
+            while selector.get_map() or process.poll() is None:
+                elapsed = time.monotonic() - started
+                cancelled = cancelled or cancellation.cancelled()
+                timed_out = elapsed >= timeout
+                if (
+                    stdout_exceeded or stderr_exceeded or cancelled or timed_out
+                ) and cleanup == "not_required":
+                    cleanup = self._terminate_group(process)
+                for key, _events in selector.select(timeout=0.05):
+                    buffer, limit = key.data
+                    chunk = os.read(key.fd, 64 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    available = max(0, limit - len(buffer))
+                    buffer.extend(chunk[:available])
+                    if key.fileobj is process.stdout:
+                        stdout_observed += len(chunk)
+                        stdout_exceeded = stdout_exceeded or len(chunk) > available
+                    else:
+                        stderr_observed += len(chunk)
+                        stderr_exceeded = stderr_exceeded or len(chunk) > available
+                if process.poll() is not None and not selector.get_map():
+                    break
+            process.wait()
+        finally:
+            selector.close()
         return (
             bytes(stdout_buffer),
             bytes(stderr_buffer),

@@ -2585,7 +2585,7 @@ def test_node_run_with_missing_binding_fails_closed_with_inspector_diagnostic(
         accepted_graph_revision_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
-        remaining_budgets={"worker_turns": 1},
+        remaining_budgets={"worker_turns": 1, "artifact_bytes": 100_000},
     )
     coordinator = WorkCoordinator(
         store,
@@ -2685,7 +2685,7 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         accepted_graph_revision_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
-        remaining_budgets={"worker_turns": 1, "processes": 1},
+        remaining_budgets={"worker_turns": 1, "processes": 1, "artifact_bytes": 100_000},
         completion_criteria=completion_criteria,
     )
     with SQLiteStore(tmp_path / "mutation.db") as store:
@@ -3185,7 +3185,7 @@ def test_accepted_process_allowance_is_cumulative_and_survives_resume(
         accepted_plan_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
-        remaining_budgets={"worker_turns": 1, "processes": limit},
+        remaining_budgets={"worker_turns": 1, "processes": limit, "artifact_bytes": 100_000},
         completion_criteria=criteria,
     )
     proposals = tuple(

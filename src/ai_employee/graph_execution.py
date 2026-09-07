@@ -797,6 +797,13 @@ def _authoritative_node_result(
         or worker_result.request_digest != request.content_digest
     ):
         raise ValueError("worker result is not bound to the exact request")
+    if run.status == "failed" and run.failure_code == "NODE_ARTIFACT_BUDGET_EXCEEDED":
+        return NodeExecutionResult(
+            worker_result=worker_result,
+            criterion_evidence=(),
+            workspace_id=run.workspace_id,
+            failure_code=run.failure_code,
+        )
     acceptances = store.list_records(
         "non_mutating_result_acceptance_v2",
         NonMutatingResultAcceptance,

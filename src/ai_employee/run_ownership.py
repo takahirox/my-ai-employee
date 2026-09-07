@@ -11,6 +11,12 @@ from .domain.base import Digest, Identifier, UtcTimestamp
 from .domain.v2 import DigestedRecordV2
 
 
+class RunCancellationRequested(BaseException):
+    """An accepted cancellation fences terminal success inside the store transaction."""
+
+    action = "cancel"
+
+
 class RunExecutionOwnerRecord(DigestedRecordV2):
     """Immutable acquisition authority for one exact graph execution attempt."""
 

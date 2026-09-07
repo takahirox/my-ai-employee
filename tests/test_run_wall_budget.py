@@ -282,3 +282,175 @@ def test_invalid_budget_cannot_mutate_an_active_scope(tmp_path, limit):
         ):
             raise AssertionError("invalid nested budget admitted")
         assert budget.limit == 10.0
+
+
+@pytest.mark.parametrize("normal_first", [False, True])
+@pytest.mark.parametrize("normal_seconds", [2.0, 5.0])
+def test_normal_finalization_and_recovery_settle_one_interval(
+    tmp_path, normal_first, normal_seconds
+):
+    import threading
+
+    database = tmp_path / "settlement.db"
+    pending = threading.Event()
+    release = threading.Event()
+    errors = []
+    clock = [0.0]
+
+    class DelayedStore(SQLiteStore):
+        def put_once(self, kind, model, **kwargs):
+            if kind == "run_wall_finish_v2" and not model.recovered_interval:
+                if normal_first:
+                    super().put_once(kind, model, **kwargs)
+                pending.set()
+                assert release.wait(10)
+            return super().put_once(kind, model, **kwargs)
+
+    def first():
+        try:
+            with (
+                DelayedStore(database) as store,
+                wall_budget_scope(
+                    store,
+                    "run",
+                    10.0,
+                    clock=lambda: clock[0],
+                    utc_clock=lambda: fixture.NOW,
+                ),
+            ):
+                clock[0] = normal_seconds
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert pending.wait(10)
+    try:
+        with (
+            SQLiteStore(database) as store,
+            wall_budget_scope(
+                store,
+                "run",
+                10.0,
+                clock=lambda: 0.0,
+                utc_clock=lambda: fixture.NOW + timedelta(seconds=3),
+            ) as budget,
+        ):
+            assert budget.remaining_seconds == (10.0 - normal_seconds if normal_first else 7.0)
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert not errors
+    with SQLiteStore(database) as store:
+        receipts = store.list_records("run_wall_finish_v2", RunWallFinish, run_id="run")
+        assert len({item.start_digest for item in receipts}) == 2
+        assert len(receipts) == (2 if normal_first else 3)
+        assert sum(not item.recovered_interval for item in receipts) == 2
+        with wall_budget_scope(store, "run", 10.0) as resumed:
+            assert resumed.prior == (normal_seconds if normal_first else max(normal_seconds, 3.0))
+
+
+def test_historical_normal_recovery_overlap_is_charged_once_conservatively(tmp_path):
+    with SQLiteStore(tmp_path / "legacy-race.db") as store:
+        start = RunWallStart(
+            id="start",
+            invocation_id="invocation",
+            graph_run_id="run",
+            run_id="run",
+            created_at=fixture.NOW,
+            started_at=fixture.NOW,
+            limit_seconds=10.0,
+        )
+        store.put_once("run_wall_start_v2", start, run_id="run")
+        for name, seconds, recovered in (("normal", 2.0, False), ("recovery", 3.0, True)):
+            finish = RunWallFinish(
+                id=name,
+                graph_run_id="run",
+                run_id="run",
+                created_at=fixture.NOW,
+                start_digest=start.content_digest,
+                limit_seconds=10.0,
+                active_seconds=seconds,
+                recovered_interval=recovered,
+            )
+            store.put_once("run_wall_finish_v2", finish, run_id="run")
+        with wall_budget_scope(store, "run", 10.0) as budget:
+            assert budget.prior == 3.0
+        bad = finish.model_dump()
+        bad.update(id="conflicting-normal", recovered_interval=False, content_digest=None)
+        store.put_once("run_wall_finish_v2", RunWallFinish.model_validate(bad), run_id="run")
+        with (
+            pytest.raises(ValueError, match="conflicting completion receipts"),
+            wall_budget_scope(store, "run", 10.0),
+        ):
+            pass
+
+
+@pytest.mark.parametrize("expire", [False, True])
+def test_isolated_verification_receives_shared_deadline_and_rejects_late_success(
+    tmp_path,
+    monkeypatch,
+    expire,
+):
+    import ai_employee.isolated_execution as isolated
+    from ai_employee.domain.v2 import DecisionOutcome, PolicyDecision
+    from ai_employee.isolated_worker import IsolatedWorkerProfile
+    from ai_employee.services_v2 import AtomicArtifactStore
+
+    clock = [0.0]
+    observations = {}
+
+    class Container:
+        def __init__(self, profile, root, *, seconds, cancellation, **kwargs):
+            observations["seconds"] = seconds
+            self.cancellation = cancellation
+            self.native_process_usage = {"admitted": 1}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            observations["cleaned"] = True
+
+        def run_guarded(self, argv, process_limit):
+            clock[0] += 2.0 if expire else 0.1
+            observations["cancelled"] = self.cancellation.cancelled()
+            return 0, b"", b""
+
+    monkeypatch.setattr(isolated, "DockerCandidate", Container)
+    executor = isolated.DockerProcessExecutor(
+        (tmp_path,), AtomicArtifactStore(tmp_path / "artifacts")
+    )
+    executor.profile = IsolatedWorkerProfile(image="sha256:" + "1" * 64)
+    request = ProcessRequest(
+        id="verify",
+        run_id="run",
+        created_at=fixture.NOW,
+        argv=("python", "-c", "pass"),
+        timeout_seconds=20.0,
+        purpose="verify shared deadline",
+    )
+    decision = PolicyDecision(
+        id="allow",
+        run_id="run",
+        created_at=fixture.NOW,
+        request_digest=request.content_digest,
+        effective_policy_digest=fixture.POLICY,
+        outcome=DecisionOutcome.ALLOW,
+        reason_code="fixture",
+    )
+    with (
+        SQLiteStore(tmp_path / "isolated.db") as store,
+        wall_budget_scope(store, "run", 10.0, clock=lambda: clock[0]),
+    ):
+        clock[0] = 9.0
+        if expire:
+            with pytest.raises(WallTimeExceeded):
+                executor.execute(request, decision, StageCancellation())
+        else:
+            result = executor.execute(request, decision, StageCancellation())
+            assert result.status == "succeeded"
+            assert result.request_digest == request.content_digest
+    assert observations == {"seconds": 1.0, "cancelled": expire, "cleaned": True}
+    assert request.timeout_seconds == 20.0

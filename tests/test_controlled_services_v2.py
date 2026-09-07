@@ -921,3 +921,41 @@ def test_diff_preserves_racy_index_detection_and_original_index(
     assert index.read_bytes() == original_index
     assert index.stat().st_mtime_ns == original_timestamp
     assert not (tmp_path / "state" / "index-racy-check").exists()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_closed_output_pipes_do_not_end_process_supervision(tmp_path, cancel):
+    import time
+
+    started = time.monotonic()
+
+    class Cancellation:
+        def cancelled(self):
+            return cancel and time.monotonic() - started >= 0.1
+
+    class Executor(LocalProcessExecutor):
+        spawned = None
+
+        def _capture(self, process, *args, **kwargs):
+            self.spawned = process
+            return super()._capture(process, *args, **kwargs)
+
+    executor = Executor(
+        (tmp_path,),
+        AtomicArtifactStore(tmp_path / "artifacts"),
+        terminate_grace_seconds=0.1,
+    )
+    request = ProcessRequest(
+        id="closed-pipes",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", "exec 1>&- 2>&-; exec sleep 10"),
+        timeout_seconds=5.0 if cancel else 0.1,
+        purpose="supervise process lifetime after EOF",
+    )
+    result = executor.execute(request, allow(request.content_digest), Cancellation())
+    assert result.failure.code is (
+        StableFailureCode.CANCELLED if cancel else StableFailureCode.TIMEOUT
+    )
+    assert result.duration_seconds < 2.0
+    assert executor.spawned.poll() is not None
