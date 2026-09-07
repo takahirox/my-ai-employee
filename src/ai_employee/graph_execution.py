@@ -101,11 +101,6 @@ class ParentCandidateEvaluator(Protocol):
     def replay(self, evaluation_id: Identifier) -> ParentCandidateEvaluationReplay: ...
 
 
-class _NeverCancelled:
-    def cancelled(self) -> bool:
-        return False
-
-
 class _ExecutionSession:
     def __init__(
         self,
@@ -174,7 +169,7 @@ class _ExecutionSession:
 
 
 class GraphExecutionService:
-    """Schedule accepted nodes, compose exact patches, and stop before parent evaluation."""
+    """Execute and verify exact graph candidates inside one owned run lifecycle."""
 
     def __init__(
         self,
@@ -272,13 +267,47 @@ class GraphExecutionService:
             plan_only=plan_only,
             resume=resume,
             replan=replan,
+            finalize_parent=lambda run, cancellation: self._finalize_parent(
+                run,
+                cancellation,
+                session,
+                orchestrator,
+                goal,
+                harness_digest,
+                effective_policy_digest,
+            ),
         )
+        if (
+            graph_run.status == "failed"
+            and graph_run.parent_evaluation_digest is not None
+            and orchestrator.prepare_parent_repair(run_id, graph_run.parent_evaluation_digest)
+        ):
+            return self.run(
+                goal,
+                orchestrator.replay(run_id).acceptance.accepted_revision.graph,
+                policy,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                run_id=run_id,
+                available_capabilities=capabilities,
+                resume=True,
+            )
+        return self.store.get("graph_run_v2", run_id, GraphRunRecord)
+
+    def _finalize_parent(
+        self,
+        graph_run: GraphRunRecord,
+        cancellation: Cancellation,
+        session: _ExecutionSession,
+        orchestrator: TaskOrchestrator,
+        goal: Goal,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+    ) -> GraphRunRecord:
+        run_id = graph_run.id
         recovered = self._recover_policy_approval_pointer(graph_run)
         if recovered is not None:
             return recovered
-        if plan_only or graph_run.failure_code != "PARENT_EVALUATION_UNAVAILABLE":
-            return graph_run
-
         current_digest = graph_run.accepted_graph_revision_digest
         replay = orchestrator.replay(run_id)
         latest_nodes = {item.node_id: item for item in replay.nodes}
@@ -328,7 +357,9 @@ class GraphExecutionService:
             generated_paths=self.generated_paths,
             node_patches=tuple(session.node_patches[node.id] for node in writing_nodes),
         )
-        composition = self.composer.compose(composition_request, _NeverCancelled())
+        composition = self.composer.compose(composition_request, cancellation)
+        if cancellation.cancelled():
+            return graph_run
         if composition.status != "succeeded" or composition.candidate_patch is None:
             return self._update_run(
                 graph_run,
@@ -355,7 +386,7 @@ class GraphExecutionService:
                 composition,
                 harness_digest=harness_digest,
                 effective_policy_digest=effective_policy_digest,
-                cancellation=_NeverCancelled(),
+                cancellation=cancellation,
             )
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             return self._update_run(
@@ -363,6 +394,8 @@ class GraphExecutionService:
                 failure_code="PARENT_EVALUATION_UNAVAILABLE",
                 **candidate_fields,
             )
+        if cancellation.cancelled():
+            return graph_run
         evaluation_fields = {
             **candidate_fields,
             "parent_evaluation_id": evaluation.id,
@@ -375,21 +408,7 @@ class GraphExecutionService:
                 failure_code=evaluation.failure_code or "PARENT_EVALUATION_FAILED",
                 **evaluation_fields,
             )
-            evaluation_digest = evaluation.content_digest
-            if evaluation_digest is not None and orchestrator.prepare_parent_repair(
-                run_id, evaluation_digest
-            ):
-                return self.run(
-                    goal,
-                    acceptance.accepted_revision.graph,
-                    policy,
-                    harness_digest=harness_digest,
-                    effective_policy_digest=effective_policy_digest,
-                    run_id=run_id,
-                    available_capabilities=capabilities,
-                    resume=True,
-                )
-            return self.store.get("graph_run_v2", failed_run.id, GraphRunRecord)
+            return failed_run
         approval_created_at = now()
         approval_decision = PolicyDecision(
             id=identifier("graph-promotion-policy"),
@@ -543,20 +562,14 @@ class GraphExecutionService:
         )
 
     def _update_run(self, run: GraphRunRecord, **changes: object) -> GraphRunRecord:
-        updated = run.model_copy(update={"status": "failed", **changes})
-        self.store.put(
-            "graph_run_v2",
-            updated,
-            run_id=updated.id,
-            revision=updated.generation + 1,
-        )
-        return updated
+        # The owning TaskOrchestrator publishes and closes this exact final state.
+        return run.model_copy(update={"status": "failed", **changes})
 
     def _recover_policy_approval_pointer(self, run: GraphRunRecord) -> GraphRunRecord | None:
         """Recover an exact policy approval and final pointer from durable authority facts."""
 
         if (
-            run.failure_code != "PARENT_EVALUATION_UNAVAILABLE"
+            (run.status != "verifying" and run.failure_code != "PARENT_EVALUATION_UNAVAILABLE")
             or self.parent_evaluator is None
             or self.promotion_approval_policy is None
         ):

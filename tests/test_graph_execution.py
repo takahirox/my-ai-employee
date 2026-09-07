@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -81,9 +82,11 @@ from ai_employee.services_v2 import (
 )
 from ai_employee.storage import SQLiteStore
 from ai_employee.task_orchestration import (
+    GraphRunRecord,
     LoopAction,
     LoopTransitionRecord,
     NodeExecutionRecord,
+    RunOwnershipLost,
 )
 from ai_employee.task_planning import ProposedGraph
 
@@ -101,11 +104,21 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
         "semantic-retry",
         "semantic-stale-node",
         "generated",
+        "cancel-composition",
+        "pause-composition",
+        "cancel-parent",
+        "pause-parent",
+        "expired-parent",
+        "interrupted-parent",
     ],
 )
 def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     tmp_path: Path, parent_verification_succeeds: bool | str | None
 ) -> None:
+    stop_case = str(parent_verification_succeeds)
+    stop_action = (
+        stop_case.split("-", 1)[0] if stop_case.startswith(("cancel-", "pause-")) else None
+    )
     semantic_repair = parent_verification_succeeds == "semantic-repair"
     semantic_retry = parent_verification_succeeds == "semantic-retry"
     semantic_stale_node = parent_verification_succeeds == "semantic-stale-node"
@@ -411,6 +424,19 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         ) -> ExecutionResult:
             nonlocal parent_process_calls
             parent_process_calls += 1
+            if stop_case == "interrupted-parent":
+                raise KeyboardInterrupt()
+            if stop_case == "expired-parent":
+                with store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE run_execution_owners_v2 SET expires_at=? WHERE run_id=?",
+                        ("2000-01-01T00:00:00+00:00", "graph-e2e"),
+                    )
+            assert store.current_run_owner("graph-e2e")["status"] == "active"
+            assert store.get("graph_run_v2", "graph-e2e", GraphRunRecord).status == "verifying"
+            if stop_action and stop_case.endswith("-parent"):
+                store.request_control("graph-e2e", stop_action)
+                assert _cancellation.cancelled()
             isolated = Path(self.snapshot.isolated_worktree)  # type: ignore[attr-defined]
             assert isolated != repository
             assert all(
@@ -586,6 +612,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             def compose(self, request: object, cancellation: object) -> object:
                 nonlocal composition_calls
                 composition_calls += 1
+                assert store.current_run_owner("graph-e2e")["status"] == "active"
+                if stop_action and stop_case.endswith("-composition"):
+                    store.request_control("graph-e2e", stop_action)
+                    assert cancellation.cancelled()
                 result = real_composer.compose(request, cancellation)  # type: ignore[arg-type]
                 if semantic_stale_node:
                     accepted = next(
@@ -620,16 +650,45 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             generated_paths=harness.paths.generated,
             parent_evaluator=(None if parent_verification_succeeds is None else parent_evaluator),
         )
-        run = service.run(
-            goal,
-            proposal,
-            ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
-            harness_digest=harness_digest,
-            effective_policy_digest=effective_policy_digest,
-            run_id="graph-e2e",
-            available_capabilities=("edit_intent", "process"),
+        expected_error = (
+            RunOwnershipLost
+            if stop_case == "expired-parent"
+            else KeyboardInterrupt
+            if stop_case == "interrupted-parent"
+            else None
         )
+        with pytest.raises(expected_error) if expected_error else nullcontext():
+            run = service.run(
+                goal,
+                proposal,
+                ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                run_id="graph-e2e",
+                available_capabilities=("edit_intent", "process"),
+            )
 
+        if expected_error:
+            persisted = store.get("graph_run_v2", "graph-e2e", GraphRunRecord)
+            assert persisted.status == (
+                "verifying" if stop_case == "expired-parent" else "interrupted"
+            )
+            assert persisted.promotion_approval_id is None
+            if stop_case == "interrupted-parent":
+                assert store.current_run_owner("graph-e2e")["status"] == "closed"
+            return
+
+        if stop_action:
+            assert run.status == ("cancelled" if stop_action == "cancel" else "paused")
+            assert run.promotion_approval_id is None
+            assert store.current_run_owner("graph-e2e")["status"] == "closed"
+            assert store.control("graph-e2e") == stop_action
+            assert all(
+                (repository / f"{name}.txt").read_text() == f"{name}-before\n"
+                for name in ("a", "b", "c")
+            )
+            return
+        assert store.current_run_owner("graph-e2e")["status"] == "closed"
         assert run.status == ("ready_to_promote" if parent_ready else "failed")
         assert run.failure_code == (
             None

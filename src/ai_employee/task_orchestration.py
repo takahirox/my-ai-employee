@@ -46,6 +46,7 @@ from .domain.base import (
     ensure_utc,
     freeze_json,
 )
+from .domain.services_v2 import Cancellation
 from .domain.v2 import (
     ArtifactDescriptor,
     ArtifactDescriptorReference,
@@ -93,6 +94,7 @@ from .run_ownership import (
 )
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
+from .stage_control import bind_stage_cancellation
 from .storage import SQLiteStore
 from .task_planning import PlannerRoutingDecision, ProposedGraph
 from .task_review import (
@@ -125,6 +127,7 @@ NodeExecutionStatus = Literal[
 GraphExecutionStatus = Literal[
     "planned",
     "running",
+    "verifying",
     "paused",
     "cancelled",
     "completed",
@@ -134,7 +137,7 @@ GraphExecutionStatus = Literal[
 ]
 
 _OWNED_TERMINAL_GRAPH_STATES = frozenset(
-    {"paused", "cancelled", "completed", "failed", "interrupted"}
+    {"paused", "cancelled", "completed", "ready_to_promote", "failed", "interrupted"}
 )
 
 
@@ -836,6 +839,37 @@ def one_node_graph(
     )
 
 
+class _StageStopped(BaseException):
+    """Control flow that cannot be mistaken for a reviewer/evaluator failure."""
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+
+
+class _OwnedStageCancellation:
+    def __init__(
+        self, orchestrator: TaskOrchestrator, run_id: str, *, honor_pause: bool = True
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.run_id = run_id
+        self.honor_pause = honor_pause
+
+    def cancelled(self) -> bool:
+        self.orchestrator._heartbeat_run_owner_if_due()
+        self.orchestrator._assert_run_owner("write")
+        action = self.orchestrator.store.control(self.run_id)
+        return action == "cancel" or (self.honor_pause and action == "pause")
+
+    def check(self) -> None:
+        if self.cancelled():
+            action = self.orchestrator.store.control(self.run_id) or "cancel"
+            owner = self.orchestrator._run_owner
+            if action == "cancel" and owner is not None:
+                # Signal children before unwinding the scheduler's executor scope.
+                self.orchestrator._propagate_owner_interruption(owner)
+            raise _StageStopped(action)
+
+
 class TaskOrchestrator:
     """Accept task DAGs and fence uncomposed planner output from execution."""
 
@@ -976,6 +1010,7 @@ class TaskOrchestrator:
         plan_only: bool = False,
         resume: bool = False,
         replan: bool = False,
+        finalize_parent: Callable[[GraphRunRecord, Cancellation], GraphRunRecord] | None = None,
     ) -> GraphRunRecord:
         """Execute with bounded signal/error terminalization once ownership is acquired."""
 
@@ -990,18 +1025,44 @@ class TaskOrchestrator:
 
             signal.signal(signal.SIGTERM, interrupt_for_sigterm)
         try:
-            return self._run_impl(
-                goal,
-                proposed_graph,
-                policy,
-                harness_digest=harness_digest,
-                effective_policy_digest=effective_policy_digest,
-                run_id=run_id,
-                available_capabilities=available_capabilities,
-                plan_only=plan_only,
-                resume=resume,
-                replan=replan,
+            cancellation = _OwnedStageCancellation(self, run_id, honor_pause=False)
+            with bind_stage_cancellation(cancellation):
+                result = self._run_impl(
+                    goal,
+                    proposed_graph,
+                    policy,
+                    harness_digest=harness_digest,
+                    effective_policy_digest=effective_policy_digest,
+                    run_id=run_id,
+                    available_capabilities=available_capabilities,
+                    plan_only=plan_only,
+                    resume=resume,
+                    replan=replan,
+                    parent_finalization_available=finalize_parent is not None,
+                )
+                if result.status == "verifying":
+                    assert finalize_parent is not None
+                    cancellation = _OwnedStageCancellation(self, run_id)
+                    cancellation.check()
+                    with bind_stage_cancellation(cancellation):
+                        result = finalize_parent(result, cancellation)
+                    cancellation.check()
+                    if result.status not in _OWNED_TERMINAL_GRAPH_STATES:
+                        raise ValueError("parent finalization must return a terminal graph state")
+                    self._save_run(result)
+                return result
+        except _StageStopped as stopped:
+            current = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            cancelled = stopped.action == "cancel"
+            result = current.model_copy(
+                update={
+                    "status": "cancelled" if cancelled else "paused",
+                    "generation": current.generation + int(cancelled),
+                    "failure_code": "GRAPH_CANCELLED" if cancelled else "GRAPH_PAUSED",
+                }
             )
+            self._save_run(result)
+            return result
         except BaseException as error:
             if self._run_owner is not None:
                 status: GraphExecutionStatus = (
@@ -1030,6 +1091,7 @@ class TaskOrchestrator:
         plan_only: bool = False,
         resume: bool = False,
         replan: bool = False,
+        parent_finalization_available: bool = False,
     ) -> GraphRunRecord:
         if (resume or replan) and plan_only:
             raise ValueError("a resumed graph must execute")
@@ -2978,9 +3040,15 @@ class TaskOrchestrator:
         if self.defer_parent_evaluation and writing_graph:
             graph_run = graph_run.model_copy(
                 update={
-                    "status": "failed",
+                    "status": "verifying"
+                    if node_pass and parent_finalization_available
+                    else "failed",
                     "failure_code": (
-                        "PARENT_EVALUATION_UNAVAILABLE" if node_pass else "NODE_EXECUTION_FAILED"
+                        None
+                        if node_pass and parent_finalization_available
+                        else "PARENT_EVALUATION_UNAVAILABLE"
+                        if node_pass
+                        else "NODE_EXECUTION_FAILED"
                     ),
                 }
             )
@@ -3402,7 +3470,32 @@ class TaskOrchestrator:
             review_acceptance_binding=review_binding,
         )
 
-    def prepare_parent_repair(
+    def prepare_parent_repair(self, run_id: Identifier, evaluation_digest: Digest) -> bool:
+        """Fence the durable repair transition before opening another execution attempt."""
+        run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+        if run.status != "failed" or self.store.control(run_id) is not None:
+            return False
+        if self._run_owner is not None:
+            raise RunOwnershipLost("parent repair must begin after the prior owned invocation")
+        owned_run = run.model_copy(update={"execution_attempt": run.execution_attempt + 1})
+        self._acquire_run_owner(owned_run)
+        assert self._run_owner is not None
+        try:
+            if not self.store.put_owned_graph_run(
+                self._run_owner, owned_run, observed_at=self.clock()
+            ):
+                raise RunOwnershipLost("parent repair lost its exact acquisition")
+            return self._prepare_parent_repair(run_id, evaluation_digest)
+        finally:
+            owner = self._run_owner
+            if owner is not None:
+                current = self.store.current_run_owner(run_id)
+                if current is not None and current["status"] == "active":
+                    self._save_run(self.store.get("graph_run_v2", run_id, GraphRunRecord))
+            self._run_owner = None
+            self._next_heartbeat_at = None
+
+    def _prepare_parent_repair(
         self,
         run_id: Identifier,
         evaluation_digest: Digest,
@@ -4055,6 +4148,7 @@ class TaskOrchestrator:
         review_result: TaskReviewResult | None = None
         try:
             review_result = self.task_reviewer.review(review_request)
+            _OwnedStageCancellation(self, graph_run.id, honor_pause=False).check()
             validate_task_review_result(review_request, review_result)
             self.store.put("task_review_result_v2", review_result, run_id=graph_run.id)
             decision = decide_task_review(

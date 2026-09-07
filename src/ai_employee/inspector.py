@@ -424,7 +424,7 @@ def _run_ownership_projection(
         and current["owner_instance_id"] == current_owner.owner_instance_id
     )
     expired = bool(current is not None and observed_at >= ensure_utc(current["expires_at"]))
-    parent_nonterminal = run.status == "running"
+    parent_nonterminal = run.status in {"running", "verifying"}
     live = bool(
         parent_nonterminal
         and current is not None
@@ -441,7 +441,9 @@ def _run_ownership_projection(
             }
         )
     )
-    child_parent_incident = bool(parent_nonterminal and terminal_child_ids)
+    child_parent_incident = bool(
+        parent_nonterminal and terminal_child_ids and run.status != "verifying"
+    )
     liveness_state: str
     diagnostic_code: str | None
     if run.status in {"planned", "paused", "ready_to_promote"}:

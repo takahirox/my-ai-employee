@@ -26,6 +26,7 @@ from .model_usage import codex_payload
 from .prompt_transport import prompt_json
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_control import StageCancellation
 from .task_planning import ProposedGraph, _strict_schema
 from .worker_adapters import cli_inherit_environment
 
@@ -417,11 +418,6 @@ def decide_plan_review_action(review: TrustedPlanReview) -> PlanReviewAction:
     return PlanReviewAction.REJECT
 
 
-class _NeverCancelled:
-    def cancelled(self) -> bool:
-        return False
-
-
 class CliPlanReviewer:
     """Fresh, tool-disabled plan reviewer bound to one configured strategy."""
 
@@ -526,7 +522,7 @@ class CliPlanReviewer:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.REVIEWER_ERROR, str(error)
             ) from error
-        result = self.executor.execute(request, decision, _NeverCancelled())
+        result = self.executor.execute(request, decision, StageCancellation())
         if result.request_digest != request.content_digest:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.STALE_BINDING,
