@@ -1,0 +1,58 @@
+# Worker deadlines and bounded recovery
+
+An accepted node wall-time reservation is a hard limit. The supervisor also records
+an operator profile's recommended duration and progress observations; neither a
+recommendation nor silence alone authorizes early cancellation. The effective
+attempt deadline remains the minimum of the accepted node, adapter, execution
+policy, and remaining run allowances.
+
+## A timeout can recover within existing authority
+
+The adapter's process timeout can finish before the scheduler's watchdog fires.
+Both paths now use the same recovery decision. Previously only the watchdog path
+could use an accepted timeout retry, making the outcome depend on which timer won.
+
+A retry requires all of the following:
+
+- The returned result is bound to the exact child invocation.
+- Cleanup is confirmed. Adapter timeouts require an explicit process-cleanup
+  result; unknown or failed cleanup blocks another invocation. Legacy in-process
+  scheduler runners retain their completion acknowledgement on return within the
+  cleanup grace period.
+- The accepted node and graph permit another retry and another attempt's resources
+  remain. The original strategy, model, and backend remain unchanged.
+- The actual remaining run time can meet the selected profile's minimum. A stale
+  reservation snapshot does not authorize a retry after the overall deadline.
+
+Cancellation takes precedence. A concurrent budget-exhaustion or other failure
+is not converted into a timeout retry. Cleanup failure also prevents a replan
+recommendation. Any authorized replan still requires normal graph acceptance;
+this mechanism does not create a new plan or extend the run deadline.
+
+## Inspecting an interrupted attempt
+
+`fleet inspect RUN_ID` exposes `timeout_recoveries`. New records include a
+`context` with the timer source, exact request/result digests, cleanup status,
+remaining run seconds, and minimum retry seconds. The decision and context are
+content-digest bound. Existing records without this context retain their historical
+digests and can still be loaded.
+
+Returned worker results, including any stdout/stderr artifact references, are kept
+for diagnosis. Late proposals, patches, and completion claims do not become accepted
+evidence. A retry starts a new bounded attempt; saved output is not a resumable
+checkpoint and external side effects are not assumed to be reversible.
+
+## Scope and tradeoffs
+
+This change makes already-authorized recovery consistent. It does not enable
+retries for plans that have zero retry allowance, increase any default budgets,
+borrow repair reservations beyond the existing resource checks, change model
+routing, or purchase/reset provider allowance. In particular, the default bounded
+Planner's zero-retry policy is unchanged.
+
+Progress-based deadline extensions and general checkpoint/resume need stronger
+progress and side-effect contracts. They are not inferred from a model's elapsed
+reasoning time. Model-free tests cover both timer orderings, successful recovery,
+exhausted time/counters, failed or unknown cleanup, cancellation, result binding,
+replay, and legacy digest compatibility; these tests do not establish live-model
+success rates.

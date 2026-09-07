@@ -239,6 +239,18 @@ class WorkerAttemptHeartbeatRecord(DigestedRecordV2):
     hard_timeout_reached: bool
 
 
+class TimeoutRecoveryContext(BaseModel):
+    """Runtime facts captured after the timed-out invocation has returned."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False)
+    source: Literal["scheduler", "adapter"]
+    worker_request_digest: Digest
+    worker_result_digest: Digest
+    cleanup_confirmed: bool
+    remaining_run_seconds: float = Field(ge=0)
+    minimum_retry_seconds: float = Field(gt=0)
+
+
 class TimeoutRecoveryRecord(DigestedRecordV2):
     """A timeout recovery decision that cannot silently change execution identity."""
 
@@ -263,9 +275,21 @@ class TimeoutRecoveryRecord(DigestedRecordV2):
     retry_within_resource_budgets: bool
     normal_acceptance_required: bool
     alternate_fallback_authorized: Literal[False] = False
+    context: TimeoutRecoveryContext | None = None
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        return frozenset({"context"}) if self.context is None else frozenset()
 
     @model_validator(mode="after")
     def _recovery_never_falls_back(self) -> Self:
+        if self.context is not None and self.action != "denied":
+            if not self.context.cleanup_confirmed or self.context.remaining_run_seconds <= 0:
+                raise ValueError("timeout recovery requires confirmed cleanup and remaining time")
+            if (
+                self.action == "same_strategy_retry"
+                and self.context.remaining_run_seconds < self.context.minimum_retry_seconds
+            ):
+                raise ValueError("timeout retry cannot meet its minimum remaining time")
         retry = (self.retry_strategy_id, self.retry_model, self.retry_backend)
         source = (self.source_strategy_id, self.source_model, self.source_backend)
         if self.action == "same_strategy_retry":
@@ -452,7 +476,15 @@ def timeout_recovery_action(
     retry_within_counters: bool,
     retry_within_resource_budgets: bool,
     replan_authorized: bool,
+    context: TimeoutRecoveryContext | None = None,
 ) -> Literal["same_strategy_retry", "replan_required", "denied"]:
+    if context is not None:
+        if not context.cleanup_confirmed or context.remaining_run_seconds <= 0:
+            return "denied"
+        retry_within_resource_budgets = (
+            retry_within_resource_budgets
+            and context.remaining_run_seconds >= context.minimum_retry_seconds
+        )
     if retry_within_policy and retry_within_counters and retry_within_resource_budgets:
         return "same_strategy_retry"
     return "replan_required" if replan_authorized else "denied"

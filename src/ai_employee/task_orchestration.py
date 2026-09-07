@@ -106,6 +106,7 @@ from .task_review import (
     validate_task_review_result,
 )
 from .worker_supervision import (
+    TimeoutRecoveryContext,
     TimeoutRecoveryRecord,
     WorkerAttemptObservation,
     WorkerAttemptSupervisor,
@@ -2194,39 +2195,121 @@ class TaskOrchestrator:
                     node_id, node, request, reservation, strategy, started_at = active.pop(future)
                     try:
                         result = future.result()
-                        if future in watchdog_signals:
-                            self.store.put(
-                                "node_watchdog_v2",
-                                NodeWatchdogRecord(
-                                    id=identifier("node-watchdog"),
+                        adapter_timeout = (
+                            result.worker_result.status != "succeeded"
+                            and result.worker_result.failure is not None
+                            and result.worker_result.failure.code is StableFailureCode.TIMEOUT
+                        )
+                        timeout_recoverable_result = result.failure_code in {
+                            None,
+                            StableFailureCode.TIMEOUT.value,
+                        } and (
+                            result.worker_result.failure is None
+                            or result.worker_result.failure.code
+                            in {
+                                StableFailureCode.TIMEOUT,
+                                StableFailureCode.CANCELLED,
+                                StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED,
+                            }
+                        )
+                        if (
+                            future not in cancellation_signals
+                            and timeout_recoverable_result
+                            and (future in watchdog_signals or adapter_timeout)
+                        ):
+                            worker_result = result.worker_result
+                            if (
+                                worker_result.run_id != request.run_id
+                                or worker_result.request_digest != request.content_digest
+                            ):
+                                records[node_id] = self._advance(
+                                    records[node_id],
+                                    status="failed",
+                                    failure_code=StableFailureCode.WORKER_BOUNDARY_ERROR.value,
+                                )
+                                continue
+                            scheduler_timeout = future in watchdog_signals
+                            usage = worker_result.resource_usage
+                            cleanup = (
+                                usage.get("process_group_cleanup")
+                                if isinstance(usage, Mapping)
+                                else None
+                            )
+                            cleanup_confirmed = (
+                                cleanup
+                                in ("not_required", "sigterm_confirmed", "sigkill_confirmed")
+                                if cleanup is not None
+                                else scheduler_timeout
+                            ) and not (
+                                worker_result.failure is not None
+                                and worker_result.failure.code
+                                is StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED
+                            )
+                            if scheduler_timeout:
+                                cleanup_confirmed = cleanup_confirmed and (
+                                    monotonic() - watchdog_signals[future] <= cleanup_grace_seconds
+                                )
+                                self.store.put(
+                                    "node_watchdog_v2",
+                                    NodeWatchdogRecord(
+                                        id=identifier("node-watchdog"),
+                                        run_id=run_id,
+                                        created_at=now(),
+                                        graph_run_id=run_id,
+                                        node_id=node_id,
+                                        child_run_id=request.run_id,
+                                        accepted_graph_revision_digest=graph_digest,
+                                        generation=node.generation,
+                                        attempt=node.attempt,
+                                        allowance_seconds=timeout_profiles[
+                                            future
+                                        ].effective_timeout_seconds,
+                                        cleanup_grace_seconds=cleanup_grace_seconds,
+                                        timeout_profile_digest=timeout_profiles[
+                                            future
+                                        ].content_digest,
+                                        outcome="cleanup_confirmed"
+                                        if cleanup_confirmed
+                                        else "cleanup_failed",
+                                    ),
                                     run_id=run_id,
-                                    created_at=now(),
-                                    graph_run_id=run_id,
-                                    node_id=node_id,
-                                    child_run_id=request.run_id,
-                                    accepted_graph_revision_digest=graph_digest,
-                                    generation=node.generation,
-                                    attempt=node.attempt,
-                                    allowance_seconds=timeout_profiles[
-                                        future
-                                    ].effective_timeout_seconds,
-                                    cleanup_grace_seconds=cleanup_grace_seconds,
-                                    timeout_profile_digest=timeout_profiles[future].content_digest,
-                                    outcome=(
-                                        "cleanup_confirmed"
-                                        if (
-                                            monotonic() - watchdog_signals[future]
-                                            <= cleanup_grace_seconds
-                                            and not (
-                                                result.worker_result.failure is not None
-                                                and result.worker_result.failure.code
-                                                is StableFailureCode.PROCESS_GROUP_CLEANUP_FAILED
-                                            )
-                                        )
-                                        else "cleanup_failed"
+                                )
+                            # Preserve the exact returned result for diagnosis, without
+                            # accepting its late proposal, patch, or completion evidence.
+                            self.store.put("worker_result_v2", worker_result, run_id=run_id)
+                            timeout_code = (
+                                "WATCHDOG_TIMEOUT"
+                                if scheduler_timeout
+                                else StableFailureCode.TIMEOUT.value
+                            )
+                            records[node_id] = self._advance(
+                                records[node_id],
+                                status="failed",
+                                worker_result_id=worker_result.id,
+                                worker_result_digest=worker_result.content_digest,
+                                output_generation=node.generation,
+                                failure_code=(
+                                    timeout_code
+                                    if cleanup_confirmed
+                                    else f"{timeout_code}:CLEANUP_UNCONFIRMED"
+                                ),
+                            )
+                            recovery_context = TimeoutRecoveryContext(
+                                source="scheduler" if scheduler_timeout else "adapter",
+                                worker_request_digest=_required_digest(request.content_digest),
+                                worker_result_digest=_required_digest(worker_result.content_digest),
+                                cleanup_confirmed=cleanup_confirmed,
+                                remaining_run_seconds=max(
+                                    0.0,
+                                    graph_run.max_wall_seconds
+                                    - max(
+                                        0.0,
+                                        (ensure_utc(self.clock()) - run_started_at).total_seconds(),
                                     ),
                                 ),
-                                run_id=run_id,
+                                minimum_retry_seconds=timeout_profiles[
+                                    future
+                                ].profile_minimum_seconds,
                             )
                             remaining = cast(
                                 Mapping[str, int | float], reservation.remaining_budgets
@@ -2247,6 +2330,7 @@ class TaskOrchestrator:
                                 retry_within_counters=retry_within_counters,
                                 retry_within_resource_budgets=retry_within_resources,
                                 replan_authorized=graph_run.replan_count < graph_run.max_replans,
+                                context=recovery_context,
                             )
                             self.store.put(
                                 "timeout_recovery_v2",
@@ -2264,6 +2348,7 @@ class TaskOrchestrator:
                                     source_generation=node.generation,
                                     source_attempt=node.attempt,
                                     action=recovery_action,
+                                    context=recovery_context,
                                     routing_mode=graph_run.routing_mode.value,
                                     source_strategy_id=strategy.id,
                                     source_model=strategy.model,
@@ -2299,7 +2384,7 @@ class TaskOrchestrator:
                                         run_id=run_id,
                                         created_at=now(),
                                         action=LoopAction.RETRY,
-                                        reason_code="WATCHDOG_TIMEOUT",
+                                        reason_code=timeout_code,
                                         accepted_graph_revision_digest=graph_digest,
                                         generation=node.generation,
                                         attempt=node.attempt,
@@ -2323,15 +2408,9 @@ class TaskOrchestrator:
                                     attempt=records[node_id].attempt + 1,
                                     sequence=0,
                                     status="pending",
-                                    failure_code="RETRY_AFTER:WATCHDOG_TIMEOUT",
+                                    failure_code=f"RETRY_AFTER:{timeout_code}",
                                 )
                                 self._save_node(records[node_id])
-                            else:
-                                records[node_id] = self._advance(
-                                    records[node_id],
-                                    status="failed",
-                                    failure_code="WATCHDOG_TIMEOUT",
-                                )
                             continue
                         if future in cancellation_signals:
                             self.store.put(
