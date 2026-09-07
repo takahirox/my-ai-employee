@@ -309,7 +309,9 @@ class GitWorkspaceManager:
     ) -> bytes:
         index = self._git_path(worktree, "--git-path", "index")
         temporary_index = self.state_root / f"index-{nonce}"
-        shutil.copyfile(index, temporary_index)
+        # Git uses the index timestamp to detect same-stat, same-size edits.
+        # Advancing it on a plain copy can make a racily clean entry look unchanged.
+        shutil.copy2(index, temporary_index)
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(temporary_index)
         try:

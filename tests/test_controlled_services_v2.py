@@ -876,3 +876,48 @@ def test_installer_restricts_node_existing_lock_arguments(tmp_path: Path) -> Non
     assert result.failure is not None
     assert result.failure.code.value == "INVALID_REQUEST"
     assert "ci --ignore-scripts" in result.failure.message
+
+
+@pytest.mark.parametrize("include_new_file", [False, True])
+def test_diff_preserves_racy_index_detection_and_original_index(
+    tmp_path: Path, include_new_file: bool
+) -> None:
+    import os
+    import time
+
+    repository = tmp_path / "racy-repo"
+    repository.mkdir()
+
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(("git", "-C", str(repository), *args))
+
+    git("init", "-q")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.test")
+    # Emulate Git/filesystems that compare stat timestamps at second granularity.
+    git("config", "core.trustctime", "false")
+    git("config", "core.checkStat", "minimal")
+    source = repository / "README.md"
+    source.write_text("teh example\n")
+    stamp = int(time.time()) - 60
+    os.utime(source, (stamp, stamp))
+    git("add", ".")
+    git("commit", "-qm", "base")
+    index = repository / ".git" / "index"
+    os.utime(index, (stamp, stamp))
+    original_index = index.read_bytes()
+    original_timestamp = index.stat().st_mtime_ns
+    source.write_text("the example\n")  # same size, inode, and cached mtime
+    os.utime(source, (stamp, stamp))
+    if include_new_file:
+        (repository / "new.txt").write_text("new artifact\n")
+    manager = GitWorkspaceManager(tmp_path / "state", AtomicArtifactStore(tmp_path / "artifacts"))
+
+    patch = manager._diff(repository, "racy-check")
+
+    assert b"-teh example\n+the example\n" in patch
+    if include_new_file:
+        assert b"+new artifact\n" in patch
+    assert index.read_bytes() == original_index
+    assert index.stat().st_mtime_ns == original_timestamp
+    assert not (tmp_path / "state" / "index-racy-check").exists()
