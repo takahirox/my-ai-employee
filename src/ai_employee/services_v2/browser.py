@@ -28,6 +28,7 @@ from ai_employee.domain.v2 import (
     StableFailure,
     StableFailureCode,
 )
+from ai_employee.run_budget import check_wall_budget, remaining_timeout
 from ai_employee.serialization import versioned_digest
 
 from ._common import identifier, now
@@ -112,6 +113,7 @@ class _SyncPlaywrightEngine:
             self._playwright = self._sync_playwright().start()
             self._browser = self._playwright.chromium.launch(
                 headless=True,
+                timeout=remaining_timeout(30.0) * 1_000,
                 args=(
                     "--disable-background-networking",
                     "--disable-component-update",
@@ -146,6 +148,9 @@ class _SyncPlaywrightEngine:
         except Exception:
             self._close_all()
             raise PlaywrightUnavailableError(PLAYWRIGHT_UNAVAILABLE_MESSAGE) from None
+        except BaseException:
+            self._close_all()
+            raise
 
     def _route(self, route: Any, handler: RouteHandler) -> None:
         request = route.request
@@ -351,6 +356,7 @@ class PlaywrightBrowserEvaluationServices:
         return self._cancellation.cancelled()
 
     def open_browser(self, scenario: BrowserScenario, request: EvaluationRequest) -> str:
+        check_wall_budget()
         if self.cancelled():
             raise ValueError("browser evaluation was cancelled before launch")
         session_id = self.new_id("browser-session")
@@ -367,6 +373,7 @@ class PlaywrightBrowserEvaluationServices:
         try:
             origin = browser_origin(scenario.origin, origin_only=True)
             engine.open(lambda item: self._serve(origin, item))
+            self._check_active(session.started, scenario.timeout_seconds)
         except BaseException:
             self.teardown_browser(session_id)
             raise
@@ -404,6 +411,7 @@ class PlaywrightBrowserEvaluationServices:
                 )
                 actions_completed += 1
             payloads = self._capture_payloads(session, scenario)
+            self._check_active(session.started, scenario.timeout_seconds)
             artifacts = self._put_artifacts(
                 payloads,
                 observation_id,
@@ -411,6 +419,7 @@ class PlaywrightBrowserEvaluationServices:
                 scenario,
                 request,
             )
+            self._check_active(session.started, scenario.timeout_seconds)
         except _Cancelled:
             status = "cancelled"
             failure = StableFailure(
@@ -435,6 +444,10 @@ class PlaywrightBrowserEvaluationServices:
                 code=StableFailureCode.VERIFICATION_FAILED,
                 message="browser scenario failed",
             )
+
+        except BaseException:
+            self.teardown_browser(session_id)
+            raise
 
         final_url = self._safe_final_url(session.engine)
         duration = min(max(0.0, self._monotonic() - session.started), scenario.timeout_seconds)
@@ -509,6 +522,7 @@ class PlaywrightBrowserEvaluationServices:
         return PlaywrightRouteResponse(status=200, media_type=media_type, body=body)
 
     def _check_active(self, started: float, timeout_seconds: float) -> None:
+        check_wall_budget()
         if self.cancelled():
             raise _Cancelled
         if self._monotonic() - started >= timeout_seconds:
@@ -518,7 +532,7 @@ class PlaywrightBrowserEvaluationServices:
         remaining = timeout_seconds - (self._monotonic() - started)
         if remaining <= 0:
             raise TimeoutError("browser scenario timed out")
-        return remaining
+        return remaining_timeout(remaining)
 
     @staticmethod
     def _perform_action(

@@ -23,6 +23,7 @@ from ai_employee.domain.v2 import (
     StableFailure,
     StableFailureCode,
 )
+from ai_employee.run_budget import check_wall_budget, remaining_timeout
 
 from ._common import identifier, now
 
@@ -50,6 +51,16 @@ class _IntegrityError(Exception):
 
 class _DownloadCancelled(Exception):
     pass
+
+
+def _remaining(started: float, request: DownloadRequest, cancellation: Cancellation) -> float:
+    if cancellation.cancelled():
+        raise _DownloadCancelled("download cancelled")
+    check_wall_budget()
+    remaining = request.timeout_seconds - (time.monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError("download total timeout exceeded")
+    return remaining_timeout(remaining)
 
 
 class RestrictedDownloadClient:
@@ -99,18 +110,7 @@ class RestrictedDownloadClient:
         peers: list[str] = []
         try:
             for _hop in range(self.maximum_redirects + 1):
-                if cancellation.cancelled():
-                    return self._failed(
-                        request,
-                        started,
-                        StableFailure(
-                            code=StableFailureCode.CANCELLED,
-                            message="download cancelled",
-                        ),
-                        status="cancelled",
-                    )
-                if time.monotonic() - started >= request.timeout_seconds:
-                    raise TimeoutError("download total timeout exceeded")
+                _remaining(started, request, cancellation)
                 normalized, host, port = self._validate_url(current)
                 if normalized in visited:
                     raise ValueError("redirect loop detected")
@@ -121,40 +121,46 @@ class RestrictedDownloadClient:
                 for address in addresses:
                     self._validate_address(address)
                 peer = sorted(addresses)[0]
-                remaining = request.timeout_seconds - (time.monotonic() - started)
+                remaining = _remaining(started, request, cancellation)
                 response = self.transport(
                     normalized,
                     peer,
                     min(self.connect_timeout, remaining),
                     min(self.read_timeout, remaining),
                 )
-                self._validate_address(response.peer_ip)
-                if response.peer_ip != peer:
-                    raise ValueError("transport peer differs from the validated pinned address")
-                peers.append(peer)
-                headers = {key.lower(): value for key, value in response.headers.items()}
-                if response.status in {301, 302, 303, 307, 308}:
-                    location = headers.get("location")
-                    response.body.close()
-                    if not location:
-                        raise ValueError("redirect response is missing Location")
-                    redirects.append(normalized)
-                    current = urljoin(normalized, location)
-                    continue
-                if response.status < 200 or response.status >= 300:
-                    response.body.close()
-                    raise ValueError(f"download returned HTTP status {response.status}")
-                content_length = headers.get("content-length")
-                if content_length is not None:
-                    try:
-                        declared_length = int(content_length)
-                    except ValueError as error:
+                try:
+                    _remaining(started, request, cancellation)
+                    self._validate_address(response.peer_ip)
+                    if response.peer_ip != peer:
+                        raise ValueError("transport peer differs from the validated pinned address")
+                    peers.append(peer)
+                    headers = {key.lower(): value for key, value in response.headers.items()}
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = headers.get("location")
                         response.body.close()
-                        raise ValueError("invalid Content-Length") from error
-                    if declared_length < 0 or declared_length > maximum:
+                        if not location:
+                            raise ValueError("redirect response is missing Location")
+                        redirects.append(normalized)
+                        current = urljoin(normalized, location)
+                        continue
+                    if response.status < 200 or response.status >= 300:
                         response.body.close()
-                        raise ValueError("download exceeds byte limit")
-                content = self._read_bounded(response.body, maximum, cancellation, started, request)
+                        raise ValueError(f"download returned HTTP status {response.status}")
+                    content_length = headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            declared_length = int(content_length)
+                        except ValueError as error:
+                            response.body.close()
+                            raise ValueError("invalid Content-Length") from error
+                        if declared_length < 0 or declared_length > maximum:
+                            response.body.close()
+                            raise ValueError("download exceeds byte limit")
+                    content = self._read_bounded(
+                        response.body, maximum, cancellation, started, request
+                    )
+                finally:
+                    response.body.close()
                 actual = hashlib.sha256(content).hexdigest()
                 if request.expected_sha256 is not None and actual != request.expected_sha256:
                     raise _IntegrityError("download checksum mismatch")
@@ -188,6 +194,7 @@ class RestrictedDownloadClient:
                         redacted=bool(request.secret_bindings),
                     ),
                 )
+                _remaining(started, request, cancellation)
                 return DownloadResult(
                     id=identifier("download"),
                     run_id=request.run_id,
@@ -291,11 +298,9 @@ class RestrictedDownloadClient:
         output = bytearray()
         try:
             while True:
-                if cancellation.cancelled():
-                    raise _DownloadCancelled("download cancelled")
-                if time.monotonic() - started >= request.timeout_seconds:
-                    raise TimeoutError("download total timeout exceeded")
+                _remaining(started, request, cancellation)
                 chunk = body.read(min(64 * 1024, maximum - len(output) + 1))
+                _remaining(started, request, cancellation)
                 if not chunk:
                     return bytes(output)
                 output.extend(chunk)

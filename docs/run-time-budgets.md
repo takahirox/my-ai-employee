@@ -7,8 +7,11 @@ estimates do not independently grant more time or turn into additional stop rule
 The existing per-attempt watchdog and authorized retry limits remain in force.
 
 Each stage uses the remaining active time. Model preparation/review requests are
-bounded before policy resolution; LocalProcessExecutor also caps actual execution
-against the remaining deadline without changing an already bound request digest.
+bounded before policy resolution; local and isolated process execution, browser
+actions/captures and restricted download transport timeouts also use the remaining
+deadline without changing an already bound request digest. Late browser startup,
+capture, download transport and final EOF results are checked before acceptance;
+interruption closes their browser session or response body.
 The scheduler uses the same remaining time for dispatch and timeout recovery.
 Cancellation keeps precedence when cancellation and budget exhaustion coincide in
 an owned run. Otherwise the stable terminal code is `RUN_WALL_BUDGET_EXCEEDED`.
@@ -18,7 +21,10 @@ The CLI uses a monotonic clock. Embedded schedulers use a monotonic wall clock b
 default, with explicit clock injection supported for deterministic tests. Adapters
 must poll the cancellation token during blocking execution. As with per-attempt
 timeouts, an arbitrary noncooperative in-process plugin cannot be forcibly killed;
-its late completion does not become accepted evidence. Already returned, exactly
+its late completion does not become accepted evidence. The local process service
+cleans surviving descendants in its owned process group before returning even when
+the foreground leader exited normally and all capture pipes have closed. A mediated
+process does not grant an unmanaged background-job lifetime. Already returned, exactly
 bound worker results are retained for diagnostics when the overall deadline wins.
 
 ## Persistence and resume
@@ -45,7 +51,9 @@ from digest-bound execution-profile timings and execution-owner/closure records.
 It takes the larger observation instead of summing nested measurements, records
 the source digests, and imports only once. Unclosed legacy intervals are charged
 through the recovery observation. Profile records with stale bindings and
-ambiguous/orphan completion receipts are rejected.
+orphan completion receipts and conflicting normal completions are rejected.
+A normal completion overlapping crash recovery is charged once using the maximum
+observed duration; a late normal finalizer cannot discard previously observed time.
 
 ## Verification
 

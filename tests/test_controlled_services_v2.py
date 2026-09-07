@@ -959,3 +959,39 @@ def test_closed_output_pipes_do_not_end_process_supervision(tmp_path, cancel):
     )
     assert result.duration_seconds < 2.0
     assert executor.spawned.poll() is not None
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_returned_process_result_leaves_no_background_workspace_writer(tmp_path, exit_code):
+    import os
+    import signal
+    import time
+    from contextlib import suppress
+
+    class Executor(LocalProcessExecutor):
+        group = None
+
+        def _capture(self, process, *args, **kwargs):
+            self.group = process.pid
+            return super()._capture(process, *args, **kwargs)
+
+    executor = Executor((tmp_path,), AtomicArtifactStore(tmp_path / "artifacts"))
+    request = ProcessRequest(
+        id="background-writer",
+        run_id="run-1",
+        created_at=NOW,
+        argv=("/bin/sh", "-c", f"(exec >/dev/null 2>&1; sleep 0.3; touch late) & exit {exit_code}"),
+        timeout_seconds=1.0,
+        purpose="verify completed service owns descendant cleanup",
+    )
+    try:
+        result = executor.execute(request, allow(request.content_digest), NeverCancelled())
+        assert result.exit_code == exit_code
+        assert result.status == ("succeeded" if exit_code == 0 else "failed")
+        assert result.resource_usage["process_group_cleanup"] == "sigkill_confirmed"
+        time.sleep(0.5)
+        assert not (tmp_path / "late").exists()
+    finally:
+        if executor.group is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(executor.group, signal.SIGKILL)
