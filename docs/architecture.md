@@ -140,3 +140,8 @@ Accepted node process reservations are enforced at mediated dispatch, including
 commands, installation and required verification. Durable admissions prevent
 sequential calls or resumed execution from resetting the allowance; see
 [node process budgets](node-process-budgets.md).
+
+Adaptive worker routing reads repository-scoped, verified node outcomes from
+committed execution facts. It preserves mandatory eligibility checks and binds
+history provenance into each node route; see
+[adaptive routing history](adaptive-routing-history.md).

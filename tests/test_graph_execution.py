@@ -529,6 +529,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         )
 
     with SQLiteStore(database) as store:
+        store.claim_run_id("graph-e2e", repository)
 
         def allow_composition(edit: EditIntentRequest) -> PolicyDecision:
             return PolicyDecision(
@@ -654,6 +655,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             repository=str(repository),
             base_commit=head,
             max_concurrency=2,
+            operator_config_digest="0" * 64,
             generated_paths=harness.paths.generated,
             parent_evaluator=(None if parent_verification_succeeds is None else parent_evaluator),
         )
@@ -674,6 +676,30 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 run_id="graph-e2e",
                 available_capabilities=("edit_intent", "process"),
             )
+
+        from ai_employee.routing_history import load_verified_routing_history
+        from ai_employee.task_orchestration import NodeRouteRecord
+
+        store.claim_run_id("history-observer", repository)
+        observed_route = store.list_records("node_route_v2", NodeRouteRecord, run_id="graph-e2e")[0]
+        verified_history = load_verified_routing_history(
+            store,
+            run_id="history-observer",
+            strategies=(strategy,),
+            assessment=observed_route.assessment,
+            task_kind=goal.task_kind,
+            harness_digest=harness_digest,
+            effective_policy_digest=effective_policy_digest,
+            operator_config_digest="0" * 64,
+        )
+        if parent_ready:
+            assert verified_history.performances
+            assert all(
+                item.sample_count == item.success_count > 0
+                for item in verified_history.performances
+            )
+        else:
+            assert not verified_history.performances
 
         if stop_case == "budget-parent":
             assert run.status == "failed"
