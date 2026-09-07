@@ -85,6 +85,7 @@ from .routing import (
     profile_compatibility_bands,
     select_strategy,
 )
+from .run_budget import WallTimeExceeded, check_wall_budget, current_wall_budget, wall_budget_scope
 from .run_ownership import (
     OwnerFenceViolationRecord,
     RunExecutionOwnerRecord,
@@ -120,6 +121,9 @@ from .worker_supervision import (
     select_node_timeout,
     timeout_recovery_action,
 )
+
+_DEFAULT_UTC_CLOCK = now
+
 
 NodeExecutionStatus = Literal[
     "pending", "routed", "running", "passed", "failed", "blocked", "cancelled"
@@ -904,6 +908,7 @@ class TaskOrchestrator:
             TaskReviewSeverity.HIGH,
         ),
         clock: Callable[[], datetime] = now,
+        wall_clock: Callable[[], float] | None = None,
         owner_instance_id: Identifier | None = None,
         lease_duration_seconds: float = 15.0,
         heartbeat_interval_seconds: float = 5.0,
@@ -915,6 +920,9 @@ class TaskOrchestrator:
         self.store = store
         self.runner = runner
         self.clock = clock
+        self.wall_clock = wall_clock or (
+            monotonic if clock is _DEFAULT_UTC_CLOCK else lambda: self.clock().timestamp()
+        )
         if lease_duration_seconds <= 0:
             raise ValueError("run lease duration must be positive")
         if heartbeat_interval_seconds <= 0 or heartbeat_interval_seconds >= lease_duration_seconds:
@@ -1012,6 +1020,45 @@ class TaskOrchestrator:
         replan: bool = False,
         finalize_parent: Callable[[GraphRunRecord, Cancellation], GraphRunRecord] | None = None,
     ) -> GraphRunRecord:
+        candidate = (
+            proposed_graph.graph if isinstance(proposed_graph, ProposedGraph) else proposed_graph
+        )
+        with wall_budget_scope(
+            self.store,
+            run_id,
+            min(candidate.budget.max_wall_seconds, policy.max_wall_seconds),
+            clock=self.wall_clock,
+            utc_clock=self.clock,
+        ):
+            return self._run_owned(
+                goal,
+                proposed_graph,
+                policy,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                run_id=run_id,
+                available_capabilities=available_capabilities,
+                plan_only=plan_only,
+                resume=resume,
+                replan=replan,
+                finalize_parent=finalize_parent,
+            )
+
+    def _run_owned(
+        self,
+        goal: Goal,
+        proposed_graph: Graph | ProposedGraph,
+        policy: ExecutionPolicy,
+        *,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+        run_id: Identifier,
+        available_capabilities: Iterable[str],
+        plan_only: bool = False,
+        resume: bool = False,
+        replan: bool = False,
+        finalize_parent: Callable[[GraphRunRecord, Cancellation], GraphRunRecord] | None = None,
+    ) -> GraphRunRecord:
         """Execute with bounded signal/error terminalization once ownership is acquired."""
 
         self._run_owner = None
@@ -1047,10 +1094,48 @@ class TaskOrchestrator:
                     with bind_stage_cancellation(cancellation):
                         result = finalize_parent(result, cancellation)
                     cancellation.check()
+                    check_wall_budget()
                     if result.status not in _OWNED_TERMINAL_GRAPH_STATES:
                         raise ValueError("parent finalization must return a terminal graph state")
                     self._save_run(result)
                 return result
+        except WallTimeExceeded:
+            if self._run_owner is None:
+                raise
+            self._propagate_owner_interruption(self._run_owner)
+            current = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            latest: dict[str, NodeExecutionRecord] = {}
+            for record in self.store.list_records(
+                "node_execution_v2", NodeExecutionRecord, run_id=run_id
+            ):
+                previous = latest.get(record.node_id)
+                if previous is None or (record.generation, record.attempt, record.sequence) > (
+                    previous.generation,
+                    previous.attempt,
+                    previous.sequence,
+                ):
+                    latest[record.node_id] = record
+            for record in latest.values():
+                incomplete_review = (
+                    record.status == "passed"
+                    and self.independent_task_review
+                    and not self._task_review_pass_is_authoritative(record)
+                )
+                if (
+                    record.status in {"pending", "routed", "running", "blocked"}
+                    or incomplete_review
+                ):
+                    self._advance(record, status="failed", failure_code="RUN_WALL_BUDGET_EXCEEDED")
+            cancelled = self.store.control(run_id) == "cancel"
+            result = current.model_copy(
+                update={
+                    "status": "cancelled" if cancelled else "failed",
+                    "generation": current.generation + int(cancelled),
+                    "failure_code": "GRAPH_CANCELLED" if cancelled else "RUN_WALL_BUDGET_EXCEEDED",
+                }
+            )
+            self._save_run(result)
+            return result
         except _StageStopped as stopped:
             current = self.store.get("graph_run_v2", run_id, GraphRunRecord)
             cancelled = stopped.action == "cancel"
@@ -1670,6 +1755,29 @@ class TaskOrchestrator:
         ) as pool:
             while active or any(item.status == "pending" for item in records.values()):
                 self._heartbeat_run_owner_if_due()
+                budget = current_wall_budget()
+                if (
+                    budget is not None
+                    and budget.remaining_seconds <= 0
+                    and self.store.control(run_id) != "cancel"
+                ):
+                    if self._run_owner is not None:
+                        self._propagate_owner_interruption(self._run_owner)
+                    for completed_future, active_item in active.items():
+                        if not completed_future.done() or completed_future.cancelled():
+                            continue
+                        _, _, expired_request, *_rest = active_item
+                        try:
+                            late_result = completed_future.result().worker_result
+                        except Exception:
+                            continue
+                        if (
+                            late_result.run_id == expired_request.run_id
+                            and late_result.request_digest == expired_request.content_digest
+                        ):
+                            # Retain returned diagnostics without accepting completion evidence.
+                            self.store.put("worker_result_v2", late_result, run_id=run_id)
+                    budget.check()
                 if stop_action is None:
                     observed = self.store.control(run_id)
                     if observed == "pause" or observed == "cancel":
@@ -1839,8 +1947,11 @@ class TaskOrchestrator:
                         0.0,
                         (ensure_utc(self.clock()) - run_started_at).total_seconds(),
                     )
-                    remaining_wall_seconds = max(
-                        0.0, graph_run.max_wall_seconds - elapsed_run_seconds
+                    active_budget = current_wall_budget()
+                    remaining_wall_seconds = (
+                        max(0.0, graph_run.max_wall_seconds - elapsed_run_seconds)
+                        if active_budget is None
+                        else active_budget.remaining_seconds
                     )
                     timeout_profile = select_node_timeout(
                         id=identifier("worker-timeout-profile"),
@@ -2356,18 +2467,25 @@ class TaskOrchestrator:
                                     else f"{timeout_code}:CLEANUP_UNCONFIRMED"
                                 ),
                             )
+                            active_budget = current_wall_budget()
                             recovery_context = TimeoutRecoveryContext(
                                 source="scheduler" if scheduler_timeout else "adapter",
                                 worker_request_digest=_required_digest(request.content_digest),
                                 worker_result_digest=_required_digest(worker_result.content_digest),
                                 cleanup_confirmed=cleanup_confirmed,
-                                remaining_run_seconds=max(
-                                    0.0,
-                                    graph_run.max_wall_seconds
-                                    - max(
+                                remaining_run_seconds=(
+                                    active_budget.remaining_seconds
+                                    if active_budget is not None
+                                    else max(
                                         0.0,
-                                        (ensure_utc(self.clock()) - run_started_at).total_seconds(),
-                                    ),
+                                        graph_run.max_wall_seconds
+                                        - max(
+                                            0.0,
+                                            (
+                                                ensure_utc(self.clock()) - run_started_at
+                                            ).total_seconds(),
+                                        ),
+                                    )
                                 ),
                                 minimum_retry_seconds=timeout_profiles[
                                     future
@@ -4149,6 +4267,7 @@ class TaskOrchestrator:
         try:
             review_result = self.task_reviewer.review(review_request)
             _OwnedStageCancellation(self, graph_run.id, honor_pause=False).check()
+            check_wall_budget()
             validate_task_review_result(review_request, review_result)
             self.store.put("task_review_result_v2", review_result, run_id=graph_run.id)
             decision = decide_task_review(
@@ -5187,6 +5306,8 @@ class TaskOrchestrator:
                 )
 
     def _save_run(self, run: GraphRunRecord) -> None:
+        if run.status in {"planned", "completed", "ready_to_promote"}:
+            check_wall_budget()
         owner = self._run_owner
         if owner is None:
             self.store.put("graph_run_v2", run, run_id=run.id, revision=run.generation + 1)

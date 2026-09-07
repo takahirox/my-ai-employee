@@ -238,7 +238,8 @@ def test_scheduler_watchdog_terminalizes_an_overdue_node_attempt(
     monkeypatch.setattr(task_orchestration, "wait", wait_with_completion_after_snapshot)
 
     with SQLiteStore(tmp_path / "watchdog.db") as store:
-        run = TaskOrchestrator(store, slow_runner, (_strategy(),)).run(
+        # Isolate the per-attempt watchdog from the separately tested shared wall clock.
+        run = TaskOrchestrator(store, slow_runner, (_strategy(),), wall_clock=lambda: 0.0).run(
             goal,
             graph,
             ExecutionPolicy(max_nodes=1, max_attempts=1, max_wall_seconds=1.0),

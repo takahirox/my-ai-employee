@@ -50,6 +50,7 @@ from .promotion_approval import (
     PromotionPolicyDecision,
     validate_exact_parent_evidence_store,
 )
+from .run_budget import check_wall_budget, wall_budget_scope
 from .serialization import canonical_json
 from .services_v2 import DigestApprovalService
 from .services_v2._common import identifier, now
@@ -253,6 +254,39 @@ class GraphExecutionService:
         resume: bool = False,
         replan: bool = False,
     ) -> GraphRunRecord:
+        candidate = (
+            proposed_graph.graph if isinstance(proposed_graph, ProposedGraph) else proposed_graph
+        )
+        with wall_budget_scope(
+            self.store, run_id, min(candidate.budget.max_wall_seconds, policy.max_wall_seconds)
+        ):
+            return self._run_impl(
+                goal,
+                proposed_graph,
+                policy,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                run_id=run_id,
+                available_capabilities=available_capabilities,
+                plan_only=plan_only,
+                resume=resume,
+                replan=replan,
+            )
+
+    def _run_impl(
+        self,
+        goal: Goal,
+        proposed_graph: Graph | ProposedGraph,
+        policy: ExecutionPolicy,
+        *,
+        harness_digest: Digest,
+        effective_policy_digest: Digest,
+        run_id: Identifier,
+        available_capabilities: Iterable[str],
+        plan_only: bool = False,
+        resume: bool = False,
+        replan: bool = False,
+    ) -> GraphRunRecord:
         capabilities = tuple(available_capabilities)
         session = _ExecutionSession(self.coordinator_factory, self.repository, self.base_commit)
         orchestrator = self._orchestrator(session.run_node)
@@ -360,6 +394,7 @@ class GraphExecutionService:
         composition = self.composer.compose(composition_request, cancellation)
         if cancellation.cancelled():
             return graph_run
+        check_wall_budget()
         if composition.status != "succeeded" or composition.candidate_patch is None:
             return self._update_run(
                 graph_run,
@@ -396,6 +431,7 @@ class GraphExecutionService:
             )
         if cancellation.cancelled():
             return graph_run
+        check_wall_budget()
         evaluation_fields = {
             **candidate_fields,
             "parent_evaluation_id": evaluation.id,
