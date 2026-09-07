@@ -150,18 +150,57 @@ def proposed_graph_schema_json(
             max_wall_seconds
         )
     if max_nodes is not None or max_wall_seconds is not None:
-        node = schema["$defs"]["Node"]["properties"]
-        for name, value in {
-            "retry_limit": 0,
-            "max_iterations": 1,
-            "attempt": 0,
-            "generation": 0,
-        }.items():
-            node[name] = {"type": "integer", "const": value}
         for name in ("max_retries", "max_replans"):
             budget[name] = {"type": "integer", "const": 0}
+        _compact_initial_graph_schema(schema)
     _strict_schema(schema)
     return canonical_json(schema).encode()
+
+
+def _compact_initial_graph_schema(schema: dict[str, object]) -> None:
+    """Ask for planning decisions, leaving initial record metadata to model defaults."""
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)
+    omitted = {
+        "Graph": ("graph_schema_version",),
+        "Node": (
+            "retry_limit",
+            "max_iterations",
+            "configuration",
+            "state",
+            "generation",
+            "graph_revision",
+            "attempt",
+            "transitions",
+            "failure",
+        ),
+        "Edge": ("condition", "loop", "max_traversals"),
+        "OutputContract": ("contract_version",),
+    }
+    for name, definition in [("", schema), *definitions.items()]:
+        properties = definition.get("properties", {})
+        for field in ("schema_version", *omitted.get(name, ())):
+            properties.pop(field, None)
+    # Removed record metadata can leave large transition/failure definitions unreachable.
+    reachable: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            reference = value.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                name = reference.removeprefix("#/$defs/")
+                if name not in reachable:
+                    reachable.add(name)
+                    visit(definitions[name])
+            for key, child in value.items():
+                if key != "$defs":
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(schema)
+    schema["$defs"] = {name: value for name, value in definitions.items() if name in reachable}
 
 
 def _canonicalize_graph_payload(
@@ -340,6 +379,10 @@ class CliProposedGraphPlanner:
                     "multi-node graph keep composition-only checks at parent scope. For editing "
                     "nodes, bind completion evidence to the workspace_patch artifact and use only "
                     "the exact Goal verification IDs; do not invent command IDs. "
+                    "Initial schema versions, execution state and generation fences come from "
+                    "runtime defaults; do not emit fields absent from the output schema. "
+                    "Keep objectives and criterion descriptions concise while preserving every "
+                    "requirement and explicitly allowed execution alternative. "
                     "Return only the supplied strict JSON schema. "
                     + SIMPLICITY_GUIDANCE
                     + "Justify DAG nodes and edges by real dependencies, useful parallelism, "
