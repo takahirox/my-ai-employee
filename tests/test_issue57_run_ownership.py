@@ -457,3 +457,114 @@ time.sleep(30)
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("outcome", ["success", "expired", "superseded"])
+def test_node_assessment_polls_owner_lease_and_fences_late_results(
+    tmp_path: Path, outcome: str
+) -> None:
+    from ai_employee.domain import SemanticTaskProfile
+    from ai_employee.domain.v2 import DecisionOutcome, ExecutionResult, PolicyDecision
+    from ai_employee.serialization import canonical_json
+    from ai_employee.task_orchestration import NodeSemanticAssessmentRecord, RunOwnershipLost
+    from ai_employee.worker_adapters import CliTaskAssessmentAdapter
+
+    clock = [NOW]
+    strategy = ExecutionStrategy(
+        id="assessment-owner",
+        routing_mode=RoutingMode.ADAPTIVE,
+        backend="codex_cli",
+        model="fixture",
+        effort="high",
+    )
+    profile = SemanticTaskProfile.model_validate_json(
+        '{"task_type":"implementation","reasoning_class":"simple",'
+        '"scope":"local","ambiguity":"low","reasons":["fixture"]}'
+    )
+    run = _run()
+    graph = one_node_graph(run.goal, graph_id="assessment-graph", node_id="assessment-node")
+    with SQLiteStore(tmp_path / "assessment-owner.db") as store:
+        store.put("graph_run_v2", run, run_id=run.id)
+
+        class PollingExecutor:
+            def execute(self, request, _decision, cancellation):
+                # The assessment outlives the initial 15-second lease, with no real sleep.
+                for _ in range(8):
+                    clock[0] += timedelta(seconds=5)
+                    assert cancellation.cancelled() is False
+                if outcome != "success":
+                    clock[0] += timedelta(seconds=16)
+                    if outcome == "superseded":
+                        replacement = _owner(
+                            run, owner_id="replacement", attempt=1, acquired_at=clock[0]
+                        )
+                        assert store.acquire_run_owner(replacement) is None
+                        cancellation.cancelled()  # stale heartbeat must fail before result parsing
+                return ExecutionResult(
+                    id="assessment-result",
+                    run_id=request.run_id,
+                    created_at=clock[0],
+                    request_digest=request.content_digest,
+                    status="succeeded",
+                    exit_code=0,
+                    duration_seconds=40.0,
+                    stdout_artifact_digest="9" * 64,
+                )
+
+        assessor = CliTaskAssessmentAdapter(
+            PollingExecutor(),
+            lambda _digest: canonical_json(profile).encode(),
+            lambda request: PolicyDecision(
+                id="assessment-policy",
+                run_id=request.run_id,
+                created_at=clock[0],
+                request_digest=request.content_digest,
+                effective_policy_digest="2" * 64,
+                outcome=DecisionOutcome.ALLOW,
+                reason_code="fixture",
+            ),
+            run_id=run.id,
+            strategy=strategy,
+            executable="unused",
+            cwd=".",
+            prompt_writer=lambda _body: "8" * 64,
+            output_schema_path="unused-schema.json",
+        )
+        orchestrator = TaskOrchestrator(
+            store,
+            lambda *_args: pytest.fail("no worker should run"),
+            (strategy,),
+            node_assessor=assessor,
+            clock=lambda: clock[0],
+            lease_duration_seconds=15.0,
+            heartbeat_interval_seconds=5.0,
+        )
+        orchestrator._acquire_run_owner(run)
+
+        def assess():
+            orchestrator._prepare_node_assessments(
+                run.id,
+                {node.id: node for node in graph.nodes},
+                {"assessment-node": ()},
+                ZERO,
+                "2" * 64,
+                "1" * 64,
+                invoke=True,
+            )
+
+        if outcome == "success":
+            assess()
+        else:
+            with pytest.raises(RunOwnershipLost):
+                assess()
+        records = store.list_records(
+            "node_semantic_assessment_v2", NodeSemanticAssessmentRecord, run_id=run.id
+        )
+        assert len(records) == (1 if outcome == "success" else 0)
+        heartbeats = store.list_records(
+            "run_lease_heartbeat_v2", RunLeaseHeartbeatRecord, run_id=run.id
+        )
+        assert len(heartbeats) == 8
+        if outcome == "success":
+            orchestrator._assert_run_owner("write")
+            assert records[0].semantic_profile == profile
