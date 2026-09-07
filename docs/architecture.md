@@ -150,6 +150,13 @@ committed execution facts. It preserves mandatory eligibility checks and binds
 history provenance into each node route; see
 [adaptive routing history](adaptive-routing-history.md).
 
+Within one semantic classifier instance, an identical prompt and execution/policy
+scope may reuse the last successfully validated categorical profile. This avoids
+classifying an unchanged one-node objective twice. Fresh policy correlation,
+denial, owner polling and wall-budget checks still run, and each node retains its
+own deterministic risk/capability facts and persisted assessment. Classifier
+failures, worker outputs and cross-invocation state are not cached.
+
 ### Writing-node artifact reservations
 
 Accepted writing nodes charge unique artifact content bytes against their explicit
