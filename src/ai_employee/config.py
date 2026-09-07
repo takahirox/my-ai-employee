@@ -253,7 +253,7 @@ def default_operator_routing_config() -> OperatorRoutingConfig:
                 model="gpt-5.6-luna",
                 effort="max",
                 capabilities=("edit_intent", "process"),
-                planner_eligible=True,
+                planner_eligible=False,
                 min_complexity=1,
                 max_complexity=3,
                 min_scale=1,

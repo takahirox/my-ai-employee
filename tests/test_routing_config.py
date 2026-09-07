@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -39,7 +41,7 @@ def test_config_without_routing_uses_builtin_codex_balanced_default() -> None:
     assert strategies[0].max_complexity == 3
     assert strategies[0].max_scale == 3
     assert strategies[0].max_risk == 0
-    assert config.planner_strategies(RoutingMode.ADAPTIVE) == strategies
+    assert config.planner_strategies(RoutingMode.ADAPTIVE) == (strategies[1],)
 
     claude = config.execution_strategies(RoutingMode.ADAPTIVE, "claude-only")
     assert tuple((strategy.id, strategy.model, strategy.effort) for strategy in claude) == (
@@ -311,3 +313,43 @@ def test_strategy_config_rejects_invalid_bounds(bounds: dict[str, int]) -> None:
             },
             strict=True,
         )
+
+
+def test_builtin_codex_roles_keep_luna_workers_and_use_sol_for_planning() -> None:
+    config = OperatorConfig()
+    assessment = merge_semantic_profile(
+        assess_task(
+            "Apply one explicit text transformation",
+            run_id="role-selection",
+            required_capabilities=("edit_intent", "process"),
+        ),
+        SemanticTaskProfile(
+            task_type=SemanticTaskType.MECHANICAL,
+            reasoning_class=SemanticReasoningClass.MECHANICAL,
+            scope=SemanticScope.BOUNDED,
+            ambiguity=SemanticAmbiguity.LOW,
+            reasons=("one explicit transformation",),
+        ),
+    )
+    workers = config.execution_strategies(RoutingMode.ADAPTIVE)
+    planners = config.planner_strategies(RoutingMode.ADAPTIVE)
+    kwargs = dict(
+        mode=RoutingMode.ADAPTIVE,
+        assessment=assessment,
+        allowed_strategy_ids=tuple(item.id for item in workers),
+        allowed_backends=("codex_cli",),
+    )
+    assert select_strategy(workers, **kwargs).id == "codex-luna-max"
+    assert select_strategy(planners, **kwargs).id == "codex-sol-high"
+
+
+def test_operator_can_explicitly_admit_luna_to_planning() -> None:
+    payload = OperatorConfig().model_dump(mode="json")
+    for strategy in payload["routing"]["strategies"]:
+        if strategy["id"] == "codex-luna-max":
+            strategy["planner_eligible"] = True
+    config = OperatorConfig.model_validate_json(json.dumps(payload))
+    assert tuple(item.id for item in config.planner_strategies(RoutingMode.ADAPTIVE)) == (
+        "codex-luna-max",
+        "codex-sol-high",
+    )

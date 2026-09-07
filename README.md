@@ -186,6 +186,12 @@ Planner boundary, required capabilities, risk, and compatibility bounds before s
 complete candidate and eligible sets, profile, assessor, selected Planner and routing reasons are
 digest-bound to the ProposedGraph and persisted GraphRun. `--planner-strategy` retains exact fixed
 Planner selection while enforcing the same eligibility constraints.
+The built-in `codex-balanced` set assigns planning (and its plan review) to
+`gpt-5.6-sol`/`high`. `gpt-5.6-luna`/`max` remains eligible for bounded low-risk
+workers. This role split prioritizes completing planning within short execution
+budgets; it does not imply lower monetary cost. An explicit operator configuration
+can re-enable Luna planning with `planner_eligible: true`; existing explicit
+strategy configurations retain their chosen eligibility.
 Adaptive planner routing fields are persisted as non-authoritative hints. After graph
 acceptance, each node that will use adaptive routing receives an independent tool-disabled
 semantic assessment from the configured assessment strategy. Fleet binds that assessment to
