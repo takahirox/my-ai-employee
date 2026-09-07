@@ -55,6 +55,7 @@ from ai_employee.task_planning import (
     CliProposedGraphPlanner,
     ProposedGraph,
     ProposedGraphPayload,
+    _canonicalize_graph_payload,
     proposed_graph_schema_json,
 )
 
@@ -863,3 +864,52 @@ def test_compact_initial_graph_restores_the_same_defaults_and_evidence_contract(
     assert "StateTransition" not in schema["$defs"]
     assert "Failure" not in schema["$defs"]
     assert len(json.dumps(wire)) < len(full.model_dump_json())
+
+
+@pytest.mark.parametrize(
+    "objective", [None, "Build a reusable framework and require its source as the result"]
+)
+def test_single_node_inherits_exact_goal_without_dropping_criteria_or_budgets(objective) -> None:
+    goal = Goal(
+        id="goal-fidelity",
+        statement=(
+            "Produce the requested report. You may compute it directly OR use a script. "
+            "Preserve input files."
+        ),
+    )
+    _, proposal = _capture_planner_prompt(goal)
+    node = proposal.graph.nodes[0].model_copy(update={"objective": objective})
+    graph = proposal.graph.model_copy(update={"nodes": (node,)})
+    actual = _canonicalize_graph_payload(
+        ProposedGraphPayload(goal_id=goal.id, graph=graph),
+        goal=goal,
+        available_capabilities=("process",),
+    )
+    assert actual.nodes[0].objective == goal.statement
+    assert actual.nodes[0].completion_criteria == node.completion_criteria
+    assert actual.nodes[0].resource_budget == node.resource_budget
+    assert actual.nodes[0].output_contract == node.output_contract
+    assert actual.budget == graph.budget
+    assert actual.nodes[0].semantic_profile == node.semantic_profile
+    assert graph.nodes[0].objective == objective
+
+
+def test_multi_node_planning_keeps_each_decomposed_objective() -> None:
+    goal = Goal(id="decomposed-goal", statement="Analyze two independent modules")
+    _, proposal = _capture_planner_prompt(goal)
+    a = proposal.graph.nodes[0].model_copy(update={"id": "a", "objective": "Analyze module a"})
+    b = a.model_copy(update={"id": "b", "objective": "Analyze module b"})
+    graph = proposal.graph.model_copy(
+        update={
+            "nodes": (a, b),
+            "entry_node_ids": ("a", "b"),
+            "terminal_node_ids": ("a", "b"),
+            "budget": proposal.graph.budget.model_copy(update={"max_nodes": 2, "max_attempts": 2}),
+        }
+    )
+    actual = _canonicalize_graph_payload(
+        ProposedGraphPayload(goal_id=goal.id, graph=graph),
+        goal=goal,
+        available_capabilities=("process",),
+    )
+    assert actual == graph

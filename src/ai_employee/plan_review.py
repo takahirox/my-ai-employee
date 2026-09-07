@@ -192,6 +192,10 @@ PLAN_REVIEW_RUBRIC = {
         SIMPLICITY_REVIEW_GUIDANCE,
         "Report only findings grounded in the supplied Goal and ProposedGraph.",
         "Treat justified breadth explicitly required by the Goal as necessary scope.",
+        "Preserve the requested deliverable type and explicitly permitted alternatives. "
+        "Do not turn producing a result into an extra requirement to deliver a reusable "
+        "implementation unless the Goal requires it. Supporting code can be a valid method "
+        "without becoming a mandatory deliverable.",
         "Minimality cannot remove correctness, safety, compatibility, required error "
         "handling, or verification.",
         "Use blocking only when the graph must change before acceptance; otherwise use advisory.",

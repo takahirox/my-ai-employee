@@ -83,3 +83,10 @@ generation, transitions, failure, and unsupported edge control flow). Domain def
 restore those values before normal graph acceptance. Goals, capabilities, completion
 criteria, verification IDs, resource budgets, independent assessments and reviews retain
 the same validation and authority. Unbounded graph serialization is unchanged.
+
+A one-node proposal inherits the exact original Goal statement as its objective before
+review and acceptance. Its criteria, budgets and output contract remain unchanged. The
+planner may emit a null objective for this case, avoiding a redundant paraphrase that can
+change the requested deliverable or lose allowed alternatives. Multi-node objectives
+continue to describe the assigned subgoals. Plan review also checks for extra deliverable
+requirements; supporting code is a method unless the Goal requires it as an output.
