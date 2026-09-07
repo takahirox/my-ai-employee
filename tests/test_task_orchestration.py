@@ -318,7 +318,7 @@ def test_mutating_compatibility_graph_reserves_one_bounded_repair() -> None:
 
     node = graph.nodes[0]
     assert node.resource_budget.processes == 3
-    assert node.resource_budget.wall_seconds == 6.0
+    assert node.resource_budget.wall_seconds == 12.0
     assert graph.budget.max_attempts == 2
     assert graph.budget.max_repairs == 1
     assert graph.budget.max_loop_iterations == 2

@@ -648,7 +648,14 @@ def test_replan_limits_and_aggregate_budgets_do_not_reset(tmp_path: Path) -> Non
         assert final_remaining["node_attempts"] == 0
         assert final_remaining["worker_turns"] == 0
         assert final_remaining["processes"] == 0
-        assert final_remaining["wall_seconds"] == 0.0
+        # Wall time is the same durable deadline across revisions, not the sum
+        # of per-attempt ceilings. Exhausting other resources grants no new time.
+        assert (
+            0
+            < final_remaining["wall_seconds"]
+            <= replay.reservations[0].remaining_budgets["wall_seconds"]
+            < 3.0
+        )
         assert final_remaining["artifact_bytes"] == 0
         by_node = {item.node_id: item for item in replay.nodes}
         assert by_node["join"].failure_code == "DUPLICATE_OR_BUDGETED_CLAIM"

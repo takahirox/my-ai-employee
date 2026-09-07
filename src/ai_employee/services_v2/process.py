@@ -60,6 +60,8 @@ class LocalProcessExecutor:
         maximum_processes: int = 1,
         terminate_grace_seconds: float = 1.0,
         stdout_storage_filter: Callable[[ProcessRequest, bytes], bytes] | None = None,
+        stdout_observer_factory: Callable[[ProcessRequest], Callable[[bytes, float], None]]
+        | None = None,
     ) -> None:
         if maximum_processes < 1:
             raise ValueError("maximum_processes must be positive")
@@ -71,6 +73,7 @@ class LocalProcessExecutor:
         self.stdin_resolver = stdin_resolver
         self.terminate_grace_seconds = terminate_grace_seconds
         self.stdout_storage_filter = stdout_storage_filter
+        self.stdout_observer_factory = stdout_observer_factory
         self._slots = threading.BoundedSemaphore(maximum_processes)
         self._output_descriptors: dict[tuple[str, str, str], ArtifactDescriptor] = {}
 
@@ -267,6 +270,11 @@ class LocalProcessExecutor:
         stdout_observed = stderr_observed = 0
         cleanup = "not_required"
         try:
+            observer = (
+                self.stdout_observer_factory(request)
+                if self.stdout_observer_factory is not None
+                else None
+            )
             while selector.get_map() or process.poll() is None:
                 elapsed = time.monotonic() - started
                 cancelled = cancelled or cancellation.cancelled()
@@ -284,6 +292,8 @@ class LocalProcessExecutor:
                     available = max(0, limit - len(buffer))
                     buffer.extend(chunk[:available])
                     if key.fileobj is process.stdout:
+                        if observer is not None:
+                            observer(chunk[:available], time.monotonic() - started)
                         stdout_observed += len(chunk)
                         stdout_exceeded = stdout_exceeded or len(chunk) > available
                     else:

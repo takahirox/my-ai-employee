@@ -59,6 +59,7 @@ from .graph_evaluation import (
 from .incident_runtime import INCIDENT_RUN_RECORD_KIND, IncidentRunRecord
 from .inspector_ui import INDEX as _INDEX
 from .jobs import JobGraphRunRecord, JobRecord
+from .model_progress import ModelProgressRecord
 from .model_usage import inspect_usage
 from .parent_review import (
     ParentSemanticRepairRequest,
@@ -751,6 +752,10 @@ def inspect_graph_run(
         "worker_budget_preflights": [_json_model(item) for item in timeout_preflights],
         "worker_attempt_heartbeats": [_json_model(item) for item in attempt_heartbeats],
         "timeout_recoveries": [_json_model(item) for item in timeout_recoveries],
+        "model_progress": [
+            _json_model(item)
+            for item in store.list_records("model_progress_v2", ModelProgressRecord, run_id=run_id)
+        ],
         "node_watchdogs": [_json_model(item) for item in watchdogs],
         "node_control_propagations": [_json_model(item) for item in control_propagations],
         "child_worker_outcomes": child_worker_outcomes,

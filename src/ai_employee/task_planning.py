@@ -211,19 +211,16 @@ def _canonicalize_graph_payload(
         totals = {
             "worker_turns": sum(node.resource_budget.worker_turns for node in graph.nodes),
             "processes": sum(node.resource_budget.processes for node in graph.nodes),
-            "wall_seconds": sum(node.resource_budget.wall_seconds for node in graph.nodes),
             "artifact_bytes": sum(node.resource_budget.artifact_bytes for node in graph.nodes),
         }
         repair = {
             "worker_turns": max(node.resource_budget.worker_turns for node in writing_nodes),
             "processes": max(node.resource_budget.processes for node in writing_nodes),
-            "wall_seconds": max(node.resource_budget.wall_seconds for node in writing_nodes),
             "artifact_bytes": max(node.resource_budget.artifact_bytes for node in writing_nodes),
         }
         limits = {
             "worker_turns": budget.max_worker_turns,
             "processes": budget.max_processes,
-            "wall_seconds": budget.max_wall_seconds,
             "artifact_bytes": budget.max_artifact_bytes,
         }
         missing = tuple(
@@ -235,6 +232,10 @@ def _canonicalize_graph_payload(
             raise ValueError(
                 "mutating ProposedGraph resource budget omits repair reserve: " + ", ".join(missing)
             )
+    if any(
+        node.resource_budget.wall_seconds > graph.budget.max_wall_seconds for node in graph.nodes
+    ):
+        raise ValueError("node timeout exceeds the shared graph wall deadline")
     return graph
 
 
@@ -317,14 +318,17 @@ class CliProposedGraphPlanner:
                     "acceptance; do not select an execution strategy. "
                     "For a mutating graph set max_repairs to 1, max_loop_iterations to 2, and "
                     "max_attempts to at least the node count plus one. Its aggregate worker-turn, "
-                    "process, wall-time, and artifact budgets must cover the initial sum plus one "
+                    "process, and artifact budgets must cover the initial sum plus one "
                     "largest writing-node reservation for repair, without exceeding the supplied "
                     "bounds. The supplied bounds are hard limits and take precedence over the "
                     "Goal's default budget. Node wall_seconds is a hard execution timeout, not "
-                    "an estimate of task difficulty. Allocate the available wall-time envelope "
-                    "across initial nodes and the required repair reserve; do not choose a tiny "
-                    "timeout merely because the task appears simple. For one writing node, "
-                    "at most half of max_wall_seconds is available per initial/repair attempt. "
+                    "an estimate of task difficulty. Wall time is a shared run deadline, including "
+                    "planning, assessments, execution, verification, and repairs. It is not an "
+                    "additive reservation per attempt. Use the full max_wall_seconds as the "
+                    "node ceiling unless the goal explicitly requests a shorter timeout. The "
+                    "runtime clips every attempt to the actual remaining time and keeps time "
+                    "for finalization. A repair uses only the time left after the first attempt; "
+                    "never assume a second full duration will remain. "
                     "For a non-mutating graph do not invent edit_intent or patch evidence. "
                     "Edges mean required dependencies only: do "
                     "not emit "

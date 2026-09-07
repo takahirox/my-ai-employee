@@ -802,7 +802,7 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
         "type": "string",
         "enum": ["edit_intent"],
     }
-    assert edit_proposal["properties"]["payload"]["properties"]["unified_diff"] == {
+    assert edit_proposal["properties"]["payload"]["anyOf"][0]["properties"]["unified_diff"] == {
         "type": "string"
     }
     assert edit_proposal["properties"]["expected_artifact_kinds"]["items"] == {

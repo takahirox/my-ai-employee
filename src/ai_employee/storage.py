@@ -1198,9 +1198,19 @@ class SQLiteStore:
         artifact_bytes: int,
         limits: dict[str, int | float],
         record_factory: Callable[[dict[str, int | float]], BaseModel],
+        shared_wall_seconds: float | None = None,
     ) -> BaseModel | None:
         """Atomically claim one attempt, reserve all resources, and record the snapshot."""
 
+        if shared_wall_seconds is not None:
+            import math
+
+            if (
+                not math.isfinite(shared_wall_seconds)
+                or shared_wall_seconds < 0
+                or shared_wall_seconds > float(limits["wall_seconds"])
+            ):
+                raise ValueError("invalid shared wall remainder")
         self.migrate_v2()
         requested = {
             "worker_turns": worker_turns,
@@ -1229,9 +1239,11 @@ class SQLiteStore:
             if (
                 duplicate is not None
                 or int(row["claims"]) >= max_claims
+                or (shared_wall_seconds is not None and shared_wall_seconds <= 0)
                 or any(
                     float(row[name]) + float(value) > float(limits[name])
                     for name, value in requested.items()
+                    if name != "wall_seconds" or shared_wall_seconds is None
                 )
             ):
                 connection.rollback()
@@ -1260,6 +1272,10 @@ class SQLiteStore:
             }
             for name, value in requested.items():
                 remaining[name] = limits[name] - float(row[name]) - float(value)
+                if name == "wall_seconds" and shared_wall_seconds is not None:
+                    # Diagnostic snapshot only. The scheduler re-reads its durable
+                    # run deadline before every admission; this is not new time.
+                    remaining[name] = shared_wall_seconds
                 if name != "wall_seconds":
                     remaining[name] = int(remaining[name])
             record = record_factory(remaining)

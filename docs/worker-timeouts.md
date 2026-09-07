@@ -4,7 +4,16 @@ An accepted node wall-time reservation is a hard limit. The supervisor also reco
 an operator profile's recommended duration and progress observations; neither a
 recommendation nor silence alone authorizes early cancellation. The effective
 attempt deadline remains the minimum of the accepted node, adapter, execution
-policy, and remaining run allowances.
+policy, and remaining run allowances, with a small finalization reserve (default
+2 seconds, capped at 5% of the actual remainder).
+
+Wall time is a shared, durable deadline covering planning, assessments, workers,
+verification, and repair. New plans do not reserve two full wall durations for an
+initial attempt and a possible repair. Their node ceilings may use the full run
+limit; each admission is clipped to time actually left. A repair can use only that
+remainder. Explicit smaller accepted node ceilings remain binding. Worker turns,
+processes, artifacts, attempts, and retry counters retain their cumulative reservations.
+Pause/resume and recovery retain previously consumed active wall time.
 
 ## A timeout can recover within existing authority
 
@@ -41,6 +50,14 @@ Returned worker results, including any stdout/stderr artifact references, are ke
 for diagnosis. Late proposals, patches, and completion claims do not become accepted
 evidence. A retry starts a new bounded attempt; saved output is not a resumable
 checkpoint and external side effects are not assumed to be reversible.
+
+Configured local Codex invocations also persist `model_progress_v2` while stdout
+arrives. Inspector exposes `model_progress`, containing event kinds, observation
+times, elapsed/item durations, and numeric exit status. Commands, arguments, tool
+output, reasoning text, provider item IDs, and provider timestamps are excluded.
+At most 128 records per invocation retain a prefix and the latest observation.
+These are diagnostics, never completion or routing evidence. A hard host kill can
+still leave an unmatched start; absence of an event does not prove inactivity.
 
 ## Scope and tradeoffs
 

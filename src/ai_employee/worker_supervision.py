@@ -100,6 +100,7 @@ class WorkerSupervisionPolicy(BaseModel):
     heartbeat_interval_seconds: float = Field(default=30.0, gt=0)
     no_progress_threshold_seconds: float = Field(default=300.0, gt=0)
     max_heartbeat_records: int = Field(default=240, ge=2, le=10_000)
+    finalization_reserve_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _valid_policy(self) -> Self:

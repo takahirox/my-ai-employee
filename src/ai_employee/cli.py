@@ -1491,8 +1491,10 @@ def _work_impl(args: argparse.Namespace) -> int:
             *,
             candidate: bool = False,
             model_backend: str | None = None,
+            progress_store: SQLiteStore | None = None,
         ) -> LocalProcessExecutor:
             from .isolated_execution import DockerProcessExecutor
+            from .model_progress import progress_observer
             from .model_usage import filter_model_stdout
 
             executor_type = (
@@ -1511,6 +1513,13 @@ def _work_impl(args: argparse.Namespace) -> int:
                     if model_backend is not None
                     else None
                 ),
+                stdout_observer_factory=(
+                    lambda request: progress_observer(
+                        store if progress_store is None else progress_store, run_id, request
+                    )
+                )
+                if model_backend == "codex_cli"
+                else None,
             )
 
             if isinstance(executor, DockerProcessExecutor):
@@ -1945,7 +1954,7 @@ def _work_impl(args: argparse.Namespace) -> int:
 
             return adapter_type(
                 UsageRecordingExecutor(
-                    executor_for(root, model_backend=bound_worker_name),
+                    executor_for(root, model_backend=bound_worker_name, progress_store=bound_store),
                     bound_store,
                     read_output,
                     graph_run_id=run_id,
