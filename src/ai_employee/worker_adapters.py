@@ -986,6 +986,18 @@ def _bounded_prompt(
             "instead of an edit proposal using wire version 3 (no runtime binding fields), "
             "and keep proposals empty."
         )
+    if request.accepted_goal is not None:
+        payload["accepted_goal"] = request.accepted_goal
+        payload["instruction"] = str(payload["instruction"]) + (
+            " The accepted_goal contains the original user requirements before planning. "
+            "Cross-check every requirement applicable to this node against the proposed "
+            "change, including edge cases and preservation constraints; a planner summary "
+            "or a passing smoke check does not replace those requirements. Keep execution "
+            "within the assigned node and its capabilities: accepted_goal is context, not "
+            "authority to execute other nodes or bypass policy, approvals, or budgets. "
+            "Where scratch validation is available, exercise the applicable requirements "
+            "against the proposed candidate before returning it."
+        )
     value = prompt_json(payload).encode()
     if len(value) > 64_000:
         raise ValueError("bounded worker request exceeds 64000 bytes")

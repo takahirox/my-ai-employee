@@ -333,7 +333,9 @@ def test_planner_prompt_defaults_to_minimal_sufficient_and_preserves_explicit_br
     assert local_prompt["goal"] == local_goal.model_dump(mode="json")
     assert broad_prompt["goal"] == broad_goal.model_dump(mode="json")
     assert local_prompt["response_schema"] == broad_prompt["response_schema"]
-    assert local_prompt["response_schema"] == json.loads(proposed_graph_schema_json())
+    assert local_prompt["response_schema"] == json.loads(
+        proposed_graph_schema_json(max_nodes=1, max_wall_seconds=30.0)
+    )
     assert isinstance(instruction, str)
     assert instruction == broad_prompt["instruction"]
     assert "minimal_sufficient is the default" in instruction
@@ -802,3 +804,31 @@ def test_sigterm_during_planning_persists_interrupted_job_history(
     assert outcome.status == "interrupted"
     assert overview["active"] == []
     assert overview["history"][0]["overall_status"] == "interrupted"
+
+
+@pytest.mark.parametrize("seconds", [0.0, -1.0, float("nan"), float("inf")])
+def test_planner_schema_rejects_invalid_time_envelopes(seconds: float) -> None:
+    with pytest.raises(ValueError, match="planning time bound"):
+        proposed_graph_schema_json(max_nodes=1, max_wall_seconds=seconds)
+
+
+def test_planner_output_schema_carries_execution_bounds_without_mutating_default() -> None:
+    default = proposed_graph_schema_json()
+    bounded = json.loads(proposed_graph_schema_json(max_nodes=3, max_wall_seconds=180.0))
+    budget = bounded["$defs"]["Budget"]["properties"]
+    assert budget["max_wall_seconds"]["maximum"] == 180.0
+    assert budget["max_wall_seconds"]["default"] <= 180.0
+    assert budget["max_attempts"]["maximum"] == 6
+    assert budget["max_nodes"]["maximum"] == 3
+    assert bounded["$defs"]["Graph"]["properties"]["nodes"]["maxItems"] == 3
+    assert proposed_graph_schema_json() == default
+
+
+def test_bounded_planner_schema_forbids_unsupported_initial_execution_fences() -> None:
+    schema = json.loads(proposed_graph_schema_json(max_nodes=16, max_wall_seconds=180.0))
+    node = schema["$defs"]["Node"]["properties"]
+    assert node["retry_limit"]["const"] == 0
+    assert node["max_iterations"]["const"] == 1
+    assert node["attempt"]["const"] == node["generation"]["const"] == 0
+    budget = schema["$defs"]["Budget"]["properties"]
+    assert budget["max_retries"]["const"] == budget["max_replans"]["const"] == 0

@@ -1901,6 +1901,7 @@ class TaskOrchestrator:
                         run_id=_node_worker_run_id(run_id, node),
                         created_at=now(),
                         goal=repair_goal_by_node.get(node_id, node.objective or node.name),
+                        accepted_goal=graph_run.goal.statement,
                         task_kind=graph_run.goal.task_kind,
                         processes_authorized=graph_run.goal.processes_authorized,
                         completion_criteria=node.completion_criteria,

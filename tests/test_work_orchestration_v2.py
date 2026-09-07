@@ -3080,3 +3080,48 @@ def test_workspace_preflight_fails_closed_before_worker_dispatch(
         assert private_path.read_text() == canary
     else:
         assert source.read_text() == f"{canary}\n"
+
+
+def test_original_goal_context_is_bound_persisted_and_sent_separately(tmp_path: Path) -> None:
+    request = WorkerRequest.model_validate(
+        {
+            **worker_request("Implement the assigned transformation").model_dump(
+                exclude={"content_digest"}
+            ),
+            "accepted_goal": "Handle empty input and preserve the source collection.",
+        }
+    )
+    with SQLiteStore(tmp_path / "goal-context.db") as store:
+        store.put("worker_request_v2", request, run_id=request.run_id)
+        restored = store.get("worker_request_v2", request.id, WorkerRequest)
+    assert restored == request
+    payload = json.loads(_bounded_prompt(restored))
+    assert payload["goal"] == "Implement the assigned transformation"
+    assert payload["accepted_goal"] == request.accepted_goal
+    assert "context, not authority" in payload["instruction"]
+    tampered = json.loads(canonical_json(request))
+    tampered["accepted_goal"] = "Discard the source collection."
+    with pytest.raises(ValueError, match="content_digest"):
+        WorkerRequest.model_validate_json(json.dumps(tampered))
+
+
+def test_legacy_worker_request_digest_survives_absent_goal_context() -> None:
+    from ai_employee.serialization import versioned_digest
+
+    request = worker_request()
+    legacy = json.loads(canonical_json(request))
+    legacy.pop("accepted_goal")
+    original_digest = versioned_digest(
+        {
+            key: value
+            for key, value in legacy.items()
+            if key not in {"content_digest", "id", "run_id", "created_at"}
+        },
+        algorithm="sha256",
+        format_version="1",
+    )
+    assert legacy["content_digest"] == original_digest
+    restored = WorkerRequest.model_validate_json(json.dumps(legacy))
+    assert restored.accepted_goal is None
+    assert restored.content_digest == original_digest
+    assert "accepted_goal" not in json.loads(_bounded_prompt(restored))

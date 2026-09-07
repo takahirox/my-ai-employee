@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Self
@@ -124,8 +125,40 @@ def _strict_schema(value: object) -> None:
             _strict_schema(child)
 
 
-def proposed_graph_schema_json() -> bytes:
+def proposed_graph_schema_json(
+    *, max_nodes: int | None = None, max_wall_seconds: float | None = None
+) -> bytes:
+    """Constrain model output to the same envelope enforced at graph acceptance."""
     schema = ProposedGraphPayload.model_json_schema()
+    budget = schema["$defs"]["Budget"]["properties"]
+    if max_nodes is not None:
+        if max_nodes < 1:
+            raise ValueError("planning node bound must be positive")
+        budget["max_nodes"]["maximum"] = max_nodes
+        budget["max_nodes"]["default"] = min(budget["max_nodes"]["default"], max_nodes)
+        budget["max_attempts"]["maximum"] = max_nodes * 2
+        schema["$defs"]["Graph"]["properties"]["nodes"]["maxItems"] = max_nodes
+    if max_wall_seconds is not None:
+        if not math.isfinite(max_wall_seconds) or max_wall_seconds <= 0:
+            raise ValueError("planning time bound must be finite and positive")
+        budget["max_wall_seconds"]["maximum"] = max_wall_seconds
+        budget["max_wall_seconds"]["default"] = min(
+            budget["max_wall_seconds"]["default"], max_wall_seconds
+        )
+        schema["$defs"]["NodeResourceBudget"]["properties"]["wall_seconds"]["maximum"] = (
+            max_wall_seconds
+        )
+    if max_nodes is not None or max_wall_seconds is not None:
+        node = schema["$defs"]["Node"]["properties"]
+        for name, value in {
+            "retry_limit": 0,
+            "max_iterations": 1,
+            "attempt": 0,
+            "generation": 0,
+        }.items():
+            node[name] = {"type": "integer", "const": value}
+        for name in ("max_retries", "max_replans"):
+            budget[name] = {"type": "integer", "const": 0}
     _strict_schema(schema)
     return canonical_json(schema).encode()
 
@@ -254,6 +287,9 @@ class CliProposedGraphPlanner:
         max_wall_seconds: float,
     ) -> ProposedGraph:
         allowed = tuple(dict.fromkeys(available_capabilities))
+        response_schema = proposed_graph_schema_json(
+            max_nodes=max_nodes, max_wall_seconds=max_wall_seconds
+        )
         prompt = prompt_json(
             {
                 "protocol": "fleet-proposed-graph/2",
@@ -282,7 +318,13 @@ class CliProposedGraphPlanner:
                     "max_attempts to at least the node count plus one. Its aggregate worker-turn, "
                     "process, wall-time, and artifact budgets must cover the initial sum plus one "
                     "largest writing-node reservation for repair, without exceeding the supplied "
-                    "bounds. For a non-mutating graph do not invent edit_intent or patch evidence. "
+                    "bounds. The supplied bounds are hard limits and take precedence over the "
+                    "Goal's default budget. Node wall_seconds is a hard execution timeout, not "
+                    "an estimate of task difficulty. Allocate the available wall-time envelope "
+                    "across initial nodes and the required repair reserve; do not choose a tiny "
+                    "timeout merely because the task appears simple. For one writing node, "
+                    "at most half of max_wall_seconds is available per initial/repair attempt. "
+                    "For a non-mutating graph do not invent edit_intent or patch evidence. "
                     "Edges mean required dependencies only: do "
                     "not emit "
                     "conditions, loops, retries, re-planning, or generalized control flow. "
@@ -310,7 +352,7 @@ class CliProposedGraphPlanner:
                     "max_repairs": 1,
                     "max_loop_iterations": 2,
                 },
-                "response_schema": json.loads(proposed_graph_schema_json()),
+                "response_schema": json.loads(response_schema),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
@@ -318,7 +360,7 @@ class CliProposedGraphPlanner:
             id=identifier("graph-planner-process"),
             run_id=self.run_id,
             created_at=now(),
-            argv=self._argv(),
+            argv=self._argv(schema_json=response_schema),
             cwd=self.cwd,
             inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
@@ -399,6 +441,9 @@ class CliProposedGraphPlanner:
             raise PlanReviewValidationError(issues)
 
         allowed = tuple(dict.fromkeys(available_capabilities))
+        response_schema = proposed_graph_schema_json(
+            max_nodes=max_nodes, max_wall_seconds=max_wall_seconds
+        )
         prompt = prompt_json(
             {
                 "protocol": "fleet-proposed-graph-revision/2",
@@ -429,7 +474,7 @@ class CliProposedGraphPlanner:
                     "max_repairs": 1,
                     "max_loop_iterations": 2,
                 },
-                "response_schema": json.loads(proposed_graph_schema_json()),
+                "response_schema": json.loads(response_schema),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
@@ -437,7 +482,7 @@ class CliProposedGraphPlanner:
             id=identifier("graph-planner-revision-process"),
             run_id=self.run_id,
             created_at=now(),
-            argv=self._argv(),
+            argv=self._argv(schema_json=response_schema),
             cwd=self.cwd,
             inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
@@ -504,8 +549,8 @@ class CliProposedGraphPlanner:
             replan_evidence=original.replan_evidence,
         )
 
-    def _argv(self) -> tuple[str, ...]:
-        schema = proposed_graph_schema_json().decode()
+    def _argv(self, *, schema_json: bytes | None = None) -> tuple[str, ...]:
+        schema = (schema_json or proposed_graph_schema_json()).decode()
         if self.strategy.backend == "codex_cli":
             assert self.output_schema_path is not None
             return (

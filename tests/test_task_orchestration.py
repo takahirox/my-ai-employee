@@ -818,6 +818,7 @@ def test_explicit_breadth_objective_propagates_to_worker_request(tmp_path: Path)
     assert run.status == "completed"
     assert len(requests) == 1
     assert requests[0].goal == objective
+    assert requests[0].accepted_goal == goal.statement
     assert requests[0].accepted_plan_digest == run.accepted_graph_revision_digest
     assert "scope_mode" not in requests[0].model_dump()
 
