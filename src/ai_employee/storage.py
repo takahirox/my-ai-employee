@@ -322,6 +322,69 @@ class SQLiteStore:
             )
         return cursor.rowcount == 1
 
+    def claim_node_process(
+        self,
+        admission: BaseModel,
+        legacy: BaseModel,
+    ) -> bool:
+        """Atomically consume a node admission before dispatch; never refund on a crash."""
+        from .process_budget import NodeProcessAdmission
+
+        if not isinstance(admission, NodeProcessAdmission) or not isinstance(
+            legacy, NodeProcessAdmission
+        ):
+            raise TypeError("node process claims require bound admission records")
+        if (
+            admission.phase == "legacy"
+            or legacy.phase != "legacy"
+            or legacy.node_run_id != admission.node_run_id
+            or legacy.worker_request_digest != admission.worker_request_digest
+        ):
+            raise ValueError("process claim and legacy seed must share one accepted node")
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT payload FROM records WHERE kind='node_process_admission_v2' AND run_id=?",
+                (admission.run_id,),
+            ).fetchall()
+            previous = [
+                NodeProcessAdmission.model_validate_json(row["payload"], strict=True)
+                for row in rows
+            ]
+            if not previous:
+                previous = [legacy]
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                    "VALUES('node_process_admission_v2',?,?,1,?)",
+                    (legacy.id, legacy.run_id, canonical_json(legacy)),
+                )
+            if any(
+                item.node_run_id != admission.node_run_id
+                or item.worker_request_digest != admission.worker_request_digest
+                for item in previous
+            ):
+                raise ValueError("node process accounting has stale request bindings")
+            limit = min(item.process_limit for item in (*previous, admission))
+            native = max(item.native_reservation for item in (*previous, admission))
+            verification = max(item.verification_reservation for item in (*previous, admission))
+            consumed = sum(item.units for item in previous)
+            optional = sum(item.units for item in previous if item.phase != "verification")
+            allowed = consumed < limit - native and (
+                admission.phase == "verification" or optional < limit - native - verification
+            )
+            if allowed:
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                    "VALUES('node_process_admission_v2',?,?,1,?)",
+                    (admission.id, admission.run_id, canonical_json(admission)),
+                )
+            connection.commit()
+            return allowed
+        except BaseException:
+            connection.rollback()
+            raise
+
     def append_record(self, kind: str, model: BaseModel, *, run_id: str | None = None) -> int:
         """Append a new immutable revision without replacing historical payloads."""
 

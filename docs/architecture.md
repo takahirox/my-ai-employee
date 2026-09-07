@@ -135,3 +135,8 @@ classification, node attempts, task review, composition, parent verification and
 bounded parent repair share its remaining time. Nested stages may tighten the
 accepted limit, but cannot replenish it. See [run-time-budgets.md](run-time-budgets.md)
 for persistence, pause/resume, legacy migration and crash accounting.
+
+Accepted node process reservations are enforced at mediated dispatch, including
+commands, installation and required verification. Durable admissions prevent
+sequential calls or resumed execution from resetting the allowance; see
+[node process budgets](node-process-budgets.md).

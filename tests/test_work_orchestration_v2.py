@@ -36,6 +36,7 @@ from ai_employee.domain.v2 import (
     DecisionOutcome,
     EditIntentRequest,
     ExecutionResult,
+    InstallRequest,
     InstallResult,
     NodeVerificationBinding,
     NonMutatingResult,
@@ -2684,7 +2685,7 @@ def test_node_verification_workspace_mutation_fails_with_exact_bounded_evidence(
         accepted_graph_revision_digest=ZERO,
         harness_digest=ZERO,
         effective_policy_digest=canonical_digest([policy.content_digest]),
-        remaining_budgets={"worker_turns": 1},
+        remaining_budgets={"worker_turns": 1, "processes": 1},
         completion_criteria=completion_criteria,
     )
     with SQLiteStore(tmp_path / "mutation.db") as store:
@@ -3125,3 +3126,186 @@ def test_legacy_worker_request_digest_survives_absent_goal_context() -> None:
     assert restored.accepted_goal is None
     assert restored.content_digest == original_digest
     assert "accepted_goal" not in json.loads(_bounded_prompt(restored))
+
+
+@pytest.mark.parametrize(
+    ("limit", "native", "pause", "expected_calls", "exhausted"),
+    [
+        (1, 0, False, 0, True),
+        (2, 0, False, 1, True),
+        (4, 0, False, 4, False),
+        (4, 2, False, 1, True),
+        (2, 0, True, 1, True),
+        (4, 0, True, 4, False),
+    ],
+)
+@pytest.mark.parametrize("install", [False, True])
+def test_accepted_process_allowance_is_cumulative_and_survives_resume(
+    tmp_path: Path,
+    limit: int,
+    native: int,
+    pause: bool,
+    expected_calls: int,
+    exhausted: bool,
+    install: bool,
+) -> None:
+    from ai_employee.process_budget import NodeProcessAdmission
+
+    run_id = "process-budget-node"
+    policy = builtin_policy(run_id).model_copy(
+        update={
+            "allowed_capabilities": ("edit_intent", "process", "install"),
+            "install_ecosystems": ("node_project",),
+            "content_digest": None,
+        }
+    )
+    patch = b"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
+    workspace = FakeWorkspace(patch)
+    calls: list[str] = []
+    db = tmp_path / "process-budget.db"
+    verification = ProcessRequest(
+        id="verify", run_id=run_id, created_at=NOW, argv=("verify",), purpose="required check"
+    )
+    criteria = (
+        CompletionCriterion(
+            id="checked",
+            description="candidate passes",
+            verification_requirement_ids=("test",),
+            required_artifact_ids=("workspace_patch",),
+        ),
+    )
+    request = WorkerRequest(
+        id="accepted",
+        run_id=run_id,
+        created_at=NOW,
+        goal="change a",
+        node_id="node",
+        graph_run_id="graph",
+        accepted_graph_revision_digest=ZERO,
+        accepted_plan_digest=ZERO,
+        harness_digest=ZERO,
+        effective_policy_digest=canonical_digest([policy.content_digest]),
+        remaining_budgets={"worker_turns": 1, "processes": limit},
+        completion_criteria=criteria,
+    )
+    proposals = tuple(
+        ActionProposal(
+            id=f"proposal-{i}",
+            run_id=run_id,
+            created_at=NOW,
+            worker_id="scripted",
+            kind=ActionKind.PROCESS,
+            reason="bounded process",
+            payload=ProcessRequest(
+                id=f"command-{i}",
+                run_id=run_id,
+                created_at=NOW,
+                argv=("command", str(i)),
+                purpose="bounded action",
+                timeout_seconds=1.0,
+                stdout_bytes=32,
+                stderr_bytes=32,
+            ),
+        )
+        for i in range(3)
+    )
+
+    if install:
+        proposals = tuple(
+            ActionProposal(
+                id=f"install-proposal-{i}",
+                run_id=run_id,
+                created_at=NOW,
+                worker_id="scripted",
+                kind=ActionKind.INSTALL,
+                reason="bounded installation",
+                payload=InstallRequest(
+                    id=f"install-{i}",
+                    run_id=run_id,
+                    created_at=NOW,
+                    ecosystem="node_project",
+                    operation="existing_lock",
+                    manifest_path=f"package-{i}.json",
+                    lock_path="package-lock.json",
+                    manifest_digest=ZERO,
+                    lock_digest=ZERO,
+                    manager_executable="bin/npm",
+                    manager_version="1",
+                    argv=("ci", "--ignore-scripts"),
+                    target="node_modules",
+                ),
+            )
+            for i in range(3)
+        )
+
+    def coordinator(store: SQLiteStore) -> WorkCoordinator:
+        class Executor(SuccessfulExecutor):
+            def execute(
+                self, req: ProcessRequest, decision: PolicyDecision, cancel: object
+            ) -> ExecutionResult:
+                calls.append(req.id)
+                if pause and len(calls) == 1:
+                    store.request_control(run_id, "pause")
+                return super().execute(req, decision, cancel)
+
+        class Installer:
+            def install(
+                self, req: InstallRequest, _decision: PolicyDecision, _cancel: object
+            ) -> InstallResult:
+                calls.append(req.id)
+                if pause and len(calls) == 1:
+                    store.request_control(run_id, "pause")
+                return InstallResult(
+                    id="result-" + req.id,
+                    run_id=req.run_id,
+                    created_at=NOW,
+                    request_digest=req.content_digest or ZERO,
+                    status="succeeded",
+                    duration_seconds=0.01,
+                )
+
+        return WorkCoordinator(
+            store,
+            DeterministicRuntime({}, store=store),
+            workspace,  # type: ignore[arg-type]
+            lambda *_: ScriptedWorkerAdapter([WorkerProposalEnvelope(proposals=proposals)]),
+            lambda _: Executor(),
+            lambda _: patch,
+            (policy,),
+            installer_factory=lambda _: Installer(),
+            native_process_reservation=native,
+            verification_requests=(verification,),
+            verification_bindings=(
+                NodeVerificationBinding(
+                    id="binding",
+                    run_id=run_id,
+                    created_at=NOW,
+                    requirement_id="test",
+                    process_request_id=verification.id,
+                    process_request_digest=verification.content_digest or ZERO,
+                ),
+            ),
+            allowed_processes=(verification.argv, *(("command", str(i)) for i in range(3))),
+            request_promotion_approval=False,
+        )
+
+    with SQLiteStore(db) as store:
+        result = coordinator(store).execute_node(
+            request, criteria, str(tmp_path), "a" * 40, worker_name="scripted"
+        )
+        if pause:
+            assert result.status == "paused", result.failure_code
+    if pause:
+        with SQLiteStore(db) as store:
+            store.clear_control(run_id)
+            result = coordinator(store).resume(run_id)
+    assert len(calls) == expected_calls, result.failure_code
+    assert (result.failure_code == "NODE_PROCESS_BUDGET_EXCEEDED") is exhausted
+    if not exhausted:
+        assert result.status == "ready_to_promote"
+    with SQLiteStore(db) as store:
+        receipts = store.list_records(
+            "node_process_admission_v2", NodeProcessAdmission, run_id=run_id
+        )
+        assert sum(item.units for item in receipts) == expected_calls
+        assert all(item.worker_request_digest == request.content_digest for item in receipts)
