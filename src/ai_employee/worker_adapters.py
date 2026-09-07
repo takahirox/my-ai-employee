@@ -42,7 +42,12 @@ from .worker_attribution import attribute_read_only_payload, model_read_only_sch
 
 
 class _NeverCancelled:
+    def __init__(self, on_poll: Callable[[], None] | None = None) -> None:
+        self.on_poll = on_poll
+
     def cancelled(self) -> bool:
+        if self.on_poll is not None:
+            self.on_poll()
         return False
 
 
@@ -582,6 +587,8 @@ class CliTaskAssessmentAdapter:
         self,
         goal: str,
         deterministic: TaskAssessment,
+        *,
+        on_poll: Callable[[], None] | None = None,
     ) -> SemanticTaskProfile:
         prompt = prompt_json(
             {
@@ -623,7 +630,7 @@ class CliTaskAssessmentAdapter:
             raise ValueError("assessment policy decision uses another effective policy")
         if decision.outcome is not DecisionOutcome.ALLOW:
             raise ValueError(f"assessment policy did not allow execution: {decision.outcome.value}")
-        result = self.executor.execute(request, decision, _NeverCancelled())
+        result = self.executor.execute(request, decision, _NeverCancelled(on_poll))
         if result.run_id != request.run_id or result.request_digest != request.content_digest:
             raise ValueError("assessment result is bound to another request")
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
@@ -640,6 +647,16 @@ class CliTaskAssessmentAdapter:
         except ValueError as error:
             raise ValueError(f"invalid semantic task assessment: {error}") from error
         return assessment
+
+    def assess_supervised(
+        self,
+        goal: str,
+        deterministic: TaskAssessment,
+        *,
+        on_poll: Callable[[], None],
+    ) -> SemanticTaskProfile:
+        """Keep the caller's lease alive through the bounded process polling loop."""
+        return self.assess(goal, deterministic, on_poll=on_poll)
 
     def _argv(self) -> tuple[str, ...]:
         schema = semantic_assessment_schema_json().decode()

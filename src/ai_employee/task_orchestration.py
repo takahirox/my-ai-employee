@@ -11,7 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from datetime import datetime, timedelta
 from time import monotonic
-from typing import Any, ClassVar, Literal, Protocol, Self, cast
+from typing import Any, ClassVar, Literal, Protocol, Self, cast, runtime_checkable
 
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.main import BaseModel
@@ -672,6 +672,17 @@ class NodeAssessor(Protocol):
         self,
         goal: str,
         deterministic: TaskAssessment,
+    ) -> SemanticTaskProfile: ...
+
+
+@runtime_checkable
+class SupervisedNodeAssessor(NodeAssessor, Protocol):
+    def assess_supervised(
+        self,
+        goal: str,
+        deterministic: TaskAssessment,
+        *,
+        on_poll: Callable[[], None],
     ) -> SemanticTaskProfile: ...
 
 
@@ -3580,7 +3591,17 @@ class TaskOrchestrator:
             if existing:
                 raise ValueError("semantic node assessment is duplicated or stale")
             assert self.node_assessor is not None
-            profile = self.node_assessor.assess(node.objective or node.name, deterministic)
+            self._heartbeat_run_owner_if_due()
+            if isinstance(self.node_assessor, SupervisedNodeAssessor):
+                profile = self.node_assessor.assess_supervised(
+                    node.objective or node.name,
+                    deterministic,
+                    on_poll=self._heartbeat_run_owner_if_due,
+                )
+            else:
+                profile = self.node_assessor.assess(node.objective or node.name, deterministic)
+            # A late or superseded assessment must never become an authoritative fact.
+            self._assert_run_owner("write")
             assessment = merge_semantic_profile(deterministic, profile)
             record = NodeSemanticAssessmentRecord(
                 id=identifier("node-semantic-assessment"),
