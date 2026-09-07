@@ -19,3 +19,8 @@ duplicates, traversal, NUL/CR content, and oversized inputs are rejected. Existi
 files still require an ordinary edit diff; new-file proposals cannot overwrite
 them. Every compiled change retains the normal policy, path, evidence, and promotion
 checks. Full benchmark success must be measured separately from model-free tests.
+
+The connection emits an empty `pocket.usage` status event with a `complete` flag
+from persisted model invocation records. An interrupted invocation leaves usage
+incomplete even when the controller returns normally for grading. Numeric subtotals
+continue to come exclusively from native usage records; the status event adds none.

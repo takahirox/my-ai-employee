@@ -116,10 +116,12 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
             }
         )
     )
+    usage_complete = False
     if emitted.get("run_id"):
         with SQLiteStore(home / ".fleet/fleet.db") as store:
+            usage = inspect_usage(store, [emitted["run_id"]])
             details = {
-                "usage": inspect_usage(store, [emitted["run_id"]]),
+                "usage": usage,
                 "profile": inspect_profile(store, emitted["run_id"]),
                 "progress": [
                     record.model_dump(mode="json")
@@ -129,6 +131,17 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
                 ],
             }
         (logs / "fleet-diagnostics.json").write_text(json.dumps(details, indent=2))
+        invocations = usage["invocation_details"]
+        usage_complete = (
+            isinstance(invocations, list)
+            and bool(invocations)
+            and all(
+                isinstance(invocation, dict) and invocation.get("complete") is True
+                for invocation in invocations
+            )
+        )
+    # Numeric records come from the native transport; this event adds no tokens.
+    print(json.dumps({"type": "pocket.usage", "usage": {}, "complete": usage_complete}))
     if result.returncode == 0 and emitted.get("status") == "ready_to_promote":
         patch = execute(["fleet", "diff", emitted["run_id"]], cwd=root, deadline=deadline)
         # Export the captured parent candidate into this disposable task only.
