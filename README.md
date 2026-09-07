@@ -345,6 +345,7 @@ approval. Host-global installation remains denied.
 - [Security, permissions, sandboxing, and secrets](docs/security.md)
 - [Opt-in public operational incident reporting runbook](docs/incident-reporting.md) for the
   approval, privacy, deduplication, token, and failure boundaries of GitHub Issue publishing
+- [Worker deadlines and bounded timeout recovery](docs/worker-timeouts.md)
 - [Development and release checks](docs/development.md)
 - [v0.2/v0.3 roadmap](docs/roadmap.md)
 - [Normative v0.2 specification](docs/v0.2-spec.md)
