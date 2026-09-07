@@ -182,21 +182,17 @@ def _import_legacy_usage(
         limit_seconds=limit,
         legacy_sources=tuple(sorted(sources)),
     )
-    store.put_once("run_wall_start_v2", start, run_id=run_id)
-    store.put_once(
-        "run_wall_finish_v2",
-        RunWallFinish(
-            id=invocation_id + "-finish",
-            run_id=run_id,
-            created_at=observed_at,
-            graph_run_id=run_id,
-            start_digest=start.content_digest or "",
-            limit_seconds=limit,
-            active_seconds=max(profile_seconds, owner_seconds),
-            recovered_interval=True,
-        ),
+    finish = RunWallFinish(
+        id=invocation_id + "-finish",
         run_id=run_id,
+        created_at=observed_at,
+        graph_run_id=run_id,
+        start_digest=start.content_digest or "",
+        limit_seconds=limit,
+        active_seconds=max(profile_seconds, owner_seconds),
+        recovered_interval=True,
     )
+    store.put_legacy_wall_import(start, finish)
 
 
 @contextmanager
@@ -253,6 +249,8 @@ def wall_budget_scope(
         limit = min(limit, record.limit_seconds)
         completed = by_start.pop(record.content_digest or "", None)
         if completed is None:
+            if record.legacy_sources:
+                raise ValueError("legacy wall-time import is incomplete")
             # An unclosed interval is charged until recovery, never reset. Once
             # recovered its duration is frozen, so a later pause does not accrue it again.
             elapsed = max(0.0, (observed_at - record.started_at).total_seconds())

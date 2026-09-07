@@ -454,3 +454,96 @@ def test_isolated_verification_receives_shared_deadline_and_rejects_late_success
             assert result.request_digest == request.content_digest
     assert observations == {"seconds": 1.0, "cancelled": expire, "cleaned": True}
     assert request.timeout_seconds == 20.0
+
+
+def test_competing_legacy_imports_publish_one_matching_pair(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from ai_employee.run_budget import _import_legacy_usage
+    from tests.test_issue57_run_ownership import _owner, _run
+
+    database = tmp_path / "legacy-import-race.db"
+    owner = _owner(_run("run"))
+    with SQLiteStore(database) as store:
+        assert store.acquire_run_owner(owner) is None
+    barrier = Barrier(2)
+    admissions = []
+
+    class RacingStore(SQLiteStore):
+        def put_legacy_wall_import(self, start, finish):
+            barrier.wait(5)
+            inserted = super().put_legacy_wall_import(start, finish)
+            admissions.append(inserted)
+            return inserted
+
+    def import_usage(seconds):
+        with RacingStore(database) as store:
+            _import_legacy_usage(
+                store, "run", 200.0, owner.acquired_at + timedelta(seconds=seconds)
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(import_usage, (101, 102)))
+    assert sorted(admissions) == [False, True]
+    with SQLiteStore(database) as store:
+        starts = store.list_records("run_wall_start_v2", RunWallStart, run_id="run")
+        finishes = store.list_records("run_wall_finish_v2", RunWallFinish, run_id="run")
+        assert len(starts) == len(finishes) == 1
+        assert finishes[0].start_digest == starts[0].content_digest
+        assert finishes[0].active_seconds in (101.0, 102.0)
+        with wall_budget_scope(store, "run", 500.0, clock=lambda: 0.0) as budget:
+            assert budget.limit == 200.0
+            assert budget.remaining_seconds == 200.0 - finishes[0].active_seconds
+
+
+def test_legacy_import_transaction_cannot_leave_a_half_pair(tmp_path):
+    import sqlite3
+
+    from ai_employee.run_budget import _import_legacy_usage
+    from tests.test_issue57_run_ownership import _owner, _run
+
+    with SQLiteStore(tmp_path / "legacy-import-rollback.db") as store:
+        owner = _owner(_run("run"))
+        assert store.acquire_run_owner(owner) is None
+        with store.transaction() as connection:
+            connection.execute(
+                "CREATE TRIGGER fixture_abort_finish BEFORE INSERT ON records "
+                "WHEN NEW.kind='run_wall_finish_v2' BEGIN SELECT RAISE(ABORT, 'fixture'); END"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="fixture"):
+            _import_legacy_usage(store, "run", 200.0, owner.acquired_at + timedelta(seconds=101))
+        assert not store.list_records("run_wall_start_v2", RunWallStart, run_id="run")
+        assert not store.list_records("run_wall_finish_v2", RunWallFinish, run_id="run")
+        with store.transaction() as connection:
+            connection.execute("DROP TRIGGER fixture_abort_finish")
+        with wall_budget_scope(
+            store,
+            "run",
+            200.0,
+            clock=lambda: 0.0,
+            utc_clock=lambda: owner.acquired_at + timedelta(seconds=101),
+        ) as budget:
+            assert budget.prior == 101.0
+
+
+def test_incomplete_historical_import_cannot_reset_known_legacy_usage(tmp_path):
+    with SQLiteStore(tmp_path / "old-half-import.db") as store:
+        start = RunWallStart(
+            id="old-import",
+            invocation_id="old-import",
+            graph_run_id="run",
+            run_id="run",
+            created_at=fixture.NOW,
+            started_at=fixture.NOW,
+            limit_seconds=200.0,
+            legacy_sources=("1" * 64,),
+        )
+        store.put_once("run_wall_start_v2", start, run_id="run")
+        with (
+            pytest.raises(ValueError, match="legacy wall-time import is incomplete"),
+            wall_budget_scope(store, "run", 200.0),
+        ):
+            pass
+        assert len(store.list_records("run_wall_start_v2", RunWallStart, run_id="run")) == 1
+        assert not store.list_records("run_wall_finish_v2", RunWallFinish, run_id="run")

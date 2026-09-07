@@ -323,6 +323,60 @@ class SQLiteStore:
             )
         return cursor.rowcount == 1
 
+    def put_legacy_wall_import(self, start: BaseModel, finish: BaseModel) -> bool:
+        """Publish one authoritative legacy accounting pair, never a half import."""
+        from .run_budget import RunWallFinish, RunWallStart
+
+        if not isinstance(start, RunWallStart) or not isinstance(finish, RunWallFinish):
+            raise TypeError("legacy wall import requires typed start and finish records")
+        if (
+            not start.legacy_sources
+            or finish.run_id != start.run_id
+            or finish.start_digest != start.content_digest
+            or finish.limit_seconds != start.limit_seconds
+            or not finish.recovered_interval
+        ):
+            raise ValueError("legacy wall import has mismatched authority")
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = [
+                connection.execute(
+                    "SELECT payload FROM records WHERE kind=? AND record_id=? AND revision=1",
+                    (kind, record.id),
+                ).fetchone()
+                for kind, record in (
+                    ("run_wall_start_v2", start),
+                    ("run_wall_finish_v2", finish),
+                )
+            ]
+            if any(row is not None for row in rows):
+                if any(row is None for row in rows):
+                    raise ValueError("legacy wall import has an incomplete persisted pair")
+                retained_start = RunWallStart.model_validate_json(rows[0]["payload"], strict=True)
+                retained_finish = RunWallFinish.model_validate_json(rows[1]["payload"], strict=True)
+                if (
+                    retained_start.run_id != start.run_id
+                    or retained_finish.run_id != start.run_id
+                    or not retained_start.legacy_sources
+                    or retained_finish.start_digest != retained_start.content_digest
+                    or retained_finish.limit_seconds != retained_start.limit_seconds
+                    or not retained_finish.recovered_interval
+                ):
+                    raise ValueError("legacy wall import has stale persisted bindings")
+                connection.rollback()
+                return False
+            for kind, record in (("run_wall_start_v2", start), ("run_wall_finish_v2", finish)):
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) VALUES(?,?,?,1,?)",
+                    (kind, record.id, start.run_id, canonical_json(record)),
+                )
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+
     def claim_node_artifact(self, admission: BaseModel) -> bool:
         """Reserve unique content atomically before publication; never refund on a crash."""
         from .artifact_budget import NodeArtifactAdmission

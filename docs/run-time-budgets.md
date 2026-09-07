@@ -53,7 +53,10 @@ was free. Subsequent pauses do not keep charging the recovered interval.
 For existing runs without these records, the first invocation imports known usage
 from digest-bound execution-profile timings and execution-owner/closure records.
 It takes the larger observation instead of summing nested measurements, records
-the source digests, and imports only once. Unclosed legacy intervals are charged
+the source digests, and imports only once. The legacy start/finish pair is inserted
+in one SQLite transaction: concurrent importers use the winning complete pair,
+and an interrupted insert cannot publish half an import. Pre-existing incomplete
+legacy imports are rejected rather than treating known prior work as free. Unclosed legacy intervals are charged
 through the recovery observation. Profile records with stale bindings and
 orphan completion receipts and conflicting normal completions are rejected.
 A normal completion overlapping crash recovery is charged once using the maximum
