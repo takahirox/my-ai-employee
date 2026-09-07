@@ -828,7 +828,7 @@ def one_node_graph(
         completion_criteria=criteria,
         resource_budget=NodeResourceBudget(
             processes=attempt_processes if writing else 1,
-            wall_seconds=max_wall_seconds / 2 if writing else max_wall_seconds,
+            wall_seconds=max_wall_seconds,
         ),
     )
     budget = (
@@ -1959,6 +1959,14 @@ class TaskOrchestrator:
                         if active_budget is None
                         else active_budget.remaining_seconds
                     )
+                    remaining_wall_seconds = max(
+                        0.0,
+                        remaining_wall_seconds
+                        - min(
+                            self.worker_supervision_policy.finalization_reserve_seconds,
+                            remaining_wall_seconds * 0.05,
+                        ),
+                    )
                     timeout_profile = select_node_timeout(
                         id=identifier("worker-timeout-profile"),
                         run_id=run_id,
@@ -2048,6 +2056,9 @@ class TaskOrchestrator:
                         artifact_bytes=node.resource_budget.artifact_bytes,
                         limits=limits,
                         record_factory=create_reservation,
+                        shared_wall_seconds=(
+                            remaining_wall_seconds if active_budget is not None else None
+                        ),
                     )
                     if reservation is None:
                         records[node_id] = self._advance(
@@ -5436,11 +5447,16 @@ def _node_resources_remain(
     node: Node,
     remaining: Mapping[str, int | float],
 ) -> bool:
+    wall_budget = current_wall_budget()
     return (
         int(remaining["node_attempts"]) > 0
         and int(remaining["worker_turns"]) >= node.resource_budget.worker_turns
         and int(remaining["processes"]) >= node.resource_budget.processes
-        and float(remaining["wall_seconds"]) >= node.resource_budget.wall_seconds
+        and (
+            wall_budget.remaining_seconds > 0
+            if wall_budget is not None
+            else float(remaining["wall_seconds"]) >= node.resource_budget.wall_seconds
+        )
         and int(remaining["artifact_bytes"]) >= node.resource_budget.artifact_bytes
     )
 

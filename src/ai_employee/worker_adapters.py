@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
@@ -996,7 +996,12 @@ def _bounded_prompt(
             "the "
             "supplied run_id for both the proposal and payload run_id. Set assistant_note "
             "directly; use an empty string when there is no note. Encode a usage object as JSON "
-            "text in usage_json, using {} when no usage is available. In unified_diff, use "
+            "text in usage_json, using {} when no usage is available. For NEW nonempty text "
+            "files, prefer files: [{path, content}] in the edit_intent payload instead of "
+            "unified_diff. Include the same paths in order in paths. Content is the complete "
+            "literal LF text; Fleet builds the diff and refuses to overwrite an existing file. "
+            "Use separate proposals for new files and edits of existing files. "
+            "In unified_diff, use "
             "a standard Git unified diff beginning with diff --git for every file; never use "
             "*** Begin Patch, *** Add File, or other apply_patch markers. Use actual newline "
             "characters for line boundaries; do not "
@@ -1266,6 +1271,9 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
             if isinstance(request, dict):
                 request.pop("content_digest", None)
                 request.pop("digest_metadata", None)
+                if proposal.get("kind") == "edit_intent" and "files" in request:
+                    request["unified_diff"] = _new_files_diff(request)
+                    del request["files"]
                 unified_diff = request.get("unified_diff")
                 if proposal.get("kind") == "edit_intent" and isinstance(unified_diff, str):
                     try:
@@ -1276,6 +1284,42 @@ def _validate_worker_envelope(payload: str) -> WorkerProposalEnvelope:
                         raise _InvalidEditIntentDiff(1) from error
     normalized = json.dumps(raw, separators=(",", ":"))
     return WorkerProposalEnvelope.model_validate_json(normalized, strict=True)
+
+
+def _new_files_diff(request: dict[str, object]) -> str:
+    """Compile explicit new-file contents without granting overwrite authority."""
+
+    files = request.get("files")
+    if "unified_diff" in request or not isinstance(files, list) or not 1 <= len(files) <= 64:
+        raise ValueError("new files require one bounded, unambiguous representation")
+    paths: list[str] = []
+    sections: list[str] = []
+    total = 0
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "content"}:
+            raise ValueError("new files require exactly path and content")
+        path, content = item["path"], item["content"]
+        if not isinstance(path, str) or not _safe_diff_path(path) or path in paths:
+            raise ValueError("new-file paths must be safe and unique")
+        if not isinstance(content, str) or not content or "\x00" in content or "\r" in content:
+            raise ValueError("new files require nonempty LF text")
+        total += len(content.encode("utf-8"))
+        if total > 1_000_000:
+            raise ValueError("new-file contents exceed the transport limit")
+        paths.append(path)
+        lines = content.split("\n")
+        if content.endswith("\n"):
+            lines.pop()
+        body = "".join("+" + line + "\n" for line in lines)
+        if not content.endswith("\n"):
+            body += "\\ No newline at end of file\n"
+        sections.append(
+            f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+            f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n{body}"
+        )
+    if not isinstance(request.get("paths"), list) or request["paths"] != paths:
+        raise ValueError("new files must match the exact ordered declared paths")
+    return "".join(sections)
 
 
 def _evidence_ref_shape_error(payload: object) -> ValueError | None:
@@ -1773,7 +1817,29 @@ def worker_proposal_schema_json() -> bytes:
             "additionalProperties": False,
         }
 
-    edit_proposal_schema = proposal_schema("edit_intent", edit_payload_schema)
+    files_payload_schema = {
+        **edit_payload_schema,
+        "properties": {
+            **{
+                key: value
+                for key, value in cast(dict[str, object], edit_payload_schema["properties"]).items()
+                if key != "unified_diff"
+            },
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": [*identity_properties, "paths", "summary", "files"],
+    }
+    edit_proposal_schema = proposal_schema(
+        "edit_intent", {"anyOf": [edit_payload_schema, files_payload_schema]}
+    )
     install_proposal_schema = proposal_schema("install", install_payload_schema)
     schema: dict[str, object] = {
         "type": "object",

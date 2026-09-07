@@ -42,6 +42,7 @@ dev = [
 ]
 
 [project.scripts]
+fleet-bench-default = "ai_employee.benchmark_default:main"
 fleet = "ai_employee.cli:main"
 fleet-bench = "ai_employee.benchmark_adapter:main"
 
