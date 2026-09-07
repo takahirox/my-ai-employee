@@ -37,7 +37,7 @@ from .model_usage import codex_payload
 from .prompt_transport import prompt_json
 from .routing import SEMANTIC_PROFILE_RUBRIC
 from .run_budget import check_wall_budget, remaining_timeout
-from .serialization import canonical_json
+from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .worker_attribution import attribute_read_only_payload, model_read_only_schema
 
@@ -583,6 +583,7 @@ class CliTaskAssessmentAdapter:
         self.output_schema_path = output_schema_path
         self.timeout_seconds = timeout_seconds
         self.expected_effective_policy_digest = expected_effective_policy_digest
+        self._last_assessment: tuple[str, SemanticTaskProfile] | None = None
 
     def assess(
         self,
@@ -631,6 +632,24 @@ class CliTaskAssessmentAdapter:
             raise ValueError("assessment policy decision uses another effective policy")
         if decision.outcome is not DecisionOutcome.ALLOW:
             raise ValueError(f"assessment policy did not allow execution: {decision.outcome.value}")
+        # The classifier consumes only this prompt, not repository or prior worker state.
+        # A one-node plan often asks the same classification twice. Reuse one validated
+        # result locally, while still checking fresh policy and the owning invocation.
+        cache_key = canonical_digest(
+            (
+                prompt.decode(),
+                self.run_id,
+                self.strategy,
+                request.argv,
+                request.cwd,
+                decision.effective_policy_digest,
+            )
+        )
+        if self._last_assessment is not None and self._last_assessment[0] == cache_key:
+            if on_poll is not None:
+                on_poll()
+            check_wall_budget()
+            return self._last_assessment[1]
         result = self.executor.execute(request, decision, _NeverCancelled(on_poll))
         check_wall_budget()
         if result.run_id != request.run_id or result.request_digest != request.content_digest:
@@ -648,6 +667,7 @@ class CliTaskAssessmentAdapter:
             assessment = SemanticTaskProfile.model_validate_json(payload, strict=True)
         except ValueError as error:
             raise ValueError(f"invalid semantic task assessment: {error}") from error
+        self._last_assessment = (cache_key, assessment)
         return assessment
 
     def assess_supervised(
