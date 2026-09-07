@@ -73,3 +73,13 @@ reasoning time. Model-free tests cover both timer orderings, successful recovery
 exhausted time/counters, failed or unknown cleanup, cancellation, result binding,
 replay, and legacy digest compatibility; these tests do not establish live-model
 success rates.
+
+The worker request and its persisted context advertise the effective attempt allowance,
+including already-consumed planning time and stricter adapter/policy ceilings. The original
+node reservation remains recorded separately; it is not advertised as available work time.
+
+Bounded planner output omits initial execution metadata (schema versions, state,
+generation, transitions, failure, and unsupported edge control flow). Domain defaults
+restore those values before normal graph acceptance. Goals, capabilities, completion
+criteria, verification IDs, resource budgets, independent assessments and reviews retain
+the same validation and authority. Unbounded graph serialization is unchanged.

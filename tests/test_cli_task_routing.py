@@ -827,8 +827,39 @@ def test_planner_output_schema_carries_execution_bounds_without_mutating_default
 def test_bounded_planner_schema_forbids_unsupported_initial_execution_fences() -> None:
     schema = json.loads(proposed_graph_schema_json(max_nodes=16, max_wall_seconds=180.0))
     node = schema["$defs"]["Node"]["properties"]
-    assert node["retry_limit"]["const"] == 0
-    assert node["max_iterations"]["const"] == 1
-    assert node["attempt"]["const"] == node["generation"]["const"] == 0
+    assert not {"retry_limit", "max_iterations", "attempt", "generation"} & node.keys()
+    assert schema["$defs"]["Node"]["additionalProperties"] is False
     budget = schema["$defs"]["Budget"]["properties"]
     assert budget["max_retries"]["const"] == budget["max_replans"]["const"] == 0
+
+
+def test_compact_initial_graph_restores_the_same_defaults_and_evidence_contract() -> None:
+    goal = Goal(id="compact-goal", statement="produce the required evidence")
+    _, proposal = _capture_planner_prompt(goal)
+    full = ProposedGraphPayload(goal_id=goal.id, graph=proposal.graph)
+    wire = full.model_dump(mode="json")
+    schema = json.loads(proposed_graph_schema_json(max_nodes=1, max_wall_seconds=30.0))
+
+    # Project the fixture through the actual advertised wire schema.
+    def project(value, contract):
+        if "$ref" in contract:
+            contract = schema["$defs"][contract["$ref"].split("/")[-1]]
+        if isinstance(value, dict) and "properties" in contract:
+            return {
+                key: project(value[key], nested) for key, nested in contract["properties"].items()
+            }
+        if isinstance(value, list) and "items" in contract:
+            return [project(item, contract["items"]) for item in value]
+        return value
+
+    wire = project(wire, schema)
+    restored = ProposedGraphPayload.model_validate_json(json.dumps(wire), strict=True)
+    # Initial state metadata comes from the domain defaults, never the model.
+    expected = full.graph.nodes[0].model_copy(update={"state": Node.model_fields["state"].default})
+    assert restored.graph.nodes[0] == expected
+    assert restored.graph.budget == full.graph.budget
+    assert restored.graph.nodes[0].completion_criteria == full.graph.nodes[0].completion_criteria
+    assert "schema_version" not in wire
+    assert "StateTransition" not in schema["$defs"]
+    assert "Failure" not in schema["$defs"]
+    assert len(json.dumps(wire)) < len(full.model_dump_json())

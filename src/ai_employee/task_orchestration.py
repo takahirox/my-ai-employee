@@ -2116,7 +2116,12 @@ class TaskOrchestrator:
                         attempt=node.attempt,
                         harness_digest=harness_digest,
                         effective_policy_digest=effective_policy_digest,
-                        remaining_budgets=reservation.requested,
+                        remaining_budgets=freeze_json(
+                            {
+                                **cast(Mapping[str, int | float], reservation.requested),
+                                "wall_seconds": timeout_profile.effective_timeout_seconds,
+                            }
+                        ),
                         prior_result_digests=prior_results,
                         prior_artifact_digests=prior_artifacts,
                         predecessor_outputs=predecessor_outputs,
