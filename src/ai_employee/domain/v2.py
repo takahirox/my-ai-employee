@@ -419,6 +419,7 @@ class PredecessorOutputReference(SchemaModelV2):
 class WorkerRequest(DigestedRecordV2):
     schema_name: ClassVar[str] = "worker_request"
     goal: str = Field(min_length=1, max_length=20_000)
+    accepted_goal: str | None = Field(default=None, min_length=1, max_length=10_000)
     task_kind: GoalTaskKind = GoalTaskKind.MUTATING
     processes_authorized: bool = True
     # Description-only strings remain readable for historical digested records. New graph
@@ -443,6 +444,11 @@ class WorkerRequest(DigestedRecordV2):
     _context_paths = field_validator("workspace_context")(
         lambda values: tuple(_relative_path(value) for value in values)
     )
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        # Older requests predate the original-goal context. Its absence must not
+        # change their persisted digests; new non-null context is fully bound.
+        return frozenset({"accepted_goal"}) if self.accepted_goal is None else frozenset()
 
     @model_validator(mode="after")
     def _graph_binding_is_complete(self) -> Self:

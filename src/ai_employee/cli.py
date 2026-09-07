@@ -1781,7 +1781,12 @@ def _work(args: argparse.Namespace) -> int:
             planner_schema_path: str | None = None
             if planner_strategy.backend == "codex_cli":
                 planner_schema = assessment_directory / "proposed-graph.json"
-                planner_schema.write_bytes(proposed_graph_schema_json())
+                planner_schema.write_bytes(
+                    proposed_graph_schema_json(
+                        max_nodes=16,
+                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    )
+                )
                 planner_schema_path = str(planner_schema)
                 reviewer_schema = assessment_directory / "plan-review.json"
                 reviewer_schema.write_bytes(plan_review_schema_json())
