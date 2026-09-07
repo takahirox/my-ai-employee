@@ -215,6 +215,11 @@ def _canonicalize_graph_payload(
         if node.semantic_profile is None:
             raise ValueError(f"ProposedGraph node {node.id!r} is missing semantic_profile")
     graph = payload.graph
+    if len(graph.nodes) == 1:
+        # A single node owns the entire Goal; paraphrasing is not decomposition.
+        graph = graph.model_copy(
+            update={"nodes": (graph.nodes[0].model_copy(update={"objective": goal.statement}),)}
+        )
     allowed = set(available_capabilities)
     unknown = {
         capability
@@ -349,7 +354,14 @@ class CliProposedGraphPlanner:
                     "security relevance, or audit-like subject matter. Preserve any such explicit "
                     "breadth in the relevant node objectives and completion criteria because they "
                     "are the worker-facing scope. Nodes and edges are the only dependency "
-                    "authority. Every node needs an objective, completion criteria, an output "
+                    "authority. A single-node graph inherits the complete original Goal as its "
+                    "objective at the runtime boundary; emit null for that objective instead of "
+                    "paraphrasing it. Multi-node objectives must preserve their assigned scope. "
+                    "Preserve the requested deliverable type and explicitly allowed alternatives. "
+                    "Producing a result does not require delivering a reusable implementation "
+                    "unless the Goal requires one. Supporting code may still be the simplest "
+                    "method, but do not make it an extra completion requirement. "
+                    "Every node needs completion criteria, an output "
                     "contract, categorical semantic_profile, bounded risk, and only capabilities "
                     "from available_capabilities. Complexity, scale, risk, capabilities, and "
                     "semantic_profile are planner hints only. The runtime persists them as "
