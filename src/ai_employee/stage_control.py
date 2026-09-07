@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .domain.services_v2 import Cancellation
-from .run_budget import current_wall_budget
+from .run_budget import check_wall_budget, current_wall_budget
 
 _CURRENT: ContextVar[Cancellation | None] = ContextVar("fleet_stage_cancellation", default=None)
 
@@ -25,6 +25,13 @@ def bind_stage_cancellation(cancellation: Cancellation) -> Iterator[None]:
         _CURRENT.reset(token)
 
 
+class StageStopped(BaseException):
+    """Runtime lifecycle control, never a model/protocol failure."""
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+
+
 class StageCancellation:
     """Resolve the active runtime token without retaining a previous invocation."""
 
@@ -33,3 +40,12 @@ class StageCancellation:
         cancelled = current is not None and current.cancelled()
         budget = current_wall_budget()
         return cancelled or (budget is not None and budget.remaining_seconds <= 0)
+
+    def check(self) -> None:
+        check_wall_budget()
+        current = _CURRENT.get()
+        checker = getattr(current, "check", None)
+        if callable(checker):
+            checker()
+        elif current is not None and current.cancelled():
+            raise StageStopped("cancel")

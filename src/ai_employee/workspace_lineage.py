@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import os
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -31,7 +30,7 @@ from .domain.v2 import (
 )
 from .graph_composition import NodePatchArtifact
 from .serialization import canonical_digest
-from .services_v2._common import identifier, now
+from .services_v2._common import identifier, now, run_git_command
 from .services_v2.workspace import GitWorkspaceManager
 from .storage import SQLiteStore
 
@@ -130,7 +129,7 @@ def _patch_tree(
         ):
             if args[0] == "apply" and not patch:
                 continue
-            result = subprocess.run(
+            result = run_git_command(
                 ("git", "-C", root, *args),
                 input=data,
                 env=environment,

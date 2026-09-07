@@ -24,7 +24,11 @@ timeouts, an arbitrary noncooperative in-process plugin cannot be forcibly kille
 its late completion does not become accepted evidence. The local process service
 cleans surviving descendants in its owned process group before returning even when
 the foreground leader exited normally and all capture pipes have closed. A mediated
-process does not grant an unmanaged background-job lifetime. Already returned, exactly
+process does not grant an unmanaged background-job lifetime. Internal Git operations
+for worktree creation, patch validation/capture and candidate reconstruction also
+poll the shared stage control and wall budget through one supervised Git boundary.
+Their hooks and filters are cleaned with that operation. These deterministic runtime
+operations do not consume model-mediated process reservations. Already returned, exactly
 bound worker results are retained for diagnostics when the overall deadline wins.
 
 ## Persistence and resume

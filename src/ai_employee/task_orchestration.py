@@ -97,6 +97,7 @@ from .run_ownership import (
 )
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
+from .stage_control import StageStopped as _StageStopped
 from .stage_control import bind_stage_cancellation
 from .storage import SQLiteStore
 from .task_planning import PlannerRoutingDecision, ProposedGraph
@@ -851,13 +852,6 @@ def one_node_graph(
         terminal_node_ids=(node.id,),
         budget=budget,
     )
-
-
-class _StageStopped(BaseException):
-    """Control flow that cannot be mistaken for a reviewer/evaluator failure."""
-
-    def __init__(self, action: str) -> None:
-        self.action = action
 
 
 class _OwnedStageCancellation:
