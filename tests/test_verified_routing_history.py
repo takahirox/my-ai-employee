@@ -7,6 +7,7 @@ import pytest
 from ai_employee.domain import (
     Budget,
     CompletionCriterion,
+    Edge,
     ExecutionPolicy,
     ExecutionStrategy,
     Goal,
@@ -75,6 +76,8 @@ def execute(
     harness: str = ZERO,
     config: str = CONFIG,
     pause: bool = False,
+    pause_after_result: bool = False,
+    runtime_failure: str | None = None,
     strategies: tuple[ExecutionStrategy, ...] = STRATEGIES,
 ) -> tuple[TaskOrchestrator, GraphRunRecord]:
     store.claim_run_id(run_id, repository)
@@ -84,7 +87,11 @@ def execute(
         node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
     ) -> NodeExecutionResult:
         clock[0] += timedelta(seconds=seconds)
+        if pause_after_result:
+            with SQLiteStore(store.path) as control:
+                control.request_control(run_id, "pause")
         return NodeExecutionResult(
+            failure_code=runtime_failure,
             worker_result=WorkerResult(
                 id="result-" + request.run_id,
                 run_id=request.run_id,
@@ -117,10 +124,25 @@ def execute(
     )
     if pause:
         store.request_control(run_id, "pause")
+    task_graph = GRAPH
+    task_policy = POLICY
+    if pause_after_result:
+        task_graph = GRAPH.model_copy(
+            update={
+                "nodes": (
+                    GRAPH.nodes[0],
+                    GRAPH.nodes[0].model_copy(update={"id": "next", "complexity": 3}),
+                ),
+                "edges": (Edge(id="next-edge", source_id="node", target_id="next"),),
+                "terminal_node_ids": ("next",),
+                "budget": GRAPH.budget.model_copy(update={"max_nodes": 2, "max_attempts": 2}),
+            }
+        )
+        task_policy = POLICY.model_copy(update={"max_nodes": 2, "max_attempts": 2})
     result = orchestrator.run(
         GOAL,
-        GRAPH,
-        POLICY,
+        task_graph,
+        task_policy,
         run_id=run_id,
         harness_digest=harness,
         effective_policy_digest=ZERO,
@@ -312,3 +334,64 @@ def test_history_respects_task_class_and_policy(tmp_path: Path, mismatch: str) -
             operator_config_digest=CONFIG,
         )
         assert not queried.performances
+
+
+def test_completed_node_resume_preserves_one_original_sample_and_duration(tmp_path):
+    from ai_employee.task_orchestration import NodeExecutionRecord
+
+    with SQLiteStore(tmp_path / "retained.db") as store:
+        repo = tmp_path / "repo"
+        scheduler, paused = execute(
+            store, repo, "retained", fixed="beta", seconds=2.0, pause_after_result=True
+        )
+        assert paused.status == "paused"
+        scheduler.clock = lambda: datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=50)
+        accepted = scheduler.replay(paused.id).acceptance.accepted_revision.graph
+        resumed = scheduler.run(
+            GOAL,
+            accepted,
+            paused.execution_policy,
+            run_id=paused.id,
+            harness_digest=ZERO,
+            effective_policy_digest=ZERO,
+            available_capabilities=("process",),
+            resume=True,
+        )
+        assert resumed.status == "completed"
+        _, observer = execute(store, repo, "observer")
+        observed = history(store, observer.id)
+        assert [
+            (item.sample_count, item.success_count, item.total_duration_seconds)
+            for item in observed.performances
+        ] == [(1, 1, 2.0)]
+        assert history(store, observer.id).evidence_digests == observed.evidence_digests
+        records = store.list_records("node_execution_v2", NodeExecutionRecord, run_id=paused.id)
+        original = next(
+            item for item in records if item.status == "passed" and item.generation == 0
+        )
+        assert original.content_digest in observed.evidence_digests
+        # A retained copy alone is insufficient: the original execution is required.
+        with store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM records WHERE kind='node_execution_v2' AND record_id=?", (original.id,)
+            )
+        assert not history(store, observer.id).performances
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "NODE_ARTIFACT_BUDGET_EXCEEDED",
+        "NODE_PROCESS_BUDGET_EXCEEDED",
+        "TIMEOUT",
+        "CANCELLED",
+        "NETWORK_BLOCKED",
+    ],
+)
+def test_runtime_failure_with_node_evaluator_fail_does_not_train_model_quality(tmp_path, code):
+    with SQLiteStore(tmp_path / "runtime.db") as store:
+        repo = tmp_path / "repo"
+        _, failed = execute(store, repo, "capacity", fixed="alpha", runtime_failure=code)
+        assert failed.status == "failed"
+        _, observer = execute(store, repo, "observer")
+        assert not history(store, observer.id).performances

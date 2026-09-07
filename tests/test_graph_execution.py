@@ -692,7 +692,11 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         from ai_employee.task_orchestration import NodeRouteRecord
 
         store.claim_run_id("history-observer", repository)
-        observed_route = store.list_records("node_route_v2", NodeRouteRecord, run_id="graph-e2e")[0]
+        observed_route = next(
+            item
+            for item in store.list_records("node_route_v2", NodeRouteRecord, run_id="graph-e2e")
+            if item.node_id == "a"
+        )
         verified_history = load_verified_routing_history(
             store,
             run_id="history-observer",
@@ -709,7 +713,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 item.sample_count == item.success_count > 0
                 for item in verified_history.performances
             )
-        elif stop_case != "artifact-budget":
+        else:
             assert not verified_history.performances
 
         if stop_case == "artifact-budget":
@@ -768,6 +772,21 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 if semantic_pause:
                     assert semantic_reviewer.calls >= 1
                 assert all(item.status == "passed" for item in service.replay("graph-e2e").nodes)
+                resumed_history = load_verified_routing_history(
+                    store,
+                    run_id="history-observer",
+                    strategies=(strategy,),
+                    assessment=observed_route.assessment,
+                    task_kind=goal.task_kind,
+                    harness_digest=harness_digest,
+                    effective_policy_digest=effective_policy_digest,
+                    operator_config_digest="0" * 64,
+                )
+                assert sum(item.success_count for item in resumed_history.performances) == 2
+                assert all(
+                    item.sample_count == item.success_count for item in resumed_history.performances
+                )
+
                 assert store.current_run_owner("graph-e2e")["status"] == "closed"
             return
         assert store.current_run_owner("graph-e2e")["status"] == "closed"
