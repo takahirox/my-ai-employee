@@ -292,6 +292,19 @@ class LocalProcessExecutor:
                 if process.poll() is not None and not selector.get_map():
                     break
             process.wait()
+            if cleanup == "not_required":
+                # EOF and an exited leader do not prove that its owned group is
+                # empty: background descendants can close the captured pipes.
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as error:
+                    raise _ProcessGroupCleanupError(
+                        "remaining process group cannot be inspected"
+                    ) from error
+                else:
+                    cleanup = self._terminate_group(process)
         finally:
             selector.close()
         return (

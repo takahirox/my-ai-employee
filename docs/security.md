@@ -42,5 +42,8 @@ Project Harness. Overrides must be absolute paths, are resolved through the cont
 authority. Runtime dependency directories must be explicitly listed as `path_entries`;
 the unrestricted host `PATH` is never inherited.
 
-v0.2 does not provide containers, remote execution, deployment, automatic Git commit/push,
-or a distributed security boundary. Report vulnerabilities according to `SECURITY.md`.
+The default profile uses local managed execution. The explicitly enabled
+[isolated worker profile](isolated-worker.md) provides bounded Linux Docker isolation
+with its documented restrictions. Fleet does not provide remote execution, deployment,
+automatic Git commit/push, or a distributed security boundary. Report vulnerabilities
+according to `SECURITY.md`.

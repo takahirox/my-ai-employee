@@ -4,7 +4,6 @@ import hashlib
 import io
 import os
 import shutil
-import subprocess
 from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
@@ -31,7 +30,7 @@ from ai_employee.domain.v2 import (
     WorkspaceSnapshot,
 )
 
-from ._common import identifier, now, run_git, sha256_bytes
+from ._common import identifier, now, run_git, run_git_command, sha256_bytes
 
 
 class GitWorkspaceManager:
@@ -124,7 +123,7 @@ class GitWorkspaceManager:
         destination = self.state_root / f"worktree-{request.run_id}-{request.id}"
         if self.state_root not in destination.resolve().parents or destination.exists():
             raise ValueError("isolated worktree destination is unsafe or already exists")
-        completed = subprocess.run(
+        completed = run_git_command(
             ("git", "-C", str(repository), "worktree", "add", "--detach", str(destination), head),
             capture_output=True,
             check=False,
@@ -226,7 +225,7 @@ class GitWorkspaceManager:
                 StableFailureCode.INVALID_REQUEST,
                 "unified diff paths must exactly match declared edit paths",
             )
-        check = subprocess.run(
+        check = run_git_command(
             (
                 "git",
                 "-C",
@@ -265,7 +264,7 @@ class GitWorkspaceManager:
                     }
                 ),
             )
-        applied = subprocess.run(
+        applied = run_git_command(
             (
                 "git",
                 "-C",
@@ -315,7 +314,7 @@ class GitWorkspaceManager:
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(temporary_index)
         try:
-            listed = subprocess.run(
+            listed = run_git_command(
                 (
                     "git",
                     "-C",
@@ -341,7 +340,7 @@ class GitWorkspaceManager:
                 if not any(fnmatchcase(path, pattern) for pattern in generated_paths)
             )
             if included:
-                add = subprocess.run(
+                add = run_git_command(
                     ("git", "-C", str(worktree), "add", "--intent-to-add", "--", *included),
                     env=environment,
                     capture_output=True,
@@ -349,7 +348,7 @@ class GitWorkspaceManager:
                 )
                 if add.returncode:
                     raise ValueError(add.stderr.decode("utf-8", "replace"))
-            patch = subprocess.run(
+            patch = run_git_command(
                 ("git", "-C", str(worktree), "diff", "--binary", "--no-ext-diff", base, "--"),
                 env=environment,
                 capture_output=True,
@@ -403,7 +402,7 @@ class GitWorkspaceManager:
             raise ValueError("source worktree dirty state changed")
         with self.artifacts.open_verified(reviewed_patch) as stream:
             patch = stream.read()
-        check = subprocess.run(
+        check = run_git_command(
             ("git", "-C", str(original), "apply", "--check", "--whitespace=nowarn", "-"),
             input=patch,
             capture_output=True,
@@ -412,7 +411,7 @@ class GitWorkspaceManager:
         if check.returncode:
             raise ValueError(f"patch preflight failed: {check.stderr.decode('utf-8', 'replace')}")
         preflight = sha256_bytes(check.stdout + check.stderr + b"ok")
-        applied = subprocess.run(
+        applied = run_git_command(
             ("git", "-C", str(original), "apply", "--whitespace=nowarn", "-"),
             input=patch,
             capture_output=True,
