@@ -2130,6 +2130,11 @@ def _work_impl(args: argparse.Namespace) -> int:
                         artifacts,
                         network_mediated=harness.network.mode.value != "disabled",
                     ),
+                    native_process_reservation=(
+                        operator_config.isolated_worker.native_process_limit
+                        if operator_config.isolated_worker is not None
+                        else 0
+                    ),
                     max_worker_turns=max(1, node.resource_budget.worker_turns),
                     verification_requests=node_verification_requests,
                     verification_bindings=node_verification_bindings,

@@ -62,6 +62,7 @@ from .domain.v2 import (
     authoritative_worker_evidence_digests,
 )
 from .graph import accept_task_graph
+from .process_budget import NodeProcessAdmission, accepted_process_limit
 from .runtime import DeterministicRuntime
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
@@ -337,6 +338,7 @@ class WorkCoordinator:
         download_client: DownloadClient | None = None,
         installer_factory: Callable[[WorkspaceSnapshot], Installer] | None = None,
         max_worker_turns: int = 1,
+        native_process_reservation: int = 0,
         verification_requests: tuple[ProcessRequest, ...] = (),
         verification_bindings: tuple[NodeVerificationBinding, ...] = (),
         protected_paths: tuple[str, ...] = (".git/**",),
@@ -371,6 +373,9 @@ class WorkCoordinator:
         self.approval_service = approval_service
         self.download_client = download_client
         self.installer_factory = installer_factory
+        if type(native_process_reservation) is not int or native_process_reservation < 0:
+            raise ValueError("native process reservation must be a nonnegative integer")
+        self.native_process_reservation = native_process_reservation
         self.max_worker_turns = max_worker_turns
         self.verification_requests = verification_requests
         self.verification_bindings = verification_bindings
@@ -908,6 +913,84 @@ class WorkCoordinator:
         )
         return acceptance
 
+    def _admit_process(
+        self,
+        run: WorkRun,
+        service_request_digest: str,
+        *,
+        verification: bool = False,
+    ) -> bool:
+        if run.worker_request_digest is None:
+            # Compatibility work runs have no accepted per-node reservation.
+            return True
+        requests = [
+            item
+            for item in self.store.list_records("worker_request_v2", WorkerRequest, run_id=run.id)
+            if item.content_digest == run.worker_request_digest
+        ]
+        try:
+            if len(requests) != 1 or requests[0].run_id != run.id:
+                raise ValueError("accepted node process request is missing or ambiguous")
+            limit = accepted_process_limit(requests[0])
+            # Older resumable runs have action-start receipts and completed verification
+            # results. Import their known dispatches exactly once inside the claim transaction.
+            process_digests = {
+                proposal.payload.content_digest
+                for result in self.store.list_records(
+                    "worker_result_v2", WorkerResult, run_id=run.id
+                )
+                for proposal in result.proposals
+                if proposal.kind in {ActionKind.PROCESS, ActionKind.INSTALL}
+            }
+            legacy_actions = sum(
+                event.kind == "action_started" and event.request_digest in process_digests
+                for event in self.store.work_events(run.id)
+            )
+            legacy_verifications = len(
+                self.store.list_records("verification_result_v2", ExecutionResult, run_id=run.id)
+            )
+            common = {
+                "run_id": run.id,
+                "created_at": now(),
+                "node_run_id": run.id,
+                "worker_request_digest": run.worker_request_digest,
+                "service_request_digest": service_request_digest,
+                "process_limit": limit,
+                "native_reservation": self.native_process_reservation,
+                "verification_reservation": len(self.verification_requests),
+            }
+            admission_id = identifier("node-process")
+            legacy_id = "node-process-legacy-" + canonical_digest(run.id)
+            admission = NodeProcessAdmission(
+                **common,  # type: ignore[arg-type]
+                id=admission_id,
+                admission_id=admission_id,
+                phase="verification" if verification else "action",
+                units=1,
+            )
+            legacy = NodeProcessAdmission(
+                **common,  # type: ignore[arg-type]
+                id=legacy_id,
+                admission_id=legacy_id,
+                phase="legacy",
+                units=legacy_actions + legacy_verifications,
+            )
+            allowed = self.store.claim_node_process(admission, legacy)
+        except ValueError as error:
+            allowed = False
+            detail = str(error)
+        else:
+            detail = "accepted node process allowance is exhausted" if not allowed else "admitted"
+        if not allowed:
+            self._event(
+                run.id,
+                "node_process_budget_rejected",
+                "runtime",
+                request_digest=service_request_digest,
+                details={"stable_failure_code": "NODE_PROCESS_BUDGET_EXCEEDED", "message": detail},
+            )
+        return allowed
+
     def _execute_actions(
         self,
         run: WorkRun,
@@ -938,6 +1021,13 @@ class WorkCoordinator:
                 return self._update(run, status="waiting_approval", pending_approval_id=approval.id)
             payload = proposal.payload
             service_decision = bind_service_decision(payload, decision)
+            if proposal.kind in {
+                ActionKind.PROCESS,
+                ActionKind.INSTALL,
+            } and not self._admit_process(run, payload.content_digest or ""):
+                return self._update(
+                    run, status="failed", failure_code="NODE_PROCESS_BUDGET_EXCEEDED"
+                )
             self._event(
                 run.id,
                 "action_started",
@@ -1109,6 +1199,10 @@ class WorkCoordinator:
             proposal_decision = self._decide(verification_proposal)
             if proposal_decision.outcome is not DecisionOutcome.ALLOW:
                 return self._update(run, status="failed", failure_code="VERIFICATION_POLICY_DENIED")
+            if not self._admit_process(run, request.content_digest or "", verification=True):
+                return self._update(
+                    run, status="failed", failure_code="NODE_PROCESS_BUDGET_EXCEEDED"
+                )
             result = executor.execute(
                 request,
                 bind_service_decision(request, proposal_decision),
