@@ -85,6 +85,7 @@ from .routing import (
     profile_compatibility_bands,
     select_strategy,
 )
+from .routing_history import VerifiedRoutingHistory, load_verified_routing_history
 from .run_budget import WallTimeExceeded, check_wall_budget, current_wall_budget, wall_budget_scope
 from .run_ownership import (
     OwnerFenceViolationRecord,
@@ -389,6 +390,14 @@ class NodeRouteRecord(DigestedRecordV2):
     selected_strategy: ExecutionStrategy
     effective_policy_digest: Digest
     harness_digest: Digest
+    performance_history_digests: tuple[Digest, ...] = ()
+
+    def _digest_compatibility_exclusions(self) -> frozenset[str]:
+        return (
+            frozenset({"performance_history_digests"})
+            if not self.performance_history_digests
+            else frozenset()
+        )
 
 
 class NodeEvidenceRecord(DigestedRecordV2):
@@ -3989,9 +3998,23 @@ class TaskOrchestrator:
         )
         if not eligible:
             raise RoutingError("no strategy satisfies node assessment and policy")
+        history = VerifiedRoutingHistory()
+        if self.routing_mode is RoutingMode.ADAPTIVE and self.operator_config_digest is not None:
+            current_run = self.store.get("graph_run_v2", run_id, GraphRunRecord)
+            history = load_verified_routing_history(
+                self.store,
+                run_id=run_id,
+                strategies=eligible,
+                assessment=assessment,
+                task_kind=current_run.goal.task_kind,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                operator_config_digest=self.operator_config_digest,
+            )
         selected = select_strategy(
             eligible,
             mode=self.routing_mode,
+            performances=history.performances,
             required_capabilities=facts.required_capabilities,
             strategy_capabilities={item.id: item.capabilities for item in eligible},
             fixed_strategy_id=self.fixed_strategy_id,
@@ -4033,6 +4056,7 @@ class TaskOrchestrator:
             ),
             eligible_strategy_ids=tuple(item.id for item in eligible),
             selected_strategy=selected,
+            performance_history_digests=history.evidence_digests,
             effective_policy_digest=effective_policy_digest,
             harness_digest=harness_digest,
         )

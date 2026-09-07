@@ -1793,9 +1793,22 @@ def _work_impl(args: argparse.Namespace) -> int:
             planner_command = operator_config.worker_command(
                 cast(WorkerName, planner_strategy.backend)
             )
+            from .routing_history import load_verified_routing_history
+
+            history = load_verified_routing_history(
+                store,
+                run_id=run_id,
+                strategies=strategies,
+                assessment=task_assessment,
+                task_kind=goal.task_kind,
+                harness_digest=harness_digest,
+                effective_policy_digest=effective_policy_digest,
+                operator_config_digest=operator_config_digest(operator_config),
+            )
             selected_strategy = select_strategy(
                 strategies,
                 mode=routing_mode,
+                performances=history.performances,
                 assessment=task_assessment,
                 allowed_strategy_ids=harness.worker.allowed_strategy_ids,
                 allowed_backends=harness.worker.allowed,

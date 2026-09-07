@@ -787,6 +787,20 @@ class SQLiteStore:
             return None
         return {"repository_id": str(row[0]), "repository": str(row[1])}
 
+    def repository_graph_run_ids(self, run_id: str, *, limit: int = 200) -> tuple[str, ...]:
+        """Bounded history lookup without reading another repository's run payloads."""
+        if not 1 <= limit <= 200:
+            raise ValueError("routing history window must be between 1 and 200 runs")
+        rows = self._connection.execute(
+            "SELECT history.run_id FROM run_repositories history "
+            "JOIN run_repositories current ON history.repository_id=current.repository_id "
+            "WHERE current.run_id=? AND history.run_id!=? AND EXISTS "
+            "(SELECT 1 FROM records WHERE kind='graph_run_v2' AND run_id=history.run_id) "
+            "ORDER BY history.rowid DESC LIMIT ?",
+            (run_id, run_id, limit),
+        )
+        return tuple(str(row[0]) for row in rows)
+
     def job_context_for_run(self, run_id: str) -> dict[str, object] | None:
         """Return the explicit Job relationship for a run without inferring ancestry."""
 
