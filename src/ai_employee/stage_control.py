@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .domain.services_v2 import Cancellation
+from .run_budget import current_wall_budget
 
 _CURRENT: ContextVar[Cancellation | None] = ContextVar("fleet_stage_cancellation", default=None)
 
@@ -29,4 +30,6 @@ class StageCancellation:
 
     def cancelled(self) -> bool:
         current = _CURRENT.get()
-        return current is not None and current.cancelled()
+        cancelled = current is not None and current.cancelled()
+        budget = current_wall_budget()
+        return cancelled or (budget is not None and budget.remaining_seconds <= 0)

@@ -126,6 +126,7 @@ from .promotion_approval import (
     validate_policy_auto_authority,
 )
 from .routing import assess_task, merge_semantic_profile, select_strategy
+from .run_budget import WallTimeExceeded, wall_budget_scope
 from .run_explanation import explain_any_run
 from .run_ownership import RunLeaseClosureRecord, RunOrphanRecoveryRecord
 from .runtime import DeterministicRuntime, NodeExecutionContext
@@ -1113,7 +1114,11 @@ class _PreAcceptanceOutcomeGuard:
             else "failed"
         )
         stable_code = self._stable_code or (
-            "PRE_ACCEPTANCE_INTERRUPTED" if status == "interrupted" else "PRE_ACCEPTANCE_FAILED"
+            "RUN_WALL_BUDGET_EXCEEDED"
+            if exc_type is not None and issubclass(exc_type, WallTimeExceeded)
+            else "PRE_ACCEPTANCE_INTERRUPTED"
+            if status == "interrupted"
+            else "PRE_ACCEPTANCE_FAILED"
         )
         outcome = PreAcceptanceGraphRunOutcomeRecord(
             id=self._run_id,
@@ -1151,6 +1156,24 @@ def _graph_run_exit_code(graph_run: GraphRunRecord) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
+    try:
+        return _work_impl(args)
+    except WallTimeExceeded as error:
+        print(
+            canonical_json(
+                {
+                    "schema_version": "2",
+                    "run_id": error.run_id,
+                    "status": "failed",
+                    "stable_code": "RUN_WALL_BUDGET_EXCEEDED",
+                    "next_actions": (),
+                }
+            )
+        )
+        return 5
+
+
+def _work_impl(args: argparse.Namespace) -> int:
     from .engineering_guidance import guidance_scope
     from .execution_profile import choose_profile, observe_profile
     from .goal_acceptance import attach_goal_checks, harness_for_goal
@@ -1442,6 +1465,9 @@ def _work(args: argparse.Namespace) -> int:
                 job_id=getattr(args, "job_id", None),
                 job_goal=getattr(args, "job_goal", None),
             )
+        profile_scope.enter_context(
+            wall_budget_scope(store, run_id, harness.budgets.wall_seconds, started=started)
+        )
         profile_observation = profile_scope.enter_context(
             observe_profile(
                 store,

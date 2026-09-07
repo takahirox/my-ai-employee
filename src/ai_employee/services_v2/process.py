@@ -24,6 +24,7 @@ from ai_employee.domain.v2 import (
     StableFailure,
     StableFailureCode,
 )
+from ai_employee.run_budget import BudgetCancellation, remaining_timeout
 
 from ._common import identifier, now
 
@@ -80,6 +81,7 @@ class LocalProcessExecutor:
         cancellation: Cancellation,
     ) -> ExecutionResult:
         started = time.monotonic()
+        cancellation = BudgetCancellation(cancellation)
         rejection = self._validate_policy(request, decision)
         if rejection is not None:
             return self._result(request, started, failure=rejection)
@@ -90,7 +92,7 @@ class LocalProcessExecutor:
                 failure=self._failure(StableFailureCode.CANCELLED, "process was cancelled"),
                 status="cancelled",
             )
-        timeout = request.timeout_seconds
+        timeout = remaining_timeout(request.timeout_seconds)
         if not self._slots.acquire(blocking=False):
             return self._result(
                 request,

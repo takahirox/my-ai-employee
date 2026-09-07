@@ -185,11 +185,16 @@ def test_unknown_or_failed_cleanup_never_retries(tmp_path, monkeypatch, source, 
 @pytest.mark.parametrize("source", ["adapter", "scheduler"])
 @pytest.mark.parametrize("elapsed", [89.5, 90.0, 100.0])
 def test_remaining_real_time_prevents_doomed_retry(tmp_path, monkeypatch, source, elapsed):
-    run, _, recovery, attempts, _, _ = _exercise(
+    run, _, recovery, attempts, results, _ = _exercise(
         tmp_path, monkeypatch, source=source, elapsed=elapsed
     )
     assert run.status == "failed"
     assert len(attempts) == 1
+    if source == "scheduler" and elapsed >= 90.0:
+        assert run.failure_code == "RUN_WALL_BUDGET_EXCEEDED"
+        assert not recovery  # The overall deadline precedes a per-attempt recovery decision.
+        assert len(results) == 1 and results[0].failure.code is StableFailureCode.TIMEOUT
+        return
     assert recovery[0].action == "denied"
     assert recovery[0].context.remaining_run_seconds == max(0.0, 90.0 - elapsed)
 

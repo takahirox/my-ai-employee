@@ -127,3 +127,11 @@ be accepted. Adapters must poll Cancellation during blocking work, as required b
 the process service contract. A pause drains an already-running node and its task
 review, preserving its verified result for resume, but stops parent composition or
 verification before promotion readiness. Cancellation never accepts a late PASS.
+
+### Shared active wall-time budget
+
+`fleet work` binds one active wall-time budget before model preparation. Planning,
+classification, node attempts, task review, composition, parent verification and
+bounded parent repair share its remaining time. Nested stages may tighten the
+accepted limit, but cannot replenish it. See [run-time-budgets.md](run-time-budgets.md)
+for persistence, pause/resume, legacy migration and crash accounting.

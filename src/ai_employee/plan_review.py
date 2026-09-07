@@ -24,6 +24,7 @@ from .domain.v2 import (
 from .engineering_guidance import SIMPLICITY_REVIEW_GUIDANCE
 from .model_usage import codex_payload
 from .prompt_transport import prompt_json
+from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
 from .stage_control import StageCancellation
@@ -509,7 +510,7 @@ class CliPlanReviewer:
             cwd=self.cwd,
             inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=remaining_timeout(self.timeout_seconds),
             stdout_bytes=100_000,
             stderr_bytes=100_000,
             budget_class="worker",
@@ -523,6 +524,7 @@ class CliPlanReviewer:
                 PlanReviewFailureKind.REVIEWER_ERROR, str(error)
             ) from error
         result = self.executor.execute(request, decision, StageCancellation())
+        check_wall_budget()
         if result.request_digest != request.content_digest:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.STALE_BINDING,

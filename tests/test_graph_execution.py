@@ -109,6 +109,7 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
         "cancel-parent",
         "pause-parent",
         "expired-parent",
+        "budget-parent",
         "interrupted-parent",
     ],
 )
@@ -424,6 +425,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         ) -> ExecutionResult:
             nonlocal parent_process_calls
             parent_process_calls += 1
+            if stop_case == "budget-parent":
+                from ai_employee.run_budget import current_wall_budget
+
+                budget = current_wall_budget()
+                assert budget is not None
+                budget.clock = lambda: budget.started + budget.limit + 1.0
             if stop_case == "interrupted-parent":
                 raise KeyboardInterrupt()
             if stop_case == "expired-parent":
@@ -668,6 +675,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 available_capabilities=("edit_intent", "process"),
             )
 
+        if stop_case == "budget-parent":
+            assert run.status == "failed"
+            assert run.failure_code == "RUN_WALL_BUDGET_EXCEEDED"
+            assert run.promotion_approval_id is None
+            assert store.current_run_owner("graph-e2e")["status"] == "closed"
+            return
         if expected_error:
             persisted = store.get("graph_run_v2", "graph-e2e", GraphRunRecord)
             assert persisted.status == (

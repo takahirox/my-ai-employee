@@ -36,6 +36,7 @@ from .engineering_guidance import COMMENT_GUIDANCE, INVESTIGATION_GUIDANCE, SIMP
 from .model_usage import codex_payload
 from .prompt_transport import prompt_json
 from .routing import SEMANTIC_PROFILE_RUBRIC
+from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
 from .worker_attribution import attribute_read_only_payload, model_read_only_schema
@@ -614,7 +615,7 @@ class CliTaskAssessmentAdapter:
             cwd=self.cwd,
             inherit_environment=cli_inherit_environment(self.strategy.backend),
             stdin_artifact_digest=stdin_digest,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=remaining_timeout(self.timeout_seconds),
             stdout_bytes=100_000,
             stderr_bytes=100_000,
             budget_class="worker",
@@ -631,6 +632,7 @@ class CliTaskAssessmentAdapter:
         if decision.outcome is not DecisionOutcome.ALLOW:
             raise ValueError(f"assessment policy did not allow execution: {decision.outcome.value}")
         result = self.executor.execute(request, decision, _NeverCancelled(on_poll))
+        check_wall_budget()
         if result.run_id != request.run_id or result.request_digest != request.content_digest:
             raise ValueError("assessment result is bound to another request")
         if result.status != "succeeded" or result.stdout_artifact_digest is None:

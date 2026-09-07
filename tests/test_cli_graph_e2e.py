@@ -1516,3 +1516,47 @@ def test_cli_graph_promotion_repository_conflict_fails_closed(
     with SQLiteStore(database) as store:
         assert store.get("graph_run_v2", run_id, GraphRunRecord).status == "ready_to_promote"
         assert store.list_records("promotion_v2", PromotionRecord, run_id=run_id) == ()
+
+
+def test_preacceptance_deadline_is_durable_and_never_launches_a_worker(
+    tmp_path, capsys, monkeypatch
+):
+    from ai_employee.run_budget import current_wall_budget
+    from ai_employee.worker_adapters import CliTaskAssessmentAdapter
+
+    repository, operator, database, _state = _fixture(tmp_path, task_review=False)
+    original = CliTaskAssessmentAdapter.assess
+
+    def expire_before_assessment(self, *args, **kwargs):
+        budget = current_wall_budget()
+        assert budget is not None
+        budget.started = budget.clock() - budget.limit - 1.0
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CliTaskAssessmentAdapter, "assess", expire_before_assessment)
+    assert (
+        cli.main(
+            [
+                "work",
+                "change a and b concurrently, then change c",
+                "--repo",
+                str(repository),
+                "--operator-config",
+                str(operator),
+                "--max-concurrency",
+                "2",
+                "--non-interactive",
+            ]
+        )
+        == 5
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["stable_code"] == "RUN_WALL_BUDGET_EXCEEDED"
+    with SQLiteStore(database) as store:
+        outcome = store.get(
+            "pre_acceptance_graph_run_outcome_v2",
+            output["run_id"],
+            cli.PreAcceptanceGraphRunOutcomeRecord,
+        )
+        assert outcome.stable_code == "RUN_WALL_BUDGET_EXCEEDED"
+        assert not store.list_records("worker_request_v2", WorkerRequest, run_id=output["run_id"])
