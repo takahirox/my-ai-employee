@@ -51,10 +51,12 @@ from goal text, repository, worker ancestry, timestamps, or graph revision linea
 Job records carry no policy, evidence, verification, promotion, replay, or mutation authority.
 
 The worker never writes authoritative state and free-form prose is never executable.
-The Codex worker transport omits proposal and request IDs. After checking process
-correlation and cancellation, the adapter allocates these IDs locally before domain
-validation and mediation. Legacy model-supplied IDs are replaced as well. Persisted
-proposals retain their attributed IDs and digests; replay does not allocate new ones.
+The Codex worker transport omits proposal/request IDs, creation timestamps and
+run/worker attribution. After checking process correlation and cancellation, the
+adapter assigns that metadata from runtime identity and clock values before domain
+validation and mediation. Legacy model-supplied metadata is replaced as well.
+Persisted proposals retain their attributed metadata and digests; replay does not
+assign new metadata.
 General commands use `LocalProcessExecutor`. Git worktree lifecycle, diff construction,
 exact patch application, and promotion are deterministic system operations encapsulated
 by `GitWorkspaceManager`; they are not arbitrary worker subprocess authority.

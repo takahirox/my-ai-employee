@@ -123,13 +123,36 @@ def test_runtime_ids_do_not_accept_invalid_actions(defect: str) -> None:
     assert not channel.proposals
 
 
-def test_model_schema_omits_ids_for_every_proposal_and_request() -> None:
+def test_model_schema_omits_runtime_metadata_for_every_proposal_and_request() -> None:
     schema = json.loads(worker_proposal_schema_json())
     for proposal in schema["properties"]["proposals"]["items"]["anyOf"]:
-        assert "id" not in proposal["properties"]
-        assert "id" not in proposal["required"]
+        metadata = {"id", "created_at", "run_id", "worker_id"}
+        assert not metadata.intersection(proposal["properties"])
+        assert not metadata.intersection(proposal["required"])
         payload = proposal["properties"]["payload"]
         for variant in payload.get("anyOf", [payload]):
-            assert "id" not in variant["properties"]
-            assert "id" not in variant["required"]
+            assert not metadata.intersection(variant["properties"])
+            assert not metadata.intersection(variant["required"])
             assert variant["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("legacy_timestamp", [None, "", "not-a-date", "9999-01-01T00:00:00Z"])
+def test_runtime_timestamps_replace_legacy_metadata(legacy_timestamp, monkeypatch):
+    output = transport(new_file=True, legacy_ids=False)
+    proposal = output["proposals"][0]
+    for record in (proposal, proposal["payload"]):
+        if legacy_timestamp is None:
+            record.pop("created_at")
+            record.pop("run_id")
+        else:
+            record["created_at"] = legacy_timestamp
+    proposal.pop("worker_id")
+    monkeypatch.setattr("ai_employee.worker_adapters.now", lambda: NOW)
+    result = CodexCliWorkerAdapter(
+        Executor(), lambda _: json.dumps(output).encode(), allow_worker, run_id="run-1"
+    ).propose(worker_request(), Channel())
+    assert result.status == "succeeded"
+    attributed = result.proposals[0]
+    assert attributed.created_at == attributed.payload.created_at == NOW
+    assert attributed.run_id == attributed.payload.run_id == "run-1"
+    assert attributed.worker_id == "codex_cli"
