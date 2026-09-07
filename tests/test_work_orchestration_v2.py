@@ -1005,19 +1005,23 @@ def test_codex_worker_decodes_edit_transport() -> None:
 
     decoded = json.loads(adapter._extract_payload(output))
 
+    proposal_id = decoded["proposals"][0]["id"]
+    request_id = decoded["proposals"][0]["payload"]["id"]
+    assert proposal_id.startswith("proposal-") and proposal_id != "proposal-1"
+    assert request_id.startswith("request-") and request_id != "edit-1"
     assert decoded == {
         "schema_version": "2",
         "proposals": [
             {
                 "schema_version": "2",
-                "id": "proposal-1",
+                "id": proposal_id,
                 "run_id": "run-1",
                 "created_at": "2026-01-01T00:00:00Z",
                 "worker_id": "codex_cli",
                 "kind": "edit_intent",
                 "payload": {
                     "schema_version": "2",
-                    "id": "edit-1",
+                    "id": request_id,
                     "run_id": "run-1",
                     "created_at": "2026-01-01T00:00:00Z",
                     "paths": ["example.md"],

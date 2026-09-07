@@ -794,10 +794,14 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             if not isinstance(proposal, dict):
                 raise ValueError("Codex proposal entries must be JSON objects")
             # Runtime-owned attribution and scope binding must not depend on model text.
+            # These are new records, not references to existing actions. Allocate once at
+            # ingress; persistence/replay retain the attributed IDs and their digests.
+            proposal["id"] = identifier("proposal")
             proposal["worker_id"] = self.adapter
             proposal["run_id"] = self.run_id
             payload = proposal.get("payload")
             if isinstance(payload, dict):
+                payload["id"] = identifier("request")
                 payload["run_id"] = self.run_id
         usage_json = wrapper["usage_json"]
         if not isinstance(usage_json, str):
@@ -988,7 +992,8 @@ def _bounded_prompt(
         payload["transport_instruction"] = (
             "The supplied output schema accepts edit_intent proposals and existing_lock install "
             "proposals only. Put each proposed repository patch directly in proposals with all "
-            "schema fields populated. Request an existing_lock install when repository-local "
+            "schema fields populated. Omit proposal and payload IDs; Fleet allocates those "
+            "locally. Request an existing_lock install when repository-local "
             "dependencies are required for verification. That install must use manifest_path "
             "package.json, lock_path package-lock.json, manager_executable tools/fleet-npm, argv "
             "[ci, --ignore-scripts], target node_modules, network_required true, lifecycle_scripts "
@@ -1731,7 +1736,6 @@ def worker_proposal_schema_json() -> bytes:
 
     identity_properties: dict[str, object] = {
         "schema_version": {"type": "string", "enum": ["2"]},
-        "id": {"type": "string"},
         "run_id": {"type": "string"},
         "created_at": {"type": "string"},
     }
