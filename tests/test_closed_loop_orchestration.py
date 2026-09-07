@@ -969,12 +969,14 @@ def test_passed_task_review_is_not_reinvoked_after_pause_resume(tmp_path: Path) 
 
     def initial_run() -> GraphRunRecord:
         with SQLiteStore(database) as store:
+            store.claim_run_id("task-review-resume", tmp_path)
             orchestrator = TaskOrchestrator(
                 store,
                 runner,
                 (_strategy(),),
                 task_reviewer=reviewer,
                 independent_task_review=True,
+                operator_config_digest=ZERO,
             )
             return orchestrator.run(
                 goal,
@@ -1003,6 +1005,7 @@ def test_passed_task_review_is_not_reinvoked_after_pause_resume(tmp_path: Path) 
             (_strategy(),),
             task_reviewer=reviewer,
             independent_task_review=True,
+            operator_config_digest=ZERO,
         )
         resumed = orchestrator.run(
             goal,
@@ -1015,6 +1018,30 @@ def test_passed_task_review_is_not_reinvoked_after_pause_resume(tmp_path: Path) 
             resume=True,
         )
         replay = orchestrator.replay("task-review-resume")
+        from ai_employee.routing_history import load_verified_routing_history
+        from ai_employee.task_orchestration import NodeExecutionRecord
+
+        store.claim_run_id("history-observer", tmp_path)
+        route = next(item for item in replay.routes if item.node_id == "first")
+        observed = load_verified_routing_history(
+            store,
+            run_id="history-observer",
+            strategies=(_strategy(),),
+            assessment=route.assessment,
+            task_kind=goal.task_kind,
+            harness_digest=HARNESS,
+            effective_policy_digest=POLICY,
+            operator_config_digest=ZERO,
+        )
+        assert any(item.success_count > 0 for item in observed.performances)
+        original = next(
+            item
+            for item in store.list_records(
+                "node_execution_v2", NodeExecutionRecord, run_id=resumed.id
+            )
+            if item.node_id == "first" and item.status == "passed" and item.generation == 0
+        )
+        assert original.content_digest in observed.evidence_digests
 
     assert resumed.status == "completed"
     assert [item.node_id for item in reviewer.requests] == ["first", "second"]

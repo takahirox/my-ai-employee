@@ -175,6 +175,27 @@ def _verified_samples(
         if cancelled:
             return []
         try:
+            publication = record
+            if record.status == "passed" and record.output_generation != record.generation:
+                if record.generation != run.generation or record.output_generation is None:
+                    continue
+                original = latest.get((record.node_id, record.output_generation, record.attempt))
+                # Same-revision resume only changes lifecycle metadata. Never infer
+                # a retained success from a request digest or generation alone.
+                metadata = {
+                    "id",
+                    "created_at",
+                    "transitioned_at",
+                    "generation",
+                    "sequence",
+                    "content_digest",
+                }
+                if original is None or original.model_dump(exclude=metadata) != record.model_dump(
+                    exclude=metadata
+                ):
+                    continue
+                _validate_retained_node(store, publication)
+                record = original
             route = routes[record.route_digest]
             if record.worker_result_id is None:
                 continue
@@ -234,7 +255,7 @@ def _verified_samples(
             if succeeded:
                 if (
                     run.status not in {"completed", "ready_to_promote"}
-                    or record.generation != run.generation
+                    or publication.generation != run.generation
                     or record.accepted_graph_revision_digest != run.accepted_graph_revision_digest
                     or any(
                         other.node_id == record.node_id
@@ -252,14 +273,27 @@ def _verified_samples(
                 _validate_retained_node(store, record)
                 if run.independent_task_review and not _review_pass(store, run, record):
                     continue
-            elif record.status != "failed" or evaluator.decision is not EvaluationDecision.FAIL:
+            elif (
+                record.status != "failed"
+                or evaluator.decision is not EvaluationDecision.FAIL
+                or record.failure_code
+                not in {
+                    "NODE_EVALUATION_NOT_PASS",
+                    "VERIFICATION_FAILED",
+                    "PATCH_PREFLIGHT_FAILED",
+                    "WORKER_PROTOCOL_ERROR",
+                    "WORKER_EMPTY_OUTPUT",
+                    "WORKER_STRUCTURED_OUTPUT_MISSING",
+                }
+            ):
                 # Control/policy/transport interruptions and unverified review outcomes
                 # do not become model-quality observations.
                 continue
             started = [
                 item.transitioned_at
                 for item in histories
-                if (item.node_id, item.generation, item.attempt) == key
+                if (item.node_id, item.generation, item.attempt)
+                == (record.node_id, record.generation, record.attempt)
                 and item.status == "running"
                 and item.worker_request_digest == record.worker_request_digest
             ]
@@ -274,7 +308,11 @@ def _verified_samples(
                     succeeded,
                     seconds,
                     (request.run_id, request.content_digest or ""),
-                    (record.content_digest or "", closures[0].content_digest or ""),
+                    (
+                        record.content_digest or "",
+                        publication.content_digest or "",
+                        closures[0].content_digest or "",
+                    ),
                 )
             )
         except (KeyError, ValueError, StopIteration):
