@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
+from ai_employee.artifact_budget import NodeArtifactBudgetExceeded, current_artifact_budget
 from ai_employee.domain.v2 import ArtifactDescriptor, ArtifactPutRequest
 from ai_employee.serialization import canonical_json
 
@@ -28,6 +29,10 @@ class AtomicArtifactStore:
             path.mkdir(parents=True, exist_ok=True)
 
     def put(self, stream: BinaryIO, request: ArtifactPutRequest) -> ArtifactDescriptor:
+        budget = current_artifact_budget()
+        if budget is not None and request.run_id != budget.request.run_id:
+            # Workspace lineage may retain already accepted predecessor inputs.
+            budget = None
         digest = hashlib.sha256()
         size = 0
         fd, temporary_name = tempfile.mkstemp(prefix="put-", dir=self.temporary_root)
@@ -41,11 +46,15 @@ class AtomicArtifactStore:
                     size += len(chunk)
                     if size > self.maximum_bytes:
                         raise ValueError("artifact exceeds configured byte limit")
+                    if budget is not None and size > budget.limit:
+                        raise NodeArtifactBudgetExceeded("NODE_ARTIFACT_BUDGET_EXCEEDED")
                     digest.update(chunk)
                     output.write(chunk)
                 output.flush()
                 os.fsync(output.fileno())
             artifact_digest = digest.hexdigest()
+            if budget is not None:
+                budget.charge(request.run_id, artifact_digest, size)
             destination = self._content_path(artifact_digest)
             destination.parent.mkdir(parents=True, exist_ok=True)
             try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from hashlib import sha256
@@ -12,6 +13,7 @@ from typing import Literal, cast
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
+from .artifact_budget import NodeArtifactBudgetExceeded, node_artifact_scope
 from .domain import (
     CompletionCriterion,
     ExecutionPolicy,
@@ -396,16 +398,40 @@ class WorkCoordinator:
     ) -> WorkRun:
         """Execute one accepted graph request without creating another graph authority."""
 
-        return self.start(
-            request.goal,
-            repository,
-            base_commit,
-            worker_name=worker_name,
-            run_id=request.run_id,
-            _accepted_request=request,
-            _completion_criteria=completion_criteria,
-            _capture_patch=capture_patch,
-        )
+        try:
+            with node_artifact_scope(self.store, request) if capture_patch else nullcontext():
+                return self.start(
+                    request.goal,
+                    repository,
+                    base_commit,
+                    worker_name=worker_name,
+                    run_id=request.run_id,
+                    _accepted_request=request,
+                    _completion_criteria=completion_criteria,
+                    _capture_patch=capture_patch,
+                )
+        except NodeArtifactBudgetExceeded:
+            return self._artifact_budget_failure(request)
+
+    def _artifact_budget_failure(self, request: WorkerRequest) -> WorkRun:
+        run = self.store.get_work_run(request.run_id)
+        # Preserve a returned worker result; resource admission is a runtime failure.
+        if run.worker_result_id is None:
+            result = WorkerResult(
+                id=identifier("artifact-budget-result"),
+                duration_seconds=0.0,
+                run_id=request.run_id,
+                created_at=now(),
+                request_digest=request.content_digest or "",
+                status="failed",
+                failure=StableFailure(
+                    code=StableFailureCode.BUDGET_EXCEEDED,
+                    message="node artifact reservation exhausted",
+                ),
+            )
+            self.store.put("worker_result_v2", result, run_id=run.id)
+            run = self._update(run, worker_result_id=result.id)
+        return self._update(run, status="failed", failure_code="NODE_ARTIFACT_BUDGET_EXCEEDED")
 
     def start(
         self,
@@ -692,6 +718,23 @@ class WorkCoordinator:
         return self._execute_actions(run, snapshot, channel, cancellation)
 
     def resume(self, run_id: str) -> WorkRun:
+        run = self.store.get_work_run(run_id)
+        if not run.capture_patch or run.worker_request_digest is None:
+            return self._resume(run_id)
+        requests = {
+            item.content_digest: item
+            for item in self.store.list_records("worker_request_v2", WorkerRequest, run_id=run_id)
+        }
+        request = requests.get(run.worker_request_digest)
+        if request is None:
+            raise ValueError("resumed writing node lacks its accepted artifact reservation")
+        try:
+            with node_artifact_scope(self.store, request):
+                return self._resume(run_id)
+        except NodeArtifactBudgetExceeded:
+            return self._artifact_budget_failure(request)
+
+    def _resume(self, run_id: str) -> WorkRun:
         run = WorkRun.model_validate(self.store.get_work_run(run_id))
         generation, checkpoint = self.store.load_work_checkpoint(run_id)
         current_policy_digest = canonical_digest(

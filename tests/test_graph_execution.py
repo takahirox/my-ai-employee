@@ -108,9 +108,11 @@ NOW = datetime(2026, 1, 1, tzinfo=UTC)
         "pause-composition",
         "cancel-parent",
         "pause-parent",
+        "pause-semantic-parent",
         "expired-parent",
         "budget-parent",
         "interrupted-parent",
+        "artifact-budget",
     ],
 )
 def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
@@ -120,11 +122,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
     stop_action = (
         stop_case.split("-", 1)[0] if stop_case.startswith(("cancel-", "pause-")) else None
     )
+    semantic_pause = parent_verification_succeeds == "pause-semantic-parent"
     semantic_repair = parent_verification_succeeds == "semantic-repair"
     semantic_retry = parent_verification_succeeds == "semantic-retry"
     semantic_stale_node = parent_verification_succeeds == "semantic-stale-node"
     generated_outputs = parent_verification_succeeds == "generated"
-    semantic_enabled = semantic_repair or semantic_retry or semantic_stale_node
+    semantic_enabled = semantic_repair or semantic_retry or semantic_stale_node or semantic_pause
     semantic_invoked = semantic_repair or semantic_retry
     deterministic_parent_succeeds = parent_verification_succeeds in {
         True,
@@ -185,7 +188,10 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
             output_contract=OutputContract(id=f"contract-{name}"),
             required_capabilities=("edit_intent", "process"),
             completion_criteria=(criterion(name),),
-            resource_budget=NodeResourceBudget(wall_seconds=10.0),
+            resource_budget=NodeResourceBudget(
+                wall_seconds=10.0,
+                artifact_bytes=1 if stop_case == "artifact-budget" else 4096,
+            ),
             complexity=2 if name in {"a", "b"} else 3,
         )
 
@@ -198,7 +204,12 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
         ),
         entry_node_ids=("a", "b"),
         terminal_node_ids=("c",),
-        budget=Budget(max_attempts=3, max_nodes=3, max_wall_seconds=30.0),
+        budget=Budget(
+            max_attempts=3,
+            max_nodes=3,
+            max_wall_seconds=30.0,
+            max_artifact_bytes=3 if stop_case == "artifact-budget" else 12288,
+        ),
     )
     goal = Goal(
         id="goal-bounded",
@@ -580,7 +591,7 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 )
                 return bind_parent_semantic_review_payload(
                     ParentSemanticReviewPayload(
-                        findings=(finding,),
+                        findings=() if semantic_pause else (finding,),
                         reviewed_criterion_ids=("parent-verification",),
                         reviewed_node_ids=("a", "b", "c"),
                     ),
@@ -698,9 +709,17 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 item.sample_count == item.success_count > 0
                 for item in verified_history.performances
             )
-        else:
+        elif stop_case != "artifact-budget":
             assert not verified_history.performances
 
+        if stop_case == "artifact-budget":
+            assert run.status == "failed"
+            assert composition_calls == 0
+            assert any(
+                item.failure_code == "NODE_ARTIFACT_BUDGET_EXCEEDED"
+                for item in service.replay("graph-e2e").nodes
+            )
+            return
         if stop_case == "budget-parent":
             assert run.status == "failed"
             assert run.failure_code == "RUN_WALL_BUDGET_EXCEEDED"
@@ -726,6 +745,30 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 (repository / f"{name}.txt").read_text() == f"{name}-before\n"
                 for name in ("a", "b", "c")
             )
+            if stop_action == "pause":
+                # Repeat the pause before allowing completion: each composition
+                # request has fresh metadata but the same digest-bound inputs.
+                for paused_again in (True, False):
+                    if not paused_again:
+                        stop_action = None
+                        stop_case = ""
+                    deterministic_parent_succeeds = True
+                    resumed = service.run(
+                        goal,
+                        proposal,
+                        ExecutionPolicy(max_nodes=3, max_attempts=3, max_wall_seconds=30.0),
+                        harness_digest=harness_digest,
+                        effective_policy_digest=effective_policy_digest,
+                        run_id="graph-e2e",
+                        available_capabilities=("edit_intent", "process"),
+                        resume=True,
+                    )
+                    assert resumed.status == ("paused" if paused_again else "ready_to_promote")
+                    assert resumed.failure_code == ("GRAPH_PAUSED" if paused_again else None)
+                if semantic_pause:
+                    assert semantic_reviewer.calls >= 1
+                assert all(item.status == "passed" for item in service.replay("graph-e2e").nodes)
+                assert store.current_run_owner("graph-e2e")["status"] == "closed"
             return
         assert store.current_run_owner("graph-e2e")["status"] == "closed"
         assert run.status == ("ready_to_promote" if parent_ready else "failed")

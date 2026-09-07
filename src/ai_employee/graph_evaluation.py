@@ -836,7 +836,7 @@ class GraphCandidateEvaluator:
             raise ValueError("parent semantic review lacks exact accepted node executions")
         for record in latest.values():
             _validate_retained_node(self.store, record)
-        composition_requests = tuple(
+        composition_requests = _unique_records(
             item
             for item in self.store.list_records(
                 "graph_patch_composition_request_v2",
@@ -1544,7 +1544,7 @@ class GraphCandidateEvaluator:
             GraphPatchCompositionRequest,
             run_id=request.run_id,
         )
-        matching_requests = tuple(
+        matching_requests = _unique_records(
             item
             for item in composition_requests
             if item.content_digest == request.composition_request_digest

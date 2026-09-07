@@ -89,6 +89,7 @@ from .routing_history import VerifiedRoutingHistory, load_verified_routing_histo
 from .run_budget import WallTimeExceeded, check_wall_budget, current_wall_budget, wall_budget_scope
 from .run_ownership import (
     OwnerFenceViolationRecord,
+    RunCancellationRequested,
     RunExecutionOwnerRecord,
     RunLeaseClosureRecord,
     RunLeaseHeartbeatRecord,
@@ -1145,9 +1146,11 @@ class TaskOrchestrator:
             )
             self._save_run(result)
             return result
-        except _StageStopped as stopped:
+        except (_StageStopped, RunCancellationRequested) as stopped:
             current = self.store.get("graph_run_v2", run_id, GraphRunRecord)
             cancelled = stopped.action == "cancel"
+            if cancelled and self._run_owner is not None:
+                self._propagate_owner_interruption(self._run_owner)
             result = current.model_copy(
                 update={
                     "status": "cancelled" if cancelled else "paused",

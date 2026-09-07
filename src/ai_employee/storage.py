@@ -31,6 +31,7 @@ from .domain import (
 from .domain.base import ensure_utc
 from .jobs import JobGraphRunRecord, JobRecord
 from .run_ownership import (
+    RunCancellationRequested,
     RunExecutionOwnerRecord,
     RunLeaseClosureRecord,
     RunLeaseHeartbeatRecord,
@@ -322,6 +323,52 @@ class SQLiteStore:
             )
         return cursor.rowcount == 1
 
+    def claim_node_artifact(self, admission: BaseModel) -> bool:
+        """Reserve unique content atomically before publication; never refund on a crash."""
+        from .artifact_budget import NodeArtifactAdmission
+
+        if not isinstance(admission, NodeArtifactAdmission):
+            raise TypeError("artifact claims require bound admission records")
+        connection = self._connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT payload FROM records WHERE kind='node_artifact_admission_v2' AND run_id=?",
+                (admission.run_id,),
+            ).fetchall()
+            used = 0
+            existing = None
+            seen: set[str] = set()
+            for row in rows:
+                item = NodeArtifactAdmission.model_validate_json(row["payload"], strict=True)
+                if (
+                    item.run_id != admission.run_id
+                    or item.worker_request_digest != admission.worker_request_digest
+                    or item.byte_limit != admission.byte_limit
+                    or item.artifact_digest in seen
+                ):
+                    raise ValueError("artifact admission has stale or duplicate bindings")
+                seen.add(item.artifact_digest)
+                used += item.size_bytes
+                if item.artifact_digest == admission.artifact_digest:
+                    existing = item
+            if existing is not None and existing.size_bytes != admission.size_bytes:
+                raise ValueError("one content digest has conflicting artifact sizes")
+            if used + (0 if existing is not None else admission.size_bytes) > admission.byte_limit:
+                connection.rollback()
+                return False
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO records(kind,record_id,run_id,revision,payload) "
+                    "VALUES('node_artifact_admission_v2',?,?,1,?)",
+                    (admission.id, admission.run_id, canonical_json(admission)),
+                )
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+
     def claim_node_process(
         self,
         admission: BaseModel,
@@ -564,6 +611,15 @@ class SQLiteStore:
             if row is None or not _owner_row_matches(row, owner, observed_at=observed_at):
                 connection.rollback()
                 return None
+            control = connection.execute(
+                "SELECT action FROM controls WHERE run_id=?", (owner.run_id,)
+            ).fetchone()
+            if (
+                getattr(run, "status", None) in {"completed", "ready_to_promote"}
+                and control is not None
+                and control["action"] == "cancel"
+            ):
+                raise RunCancellationRequested()
             closure = closure_factory(str(row["heartbeat_digest"]))
             _put_graph_run_in_transaction(connection, run, owner.run_id)
             connection.execute(

@@ -145,3 +145,25 @@ Adaptive worker routing reads repository-scoped, verified node outcomes from
 committed execution facts. It preserves mandatory eligibility checks and binds
 history provenance into each node route; see
 [adaptive routing history](adaptive-routing-history.md).
+
+### Writing-node artifact reservations
+
+Accepted writing nodes charge unique artifact content bytes against their explicit
+`artifact_bytes` reservation. Process output, patch captures, and verification output
+share that allowance. Repeated descriptors for identical content consume bytes once;
+accepted predecessor inputs remain charged to their producer. Metadata and temporary
+streaming buffers are not content bytes. Streaming is still bounded by the per-object
+store limit and the node's total reservation.
+
+The atomic artifact store persists a node/request/content-bound admission before it
+publishes a blob. Concurrent producers cannot spend the same remaining capacity.
+Interrupted publications retain their reservation, and child resume reloads it.
+Retained descriptors from custom stores and older runs are reconciled before accepting
+completion. Exhaustion produces `NODE_ARTIFACT_BUDGET_EXCEEDED` and cannot publish a
+passing node patch. Graph reservations continue to bound the sum allocated to nodes.
+
+Normal wall-time completion and crash recovery can overlap for the same invocation.
+Their receipts are settled as one interval using the conservative maximum, so a late
+normal finalizer neither causes a duplicate-receipt failure nor loses observed time.
+Successful graph terminalization checks accepted cancellation in the same SQLite
+transaction that publishes the terminal graph and closes its owner lease.

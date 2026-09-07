@@ -31,6 +31,7 @@ from .isolated_worker import (
     NativeProcessBudgetExceeded,
 )
 from .prompt_transport import prompt_json
+from .run_budget import BudgetCancellation, check_wall_budget, remaining_timeout
 from .serialization import canonical_json
 from .services_v2._common import identifier, now
 from .services_v2.process import LocalProcessExecutor
@@ -149,10 +150,15 @@ class DockerProcessExecutor(LocalProcessExecutor):
         self, request: ProcessRequest, decision: PolicyDecision, cancellation: Cancellation
     ) -> ExecutionResult:
         started = time.monotonic()
+        cancellation = BudgetCancellation(cancellation)
         rejection = self._validate_policy(request, decision)
         if rejection:
             return self._result(request, started, failure=rejection)
         try:
+            check_wall_budget()
+            if cancellation.cancelled():
+                raise RuntimeError("isolated verification was cancelled")
+            timeout = remaining_timeout(request.timeout_seconds)
             if (
                 len(self.roots) != 1
                 or request.cwd != "."
@@ -168,13 +174,18 @@ class DockerProcessExecutor(LocalProcessExecutor):
             with DockerCandidate(
                 offline,
                 self.roots[0],
-                seconds=request.timeout_seconds,
+                seconds=timeout,
                 cancellation=cancellation,
                 output_limit=request.stdout_bytes + request.stderr_bytes,
                 include_untracked=True,
             ) as candidate:
                 code, stdout, stderr = candidate.run_guarded(request.argv, process_limit=1)
                 process_usage = candidate.native_process_usage
+            check_wall_budget()
+            if cancellation.cancelled():
+                raise RuntimeError("isolated verification was cancelled")
+            if time.monotonic() - started >= timeout:
+                raise TimeoutError("isolated verification exceeded its deadline")
             if len(stdout) > request.stdout_bytes or len(stderr) > request.stderr_bytes:
                 raise ValueError("isolated process output exceeded its per-stream budget")
             execution_id = identifier("execution")
