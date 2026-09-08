@@ -1038,9 +1038,15 @@ def _bounded_prompt(
             "and keep proposals empty."
         )
     if request.accepted_goal is not None:
-        payload["accepted_goal"] = request.accepted_goal
+        # This is a transport alias, not a scope or graph-size inference. Retain both
+        # strings in the authoritative request, including its persisted digest.
+        if request.accepted_goal == request.goal:
+            payload["accepted_goal_source"] = "goal"
+        else:
+            payload["accepted_goal"] = request.accepted_goal
         payload["instruction"] = str(payload["instruction"]) + (
-            " The accepted_goal contains the original user requirements before planning. "
+            " Original user requirements are in accepted_goal, or in goal when "
+            'accepted_goal_source is "goal". '
             "Cross-check every requirement applicable to this node against the proposed "
             "change, including edge cases and preservation constraints; a planner summary "
             "or a passing smoke check does not replace those requirements. Keep execution "

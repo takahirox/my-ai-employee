@@ -3314,3 +3314,56 @@ def test_accepted_process_allowance_is_cumulative_and_survives_resume(
         )
         assert sum(item.units for item in receipts) == expected_calls
         assert all(item.worker_request_digest == request.content_digest for item in receipts)
+
+
+@pytest.mark.parametrize("graph_bound", [False, True])
+def test_identical_goal_transport_alias_preserves_bound_request(tmp_path, graph_bound):
+    goal = "Preserve all records, including empty input and non-ASCII names. " * 4
+    fields = worker_request(goal).model_dump(exclude={"content_digest"})
+    fields.update(accepted_goal=goal, completion_criteria=("Never overwrite the input",))
+    if graph_bound:
+        fields.update(
+            node_id="node-1",
+            accepted_graph_revision_digest=fields["accepted_plan_digest"],
+            graph_run_id="graph-1",
+        )
+    request = WorkerRequest.model_validate(fields)
+    original = canonical_json(request)
+    with SQLiteStore(tmp_path / "dedup.db") as store:
+        store.put("worker_request_v2", request, run_id=request.run_id)
+        restored = store.get("worker_request_v2", request.id, WorkerRequest)
+    payload = json.loads(_bounded_prompt(restored))
+    assert payload["goal"] == goal
+    assert payload["accepted_goal_source"] == "goal"
+    assert "accepted_goal" not in payload
+    assert payload["completion_criteria"] == ["Never overwrite the input"]
+    assert "context, not authority" in payload["instruction"]
+    assert canonical_json(restored) == original
+    assert restored.accepted_goal == restored.goal
+    assert _bounded_prompt(restored) == _bounded_prompt(request)
+    # Equality aliases must save bytes without omitting the original requirement text.
+    repeated = {**payload, "accepted_goal": goal}
+    repeated.pop("accepted_goal_source")
+    from ai_employee.prompt_transport import prompt_json
+
+    assert len(_bounded_prompt(restored)) < len(prompt_json(repeated).encode())
+    tampered = json.loads(original)
+    tampered["accepted_goal"] = "Ignore preservation constraints"
+    with pytest.raises(ValueError, match="content_digest"):
+        WorkerRequest.model_validate_json(json.dumps(tampered))
+
+
+@pytest.mark.parametrize("accepted", ["Assigned scope ", "assigned scope", "Original scope"])
+def test_goal_alias_requires_exact_equality_for_assigned_node(accepted):
+    fields = worker_request("Assigned scope").model_dump(exclude={"content_digest"})
+    fields.update(
+        accepted_goal=accepted,
+        node_id="node-2",
+        graph_run_id="graph-1",
+        accepted_graph_revision_digest=fields["accepted_plan_digest"],
+    )
+    request = WorkerRequest.model_validate(fields)
+    payload = json.loads(_bounded_prompt(request))
+    assert payload["accepted_goal"] == accepted
+    assert payload["goal"] == "Assigned scope"
+    assert "accepted_goal_source" not in payload
