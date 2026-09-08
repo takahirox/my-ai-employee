@@ -203,3 +203,42 @@ def test_observation_preflight_rejects_unverified_cli_before_generation(
         adapter, "_execute", lambda *a, **kw: pytest.fail("unsupported CLI dispatched")
     )
     assert adapter.probe().availability == "unavailable"
+
+
+def test_full_adapter_preflight_with_inherited_model_proxy():
+    import os
+    import subprocess
+    from pathlib import Path
+
+    image = os.environ.get("FLEET_TEST_OBSERVATION_IMAGE")
+    if not image:
+        pytest.skip("explicit native Docker image required")
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--user",
+            "1000:1000",
+            "--entrypoint",
+            "python",
+            "-e",
+            "PYTHONPATH=/opt/test-source",
+            "--mount",
+            f"type=bind,src={root / 'src'},dst=/opt/test-source,readonly",
+            "--mount",
+            f"type=bind,src={root / 'tests/fixtures/native_observation_preflight.py'},"
+            "dst=/tmp/probe.py,readonly",
+            image,
+            "/tmp/probe.py",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

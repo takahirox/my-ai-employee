@@ -855,7 +855,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             return availability
         import sys
 
-        from .worker_observation import observation_args, observation_proxy_url
+        from .worker_observation import observation_args
 
         version = re.search(r"\b(\d+)\.(\d+)\.(\d+)", availability.version or "")
         if version is None or tuple(map(int, version.groups())) < (0, 153, 4):
@@ -871,13 +871,16 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
         assert self.scratch_directory is not None
         assert self.observation_repository is not None
         script = (
-            "import os; from pathlib import Path; "
+            "import os; from pathlib import Path; from urllib.parse import urlsplit; "
             f"p=Path({self.scratch_directory!r})/'.fleet-observation-probe'; "
             "p.write_text('ok'); p.unlink(); "
             f"assert not os.access({self.observation_repository!r}, os.W_OK); "
             + (
-                "assert (os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')) == "
-                f"{observation_proxy_url(self.scratch_directory)!r}"
+                "proxy=urlsplit(os.environ.get('HTTP_PROXY') "
+                "or os.environ.get('http_proxy') or ''); "
+                "assert proxy.scheme == 'http' and proxy.hostname == '127.0.0.1' "
+                "and proxy.port is not None and 0 < proxy.port < 65536 "
+                "and proxy.username is None and proxy.password is None"
                 if self.observation_hosts
                 else "pass"
             )

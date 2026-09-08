@@ -35,6 +35,27 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
         kwargs["stdout"].write('{"run_id":"fixture-run","status":"failed","stable_code":"TIMEOUT"}')
         kwargs["stdout"].flush()
         assert json.loads((logs / "fleet-result.json").read_text())["status"] == "failed"
+        from ai_employee.domain.base import freeze_json
+        from ai_employee.model_usage import ModelProcessDiagnostic
+        from ai_employee.services_v2._common import now
+        from ai_employee.storage import SQLiteStore
+
+        diagnostic = ModelProcessDiagnostic(
+            id="process-fixture",
+            run_id="fixture-run",
+            created_at=now(),
+            graph_run_id="fixture-run",
+            stage="worker",
+            request_digest="0" * 64,
+            process_result_digest="1" * 64,
+            status="failed",
+            exit_code=1,
+            duration_seconds=1.0,
+            resource_usage=freeze_json({"stdout_bytes": 42}),
+            transport_failures=("transport",),
+        )
+        with SQLiteStore(home / ".fleet/fleet.db") as store:
+            store.put_once("model_process_diagnostic_v2", diagnostic, run_id="fixture-run")
         kwargs["stderr"].write("diagnostic fixture")
         return SimpleNamespace(returncode=7)
 
@@ -45,7 +66,10 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
     usage = next(event for event in events if event["type"] == "pocket.usage")
     assert usage["usage"] == {}
     assert usage["complete"] is (bool(completeness) and all(completeness))
-    assert (logs / "fleet-diagnostics.json").exists()
+    details = json.loads((logs / "fleet-diagnostics.json").read_text())
+    diagnostic = details["model_process_diagnostics"][0]
+    assert diagnostic["resource_usage"] == {"stdout_bytes": 42}
+    assert diagnostic["transport_failures"] == ["transport"]
 
 
 @pytest.mark.parametrize("seconds", [0, -1, True, float("nan"), float("inf")])

@@ -89,7 +89,7 @@ def freeze_json(value: object) -> JsonValue:
 def thaw_json(value: object) -> object:
     """Convert an immutable canonical tree to ordinary JSON containers."""
 
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [thaw_json(item) for item in value]

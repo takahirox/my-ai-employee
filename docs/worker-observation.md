@@ -28,8 +28,10 @@ a model response or a URL found in task text.
 The transport explicitly enables Codex's managed network proxy and its domain
 allowlist together. It uses a per-scratch listener port; a bind conflict fails closed.
 Codex versions before 0.153.4 are rejected for this mode. A credential-free native
-preflight checks scratch writes, source write denial and the exact managed proxy URL
-before worker generation. Unsupported native isolation fails instead of consuming
+preflight checks scratch writes, source write denial and a native loopback proxy URL
+before worker generation. Codex may bridge the configured listener to a fresh internal
+port; preflight must not require that native port to equal the configured port.
+An inherited remote model-proxy URL does not satisfy this check. Unsupported native isolation fails instead of consuming
 the worker's entire reasoning budget. Domain enforcement was tested with Codex
 0.153.4 on Linux: allowed loopback HTTP succeeds, an unlisted local address returns
 403, and bypassing the proxy cannot reach the service. Merely enabling network with
