@@ -354,6 +354,7 @@ class CliWorkerAdapter:
             scratch_directory=self.scratch_directory,
             include_response_schema=self.include_response_schema,
             codex_edit_transport=self.uses_codex_edit_transport,
+            observation_enabled=self.observation_hosts is not None,
         )
         if self.observation_hosts is not None:
             payload = json.loads(prompt)
@@ -1089,8 +1090,17 @@ def _bounded_prompt(
     scratch_directory: str | None = None,
     include_response_schema: bool = False,
     codex_edit_transport: bool = False,
+    observation_enabled: bool = False,
 ) -> bytes:
     evidence_sources = _worker_evidence_sources(request)
+    workspace_instruction = (
+        "The current working directory is a disposable candidate copy; its declared scratch "
+        "paths are writable. The original repository and input files remain read-only. "
+        "Use candidate_validation for the exact observation authority. "
+        if observation_enabled
+        else "The repository is the current working directory and its filesystem is read-only "
+        "to the worker; you may inspect its files with read-only tools. "
+    )
     payload: dict[str, object] = {
         "protocol": "fleet-worker-proposal/2",
         "run_id": request.run_id,
@@ -1126,9 +1136,9 @@ def _bounded_prompt(
         ),
         "writable_scratch_directory": scratch_directory,
         "instruction": (
-            "Return only the strict JSON envelope. The repository is the current working "
-            "directory and its filesystem is read-only to the worker; you may inspect its files "
-            "with read-only tools. A mutating task that requires edit_intent must still return a "
+            "Return only the strict JSON envelope. "
+            + workspace_instruction
+            + "A mutating task that requires edit_intent must still return a "
             "typed edit proposal; read-only filesystem authority forbids direct edits, not "
             "proposals. Use minimal_sufficient as the default: propose the smallest change "
             "sufficient for the supplied node goal and "
