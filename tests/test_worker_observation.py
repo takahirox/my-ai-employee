@@ -83,6 +83,7 @@ probe=r"""
 import json,os,subprocess,urllib.request
 from pathlib import Path
 Path('writable').write_text('ok')
+assert not os.access('/tmp/source',os.W_OK)
 os.environ['TMPDIR']=str(Path.cwd()/'.tmp')
 for path in ['/tmp/source/protected','input/new']:
  try:Path(path).write_text('bad')
@@ -168,3 +169,37 @@ def test_disabled_observation_preserves_existing_identity_and_opt_in_changes_it(
             update={"worker": harness.worker.model_copy(update={"scratch_validation": True})}
         )
     ) != project_harness_digest(harness)
+
+
+@pytest.mark.parametrize("version", ["codex-cli 0.152.0", "unknown"])
+def test_observation_preflight_rejects_unverified_cli_before_generation(
+    tmp_path, monkeypatch, version
+):
+    from ai_employee.domain.v2 import WorkerAvailability
+    from ai_employee.services_v2._common import now
+    from ai_employee.worker_adapters import CliWorkerAdapter, CodexCliWorkerAdapter
+
+    availability = WorkerAvailability(
+        id="probe",
+        run_id="run",
+        created_at=now(),
+        adapter="codex_cli",
+        executable="codex",
+        availability="auth_unknown",
+        auth="unknown",
+        version=version,
+    )
+    monkeypatch.setattr(CliWorkerAdapter, "probe", lambda self: availability)
+    adapter = CodexCliWorkerAdapter(
+        None,
+        None,
+        None,
+        run_id="run",
+        scratch_directory=str(tmp_path / "scratch"),
+        observation_repository=str(tmp_path / "source"),
+        observation_hosts=("127.0.0.1",),
+    )
+    monkeypatch.setattr(
+        adapter, "_execute", lambda *a, **kw: pytest.fail("unsupported CLI dispatched")
+    )
+    assert adapter.probe().availability == "unavailable"

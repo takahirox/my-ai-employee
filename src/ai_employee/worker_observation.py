@@ -45,6 +45,11 @@ def prepare_scratch(repository: Path, parent: Path, *, candidate: bool = False) 
     return target
 
 
+def observation_proxy_url(scratch: str) -> str:
+    port = 20_000 + int(hashlib.sha256(scratch.encode()).hexdigest()[:8], 16) % 40_000
+    return f"http://127.0.0.1:{port}"
+
+
 def observation_args(
     scratch: str, hosts: tuple[str, ...], repository: str | None = None
 ) -> tuple[str, ...]:
@@ -83,11 +88,10 @@ def observation_args(
     if hosts:
         # Independent workers must not contend for Codex's fixed default listeners.
         # A bind race fails closed during native startup; it never broadens access.
-        port = 20_000 + int(hashlib.sha256(scratch.encode()).hexdigest()[:8], 16) % 40_000
         args.extend(
             (
                 "-c",
-                f'permissions.fleet-observe.network.proxy_url="http://127.0.0.1:{port}"',
+                f'permissions.fleet-observe.network.proxy_url="{observation_proxy_url(scratch)}"',
                 "-c",
                 "permissions.fleet-observe.network.enable_socks5=false",
             )

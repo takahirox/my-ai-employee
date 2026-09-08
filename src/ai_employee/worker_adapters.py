@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import ClassVar, Literal, cast
 
 from pydantic import ConfigDict, Field
@@ -255,8 +255,16 @@ class CliWorkerAdapter:
             from .worker_observation import exact_hosts
 
             exact_hosts(observation_hosts)
-            if scratch_directory is None:
-                raise ValueError("observation requires a scratch directory")
+            if (
+                scratch_directory is None
+                or observation_repository is None
+                or not Path(scratch_directory).is_absolute()
+                or not Path(observation_repository).is_absolute()
+                or self.adapter != "codex_cli"
+            ):
+                raise ValueError(
+                    "Codex observation requires explicit absolute scratch and repository paths"
+                )
         if output_schema_path is not None and (
             "\x00" in output_schema_path or not output_schema_path
         ):
@@ -847,15 +855,29 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             return availability
         import sys
 
-        from .worker_observation import observation_args
+        from .worker_observation import observation_args, observation_proxy_url
 
+        version = re.search(r"\b(\d+)\.(\d+)\.(\d+)", availability.version or "")
+        if version is None or tuple(map(int, version.groups())) < (0, 153, 4):
+            return availability.model_copy(
+                update={
+                    "availability": "unavailable",
+                    "failure": StableFailure(
+                        code=StableFailureCode.WORKER_UNAVAILABLE,
+                        message="WORKER_OBSERVATION_UNAVAILABLE: requires Codex >= 0.153.4",
+                    ),
+                }
+            )
         assert self.scratch_directory is not None
+        assert self.observation_repository is not None
         script = (
             "import os; from pathlib import Path; "
             f"p=Path({self.scratch_directory!r})/'.fleet-observation-probe'; "
             "p.write_text('ok'); p.unlink(); "
+            f"assert not os.access({self.observation_repository!r}, os.W_OK); "
             + (
-                "assert os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')"
+                "assert (os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')) == "
+                f"{observation_proxy_url(self.scratch_directory)!r}"
                 if self.observation_hosts
                 else "pass"
             )
