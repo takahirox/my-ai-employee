@@ -475,3 +475,17 @@ def test_missing_effect_advice_is_conservative_and_new_provider_schema_requires_
     schema = json.loads(semantic_assessment_schema_json(recommend_execution_path=True))
     advice_schema = schema["$defs"]["EffectAwareExecutionRecommendation"]
     assert set(advice_schema["required"]) == set(advice_schema["properties"])
+
+
+@pytest.mark.parametrize("effects", ["external_or_protected_change", "unknown"])
+def test_persisted_direct_decision_cannot_contradict_explicit_effect_advice(effects):
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures/adaptive-decision-legacy.json").read_text()
+    )
+    payload["recommendation"]["effect_scope"] = effects
+    payload["content_digest"] = None
+    with pytest.raises(ValueError, match="contradicts its intended-effect assessment"):
+        AdaptiveExecutionDecision.model_validate_json(json.dumps(payload))
+    payload["path"] = "planned"
+    payload["direct_graph_digest"] = None
+    assert AdaptiveExecutionDecision.model_validate_json(json.dumps(payload)).path == "planned"

@@ -109,4 +109,10 @@ class AdaptiveExecutionDecision(DigestedRecordV2):
             raise ValueError("adaptive decision assessment digest is stale")
         if (self.path == "direct") != (self.direct_graph_digest is not None):
             raise ValueError("only direct execution binds a deterministic graph")
+        if (
+            self.path == "direct"
+            and isinstance(self.recommendation, EffectAwareExecutionRecommendation)
+            and self.recommendation.effect_scope != "read_only_or_local_reversible"
+        ):
+            raise ValueError("direct decision contradicts its intended-effect assessment")
         return self
