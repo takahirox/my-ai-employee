@@ -314,3 +314,191 @@ def test_failed_usage_is_a_subtotal_not_a_complete_stage_total(tmp_path):
         assert report["metrics"]["input_tokens"]["total"] is None
         assert report["metrics"]["input_tokens"]["known_subtotal"] == 20
         assert report["by_stage"]["worker"]["input_tokens"] is None
+
+
+def test_streaming_discards_large_tools_before_retained_limit(tmp_path):
+    import sys
+
+    from ai_employee.model_usage import filter_model_stdout, model_stdout_filter
+    from ai_employee.services_v2 import AtomicArtifactStore, LocalProcessExecutor
+    from tests.test_controlled_services_v2 import NeverCancelled, allow
+
+    producer = tmp_path / "producer.py"
+    producer.write_text(
+        "import json\n"
+        'print(json.dumps({"type":"item.completed","item":'
+        '{"type":"command_execution","aggregated_output":"x"*1616047}}))\n'
+        'print(json.dumps({"type":"item.completed","item":'
+        '{"type":"agent_message","text":"{}"}}))\n'
+        'print(json.dumps({"type":"turn.completed","usage":'
+        '{"input_tokens":10,"output_tokens":1}}))\n'
+    )
+    request = ProcessRequest(
+        id="large-stream",
+        run_id="run",
+        created_at=now(),
+        argv=(sys.executable, str(producer)),
+        timeout_seconds=5.0,
+        stdout_bytes=1_000_000,
+        stderr_bytes=1000,
+        purpose="obtain strict worker proposal envelope",
+    )
+    artifacts = AtomicArtifactStore(tmp_path / "artifacts")
+    executor = LocalProcessExecutor(
+        (tmp_path,),
+        artifacts,
+        executable_paths=(str(__import__("pathlib").Path(sys.executable).resolve().parent),),
+        stdout_storage_filter=lambda req, data: filter_model_stdout("codex_cli", req, data),
+        stdout_stream_filter_factory=lambda req: model_stdout_filter("codex_cli", req),
+    )
+    result = executor.execute(request, allow(request.content_digest), NeverCancelled())
+    assert result.status == "succeeded"
+    assert result.resource_usage["stdout_bytes"] > 1_600_000
+    assert result.resource_usage["stdout_retained_bytes"] < 1000
+    with artifacts.open_verified(
+        executor.output_descriptor(result.stdout_artifact_digest, "process_stdout", result.id)
+    ) as f:
+        output = f.read().decode()
+    assert codex_payload(output) == "{}"
+    assert provider_usage("codex_cli", output)["input_tokens"] == 10
+
+
+def test_stream_filter_bounds_partial_lines_and_preserves_failures():
+    from ai_employee.model_usage import model_stdout_filter
+
+    request = ProcessRequest(
+        id="stream",
+        run_id="run",
+        created_at=now(),
+        argv=("fixture",),
+        timeout_seconds=1.0,
+        stdout_bytes=1000,
+        stderr_bytes=100,
+        purpose="obtain strict worker proposal envelope",
+    )
+    filt = model_stdout_filter("codex_cli", request)
+    assert filt is not None
+    assert filt.feed(b"x" * 4001) == b""
+    assert filt.exceeded and not filt.pending
+    filt = model_stdout_filter("codex_cli", request)
+    output = filt.feed(b'{"type":"error","message":"connection disconnect secret-canary"}\n')
+    assert b"transport" in output and b"canary" not in output
+    assert b"invalid_json" in filt.feed(b"not-json\n")
+    assert (
+        model_stdout_filter("codex_cli", request.model_copy(update={"purpose": "ordinary check"}))
+        is None
+    )
+
+
+def test_process_diagnostics_keep_failure_class_without_provider_body(tmp_path):
+    from ai_employee.domain.base import freeze_json
+    from ai_employee.model_usage import ModelProcessDiagnostic
+
+    request = ProcessRequest(
+        id="failed-review",
+        run_id="run-1",
+        created_at=now(),
+        argv=("fixture",),
+        timeout_seconds=1.0,
+        purpose="obtain a strict non-authoritative PlanReviewPayload",
+    )
+    result = ExecutionResult(
+        id="result-1",
+        run_id="run-1",
+        created_at=now(),
+        request_digest=request.content_digest,
+        status="succeeded",
+        exit_code=0,
+        duration_seconds=0.1,
+        stdout_artifact_digest="a" * 64,
+        resource_usage=freeze_json({"stdout_bytes": 101, "private": "secret-canary"}),
+    )
+
+    class Executor:
+        def execute(self, *args):
+            return result
+
+    with SQLiteStore(tmp_path / "state.db") as store:
+        executor = UsageRecordingExecutor(
+            Executor(),
+            store,
+            lambda _: b'{"type":"error","message":"connection disconnected secret-canary"}',
+            graph_run_id="graph",
+            backend="codex_cli",
+            model="fixture",
+            effort="high",
+            configuration_digest="b" * 64,
+        )
+        executor.execute(
+            request,
+            PolicyDecision(
+                id="decision",
+                run_id="run-1",
+                created_at=now(),
+                request_digest=request.content_digest,
+                effective_policy_digest="0" * 64,
+                outcome=DecisionOutcome.ALLOW,
+                reason_code="allowed",
+            ),
+            None,
+        )
+        records = store.list_records(
+            "model_process_diagnostic_v2", ModelProcessDiagnostic, run_id="graph"
+        )
+        assert len(records) == 1
+        assert records[0].stage == "plan_review"
+        assert records[0].transport_failures == ("transport",)
+        assert records[0].resource_usage == {"stdout_bytes": 101}
+        assert "canary" not in canonical_json(records[0])
+
+
+@pytest.mark.parametrize("case", ["raw", "event", "retained", "stderr"])
+def test_streamed_output_still_stops_at_each_finite_limit(tmp_path, case):
+    import sys
+    from pathlib import Path
+
+    from ai_employee.model_usage import model_stdout_filter
+    from ai_employee.services_v2 import AtomicArtifactStore, LocalProcessExecutor
+    from tests.test_controlled_services_v2 import NeverCancelled, allow
+
+    sources = {
+        "raw": (
+            'for _ in range(500): print(json.dumps({"type":"item.completed","item":'
+            '{"type":"command_execution","aggregated_output":"x"*100}}))'
+        ),
+        "event": (
+            'print(json.dumps({"type":"item.completed","item":'
+            '{"type":"command_execution","aggregated_output":"x"*5000}}))'
+        ),
+        "retained": (
+            'print(json.dumps({"type":"item.completed","item":'
+            '{"type":"agent_message","text":"x"*2000}}))'
+        ),
+        "stderr": 'sys.stderr.write("x"*2000);sys.stderr.flush()',
+    }
+    producer = tmp_path / "producer.py"
+    producer.write_text(
+        "import json,sys,time\n" + sources[case] + '\nprint("",flush=True)\ntime.sleep(10)\n'
+    )
+    request = ProcessRequest(
+        id="bounded",
+        run_id="run",
+        created_at=now(),
+        argv=(sys.executable, str(producer)),
+        stdout_bytes=1000,
+        stderr_bytes=1000,
+        timeout_seconds=3.0,
+        purpose="obtain strict worker proposal envelope",
+    )
+    executor = LocalProcessExecutor(
+        (tmp_path,),
+        AtomicArtifactStore(tmp_path / "artifacts"),
+        executable_paths=(Path(sys.executable).resolve().parent,),
+        stdout_stream_filter_factory=lambda r: model_stdout_filter("codex_cli", r),
+    )
+    result = executor.execute(request, allow(request.content_digest), NeverCancelled())
+    assert result.failure.code.value == "PROCESS_OUTPUT_LIMIT_EXCEEDED"
+    assert result.resource_usage["stdout_retained_bytes"] <= 1000
+    assert result.resource_usage["stderr_retained_bytes"] <= 1000
+    assert result.resource_usage["stdout_raw_limit_bytes"] == 32000
+    assert result.resource_usage["process_group_cleanup"] != "not_required"

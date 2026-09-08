@@ -224,6 +224,8 @@ class CliWorkerAdapter:
         cwd: str = ".",
         prompt_writer: Callable[[bytes], str] | None = None,
         scratch_directory: str | None = None,
+        observation_hosts: tuple[str, ...] | None = None,
+        observation_repository: str | None = None,
         output_schema_path: str | None = None,
         model: str | None = None,
         effort: str | None = None,
@@ -247,6 +249,14 @@ class CliWorkerAdapter:
         if scratch_directory is not None and ("\x00" in scratch_directory or not scratch_directory):
             raise ValueError("worker scratch directory must be non-empty and NUL-free")
         self.scratch_directory = scratch_directory
+        self.observation_hosts = observation_hosts
+        self.observation_repository = observation_repository
+        if observation_hosts is not None:
+            from .worker_observation import exact_hosts
+
+            exact_hosts(observation_hosts)
+            if scratch_directory is None:
+                raise ValueError("observation requires a scratch directory")
         if output_schema_path is not None and (
             "\x00" in output_schema_path or not output_schema_path
         ):
@@ -337,6 +347,30 @@ class CliWorkerAdapter:
             include_response_schema=self.include_response_schema,
             codex_edit_transport=self.uses_codex_edit_transport,
         )
+        if self.observation_hosts is not None:
+            payload = json.loads(prompt)
+            payload["candidate_validation"] = {
+                "directory": self.scratch_directory,
+                "allowed_hosts": self.observation_hosts,
+                "instructions": "The current directory is a disposable copy of the candidate. "
+                "Read actual inputs and page/API responses; write and run temporary candidate "
+                "code here, inspect stdout/stderr, and correct failures within the time budget. "
+                "Use chromium-headless-shell for browser observation; full Chromium requires "
+                "extra IPC. Explicitly pass --proxy-server with "
+                "the HTTP_PROXY environment value and --proxy-bypass-list=<-loopback> so that "
+                "loopback observations also use the allowlisted proxy. Set --user-data-dir "
+                "to a directory below this scratch copy and --disable-dev-shm-usage; only "
+                "the scratch copy is writable. "
+                "Use public requirement checks, including complete input coverage and specified "
+                "protocols. Network scope permits observation, not extra side effects: do not "
+                "perform real state-changing operations during a dry run. Use local fakes for "
+                "those operations. Return typed edits relative to the original repository; "
+                "scratch changes are not automatically submitted. Keep a clean baseline for "
+                "diff generation. Do not substitute smoke success for all goal requirements.",
+            }
+            prompt = prompt_json(payload).encode()
+            if len(prompt) > 64_000:
+                raise ValueError("bounded worker request exceeds 64000 bytes")
         stdin_digest = self.prompt_writer(prompt) if self.prompt_writer else None
         argv = self._proposal_argv(None if stdin_digest else prompt.decode("utf-8"))
         invocation = self._execute(
@@ -807,6 +841,55 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
     supports_reasoning_effort = True
     uses_codex_edit_transport = True
 
+    def probe(self) -> WorkerAvailability:
+        availability = super().probe()
+        if availability.availability == "unavailable" or self.observation_hosts is None:
+            return availability
+        import sys
+
+        from .worker_observation import observation_args
+
+        assert self.scratch_directory is not None
+        script = (
+            "import os; from pathlib import Path; "
+            f"p=Path({self.scratch_directory!r})/'.fleet-observation-probe'; "
+            "p.write_text('ok'); p.unlink(); "
+            + (
+                "assert os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')"
+                if self.observation_hosts
+                else "pass"
+            )
+        )
+        probe = self._execute(
+            (
+                self.executable,
+                *observation_args(
+                    self.scratch_directory, self.observation_hosts, self.observation_repository
+                ),
+                "--cd",
+                self.scratch_directory,
+                "sandbox",
+                "--",
+                sys.executable,
+                "-I",
+                "-c",
+                script,
+            ),
+            "probe worker observation sandbox",
+            10.0,
+        )
+        if probe.result.status != "succeeded":
+            return availability.model_copy(
+                update={
+                    "availability": "unavailable",
+                    "failure": StableFailure(
+                        code=StableFailureCode.WORKER_UNAVAILABLE,
+                        message="WORKER_OBSERVATION_UNAVAILABLE: native preflight failed",
+                    ),
+                }
+            )
+        return availability
+
     def _proposal_argv(self, inline_prompt: str | None) -> tuple[str, ...]:
         argv = [self.executable]
         if self.model is not None:
@@ -821,12 +904,22 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
                 "--json",
                 "--ephemeral",
                 "--ignore-user-config",
-                "--sandbox",
             )
         )
-        if self.scratch_directory is not None:
+        if self.observation_hosts is not None:
+            from .worker_observation import observation_args
+
+            assert self.scratch_directory is not None
+            argv.extend(
+                observation_args(
+                    self.scratch_directory, self.observation_hosts, self.observation_repository
+                )
+            )
+            argv.extend(("--cd", self.scratch_directory, "--skip-git-repo-check"))
+        elif self.scratch_directory is not None:
             argv.extend(
                 (
+                    "--sandbox",
                     "workspace-write",
                     "--cd",
                     self.scratch_directory,
@@ -834,7 +927,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
                 )
             )
         else:
-            argv.append("read-only")
+            argv.extend(("--sandbox", "read-only"))
         if self.output_schema_path is not None:
             argv.extend(("--output-schema", self.output_schema_path))
         if inline_prompt is not None:

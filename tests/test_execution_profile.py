@@ -21,6 +21,8 @@ def test_profile_preserves_required_reviews_and_disabled_harness_digests():
     review.pop("independent_task_review")
     review.pop("parent_semantic_review")
     payload["worker"].pop("isolated_workspace_tools")
+    payload["worker"].pop("scratch_validation")
+    payload["worker"].pop("observation_hosts")
     assert project_harness_digest(harness) == canonical_digest(payload)
     strict = ProjectHarnessV2.model_validate_json(
         '{"verification":{"review":{"independent_task_review":true,"parent_semantic_review":true}}}'

@@ -1275,6 +1275,18 @@ def _work_impl(args: argparse.Namespace) -> int:
     if resume_run is not None and operator_config_path is None:
         raise ValueError("authoritative operator configuration cannot be durably recovered")
     operator_config = load_operator_config(operator_config_path)
+    from .worker_observation import observation_authority
+
+    observation_hosts = observation_authority(
+        harness.worker.observation_hosts, operator_config.worker_observation_hosts
+    )
+    if harness.worker.scratch_validation and (
+        operator_config.isolated_worker is not None
+        or harness.worker.allowed != ("codex_cli",)
+        or not goal.processes_authorized
+    ):
+        raise ValueError("WORKER_OBSERVATION_UNSUPPORTED: select only local Codex transport")
+
     if task_fixture is not None:
         from .history_corpus import _git
 
@@ -1498,7 +1510,7 @@ def _work_impl(args: argparse.Namespace) -> int:
         ) -> LocalProcessExecutor:
             from .isolated_execution import DockerProcessExecutor
             from .model_progress import progress_observer
-            from .model_usage import filter_model_stdout
+            from .model_usage import filter_model_stdout, model_stdout_filter
 
             executor_type = (
                 DockerProcessExecutor
@@ -1513,6 +1525,11 @@ def _work_impl(args: argparse.Namespace) -> int:
                 stdin_resolver=lambda digest: artifacts.open_verified(descriptors[digest]),
                 stdout_storage_filter=(
                     (lambda request, data: filter_model_stdout(model_backend, request, data))
+                    if model_backend is not None
+                    else None
+                ),
+                stdout_stream_filter_factory=(
+                    (lambda request: model_stdout_filter(model_backend, request))
                     if model_backend is not None
                     else None
                 ),
@@ -2058,6 +2075,18 @@ def _work_impl(args: argparse.Namespace) -> int:
                 schema = schema_directory / "proposal-envelope.json"
                 schema.write_bytes(worker_proposal_schema_json())
                 output_schema_path = str(schema)
+            native_observation: tuple[str, ...] | None = None
+            if adapter_type is CodexCliWorkerAdapter and harness.worker.scratch_validation:
+                from .worker_observation import prepare_scratch
+
+                scratch_directory = str(
+                    prepare_scratch(
+                        root,
+                        workspace_root / "worker-scratch" / bound_run_id,
+                        candidate=snapshot is not None,
+                    )
+                )
+                native_observation = observation_hosts
             from .model_usage import UsageRecordingExecutor
 
             return adapter_type(
@@ -2077,6 +2106,8 @@ def _work_impl(args: argparse.Namespace) -> int:
                 executable=command.executable,
                 prompt_writer=lambda value: write_prompt(value, bound_run_id, bound_store),
                 scratch_directory=scratch_directory,
+                observation_hosts=native_observation,
+                observation_repository=str(root) if native_observation is not None else None,
                 output_schema_path=output_schema_path,
                 model=bound_model,
                 effort=bound_effort,

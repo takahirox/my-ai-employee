@@ -127,6 +127,8 @@ def test_disabled_task_review_preserves_pre_issue7_harness_digest() -> None:
     old_payload["verification"]["review"].pop("parent_semantic_review")
     old_payload["verification"]["review"].pop("plan_review")
     old_payload["worker"].pop("isolated_workspace_tools")
+    old_payload["worker"].pop("scratch_validation")
+    old_payload["worker"].pop("observation_hosts")
 
     assert project_harness_digest(harness) == canonical_digest(old_payload)
 
