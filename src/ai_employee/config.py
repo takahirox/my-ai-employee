@@ -310,12 +310,20 @@ class OperatorConfig(BaseModel):
 
     schema_version: Literal[1] = 1
     isolated_worker: IsolatedWorkerProfile | None = None
+    worker_observation_hosts: tuple[str, ...] = ()
     workers: Mapping[str, WorkerCommandConfig] = Field(default_factory=dict)
     routing: OperatorRoutingConfig | None = Field(default_factory=default_operator_routing_config)
     promotion_auto_approval: PromotionAutoApprovalConfig = PromotionAutoApprovalConfig()
     worker_supervision: WorkerSupervisionPolicy = Field(
         default_factory=default_operator_worker_supervision
     )
+
+    @field_validator("worker_observation_hosts")
+    @classmethod
+    def _observation_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        from .worker_observation import exact_hosts
+
+        return exact_hosts(value)
 
     @field_validator("workers")
     @classmethod

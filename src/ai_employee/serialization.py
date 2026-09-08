@@ -60,6 +60,11 @@ def project_harness_digest(harness: BaseModel) -> str:
     worker = payload.get("worker")
     if isinstance(worker, dict) and worker.get("isolated_workspace_tools") is False:
         worker.pop("isolated_workspace_tools")
+    if isinstance(worker, dict):
+        if worker.get("scratch_validation") is False:
+            worker.pop("scratch_validation")
+        if not worker.get("observation_hosts"):
+            worker.pop("observation_hosts", None)
     verification = payload.get("verification")
     if isinstance(verification, dict):
         review = verification.get("review")
@@ -78,6 +83,8 @@ def operator_config_digest(config: BaseModel) -> str:
     payload = config.model_dump(mode="python", by_alias=True, exclude_none=False)
     if payload.get("isolated_worker") is None:
         payload.pop("isolated_worker", None)
+    if not payload.get("worker_observation_hosts"):
+        payload.pop("worker_observation_hosts", None)
     promotion = payload.get("promotion_auto_approval")
     if isinstance(promotion, dict) and promotion.get("mode") == "manual":
         payload.pop("promotion_auto_approval")

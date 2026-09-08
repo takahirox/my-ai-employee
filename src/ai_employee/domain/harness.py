@@ -248,6 +248,8 @@ class HarnessWorker(HarnessModel):
     adaptive_routing: bool = False
     local_backend: bool = False
     isolated_workspace_tools: bool = False
+    scratch_validation: bool = False
+    observation_hosts: tuple[str, ...] = ()
 
     @field_validator("allowed_strategy_ids")
     @classmethod
@@ -260,6 +262,11 @@ class HarnessWorker(HarnessModel):
 
     @model_validator(mode="after")
     def _preferred_is_allowed(self) -> Self:
+        from ..worker_observation import exact_hosts
+
+        exact_hosts(self.observation_hosts)
+        if self.observation_hosts and not self.scratch_validation:
+            raise ValueError("observation requires disposable scratch validation")
         if len(self.allowed) != len(set(self.allowed)):
             raise ValueError("allowed workers must be unique")
         if self.preferred is not None and self.preferred not in self.allowed:

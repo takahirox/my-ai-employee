@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Protocol
 
 from ai_employee.domain.base import freeze_json
 from ai_employee.domain.services_v2 import ArtifactStore, Cancellation
@@ -27,6 +27,15 @@ from ai_employee.domain.v2 import (
 from ai_employee.run_budget import BudgetCancellation, remaining_timeout
 
 from ._common import identifier, now
+
+
+class StdoutStreamFilter(Protocol):
+    raw_limit: int
+    exceeded: bool
+
+    def feed(self, chunk: bytes) -> bytes: ...
+
+    def finish(self) -> bytes: ...
 
 
 class _ProcessGroupCleanupError(RuntimeError):
@@ -60,6 +69,8 @@ class LocalProcessExecutor:
         maximum_processes: int = 1,
         terminate_grace_seconds: float = 1.0,
         stdout_storage_filter: Callable[[ProcessRequest, bytes], bytes] | None = None,
+        stdout_stream_filter_factory: Callable[[ProcessRequest], StdoutStreamFilter | None]
+        | None = None,
         stdout_observer_factory: Callable[[ProcessRequest], Callable[[bytes, float], None]]
         | None = None,
     ) -> None:
@@ -73,6 +84,7 @@ class LocalProcessExecutor:
         self.stdin_resolver = stdin_resolver
         self.terminate_grace_seconds = terminate_grace_seconds
         self.stdout_storage_filter = stdout_storage_filter
+        self.stdout_stream_filter_factory = stdout_stream_filter_factory
         self.stdout_observer_factory = stdout_observer_factory
         self._slots = threading.BoundedSemaphore(maximum_processes)
         self._output_descriptors: dict[tuple[str, str, str], ArtifactDescriptor] = {}
@@ -144,6 +156,7 @@ class LocalProcessExecutor:
                     cancelled,
                     timed_out,
                     cleanup,
+                    stdout_raw_limit,
                 ) = self._capture(process, request, cancellation, started, timeout)
             except BaseException as error:
                 try:
@@ -211,6 +224,7 @@ class LocalProcessExecutor:
                         "stdout_bytes": stdout_observed,
                         "stderr_bytes": stderr_observed,
                         "stdout_limit_bytes": request.stdout_bytes,
+                        "stdout_raw_limit_bytes": stdout_raw_limit,
                         "stderr_limit_bytes": request.stderr_bytes,
                         "stdout_retained_bytes": len(stdout),
                         "stderr_retained_bytes": len(stderr),
@@ -255,7 +269,7 @@ class LocalProcessExecutor:
         cancellation: Cancellation,
         started: float,
         timeout: float,
-    ) -> tuple[bytes, bytes, bool, bool, int, int, bool, bool, str]:
+    ) -> tuple[bytes, bytes, bool, bool, int, int, bool, bool, str, int]:
         assert process.stdout is not None and process.stderr is not None
         selector = selectors.DefaultSelector()
         stdout_buffer = bytearray()
@@ -269,6 +283,11 @@ class LocalProcessExecutor:
         stdout_exceeded = stderr_exceeded = cancelled = timed_out = False
         stdout_observed = stderr_observed = 0
         cleanup = "not_required"
+        stream_filter = (
+            self.stdout_stream_filter_factory(request)
+            if self.stdout_stream_filter_factory is not None
+            else None
+        )
         try:
             observer = (
                 self.stdout_observer_factory(request)
@@ -287,18 +306,29 @@ class LocalProcessExecutor:
                     buffer, limit = key.data
                     chunk = os.read(key.fd, 64 * 1024)
                     if not chunk:
+                        if key.fileobj is process.stdout and stream_filter is not None:
+                            tail = stream_filter.finish()
+                            available = max(0, limit - len(buffer))
+                            buffer.extend(tail[:available])
+                            stdout_exceeded |= len(tail) > available or stream_filter.exceeded
                         selector.unregister(key.fileobj)
                         continue
-                    available = max(0, limit - len(buffer))
-                    buffer.extend(chunk[:available])
                     if key.fileobj is process.stdout:
-                        if observer is not None:
-                            observer(chunk[:available], time.monotonic() - started)
                         stdout_observed += len(chunk)
-                        stdout_exceeded = stdout_exceeded or len(chunk) > available
+                        if observer is not None:
+                            observer(chunk, time.monotonic() - started)
+                        if stream_filter is not None:
+                            stdout_exceeded |= stdout_observed > stream_filter.raw_limit
+                            chunk = stream_filter.feed(chunk)
+                            stdout_exceeded |= stream_filter.exceeded
+                        available = max(0, limit - len(buffer))
+                        buffer.extend(chunk[:available])
+                        stdout_exceeded |= len(chunk) > available
                     else:
                         stderr_observed += len(chunk)
-                        stderr_exceeded = stderr_exceeded or len(chunk) > available
+                        available = max(0, limit - len(buffer))
+                        buffer.extend(chunk[:available])
+                        stderr_exceeded |= len(chunk) > available
                 if process.poll() is not None and not selector.get_map():
                     break
             process.wait()
@@ -327,6 +357,7 @@ class LocalProcessExecutor:
             cancelled,
             timed_out,
             cleanup,
+            stream_filter.raw_limit if stream_filter is not None else request.stdout_bytes,
         )
 
     def _terminate_group(self, process: subprocess.Popen[bytes]) -> str:

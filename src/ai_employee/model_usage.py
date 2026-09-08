@@ -10,7 +10,7 @@ from typing import ClassVar, Literal
 
 from pydantic import Field
 
-from .domain.base import Digest
+from .domain.base import CanonicalData, Digest, freeze_json
 from .domain.services_v2 import Cancellation, ProcessExecutor
 from .domain.v2 import (
     DigestedRecordV2,
@@ -167,6 +167,104 @@ _MODEL_STAGES = {
 }
 
 
+class ModelProcessDiagnostic(DigestedRecordV2):
+    """Allowlisted process facts; no prompts, tool bodies, paths or provider messages."""
+
+    schema_name: ClassVar[str] = "model_process_diagnostic"
+    graph_run_id: str
+    stage: str
+    request_digest: Digest
+    process_result_digest: Digest
+    status: str
+    failure_code: str | None = None
+    exit_code: int | None = None
+    duration_seconds: float
+    resource_usage: CanonicalData
+    transport_failures: tuple[str, ...] = ()
+
+
+def transport_failure_kind(event: dict[str, object]) -> str:
+    # Classify locally, then discard the text. Unknown errors remain explicitly unknown.
+    known = {
+        "usage_limit",
+        "rate_limit",
+        "authentication",
+        "transport",
+        "invalid_request",
+        "invalid_json",
+        "unknown",
+    }
+    prior = event.get("failure_kind")
+    if isinstance(prior, str) and prior in known:
+        return prior
+    text = json.dumps(event).lower()
+    for kind, markers in (
+        ("usage_limit", ("usage_limit", "insufficient_quota", "usage limit")),
+        ("rate_limit", ("rate_limit", "rate limit", "too many requests")),
+        ("authentication", ("unauthorized", "authentication", "invalid_api_key")),
+        ("transport", ("disconnect", "connection", "stream closed", "network")),
+        ("invalid_request", ("invalid_request", "invalid request", "bad request")),
+    ):
+        if any(marker in text for marker in markers):
+            return kind
+    return "unknown"
+
+
+class CodexStdoutFilter:
+    """Bound JSONL before persistence, with separate finite raw/event/retained budgets."""
+
+    def __init__(self, request: ProcessRequest) -> None:
+        self.request = request
+        self.raw_limit = min(64_000_000, request.stdout_bytes * 32)
+        self.line_limit = min(4_000_000, request.stdout_bytes * 4)
+        self.pending = bytearray()
+        self.exceeded = False
+
+    def feed(self, chunk: bytes) -> bytes:
+        if self.exceeded:
+            return b""
+        self.pending.extend(chunk)
+        result = bytearray()
+        while b"\n" in self.pending:
+            line, _, rest = self.pending.partition(b"\n")
+            self.pending = bytearray(rest)
+            if len(line) > self.line_limit:
+                self.exceeded = True
+                break
+            result.extend(self._line(bytes(line)))
+        if len(self.pending) > self.line_limit:
+            self.exceeded = True
+        if self.exceeded:
+            self.pending.clear()
+        return bytes(result)
+
+    def _line(self, line: bytes) -> bytes:
+        if not line.strip():
+            return b""
+        # Preserve legacy plain JSON final messages but reject malformed JSONL.
+        try:
+            value = json.loads(line)
+        except (ValueError, RecursionError):
+            return b'{"type":"error","failure_kind":"invalid_json"}\n'
+        if not isinstance(value, dict):
+            return b'{"type":"error","failure_kind":"invalid_json"}\n'
+        filtered = filter_model_stdout("codex_cli", self.request, line)
+        return filtered + b"\n" if filtered else b""
+
+    def finish(self) -> bytes:
+        tail = bytes(self.pending)
+        self.pending.clear()
+        return self._line(tail) if tail and not self.exceeded else b""
+
+
+def model_stdout_filter(backend: str, request: ProcessRequest) -> CodexStdoutFilter | None:
+    return (
+        CodexStdoutFilter(request)
+        if backend == "codex_cli" and request.purpose in _MODEL_STAGES
+        else None
+    )
+
+
 def filter_model_stdout(backend: str, request: ProcessRequest, data: bytes) -> bytes:
     """Retain the existing final-payload contract and numeric accounting, not tool traces."""
 
@@ -212,7 +310,26 @@ def filter_model_stdout(backend: str, request: ProcessRequest, data: bytes) -> b
                     else {},
                 }
             )
-        elif kind in {"error", "turn.failed", "turn.started"}:
+        elif kind in {"error", "turn.failed"}:
+            known = {
+                "usage_limit",
+                "rate_limit",
+                "authentication",
+                "transport",
+                "invalid_request",
+                "invalid_json",
+                "unknown",
+            }
+            classification = event.get("failure_kind")
+            selected.append(
+                {
+                    "type": kind,
+                    "failure_kind": classification
+                    if isinstance(classification, str) and classification in known
+                    else transport_failure_kind(event),
+                }
+            )
+        elif kind == "turn.started":
             selected.append({"type": kind})
     return "\n".join(
         json.dumps(event, separators=(",", ":"), ensure_ascii=False) for event in selected
@@ -282,6 +399,46 @@ class UsageRecordingExecutor:
             }
         )
         self.store.put_once("model_usage_v2", record, run_id=self.graph_run_id)
+        resource_keys = {
+            "stdout_bytes",
+            "stderr_bytes",
+            "stdout_limit_bytes",
+            "stdout_raw_limit_bytes",
+            "stderr_limit_bytes",
+            "stdout_retained_bytes",
+            "stderr_retained_bytes",
+            "stdout_truncated",
+            "stderr_truncated",
+            "output_limit_stream",
+            "process_group_cleanup",
+        }
+        resource_usage = result.resource_usage if isinstance(result.resource_usage, Mapping) else {}
+        diagnostic = ModelProcessDiagnostic(
+            id="model-process-" + canonical_digest((request.id, result.id)),
+            run_id=request.run_id,
+            created_at=now(),
+            graph_run_id=self.graph_run_id,
+            stage=stage,
+            request_digest=request.content_digest or "",
+            process_result_digest=result.content_digest or "",
+            status=result.status,
+            failure_code=result.failure.code.value if result.failure else None,
+            exit_code=result.exit_code,
+            duration_seconds=result.duration_seconds,
+            resource_usage=freeze_json(
+                {
+                    key: value
+                    for key, value in resource_usage.items()
+                    if key in resource_keys and (value is None or type(value) in (int, str, bool))
+                }
+            ),
+            transport_failures=tuple(
+                transport_failure_kind(event)
+                for event in codex_events(output)
+                if event["type"] in {"error", "turn.failed"}
+            ),
+        )
+        self.store.put_once("model_process_diagnostic_v2", diagnostic, run_id=self.graph_run_id)
         return result
 
 
