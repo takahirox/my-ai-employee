@@ -82,6 +82,18 @@ hard-coded writes to an original absolute workspace are denied. Do not enable th
 check for a workflow that requires a real service: it is an offline check, not a
 simulated success for denied network operations.
 
+For HTTP protocol checks, `candidate_result(..., http_fixture={"steps": [...]})`
+requires a declared program and runs it offline with a public stdlib HTTP test double.
+Each bounded step declares method, path, optional exact request JSON, status and
+response JSON; optional recovery reads may be included. Unmatched requests, changed
+keys and unconsumed mandatory steps fail even if the program catches the exception
+or exits successfully. This exercises `urllib.request`/`http.client` programs without
+real service writes. It is a behavioral fixture, not an adversarial in-process
+boundary or support for arbitrary subprocess/network clients; the outer native
+sandbox continues to deny real networking. Unsupported implementations must be
+reported as unverified, not as proven protocol violations. Operator scenarios and
+output assertions come from public requirements, never hidden grading state.
+
 State-changing service calls are not harmless dry runs. Test those using local
 fakes or a separately delegated disposable service. The existing external execution
 transport still runs a declared script once after final submission: do not also

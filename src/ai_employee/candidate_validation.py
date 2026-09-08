@@ -30,7 +30,9 @@ def _regular(root: Path, relative: str, limit: int) -> Path:
     return path
 
 
-def candidate_result(root: Path, *, seconds: float = 20.0) -> Any:
+def candidate_result(
+    root: Path, *, seconds: float = 20.0, http_fixture: dict[str, Any] | None = None
+) -> Any:
     """For explicitly offline tasks only; never execute against a real remote service.
 
     A trusted, frozen Harness check calls this and validates the returned JSON against
@@ -39,6 +41,8 @@ def candidate_result(root: Path, *, seconds: float = 20.0) -> Any:
     root = root.resolve()
     manifest = root / "output/execute.json"
     if not manifest.exists() and not manifest.is_symlink():
+        if http_fixture is not None:
+            raise ValueError("HTTP protocol validation requires a declared executable candidate")
         return json.loads(_regular(root, "output/result.json", 1_000_000).read_bytes())
     value = json.loads(_regular(root, "output/execute.json", 4096).read_bytes())
     if (
@@ -68,6 +72,20 @@ def candidate_result(root: Path, *, seconds: float = 20.0) -> Any:
         if previous.is_symlink():
             raise ValueError("candidate output must not be a symlink")
         previous.unlink(missing_ok=True)
+        arguments: tuple[str, ...] = (sys.executable, "-I", str(scratch / script))
+        if http_fixture is not None:
+            from .http_validation import validate_fixture
+
+            validate_fixture(http_fixture)
+            fixture_path = control / "http-fixture.json"
+            fixture_path.write_text(json.dumps(http_fixture))
+            arguments = (
+                sys.executable,
+                "-I",
+                str(Path(__file__).with_name("http_validation.py")),
+                str(fixture_path),
+                str(scratch / script),
+            )
         artifacts = AtomicArtifactStore(control / "artifacts")
         executor = LocalProcessExecutor(
             (scratch,),
@@ -94,9 +112,7 @@ def candidate_result(root: Path, *, seconds: float = 20.0) -> Any:
                 *observation_args(str(scratch), (), str(root)),
                 "sandbox",
                 "--",
-                sys.executable,
-                "-I",
-                str(scratch / script),
+                *arguments,
             ),
             cwd=".",
             inherit_environment=("HOME",),

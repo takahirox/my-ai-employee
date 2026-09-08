@@ -60,7 +60,17 @@ program.write_text('pass')
 try:candidate_result(root)
 except ValueError:pass
 else:raise AssertionError('stale result accepted')
-print('offline candidate execution, source preservation, runtime error and stale output passed')
+fixture={'steps':[{'method':'GET','path':'/public','status':200,'response_json':{'count':7}}]}
+program.write_text("import json;from pathlib import Path;from urllib.request import urlopen;"
+ "value=json.load(urlopen('http://127.0.0.1:8080/public'));"
+ "Path('output/result.json').write_text(json.dumps(value))")
+assert candidate_result(root,http_fixture=fixture)=={'count':7}
+program.write_text("from pathlib import Path;"
+ "Path('output/result.json').write_text('{\"count\":7}')")
+try:candidate_result(root,http_fixture=fixture)
+except ValueError as e:assert 'HTTP protocol incomplete' in str(e)
+else:raise AssertionError('unexecuted protocol accepted')
+print('offline candidate execution, HTTP fixtures, source preservation and failure feedback passed')
 """
     source = Path(__file__).resolve().parents[1] / "src"
     result = subprocess.run(
