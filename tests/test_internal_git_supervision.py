@@ -12,14 +12,12 @@ from ai_employee.storage import SQLiteStore
 
 def test_internal_git_rejects_late_output_and_kills_owned_children(tmp_path):
     run_git_command(("git", "init", "-q", str(tmp_path)))
-    started = time.monotonic()
-    with (
-        SQLiteStore(tmp_path / "budget.db") as store,
-        wall_budget_scope(store, "run", 0.05),
-        pytest.raises(WallTimeExceeded),
-    ):
-        run_git(tmp_path, "-c", "alias.review-wait=!sleep 0.3; touch late", "review-wait")
-    assert time.monotonic() - started < 1.0
+    with SQLiteStore(tmp_path / "budget.db") as store, wall_budget_scope(store, "run", 0.05):
+        # Measure supervised execution, not database creation or checkpoint/close.
+        started = time.monotonic()
+        with pytest.raises(WallTimeExceeded):
+            run_git(tmp_path, "-c", "alias.review-wait=!sleep 0.3; touch late", "review-wait")
+        assert time.monotonic() - started < 1.0
     time.sleep(0.4)
     assert not (tmp_path / "late").exists()
 

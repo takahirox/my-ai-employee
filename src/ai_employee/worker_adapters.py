@@ -948,15 +948,6 @@ def _bounded_prompt(
             "maximum_references": 64,
             "sources": evidence_sources,
         },
-        "non_mutating_result_binding": {
-            "run_id": request.run_id,
-            "graph_run_id": request.graph_run_id,
-            "worker_request_digest": request.content_digest,
-            "node_id": request.node_id,
-            "accepted_graph_revision_digest": request.accepted_graph_revision_digest,
-            "generation": request.generation,
-            "attempt": request.attempt,
-        },
         "response_contract": (
             "codex-edit-transport/1"
             if codex_edit_transport
@@ -1009,6 +1000,19 @@ def _bounded_prompt(
             + INVESTIGATION_GUIDANCE
         ),
     }
+    # Codex's model schema uses wire v3 content: attribution supplies these bindings
+    # from the immutable request after process correlation. Generic/legacy adapters
+    # keep their existing prompt contract; evidence references remain separate.
+    if not codex_edit_transport:
+        payload["non_mutating_result_binding"] = {
+            "run_id": request.run_id,
+            "graph_run_id": request.graph_run_id,
+            "worker_request_digest": request.content_digest,
+            "node_id": request.node_id,
+            "accepted_graph_revision_digest": request.accepted_graph_revision_digest,
+            "generation": request.generation,
+            "attempt": request.attempt,
+        }
     if include_response_schema:
         payload["response_schema"] = _envelope_schema()
     if codex_edit_transport:
