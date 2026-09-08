@@ -287,8 +287,7 @@ def test_fresh_private_trials_compare_profiles_quality_first(
                 body = json.load(stream)
             if (
                 body.get("protocol") == "fleet-worker-proposal/2"
-                and body.get("non_mutating_result_binding", {}).get("graph_run_id")
-                == "adaptive-off"
+                and body.get("graph_run_id") == "adaptive-off"
             ):
                 worker_prompts.append(body)
         assert len(worker_prompts) == 1
