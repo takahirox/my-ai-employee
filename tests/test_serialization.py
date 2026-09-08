@@ -70,6 +70,24 @@ class SerializationTests(unittest.TestCase):
                 content_digest="f" * 64,
             )
 
+    def test_nested_frozen_payload_round_trips_through_pydantic_json(self) -> None:
+        import json
+
+        from ai_employee.domain.base import freeze_json, thaw_json
+
+        raw = {"ordered": [1, {"safe": True}], "counts": {"stdout_bytes": 42}}
+        frozen = freeze_json(raw)
+        self.assertEqual(thaw_json(frozen), raw)
+        candidate = graph().model_copy(
+            update={"nodes": (graph().nodes[0].model_copy(update={"configuration": raw}),)}
+        )
+        accepted = AcceptedGraphRevision(revision_number=1, graph=candidate)
+        payload = accepted.model_dump(mode="json")
+        self.assertEqual(json.loads(accepted.model_dump_json()), payload)
+        restored = AcceptedGraphRevision.model_validate_json(accepted.model_dump_json())
+        self.assertEqual(restored.content_digest, accepted.content_digest)
+        self.assertIsInstance(restored.graph.nodes[0].configuration, FrozenDict)
+
     def test_accepted_revision_is_deeply_immutable(self) -> None:
         raw = {"ordered": [1, {"safe": True}]}
         candidate = graph().model_copy(
