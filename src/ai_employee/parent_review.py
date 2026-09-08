@@ -572,6 +572,15 @@ PARENT_SEMANTIC_REVIEW_RUBRIC = {
         COMMENT_REVIEW_GUIDANCE,
         "Report only semantic concerns grounded in the supplied immutable candidate and evidence.",
         "Check cross-task integration and original Goal intent after deterministic verification.",
+        "Digest-bound evaluator outcomes and criterion dispositions are runtime evidence for "
+        "their named checks, not worker self-reports. Use that evidence for exactly its "
+        "declared coverage; do not assume untested requirements passed.",
+        "This observer intentionally receives the exact patch and body-free evidence, without "
+        "source input files, raw test logs or tools. Those known scope boundaries alone are not "
+        "candidate defects or material coverage gaps, and must not be repeated as limitations.",
+        "Use limitations only for a concrete required criterion that cannot be assessed from "
+        "the patch and relevant bound evidence. Name that criterion and what material evidence "
+        "is missing. Never claim independent recomputation or execution you did not perform.",
         "Use observed only for facts directly supported by cited evidence or candidate content.",
         "Use inferred or uncertain when deterministic evidence does not establish the concern.",
         "Prefer the smallest repair; required correctness and safety are not overengineering.",

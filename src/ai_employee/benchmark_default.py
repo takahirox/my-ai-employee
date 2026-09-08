@@ -12,11 +12,13 @@ from typing import Any
 
 from ai_employee.benchmark_adapter import make_harness
 from ai_employee.config import OperatorConfig
-from ai_employee.domain.v2 import WorkerBoundaryDiagnostic
+from ai_employee.domain.evaluation import EvaluationEvidenceLedger
+from ai_employee.domain.v2 import WorkerAvailability, WorkerBoundaryDiagnostic
 from ai_employee.execution_profile import inspect_profile
 from ai_employee.goal_acceptance import GoalChecks
 from ai_employee.model_progress import ModelProgressRecord
 from ai_employee.model_usage import ModelProcessDiagnostic, inspect_usage
+from ai_employee.parent_review import ParentSemanticReviewDecision, ParentSemanticReviewResult
 from ai_employee.plan_review import PlanReviewFailureEvidence
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_observation import exact_hosts
@@ -170,6 +172,36 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
         with SQLiteStore(home / ".fleet/fleet.db") as store:
             usage = inspect_usage(store, [emitted["run_id"]])
             details = {
+                "parent_review_results": [
+                    record.model_dump(mode="json")
+                    for record in store.list_records(
+                        "parent_semantic_review_result_v2",
+                        ParentSemanticReviewResult,
+                        run_id=emitted["run_id"],
+                    )
+                ],
+                "parent_review_decisions": [
+                    record.model_dump(mode="json")
+                    for record in store.list_records(
+                        "parent_semantic_review_decision_v2",
+                        ParentSemanticReviewDecision,
+                        run_id=emitted["run_id"],
+                    )
+                ],
+                "evaluation_evidence_ledgers": [
+                    record.model_dump(mode="json")
+                    for record in store.list_records(
+                        "evaluation_evidence_ledger_v2",
+                        EvaluationEvidenceLedger,
+                        run_id=emitted["run_id"],
+                    )
+                ],
+                # This connection owns a fresh trial-private DB. Availability records
+                # may belong to its child node runs, so retain those identities too.
+                "worker_availability": [
+                    record.model_dump(mode="json")
+                    for record in store.list_records("worker_availability_v2", WorkerAvailability)
+                ],
                 "model_process_diagnostics": [
                     record.model_dump(mode="json")
                     for record in store.list_records(

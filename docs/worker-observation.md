@@ -123,3 +123,17 @@ The historical plan-review and ledger-large call failures cannot be retrospectiv
 identified from missing logs. A synthetic large tool output reproduced the output
 limit path, and the streaming change fixes that path; it does not prove the original
 ledger failure had that cause. Report new trial evidence separately.
+
+## Interpreting parent review evidence
+
+The observer receives the exact patch and digest-bound deterministic results, not
+raw logs or source input bodies. It may rely on a passed check only for that check's
+named coverage; it must not claim to have independently executed or recomputed it.
+Those known observation boundaries are not by themselves a defect in the candidate.
+A material limitation must identify a required criterion and missing evidence.
+The kernel still escalates every returned limitation and rejects incomplete/stale
+coverage; this is not an automatic waiver of missing verification.
+
+The benchmark export retains bounded parent findings/limitations, decisions,
+body-free evaluation ledgers and worker availability, including child node probes,
+so a rejected candidate can be diagnosed after container cleanup.

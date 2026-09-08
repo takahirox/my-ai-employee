@@ -357,6 +357,13 @@ class CliWorkerAdapter:
         )
         if self.observation_hosts is not None:
             payload = json.loads(prompt)
+            payload["instruction"] = payload["instruction"].replace(
+                "The repository is the current working directory and its filesystem is "
+                "read-only to the worker; you may inspect its files with read-only tools.",
+                "The current working directory is a disposable candidate copy; its declared "
+                "scratch paths are writable. The original repository and input files remain "
+                "read-only. Use candidate_validation for the exact observation authority.",
+            )
             payload["candidate_validation"] = {
                 "directory": self.scratch_directory,
                 "allowed_hosts": self.observation_hosts,
