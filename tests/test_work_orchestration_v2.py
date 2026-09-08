@@ -3367,3 +3367,28 @@ def test_goal_alias_requires_exact_equality_for_assigned_node(accepted):
     assert payload["accepted_goal"] == accepted
     assert payload["goal"] == "Assigned scope"
     assert "accepted_goal_source" not in payload
+
+
+@pytest.mark.parametrize("kind", ["mutating", "non_mutating"])
+def test_codex_omits_only_runtime_owned_read_only_binding(kind):
+    fields = worker_request("Inspect the assigned records").model_dump(exclude={"content_digest"})
+    fields.update(
+        task_kind=GoalTaskKind(kind),
+        node_id="node-1",
+        graph_run_id="graph-1",
+        accepted_graph_revision_digest=fields["accepted_plan_digest"],
+    )
+    request = WorkerRequest.model_validate(fields)
+    original = canonical_json(request)
+    generic = json.loads(_bounded_prompt(request, include_response_schema=True))
+    codex = json.loads(
+        _bounded_prompt(request, codex_edit_transport=True, include_response_schema=True)
+    )
+    assert "non_mutating_result_binding" not in codex
+    assert generic["non_mutating_result_binding"]["worker_request_digest"] == request.content_digest
+    for key, value in generic.items():
+        if key not in {"non_mutating_result_binding", "response_contract"}:
+            assert codex[key] == value
+    assert "wire version 3" in codex["transport_instruction"]
+    assert "binding digests as factual evidence" in codex["instruction"]
+    assert canonical_json(request) == original
