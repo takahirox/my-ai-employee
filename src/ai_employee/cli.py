@@ -1174,6 +1174,7 @@ def _work(args: argparse.Namespace) -> int:
 
 
 def _work_impl(args: argparse.Namespace) -> int:
+    from .adaptive_execution import AdaptiveExecutionDecision, choose_adaptive_path
     from .engineering_guidance import guidance_scope
     from .execution_profile import choose_profile, observe_profile
     from .goal_acceptance import attach_goal_checks, harness_for_goal
@@ -1301,6 +1302,8 @@ def _work_impl(args: argparse.Namespace) -> int:
     planner_strategy: ExecutionStrategy | None = None
     planner_routing: PlannerRoutingDecision | None = None
     proposed_graph: ProposedGraph | None = None
+    direct_graph: Graph | None = None
+    adaptive_decision: AdaptiveExecutionDecision | None = None
     graph_planner: CliProposedGraphPlanner | None = None
     semantic_assessor: CliTaskAssessmentAdapter | None = None
     risk = 0
@@ -1725,6 +1728,60 @@ def _work_impl(args: argparse.Namespace) -> int:
                 maximum_candidate_bytes=min(1_000_000, harness.budgets.artifact_bytes),
             )
 
+        def bounded_single_node_graph() -> Graph:
+            return one_node_graph(
+                goal,
+                graph_id=f"graph-{run_id}",
+                node_id=f"node-{run_id}",
+                required_capabilities=tuple(capabilities),
+                max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                native_processes=(
+                    operator_config.isolated_worker.native_process_limit
+                    if operator_config.isolated_worker is not None
+                    else 0
+                ),
+                max_processes=min(
+                    harness.budgets.processes,
+                    policy.max_processes
+                    if policy.max_processes is not None
+                    else harness.budgets.processes,
+                ),
+            )
+
+        if resume_run is not None:
+            try:
+                adaptive_decision = store.get(
+                    "adaptive_execution_decision_v2",
+                    "adaptive-path-" + run_id,
+                    AdaptiveExecutionDecision,
+                )
+            except KeyError:
+                pass  # Historical runs retain their original execution path.
+            else:
+                if (
+                    adaptive_decision.execution_profile_digest
+                    != profile_observation.profile.content_digest
+                    or adaptive_decision.goal_digest != canonical_digest(goal)
+                    or adaptive_decision.harness_digest != project_harness_digest(harness)
+                    or adaptive_decision.operator_config_digest
+                    != operator_config_digest(operator_config)
+                    or adaptive_decision.effective_policy_digest
+                    != canonical_digest((policy.content_digest,))
+                ):
+                    raise ValueError("adaptive execution decision has stale run bindings")
+                if adaptive_decision.path == "direct":
+                    acceptances = store.list_records(
+                        "task_graph_acceptance_v2", TaskGraphAcceptance, run_id=run_id
+                    )
+                    if not any(
+                        canonical_digest(item.accepted_revision.graph)
+                        == adaptive_decision.direct_graph_digest
+                        for item in acceptances
+                    ):
+                        raise ValueError(
+                            "adaptive direct graph does not match its accepted decision"
+                        )
+
         if assessment_strategy is not None:
             assert assessment_command is not None
             assert task_assessment is not None
@@ -1734,7 +1791,7 @@ def _work_impl(args: argparse.Namespace) -> int:
             assessment_schema_path: str | None = None
             if assessment_strategy.backend == "codex_cli":
                 schema = assessment_directory / "semantic-assessment.json"
-                schema.write_bytes(semantic_assessment_schema_json())
+                schema.write_bytes(semantic_assessment_schema_json(recommend_execution_path=True))
                 assessment_schema_path = str(schema)
             semantic_assessor = CliTaskAssessmentAdapter(
                 model_executor_for(assessment_directory, assessment_strategy),
@@ -1748,60 +1805,17 @@ def _work_impl(args: argparse.Namespace) -> int:
                 output_schema_path=assessment_schema_path,
                 timeout_seconds=harness.budgets.wall_seconds,
                 expected_effective_policy_digest=canonical_digest((policy.content_digest,)),
+                execution_context={
+                    "completion_criteria": goal.model_dump(mode="json")["completion_criteria"]
+                },
             )
             semantic = semantic_assessor.assess(args.goal, task_assessment)
             task_assessment = merge_semantic_profile(
                 task_assessment,
                 semantic,
             )
-            candidates = tuple(sorted(planner_candidates, key=lambda item: item.id))
-            allowed_ids = set(harness.worker.allowed_strategy_ids)
-            allowed_backends = set(harness.worker.allowed)
-            required = set(task_assessment.required_capabilities)
-            eligible_planners = tuple(
-                item
-                for item in candidates
-                if item.id in allowed_ids
-                and item.backend in allowed_backends
-                and (item.backend not in {"ollama", "ollama_cli"} or harness.worker.local_backend)
-                and required <= set(item.capabilities)
-                and task_assessment.risk <= item.max_risk
-                and item.min_complexity <= task_assessment.complexity <= item.max_complexity
-                and item.min_scale <= task_assessment.scale <= item.max_scale
-            )
-            if not eligible_planners:
-                raise ValueError("no explicitly configured Planner satisfies routing constraints")
-            planner_selection_mode = (
-                RoutingMode.FIXED if args.planner_strategy is not None else RoutingMode.ADAPTIVE
-            )
-            selected_planner = select_strategy(
-                eligible_planners,
-                mode=planner_selection_mode,
-                fixed_strategy_id=args.planner_strategy,
-                assessment=task_assessment,
-                allowed_strategy_ids=tuple(item.id for item in eligible_planners),
-                allowed_backends=tuple(dict.fromkeys(item.backend for item in eligible_planners)),
-                local_backend_allowed=harness.worker.local_backend,
-            )
             harness_digest = project_harness_digest(harness)
             effective_policy_digest = canonical_digest((policy.content_digest,))
-            planner_routing = PlannerRoutingDecision(
-                selection_mode=planner_selection_mode,
-                strategy_set=effective_strategy_set,
-                assessment_strategy=assessment_strategy,
-                assessment=task_assessment,
-                assessment_digest=canonical_digest(task_assessment),
-                candidate_strategy_ids=tuple(item.id for item in candidates),
-                eligible_strategy_ids=tuple(item.id for item in eligible_planners),
-                selected_strategy=selected_planner,
-                effective_policy_digest=effective_policy_digest,
-                harness_digest=harness_digest,
-                operator_config_digest=operator_config_digest(operator_config),
-            )
-            planner_strategy = selected_planner.model_copy(update={"routing_reasons": ()})
-            planner_command = operator_config.worker_command(
-                cast(WorkerName, planner_strategy.backend)
-            )
             from .routing_history import load_verified_routing_history
 
             history = load_verified_routing_history(
@@ -1826,62 +1840,156 @@ def _work_impl(args: argparse.Namespace) -> int:
             worker_command = operator_config.worker_command(
                 cast(WorkerName, selected_strategy.backend)
             )
-            planner_schema_path: str | None = None
-            if planner_strategy.backend == "codex_cli":
-                planner_schema = assessment_directory / "proposed-graph.json"
-                planner_schema.write_bytes(
-                    proposed_graph_schema_json(
-                        max_nodes=16,
-                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+            path, path_reason = choose_adaptive_path(
+                task_assessment,
+                semantic_assessor.execution_recommendation,
+                plan_review_required=harness.verification.review.plan_review,
+                planning_requested=args.plan_only or args.planner_strategy is not None,
+                has_completion_criteria=bool(goal.completion_criteria),
+            )
+            if path == "direct":
+                direct_graph = bounded_single_node_graph()
+                node = direct_graph.nodes[0].model_copy(
+                    update={
+                        "semantic_profile": task_assessment.semantic_profile,
+                        "complexity": task_assessment.complexity,
+                        "scale": task_assessment.scale,
+                        "risk": max(direct_graph.nodes[0].risk, task_assessment.risk),
+                    }
+                )
+                direct_graph = direct_graph.model_copy(update={"nodes": (node,)})
+            adaptive_decision = AdaptiveExecutionDecision(
+                id="adaptive-path-" + run_id,
+                run_id=run_id,
+                created_at=now(),
+                execution_profile_digest=cast(str, profile_observation.profile.content_digest),
+                goal_digest=canonical_digest(goal),
+                assessment=task_assessment,
+                assessment_digest=canonical_digest(task_assessment),
+                assessment_strategy=assessment_strategy,
+                recommendation=semantic_assessor.execution_recommendation,
+                path=path,
+                reason=path_reason,
+                initial_worker_strategy=selected_strategy,
+                harness_digest=harness_digest,
+                operator_config_digest=operator_config_digest(operator_config),
+                effective_policy_digest=effective_policy_digest,
+                direct_graph_digest=None
+                if direct_graph is None
+                else canonical_digest(direct_graph),
+            )
+            store.put_once("adaptive_execution_decision_v2", adaptive_decision, run_id=run_id)
+            if path == "planned":
+                candidates = tuple(sorted(planner_candidates, key=lambda item: item.id))
+                allowed_ids = set(harness.worker.allowed_strategy_ids)
+                allowed_backends = set(harness.worker.allowed)
+                required = set(task_assessment.required_capabilities)
+                eligible_planners = tuple(
+                    item
+                    for item in candidates
+                    if item.id in allowed_ids
+                    and item.backend in allowed_backends
+                    and (
+                        item.backend not in {"ollama", "ollama_cli"} or harness.worker.local_backend
                     )
+                    and required <= set(item.capabilities)
+                    and task_assessment.risk <= item.max_risk
+                    and item.min_complexity <= task_assessment.complexity <= item.max_complexity
+                    and item.min_scale <= task_assessment.scale <= item.max_scale
                 )
-                planner_schema_path = str(planner_schema)
-                reviewer_schema = assessment_directory / "plan-review.json"
-                reviewer_schema.write_bytes(plan_review_schema_json())
-                reviewer_schema_path: str | None = str(reviewer_schema)
-            else:
-                reviewer_schema_path = None
-            try:
-                graph_planner = CliProposedGraphPlanner(
-                    model_executor_for(assessment_directory, planner_strategy),
-                    read_output,
-                    decide_worker_process,
-                    run_id=run_id,
-                    strategy=planner_strategy,
-                    executable=planner_command.executable,
-                    cwd=".",
-                    prompt_writer=prompt_writer,
-                    output_schema_path=planner_schema_path,
-                    timeout_seconds=harness.budgets.wall_seconds,
-                    planner_routing=planner_routing,
+                if not eligible_planners:
+                    raise ValueError(
+                        "no explicitly configured Planner satisfies routing constraints"
+                    )
+                planner_selection_mode = (
+                    RoutingMode.FIXED if args.planner_strategy is not None else RoutingMode.ADAPTIVE
                 )
-                plan_reviewer = CliPlanReviewer(
-                    model_executor_for(assessment_directory, planner_strategy),
-                    read_output,
-                    decide_worker_process,
-                    run_id=run_id,
-                    strategy=planner_strategy,
-                    executable=planner_command.executable,
-                    cwd=".",
-                    prompt_writer=prompt_writer,
-                    output_schema_path=reviewer_schema_path,
-                    timeout_seconds=harness.budgets.wall_seconds,
+                selected_planner = select_strategy(
+                    eligible_planners,
+                    mode=planner_selection_mode,
+                    fixed_strategy_id=args.planner_strategy,
+                    assessment=task_assessment,
+                    allowed_strategy_ids=tuple(item.id for item in eligible_planners),
+                    allowed_backends=tuple(
+                        dict.fromkeys(item.backend for item in eligible_planners)
+                    ),
+                    local_backend_allowed=harness.worker.local_backend,
                 )
-                proposed_graph = graph_planner.plan(
-                    goal,
-                    available_capabilities=tuple(capabilities),
+                harness_digest = project_harness_digest(harness)
+                effective_policy_digest = canonical_digest((policy.content_digest,))
+                planner_routing = PlannerRoutingDecision(
+                    selection_mode=planner_selection_mode,
+                    strategy_set=effective_strategy_set,
+                    assessment_strategy=assessment_strategy,
+                    assessment=task_assessment,
+                    assessment_digest=canonical_digest(task_assessment),
+                    candidate_strategy_ids=tuple(item.id for item in candidates),
+                    eligible_strategy_ids=tuple(item.id for item in eligible_planners),
+                    selected_strategy=selected_planner,
                     effective_policy_digest=effective_policy_digest,
                     harness_digest=harness_digest,
-                    max_nodes=16
-                    if task_fixture is None
-                    else task_fixture.execution_policy.max_nodes,
-                    max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    operator_config_digest=operator_config_digest(operator_config),
                 )
-            except ValueError:
-                stable_code = "GRAPH_PLANNER_FAILED"
-                pre_acceptance.fail(stable_code)
-                print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
-                return 7
+                planner_strategy = selected_planner.model_copy(update={"routing_reasons": ()})
+                planner_command = operator_config.worker_command(
+                    cast(WorkerName, planner_strategy.backend)
+                )
+                planner_schema_path: str | None = None
+                if planner_strategy.backend == "codex_cli":
+                    planner_schema = assessment_directory / "proposed-graph.json"
+                    planner_schema.write_bytes(
+                        proposed_graph_schema_json(
+                            max_nodes=16,
+                            max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                        )
+                    )
+                    planner_schema_path = str(planner_schema)
+                    reviewer_schema = assessment_directory / "plan-review.json"
+                    reviewer_schema.write_bytes(plan_review_schema_json())
+                    reviewer_schema_path: str | None = str(reviewer_schema)
+                else:
+                    reviewer_schema_path = None
+                try:
+                    graph_planner = CliProposedGraphPlanner(
+                        model_executor_for(assessment_directory, planner_strategy),
+                        read_output,
+                        decide_worker_process,
+                        run_id=run_id,
+                        strategy=planner_strategy,
+                        executable=planner_command.executable,
+                        cwd=".",
+                        prompt_writer=prompt_writer,
+                        output_schema_path=planner_schema_path,
+                        timeout_seconds=harness.budgets.wall_seconds,
+                        planner_routing=planner_routing,
+                    )
+                    plan_reviewer = CliPlanReviewer(
+                        model_executor_for(assessment_directory, planner_strategy),
+                        read_output,
+                        decide_worker_process,
+                        run_id=run_id,
+                        strategy=planner_strategy,
+                        executable=planner_command.executable,
+                        cwd=".",
+                        prompt_writer=prompt_writer,
+                        output_schema_path=reviewer_schema_path,
+                        timeout_seconds=harness.budgets.wall_seconds,
+                    )
+                    proposed_graph = graph_planner.plan(
+                        goal,
+                        available_capabilities=tuple(capabilities),
+                        effective_policy_digest=effective_policy_digest,
+                        harness_digest=harness_digest,
+                        max_nodes=16
+                        if task_fixture is None
+                        else task_fixture.execution_policy.max_nodes,
+                        max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
+                    )
+                except ValueError:
+                    stable_code = "GRAPH_PLANNER_FAILED"
+                    pre_acceptance.fail(stable_code)
+                    print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
+                    return 7
             add_executable_path(worker_command.executable)
             for path_entry in worker_command.path_entries:
                 executable_paths.append(Path(path_entry))
@@ -2250,29 +2358,14 @@ def _work_impl(args: argparse.Namespace) -> int:
                 )[-1].accepted_revision.graph
                 harness_digest = resume_run.harness_digest
                 effective_policy_digest = resume_run.effective_policy_digest
+            elif direct_graph is not None:
+                graph_input = direct_graph
             elif proposed_graph is not None:
                 graph_input = proposed_graph
                 harness_digest = proposed_graph.harness_digest
                 effective_policy_digest = proposed_graph.effective_policy_digest
             else:
-                graph_input = one_node_graph(
-                    goal,
-                    graph_id=f"graph-{run_id}",
-                    node_id=f"node-{run_id}",
-                    required_capabilities=tuple(capabilities),
-                    max_wall_seconds=min(1800.0, harness.budgets.wall_seconds),
-                    native_processes=(
-                        operator_config.isolated_worker.native_process_limit
-                        if operator_config.isolated_worker is not None
-                        else 0
-                    ),
-                    max_processes=min(
-                        harness.budgets.processes,
-                        policy.max_processes
-                        if policy.max_processes is not None
-                        else harness.budgets.processes,
-                    ),
-                )
+                graph_input = bounded_single_node_graph()
             try:
                 graph_run, incident_records = _execute_graph_run_with_incident_reporting(
                     store,
@@ -2309,13 +2402,14 @@ def _work_impl(args: argparse.Namespace) -> int:
                 pre_acceptance.fail(stable_code)
                 print(canonical_json(_pre_acceptance_cli_result(store, run_id, stable_code)))
                 return 7
-            print(
-                canonical_json(
-                    _graph_run_cli_result(
-                        graph_run, incident_records, store.job_context_for_run(run_id)
-                    )
-                )
+            result_payload = _graph_run_cli_result(
+                graph_run, incident_records, store.job_context_for_run(run_id)
             )
+            if adaptive_decision is not None:
+                result_payload["execution_path"] = adaptive_decision.path
+                if adaptive_decision.path == "direct" and graph_run.status == "failed":
+                    result_payload["continuation"] = adaptive_decision.continuation
+            print(canonical_json(result_payload))
             return _graph_run_exit_code(graph_run)
 
 
