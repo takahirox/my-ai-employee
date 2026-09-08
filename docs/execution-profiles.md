@@ -21,6 +21,15 @@ estimated duration do not decide the path. Ambiguity, architecture, coordination
 or invalid optional advice, `--plan-only`, an explicit `--planner-strategy`, or mandatory
 plan review retain planning. Invalid base semantic output still fails strict validation.
 
+Direct eligibility also requires an explicit `read_only_or_local_reversible` effect
+scope. External/shared-state mutations, changes to access or security policy,
+approval-sensitive or irreversible operations, and unknown effects use planning.
+Classify the intended effects of deferred scripts too: producing a local script for a
+consequential operation does not make the requested operation a routine local edit.
+A short, precisely specified workflow can still have consequential effects. The input
+risk value is a deterministic policy floor; zero is not evidence that such effects are
+absent. This gate does not grant permissions or replace required checks.
+
 Direct execution remains adaptive: the existing authority filters and strategy selection
 apply to the assessed complexity, scale, risk and capabilities. It builds one authoritative
 node and omits optional planning, plan review and redundant node assessment. The usual
@@ -34,6 +43,9 @@ and direct graph. Resume keeps the accepted path; historical runs without this r
 retain their original behavior. The inspector's `adaptive_execution` and `effective_stages`
 show the decision separately from the original profile choice. A planned run's subsequent
 node assessments use the same classifier schema, but their advice cannot change the path.
+Previously accepted recommendation records retain their original shape and digest.
+New assessments lacking effect-scope advice select planning; historical accepted direct
+runs retain their route on resume instead of being reclassified.
 
 Workers are instructed to inspect relevant code/tests within their accepted scope and
 budgets before committing to implementation details, connect observations to criteria,

@@ -13,7 +13,7 @@ from typing import ClassVar, Literal, cast
 from pydantic import ConfigDict, Field
 from pydantic.main import BaseModel
 
-from .adaptive_execution import ExecutionRecommendation, GoalAssessmentPayload
+from .adaptive_execution import EffectAwareExecutionRecommendation, GoalAssessmentPayload
 from .domain.base import DIGEST_PATTERN, Digest, freeze_json
 from .domain.models import ExecutionStrategy, SemanticTaskProfile, TaskAssessment
 from .domain.services_v2 import Cancellation, MediatedActionChannel, ProcessExecutor
@@ -590,9 +590,9 @@ class CliTaskAssessmentAdapter:
         self.timeout_seconds = timeout_seconds
         self.expected_effective_policy_digest = expected_effective_policy_digest
         self.execution_context = execution_context
-        self.execution_recommendation: ExecutionRecommendation | None = None
+        self.execution_recommendation: EffectAwareExecutionRecommendation | None = None
         self._last_assessment: (
-            tuple[str, SemanticTaskProfile, ExecutionRecommendation | None] | None
+            tuple[str, SemanticTaskProfile, EffectAwareExecutionRecommendation | None] | None
         ) = None
 
     def assess(
@@ -628,6 +628,13 @@ class CliTaskAssessmentAdapter:
                 "planning or coordination. Several local implementation/test steps can still "
                 "be direct. Use planned for coordination, architecture, explicit planning "
                 "requests, or essential uncertainty; use unknown when evidence is insufficient. "
+                "Classify intended effects, including those of scripts or deferred actions. "
+                "Use external_or_protected_change for changes to external/shared state, access "
+                "or security policy, approval-sensitive actions or irreversible operations. "
+                "Explicit steps or a short request do not make such effects routine. Use "
+                "read_only_or_local_reversible only for read-only work or reversible local "
+                "edits without those consequences; use unknown if the effect scope is unclear. "
+                "Classify reasoning difficulty independently of whether separate planning helps. "
                 "Do not infer suitability from request length or estimated duration. Do not "
                 "assess or grant risk, permissions, capabilities, model, strategy or budget. "
                 "The runtime alone applies mandatory checks and chooses the actual path."
@@ -699,8 +706,10 @@ class CliTaskAssessmentAdapter:
                 recommendation = decoded.pop("execution_recommendation", None)
                 if recommendation is not None:
                     try:
-                        self.execution_recommendation = ExecutionRecommendation.model_validate_json(
-                            canonical_json(recommendation), strict=True
+                        self.execution_recommendation = (
+                            EffectAwareExecutionRecommendation.model_validate_json(
+                                canonical_json(recommendation), strict=True
+                            )
                         )
                     except ValueError:
                         # Optional advice cannot open the direct gate when malformed.
