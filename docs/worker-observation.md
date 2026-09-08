@@ -71,6 +71,17 @@ never loaded by the connection. Semantic review covers the original request beyo
 structural smoke; it is fallible and does not replace an explicit executable check.
 Missing check coverage must be reported as a limitation, not assumed correct.
 
+For explicitly offline Python tasks, a frozen public command can call
+`ai_employee.candidate_validation.candidate_result(Path.cwd())` and validate its
+returned JSON. If an execution manifest is present, the helper runs that program
+in a fresh native-sandboxed copy with network disabled and bounded process output.
+It removes stale output first, rejects symlinks and escaping script paths, and
+returns execution errors to the existing evaluator/repair path. The original
+candidate is unchanged. Programs must work from their candidate working directory;
+hard-coded writes to an original absolute workspace are denied. Do not enable this
+check for a workflow that requires a real service: it is an offline check, not a
+simulated success for denied network operations.
+
 State-changing service calls are not harmless dry runs. Test those using local
 fakes or a separately delegated disposable service. The existing external execution
 transport still runs a declared script once after final submission: do not also
