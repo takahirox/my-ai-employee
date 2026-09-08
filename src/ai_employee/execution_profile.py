@@ -163,6 +163,8 @@ def observe_profile(
 
 
 def inspect_profile(store: SQLiteStore, run_id: str) -> dict[str, object] | None:
+    from .adaptive_execution import AdaptiveExecutionDecision
+
     try:
         profile = store.get("execution_profile_v2", "profile-" + run_id, ExecutionProfile)
     except KeyError:
@@ -190,8 +192,36 @@ def inspect_profile(store: SQLiteStore, run_id: str) -> dict[str, object] | None
         ending = max(item.created_at for item in timings if item.phase == "invocation")
         measured = (ending - beginning).total_seconds()
         elapsed = measured if measured >= 0 else None
+    adaptive_path = None
+    effective_stages = [item.model_dump(mode="json") for item in profile.stages]
+    try:
+        decision = store.get(
+            "adaptive_execution_decision_v2", "adaptive-path-" + run_id, AdaptiveExecutionDecision
+        )
+    except KeyError:
+        pass
+    else:
+        if decision.execution_profile_digest != profile.content_digest:
+            raise ValueError("adaptive decision has a stale execution-profile binding")
+        adaptive_path = {
+            "path": decision.path,
+            "reason": decision.reason,
+            "decision_digest": decision.content_digest,
+            "assessment_digest": decision.assessment_digest,
+            "selected_strategy_id": decision.selected_strategy.id,
+            "recommendation": (
+                None if decision.recommendation is None else decision.recommendation.model_dump()
+            ),
+            "continuation": decision.continuation,
+        }
+        if decision.path == "direct":
+            for stage in effective_stages:
+                if stage["stage"] in {"planning", "plan_review", "node_assessment"}:
+                    stage.update(disposition="omitted", reason=decision.reason)
     return {
         "choice": profile.model_dump(mode="json"),
+        "adaptive_execution": adaptive_path,
+        "effective_stages": effective_stages,
         "timings": [item.model_dump(mode="json") for item in timings],
         "active_invocation_wall_seconds": subtotal if complete else None,
         "completed_invocation_wall_seconds": subtotal,
