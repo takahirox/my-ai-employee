@@ -10,8 +10,10 @@ import pytest
 from ai_employee import cli
 from ai_employee.adaptive_execution import (
     AdaptiveExecutionDecision,
-    ExecutionRecommendation,
     choose_adaptive_path,
+)
+from ai_employee.adaptive_execution import (
+    EffectAwareExecutionRecommendation as ExecutionRecommendation,
 )
 from ai_employee.domain import RoutingMode, SemanticTaskProfile
 from ai_employee.execution_profile import inspect_profile
@@ -29,6 +31,7 @@ from tests.test_cli_graph_e2e import _fixture
 
 DIRECT = {
     "path": "direct",
+    "effect_scope": "read_only_or_local_reversible",
     "scope_clear": True,
     "criteria_clear": True,
     "coordinated_work_required": False,
@@ -51,6 +54,8 @@ DIRECT = {
         ({}, {"coordinated_work_required": True}, {}, "planned"),
         ({}, {"planning_requested": True}, {}, "planned"),
         ({}, {"path": "unknown"}, {}, "planned"),
+        ({}, {"effect_scope": "external_or_protected_change"}, {}, "planned"),
+        ({}, {"effect_scope": "unknown"}, {}, "planned"),
         ({}, {}, {"plan_review_required": True}, "planned"),
         ({}, {}, {"planning_requested": True}, "planned"),
         ({}, {}, {"has_completion_criteria": False}, "planned"),
@@ -140,13 +145,13 @@ def test_advice_cache_is_bound_to_accepted_criteria_and_semantics_stay_strict():
         adapter.assess("Other goal", deterministic())
 
 
-def direct_fixture(tmp_path: Path):
+def direct_fixture(tmp_path: Path, effect_scope: str = "read_only_or_local_reversible"):
     repository, operator, database, state = _fixture(tmp_path, task_review=True)
     worker = tmp_path / "fake-worker"
     source = worker.read_text()
     source = source.replace(
         '"reasons": ["independent accepted-node assessment"],',
-        '"execution_recommendation": ' + repr(DIRECT) + ",\n"
+        '"execution_recommendation": ' + repr(DIRECT | {"effect_scope": effect_scope}) + ",\n"
         '        "reasons": ["independent accepted-node assessment"],',
     )
     start = source.index('if name in {"a", "b"}:')
@@ -229,11 +234,22 @@ def test_direct_cli_keeps_adaptive_routing_reviews_evidence_and_resume(
         )
 
 
-@pytest.mark.parametrize("override", ["plan-only", "planner-strategy", "mandatory-review"])
-def test_explicit_or_mandatory_planning_overrides_direct_recommendation(
-    tmp_path, monkeypatch, override
-):
-    repository, operator, database, _ = direct_fixture(tmp_path)
+@pytest.mark.parametrize(
+    "override",
+    [
+        "plan-only",
+        "planner-strategy",
+        "mandatory-review",
+        "consequential-effects",
+        "unknown-effects",
+    ],
+)
+def test_planning_gates_override_direct_recommendation(tmp_path, monkeypatch, override):
+    effect_scope = {
+        "consequential-effects": "external_or_protected_change",
+        "unknown-effects": "unknown",
+    }.get(override, "read_only_or_local_reversible")
+    repository, operator, database, _ = direct_fixture(tmp_path, effect_scope)
     monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
     argv = ["work", "change a.txt", "--repo", str(repository), "--operator-config", str(operator)]
     if override == "mandatory-review":
@@ -247,7 +263,7 @@ def test_explicit_or_mandatory_planning_overrides_direct_recommendation(
             )
 
         monkeypatch.setattr(cli, "discover_project_harness", require_plan)
-    else:
+    elif override in {"plan-only", "planner-strategy"}:
         argv += ["--plan-only"] if override == "plan-only" else ["--planner-strategy", "low"]
 
     class PlannerReached(Exception):
@@ -394,3 +410,82 @@ raise SystemExit(0)
 
         results = store.list_records("worker_result_v2", WorkerResult)
         assert results and all(result.stdout_artifact_digest for result in results)
+
+
+def test_legacy_decision_keeps_exact_serialization_and_digest():
+    from ai_employee.adaptive_execution import ExecutionRecommendation as LegacyRecommendation
+    from ai_employee.serialization import canonical_json
+
+    payload = (Path(__file__).parent / "fixtures/adaptive-decision-legacy.json").read_text().strip()
+    decision = AdaptiveExecutionDecision.model_validate_json(payload)
+    assert type(decision.recommendation) is LegacyRecommendation
+    assert (
+        decision.content_digest
+        == "3f9b6622f0de2a5017e561097a5f07582d3de2c1594f5e77a65f540ff2699e40"
+    )
+    assert canonical_json(decision) == payload
+    assert decision.path == "direct"  # Historical accepted routes are not reselected.
+    assert (
+        choose_adaptive_path(
+            decision.assessment,
+            decision.recommendation,
+            plan_review_required=False,
+            planning_requested=False,
+            has_completion_criteria=True,
+        )[0]
+        == "planned"
+    )
+
+
+@pytest.mark.parametrize(
+    "goal", ["Approve the transfer", "Grant admin access", "Delete the production dataset"]
+)
+def test_short_explicit_consequential_work_is_not_direct_even_at_zero_policy_floor(goal):
+    assessment = merge_semantic_profile(
+        assess_task(goal, run_id="effects", risk=0),
+        SemanticTaskProfile.model_validate_json(PROFILE),
+    )
+    advice = ExecutionRecommendation(**(DIRECT | {"effect_scope": "external_or_protected_change"}))
+    assert (
+        choose_adaptive_path(
+            assessment,
+            advice,
+            plan_review_required=False,
+            planning_requested=False,
+            has_completion_criteria=True,
+        )[0]
+        == "planned"
+    )
+    assert assessment.risk == 0
+
+
+def test_missing_effect_advice_is_conservative_and_new_provider_schema_requires_it():
+    from ai_employee.worker_adapters import semantic_assessment_schema_json
+
+    adapter, execution, _ = assessor()
+    adapter.execution_context = {"completion_criteria": [{"id": "check"}]}
+    old_advice = {k: v for k, v in DIRECT.items() if k != "effect_scope"}
+    execution.response = json.dumps(
+        json.loads(PROFILE) | {"execution_recommendation": old_advice}
+    ).encode()
+    assert adapter.assess(
+        "Sort values", deterministic()
+    ) == SemanticTaskProfile.model_validate_json(PROFILE)
+    assert adapter.execution_recommendation is None
+    schema = json.loads(semantic_assessment_schema_json(recommend_execution_path=True))
+    advice_schema = schema["$defs"]["EffectAwareExecutionRecommendation"]
+    assert set(advice_schema["required"]) == set(advice_schema["properties"])
+
+
+@pytest.mark.parametrize("effects", ["external_or_protected_change", "unknown"])
+def test_persisted_direct_decision_cannot_contradict_explicit_effect_advice(effects):
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures/adaptive-decision-legacy.json").read_text()
+    )
+    payload["recommendation"]["effect_scope"] = effects
+    payload["content_digest"] = None
+    with pytest.raises(ValueError, match="contradicts its intended-effect assessment"):
+        AdaptiveExecutionDecision.model_validate_json(json.dumps(payload))
+    payload["path"] = "planned"
+    payload["direct_graph_digest"] = None
+    assert AdaptiveExecutionDecision.model_validate_json(json.dumps(payload)).path == "planned"

@@ -25,8 +25,16 @@ class ExecutionRecommendation(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class EffectAwareExecutionRecommendation(ExecutionRecommendation):
+    """Scope of intended effects, including effects of deferred scripts or actions."""
+
+    effect_scope: Literal[
+        "read_only_or_local_reversible", "external_or_protected_change", "unknown"
+    ]
+
+
 class GoalAssessmentPayload(SemanticTaskProfile):
-    execution_recommendation: ExecutionRecommendation | None = None
+    execution_recommendation: EffectAwareExecutionRecommendation | None = None
 
 
 def choose_adaptive_path(
@@ -45,6 +53,11 @@ def choose_adaptive_path(
         return "planned", "Accepted completion criteria are missing."
     if recommendation is None or recommendation.path != "direct":
         return "planned", "No validated direct-execution recommendation."
+    if (
+        not isinstance(recommendation, EffectAwareExecutionRecommendation)
+        or recommendation.effect_scope != "read_only_or_local_reversible"
+    ):
+        return "planned", "Consequential or unknown effects require the planned path."
     if (
         not recommendation.scope_clear
         or not recommendation.criteria_clear
@@ -72,7 +85,8 @@ class AdaptiveExecutionDecision(DigestedRecordV2):
     assessment: TaskAssessment
     assessment_digest: Digest
     assessment_strategy: ExecutionStrategy
-    recommendation: ExecutionRecommendation | None
+    # Keep the legacy shape intact so already accepted decisions retain their digest.
+    recommendation: EffectAwareExecutionRecommendation | ExecutionRecommendation | None
     path: Literal["direct", "planned"]
     reason: str = Field(min_length=1, max_length=1_000)
     initial_worker_strategy: ExecutionStrategy
@@ -95,4 +109,10 @@ class AdaptiveExecutionDecision(DigestedRecordV2):
             raise ValueError("adaptive decision assessment digest is stale")
         if (self.path == "direct") != (self.direct_graph_digest is not None):
             raise ValueError("only direct execution binds a deterministic graph")
+        if (
+            self.path == "direct"
+            and isinstance(self.recommendation, EffectAwareExecutionRecommendation)
+            and self.recommendation.effect_scope != "read_only_or_local_reversible"
+        ):
+            raise ValueError("direct decision contradicts its intended-effect assessment")
         return self
