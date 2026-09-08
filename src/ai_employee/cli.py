@@ -1870,7 +1870,7 @@ def _work_impl(args: argparse.Namespace) -> int:
                 recommendation=semantic_assessor.execution_recommendation,
                 path=path,
                 reason=path_reason,
-                selected_strategy=selected_strategy,
+                initial_worker_strategy=selected_strategy,
                 harness_digest=harness_digest,
                 operator_config_digest=operator_config_digest(operator_config),
                 effective_policy_digest=effective_policy_digest,

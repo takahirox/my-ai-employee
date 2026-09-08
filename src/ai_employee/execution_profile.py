@@ -208,7 +208,7 @@ def inspect_profile(store: SQLiteStore, run_id: str) -> dict[str, object] | None
             "reason": decision.reason,
             "decision_digest": decision.content_digest,
             "assessment_digest": decision.assessment_digest,
-            "selected_strategy_id": decision.selected_strategy.id,
+            "initial_worker_strategy_id": decision.initial_worker_strategy.id,
             "recommendation": (
                 None if decision.recommendation is None else decision.recommendation.model_dump()
             ),

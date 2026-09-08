@@ -264,7 +264,10 @@ def test_explicit_or_mandatory_planning_overrides_direct_recommendation(
         assert len(decisions) == 1 and decisions[0].path == "planned"
 
 
-def test_paused_direct_run_retains_decision_and_does_not_reclassify(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("stale_binding", [None, "goal_digest", "direct_graph_digest"])
+def test_paused_direct_run_retains_decision_and_does_not_reclassify(
+    tmp_path, capsys, monkeypatch, stale_binding
+):
     repository, operator, database, state = direct_fixture(tmp_path)
     monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
     worker = tmp_path / "fake-worker"
@@ -320,6 +323,19 @@ patch = (""",
         "ai_employee.worker_adapters.CliTaskAssessmentAdapter.assess", no_reassessment
     )
     monkeypatch.setattr(CliProposedGraphPlanner, "plan", no_reassessment)
+    if stale_binding:
+        changed = decision.model_dump(mode="json") | {
+            stale_binding: "f" * 64,
+            "content_digest": None,
+        }
+        invalid = AdaptiveExecutionDecision.model_validate_json(json.dumps(changed))
+        with SQLiteStore(database) as store:
+            store.put("adaptive_execution_decision_v2", invalid, run_id=run_id)
+        with pytest.raises(
+            ValueError, match=r"stale run bindings|does not match its accepted decision"
+        ):
+            cli.main(["resume", run_id])
+        return
     assert cli.main(["resume", run_id]) == 0
     assert json.loads(capsys.readouterr().out)["execution_path"] == "direct"
     with SQLiteStore(database) as store:
@@ -331,3 +347,50 @@ patch = (""",
             )
             == decision
         )
+
+
+def test_direct_failure_preserves_outcome_and_requires_explicit_continuation(
+    tmp_path, capsys, monkeypatch
+):
+    repository, operator, database, _ = direct_fixture(tmp_path)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args, **_kwargs: database)
+    worker = tmp_path / "fake-worker"
+    source = worker.read_text()
+    start = source.index('name = Path(prompt["goal"].split()[-1]).stem')
+    worker.write_text(
+        source[:start]
+        + """
+print(json.dumps({"schema_version": "2", "proposals": [],
+                  "assistant_note": "Investigation found missing cross-component design criteria.",
+                  "usage_json": "{}"}))
+raise SystemExit(0)
+"""
+    )
+
+    def no_automatic_planning(*args, **kwargs):
+        pytest.fail("direct failure silently started planning")
+
+    monkeypatch.setattr(CliProposedGraphPlanner, "plan", no_automatic_planning)
+    result = cli.main(
+        [
+            "work",
+            "change a.txt",
+            "--repo",
+            str(repository),
+            "--operator-config",
+            str(operator),
+            "--non-interactive",
+        ]
+    )
+    assert result != 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == "failed" and emitted["execution_path"] == "direct"
+    assert "explicit planned continuation" in emitted["continuation"]
+    assert (repository / "a.txt").read_text() == "a-before\n"
+    with SQLiteStore(database) as store:
+        run = store.get("graph_run_v2", emitted["run_id"], GraphRunRecord)
+        assert run.status == "failed" and run.replan_count == 0
+        from ai_employee.domain.v2 import WorkerResult
+
+        results = store.list_records("worker_result_v2", WorkerResult)
+        assert results and all(result.stdout_artifact_digest for result in results)

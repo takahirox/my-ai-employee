@@ -75,7 +75,7 @@ class AdaptiveExecutionDecision(DigestedRecordV2):
     recommendation: ExecutionRecommendation | None
     path: Literal["direct", "planned"]
     reason: str = Field(min_length=1, max_length=1_000)
-    selected_strategy: ExecutionStrategy
+    initial_worker_strategy: ExecutionStrategy
     harness_digest: Digest
     operator_config_digest: Digest
     effective_policy_digest: Digest
