@@ -22,6 +22,11 @@ from .routing import SEMANTIC_PROFILE_RUBRIC
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_contract import (
+    schema_argv,
+    validate_stage_policy,
+    validate_stage_result,
+)
 from .worker_adapters import cli_inherit_environment
 
 if TYPE_CHECKING:
@@ -416,22 +421,26 @@ class CliProposedGraphPlanner:
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
-        request = ProcessRequest(
-            id=identifier("graph-planner-process"),
-            run_id=self.run_id,
-            created_at=now(),
-            argv=self._argv(schema_json=response_schema),
-            cwd=self.cwd,
-            inherit_environment=cli_inherit_environment(self.strategy.backend),
-            stdin_artifact_digest=stdin_digest,
-            timeout_seconds=remaining_timeout(self.timeout_seconds),
-            stdout_bytes=1_000_000,
-            stderr_bytes=1_000_000,
-            budget_class="worker",
-            purpose="obtain a strict non-authoritative ProposedGraph",
-        )
-        result = self.executor.execute(request, self.policy_decider(request), _NeverCancelled())
+        with schema_argv(self._argv(schema_json=response_schema), response_schema) as argv:
+            request = ProcessRequest(
+                id=identifier("graph-planner-process"),
+                run_id=self.run_id,
+                created_at=now(),
+                argv=argv,
+                cwd=self.cwd,
+                inherit_environment=cli_inherit_environment(self.strategy.backend),
+                stdin_artifact_digest=stdin_digest,
+                timeout_seconds=remaining_timeout(self.timeout_seconds),
+                stdout_bytes=1_000_000,
+                stderr_bytes=1_000_000,
+                budget_class="worker",
+                purpose="obtain a strict non-authoritative ProposedGraph",
+            )
+            decision = self.policy_decider(request)
+            validate_stage_policy(request, decision, effective_policy_digest)
+            result = self.executor.execute(request, decision, _NeverCancelled())
         check_wall_budget()
+        validate_stage_result(request, result)
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message
@@ -539,31 +548,33 @@ class CliProposedGraphPlanner:
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
-        request = ProcessRequest(
-            id=identifier("graph-planner-revision-process"),
-            run_id=self.run_id,
-            created_at=now(),
-            argv=self._argv(schema_json=response_schema),
-            cwd=self.cwd,
-            inherit_environment=cli_inherit_environment(self.strategy.backend),
-            stdin_artifact_digest=stdin_digest,
-            timeout_seconds=remaining_timeout(self.timeout_seconds),
-            stdout_bytes=1_000_000,
-            stderr_bytes=1_000_000,
-            budget_class="worker",
-            purpose="obtain one strict non-authoritative ProposedGraph revision",
-        )
-        decision = self.policy_decider(request)
-        if decision.run_id != self.run_id or decision.request_digest != request.content_digest:
-            raise ValueError("revision policy decision is bound to another request")
-        if decision.effective_policy_digest != original.effective_policy_digest:
-            raise ValueError("revision policy decision uses another effective policy")
-        if decision.outcome is not DecisionOutcome.ALLOW:
-            raise ValueError(f"revision policy did not allow execution: {decision.outcome.value}")
-        result = self.executor.execute(request, decision, _NeverCancelled())
+        with schema_argv(self._argv(schema_json=response_schema), response_schema) as argv:
+            request = ProcessRequest(
+                id=identifier("graph-planner-revision-process"),
+                run_id=self.run_id,
+                created_at=now(),
+                argv=argv,
+                cwd=self.cwd,
+                inherit_environment=cli_inherit_environment(self.strategy.backend),
+                stdin_artifact_digest=stdin_digest,
+                timeout_seconds=remaining_timeout(self.timeout_seconds),
+                stdout_bytes=1_000_000,
+                stderr_bytes=1_000_000,
+                budget_class="worker",
+                purpose="obtain one strict non-authoritative ProposedGraph revision",
+            )
+            decision = self.policy_decider(request)
+            if decision.run_id != self.run_id or decision.request_digest != request.content_digest:
+                raise ValueError("revision policy decision is bound to another request")
+            if decision.effective_policy_digest != original.effective_policy_digest:
+                raise ValueError("revision policy decision uses another effective policy")
+            if decision.outcome is not DecisionOutcome.ALLOW:
+                raise ValueError(
+                    f"revision policy did not allow execution: {decision.outcome.value}"
+                )
+            result = self.executor.execute(request, decision, _NeverCancelled())
         check_wall_budget()
-        if result.request_digest != request.content_digest:
-            raise ValueError("revision result is bound to another request")
+        validate_stage_result(request, result)
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message

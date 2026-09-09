@@ -30,6 +30,12 @@ from .prompt_transport import prompt_json
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_contract import (
+    ReferenceContract,
+    StageContractError,
+    schema_argv,
+    validate_stage_result,
+)
 from .stage_control import StageCancellation
 from .task_planning import _strict_schema
 from .worker_adapters import cli_inherit_environment
@@ -253,6 +259,14 @@ class StaleTaskReviewResult(DigestedRecordV2):
     result_attempt: int = Field(ge=0)
 
 
+def task_reference_contract(request: TaskReviewRequest) -> ReferenceContract:
+    return ReferenceContract(
+        criteria=request.criterion_ids,
+        evidence=request.deterministic_evidence_digests,
+        artifacts=request.artifact_digests,
+    )
+
+
 def task_review_schema_json() -> bytes:
     schema = TaskReviewPayload.model_json_schema()
     _strict_schema(schema)
@@ -290,7 +304,19 @@ def parse_task_review_payload(output: str) -> TaskReviewPayload:
     ):
         raise ValueError("TaskReviewFinding has missing or unknown fields")
     try:
-        return TaskReviewPayload.model_validate_json(output, strict=True)
+        for obj in (raw, *findings):
+            for field in (
+                "reviewed_criterion_ids",
+                "criterion_ids",
+                "evidence_digests",
+                "artifact_digests",
+            ):
+                value = obj.get(field)
+                if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    obj[field] = sorted(value)
+        if all(isinstance(item["id"], str) for item in findings):
+            raw["findings"] = sorted(findings, key=lambda item: item["id"])
+        return TaskReviewPayload.model_validate_json(json.dumps(raw), strict=True)
     except ValueError as error:
         raise ValueError(f"invalid TaskReviewPayload: {error}") from error
 
@@ -306,11 +332,12 @@ def validate_task_review_result(request: TaskReviewRequest, result: TaskReviewRe
         or result.reviewer_strategy != request.reviewer_strategy
     ):
         raise ValueError("task-review result has stale or foreign bindings")
-    expected_criteria = set(request.criterion_ids)
+    contract = task_reference_contract(request)
+    expected_criteria = set(contract.criteria)
     if set(result.reviewed_criterion_ids) != expected_criteria:
         raise ValueError("task-review result does not cover the exact criteria")
-    allowed_evidence = set(request.deterministic_evidence_digests)
-    allowed_artifacts = set(request.artifact_digests)
+    allowed_evidence = set(contract.evidence)
+    allowed_artifacts = set(contract.artifacts)
     for finding in result.findings:
         if not set(finding.criterion_ids) <= expected_criteria:
             raise ValueError("task-review finding references an unknown criterion")
@@ -445,6 +472,17 @@ class CliTaskResultReviewer:
     def review(self, request: TaskReviewRequest) -> TaskReviewResult:
         if request.run_id != self.run_id or request.reviewer_strategy != self.strategy:
             raise ValueError("task-review request is bound to another reviewer or run")
+        child = request.worker_request
+        if (
+            child.graph_run_id != request.run_id
+            or request.worker_result.run_id != child.run_id
+            or child.attempt != request.attempt
+            or child.harness_digest != request.harness_digest
+            or child.effective_policy_digest != request.effective_policy_digest
+        ):
+            raise StageContractError("TASK_REVIEW_REQUEST_BINDING_INVALID")
+        contract = task_reference_contract(request)
+        response_schema = contract.schema(task_review_schema_json())
         prompt = prompt_json(
             {
                 "protocol": "fleet-task-result-review/2",
@@ -483,44 +521,55 @@ class CliTaskResultReviewer:
                         for item in request.artifact_descriptors
                     ),
                 },
-                "response_schema": json.loads(task_review_schema_json()),
+                "response_contract": contract.prompt(),
+                "response_schema": json.loads(response_schema),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
-        process_request = ProcessRequest(
-            id=identifier("task-review-process"),
-            run_id=self.run_id,
-            created_at=now(),
-            argv=self._argv(),
-            cwd=self.cwd,
-            inherit_environment=cli_inherit_environment(self.strategy.backend),
-            stdin_artifact_digest=stdin_digest,
-            timeout_seconds=remaining_timeout(self.timeout_seconds),
-            stdout_bytes=100_000,
-            stderr_bytes=100_000,
-            budget_class="worker",
-            purpose="obtain a strict non-authoritative TaskReviewPayload",
-        )
-        decision = self.policy_decider(process_request)
-        if (
-            decision.run_id != self.run_id
-            or decision.request_digest != process_request.content_digest
-            or decision.effective_policy_digest != request.effective_policy_digest
-            or decision.outcome is not DecisionOutcome.ALLOW
-        ):
-            raise ValueError("task-review policy did not allow the exact request")
-        process_result = self.executor.execute(process_request, decision, StageCancellation())
+        with schema_argv(self._argv(schema_json=response_schema), response_schema) as argv:
+            process_request = ProcessRequest(
+                id=identifier("task-review-process"),
+                run_id=self.run_id,
+                created_at=now(),
+                argv=argv,
+                cwd=self.cwd,
+                inherit_environment=cli_inherit_environment(self.strategy.backend),
+                stdin_artifact_digest=stdin_digest,
+                timeout_seconds=remaining_timeout(self.timeout_seconds),
+                stdout_bytes=100_000,
+                stderr_bytes=100_000,
+                budget_class="worker",
+                purpose="obtain a strict non-authoritative TaskReviewPayload",
+            )
+            decision = self.policy_decider(process_request)
+            if (
+                decision.run_id != self.run_id
+                or decision.request_digest != process_request.content_digest
+                or decision.effective_policy_digest != request.effective_policy_digest
+                or decision.outcome is not DecisionOutcome.ALLOW
+            ):
+                raise ValueError("task-review policy did not allow the exact request")
+            process_result = self.executor.execute(process_request, decision, StageCancellation())
         check_wall_budget()
-        if (
-            process_result.request_digest != process_request.content_digest
-            or process_result.status != "succeeded"
-            or process_result.stdout_artifact_digest is None
-        ):
-            raise ValueError("task-review invocation failed")
+        validate_stage_result(process_request, process_result)
+        if process_result.status != "succeeded" or process_result.stdout_artifact_digest is None:
+            raise StageContractError("TASK_REVIEW_PROCESS_FAILED")
         output = self.output_reader(process_result.stdout_artifact_digest).decode(
             "utf-8", "replace"
         )
-        payload = parse_task_review_payload(self._extract_payload(output))
+        try:
+            decoded = self._extract_payload(output)
+            json.loads(decoded)
+        except (TypeError, ValueError) as error:
+            raise StageContractError("TASK_REVIEW_INVALID_JSON") from error
+        try:
+            payload = parse_task_review_payload(decoded)
+        except (TypeError, ValueError) as error:
+            raise StageContractError("TASK_REVIEW_INVALID_SCHEMA") from error
+        try:
+            contract.validate(payload.model_dump())
+        except StageContractError as error:
+            raise StageContractError("TASK_REVIEW_REFERENCE_MISMATCH") from error
         return bind_task_review_payload(
             payload,
             request=request,
@@ -529,8 +578,8 @@ class CliTaskResultReviewer:
             created_at=now(),
         )
 
-    def _argv(self) -> tuple[str, ...]:
-        schema = task_review_schema_json().decode()
+    def _argv(self, *, schema_json: bytes | None = None) -> tuple[str, ...]:
+        schema = (schema_json or task_review_schema_json()).decode()
         if self.strategy.backend == "codex_cli":
             assert self.output_schema_path is not None
             return (

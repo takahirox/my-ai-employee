@@ -40,6 +40,7 @@ from .routing import SEMANTIC_PROFILE_RUBRIC
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_contract import stage_result_matches, validate_stage_result
 from .worker_attribution import attribute_read_only_payload, model_read_only_schema
 
 
@@ -297,6 +298,7 @@ class CliWorkerAdapter:
             (self.executable, "--version"), "probe worker version", 10.0
         )
         version = version_invocation.result
+        validate_stage_result(version_invocation.request, version)
         if version.status != "succeeded" or version.stdout_artifact_digest is None:
             return WorkerAvailability(
                 id=identifier("worker-probe"),
@@ -314,6 +316,7 @@ class CliWorkerAdapter:
             )
         help_invocation = self._execute((self.executable, "--help"), "probe worker help", 10.0)
         help_result = help_invocation.result
+        validate_stage_result(help_invocation.request, help_result)
         help_text = self._output(help_result.stdout_artifact_digest)
         if help_result.status != "succeeded" or self.noninteractive_flag not in help_text:
             return WorkerAvailability(
@@ -389,6 +392,18 @@ class CliWorkerAdapter:
             stdin_digest=stdin_digest,
         )
         process = invocation.result
+        if invocation.request.run_id != request.run_id or not stage_result_matches(
+            invocation.request, process
+        ):
+            return _worker_failure(
+                request,
+                started,
+                StableFailureCode.WORKER_BOUNDARY_ERROR,
+                "worker process result does not match its originating invocation",
+                adapter=self.adapter,
+                stage="process",
+                diagnostic_code="WORKER_PROCESS_BINDING_INVALID",
+            )
         if process.status != "succeeded":
             failure = process.failure or StableFailure(
                 code=StableFailureCode.WORKER_PROTOCOL_ERROR,
@@ -404,20 +419,6 @@ class CliWorkerAdapter:
                 invocation=invocation,
                 retryable=failure.retryable,
                 status=process.status,
-            )
-        if (
-            invocation.request.run_id != request.run_id
-            or process.run_id != request.run_id
-            or process.request_digest != invocation.request.content_digest
-        ):
-            return _worker_failure(
-                request,
-                started,
-                StableFailureCode.WORKER_BOUNDARY_ERROR,
-                "worker process result does not match its originating invocation",
-                adapter=self.adapter,
-                stage="process",
-                diagnostic_code="WORKER_PROCESS_BINDING_INVALID",
             )
         if self.cancellation.cancelled():
             return _worker_failure(
@@ -731,7 +732,7 @@ class CliTaskAssessmentAdapter:
             return self._last_assessment[1]
         result = self.executor.execute(request, decision, _NeverCancelled(on_poll))
         check_wall_budget()
-        if result.run_id != request.run_id or result.request_digest != request.content_digest:
+        if not stage_result_matches(request, result):
             raise ValueError("assessment result is bound to another request")
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
@@ -905,6 +906,7 @@ class CodexCliWorkerAdapter(CliWorkerAdapter):
             "probe worker observation sandbox",
             10.0,
         )
+        validate_stage_result(probe.request, probe.result)
         if probe.result.status != "succeeded":
             return availability.model_copy(
                 update={

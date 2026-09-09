@@ -97,6 +97,7 @@ from .run_ownership import (
 )
 from .serialization import canonical_digest
 from .services_v2._common import identifier, now
+from .stage_contract import StageContractError
 from .stage_control import StageStopped as _StageStopped
 from .stage_control import bind_stage_cancellation
 from .storage import SQLiteStore
@@ -3670,6 +3671,8 @@ class TaskOrchestrator:
         ):
             return False
         evaluation = evaluations[0]
+        if evaluation.failure_code == "PARENT_SEMANTIC_REVIEW_UNAVAILABLE":
+            return False
         feedback = tuple(
             dict.fromkeys(
                 (
@@ -4295,7 +4298,7 @@ class TaskOrchestrator:
                 run_id=graph_run.id,
                 created_at=now(),
             )
-        except Exception:
+        except Exception as error:
             if review_result is not None:
                 self.store.put(
                     "stale_task_review_result_v2",
@@ -4325,7 +4328,9 @@ class TaskOrchestrator:
                 generation=node.generation,
                 attempt=node.attempt,
                 action=TaskReviewAction.FAIL,
-                reason_code="TASK_REVIEW_FAILED",
+                reason_code=(
+                    error.code if isinstance(error, StageContractError) else "TASK_REVIEW_FAILED"
+                ),
             )
         self.store.put("task_review_decision_v2", decision, run_id=graph_run.id)
         feedback = tuple(

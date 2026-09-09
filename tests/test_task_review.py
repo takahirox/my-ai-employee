@@ -23,7 +23,6 @@ from ai_employee.task_review import (
     TaskReviewPayload,
     TaskReviewRequest,
     bind_task_review_payload,
-    task_review_schema_json,
     validate_task_review_result,
 )
 
@@ -171,7 +170,9 @@ def test_task_reviewer_receives_exact_bounded_payload_after_opt_in() -> None:
     assert prompt["request"]["worker_request"]["content_digest"] == (request.worker_request_digest)
     assert prompt["request"]["worker_result"]["content_digest"] == (request.worker_result_digest)
     assert prompt["request"]["artifact_descriptors"] == []
-    assert prompt["response_schema"] == json.loads(task_review_schema_json())
+    assert prompt["response_schema"]["properties"]["reviewed_criterion_ids"]["items"]["enum"] == [
+        "criterion-fix"
+    ]
     assert {"repository", "conversation_history", "artifact_bodies"}.isdisjoint(prompt)
 
 

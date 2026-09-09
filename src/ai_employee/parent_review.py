@@ -32,6 +32,12 @@ from .review_diagnostics import ParentReviewError
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_contract import (
+    ReferenceContract,
+    StageContractError,
+    schema_argv,
+    validate_stage_result,
+)
 from .stage_control import StageCancellation
 from .task_planning import _strict_schema
 from .worker_adapters import cli_inherit_environment
@@ -385,6 +391,15 @@ class ParentSemanticReviewer(Protocol):
     def review(self, request: ParentSemanticReviewRequest) -> ParentSemanticReviewResult: ...
 
 
+def parent_reference_contract(request: ParentSemanticReviewRequest) -> ReferenceContract:
+    return ReferenceContract(
+        request.criterion_ids,
+        request.node_ids,
+        request.allowed_evidence_digests,
+        request.allowed_artifact_digests,
+    )
+
+
 def parent_semantic_review_schema_json() -> bytes:
     schema = ParentSemanticReviewPayload.model_json_schema()
     _strict_schema(schema)
@@ -477,10 +492,11 @@ def validate_parent_semantic_review_result(
         raise ValueError("parent semantic review does not cover the exact Goal criteria")
     if result.reviewed_node_ids != request.node_ids:
         raise ValueError("parent semantic review does not cover the exact accepted nodes")
-    expected_criteria = set(request.criterion_ids)
-    expected_nodes = set(request.node_ids)
-    allowed_evidence = set(request.allowed_evidence_digests)
-    allowed_artifacts = set(request.allowed_artifact_digests)
+    contract = parent_reference_contract(request)
+    expected_criteria = set(contract.criteria)
+    expected_nodes = set(contract.nodes)
+    allowed_evidence = set(contract.evidence)
+    allowed_artifacts = set(contract.artifacts)
     for finding in result.findings:
         if not set(finding.criterion_ids) <= expected_criteria:
             raise ValueError("parent semantic finding references an unknown criterion")
@@ -639,6 +655,8 @@ class CliParentSemanticReviewer:
             candidate_patch = candidate.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValueError("parent semantic-review candidate patch is not UTF-8") from error
+        contract = parent_reference_contract(request)
+        response_schema = contract.schema(parent_semantic_review_schema_json())
         prompt = prompt_json(
             {
                 "protocol": "fleet-parent-semantic-review/2",
@@ -681,40 +699,43 @@ class CliParentSemanticReviewer:
                         )
                     ),
                 },
-                "response_schema": json.loads(parent_semantic_review_schema_json()),
+                "response_contract": contract.prompt(),
+                "response_schema": json.loads(response_schema),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
-        process_request = ProcessRequest(
-            id=identifier("parent-semantic-review-process"),
-            run_id=self.run_id,
-            created_at=now(),
-            argv=self._argv(),
-            cwd=self.cwd,
-            inherit_environment=cli_inherit_environment(self.strategy.backend),
-            stdin_artifact_digest=stdin_digest,
-            timeout_seconds=remaining_timeout(self.timeout_seconds),
-            stdout_bytes=100_000,
-            stderr_bytes=100_000,
-            budget_class="worker",
-            purpose="obtain strict non-authoritative parent semantic evidence",
-        )
-        decision = self.policy_decider(process_request)
-        if (
-            decision.run_id != self.run_id
-            or decision.request_digest != process_request.content_digest
-            or decision.effective_policy_digest != request.effective_policy_digest
-            or decision.outcome is not DecisionOutcome.ALLOW
-        ):
-            raise ValueError("parent semantic-review policy did not allow the exact request")
-        process_result = self.executor.execute(process_request, decision, StageCancellation())
+        with schema_argv(self._argv(schema_json=response_schema), response_schema) as argv:
+            process_request = ProcessRequest(
+                id=identifier("parent-semantic-review-process"),
+                run_id=self.run_id,
+                created_at=now(),
+                argv=argv,
+                cwd=self.cwd,
+                inherit_environment=cli_inherit_environment(self.strategy.backend),
+                stdin_artifact_digest=stdin_digest,
+                timeout_seconds=remaining_timeout(self.timeout_seconds),
+                stdout_bytes=100_000,
+                stderr_bytes=100_000,
+                budget_class="worker",
+                purpose="obtain strict non-authoritative parent semantic evidence",
+            )
+            decision = self.policy_decider(process_request)
+            if (
+                decision.run_id != self.run_id
+                or decision.request_digest != process_request.content_digest
+                or decision.effective_policy_digest != request.effective_policy_digest
+                or decision.outcome is not DecisionOutcome.ALLOW
+            ):
+                raise ValueError("parent semantic-review policy did not allow the exact request")
+            process_result = self.executor.execute(process_request, decision, StageCancellation())
         check_wall_budget()
-        if (
-            process_result.run_id != self.run_id
-            or process_result.request_digest != process_request.content_digest
-            or process_result.status != "succeeded"
-            or process_result.stdout_artifact_digest is None
-        ):
+        try:
+            validate_stage_result(process_request, process_result)
+        except StageContractError as error:
+            raise ParentReviewError(
+                "PARENT_REVIEW_REQUEST_BINDING_FAILED", "request_binding", error
+            ) from error
+        if process_result.status != "succeeded" or process_result.stdout_artifact_digest is None:
             raise ValueError("parent semantic-review invocation failed")
         output = self.output_reader(process_result.stdout_artifact_digest).decode(
             "utf-8", "replace"
@@ -767,8 +788,8 @@ class CliParentSemanticReviewer:
                 received_nodes=len(payload.reviewed_node_ids),
             ) from error
 
-    def _argv(self) -> tuple[str, ...]:
-        schema = parent_semantic_review_schema_json().decode()
+    def _argv(self, *, schema_json: bytes | None = None) -> tuple[str, ...]:
+        schema = (schema_json or parent_semantic_review_schema_json()).decode()
         if self.strategy.backend == "codex_cli":
             assert self.output_schema_path is not None
             return (
