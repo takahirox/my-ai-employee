@@ -28,6 +28,7 @@ from .domain.v2 import (
 from .engineering_guidance import COMMENT_REVIEW_GUIDANCE, SIMPLICITY_REVIEW_GUIDANCE
 from .model_usage import codex_payload
 from .prompt_transport import prompt_json
+from .review_diagnostics import ParentReviewError
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
@@ -718,14 +719,53 @@ class CliParentSemanticReviewer:
         output = self.output_reader(process_result.stdout_artifact_digest).decode(
             "utf-8", "replace"
         )
-        payload = parse_parent_semantic_review_payload(self._extract_payload(output))
-        return bind_parent_semantic_review_payload(
-            payload,
-            request=request,
-            record_id=identifier("parent-semantic-review-result"),
-            run_id=self.run_id,
-            created_at=now(),
-        )
+        response_digest = process_result.stdout_artifact_digest
+        try:
+            decoded = self._extract_payload(output)
+            # Keep JSON syntax failure distinct from the strict payload schema.
+            json.loads(decoded)
+        except (TypeError, ValueError) as error:
+            raise ParentReviewError(
+                "PARENT_REVIEW_INVALID_JSON",
+                "response_parse",
+                error,
+                response_digest=response_digest,
+            ) from error
+        try:
+            payload = parse_parent_semantic_review_payload(decoded)
+        except (TypeError, ValueError) as error:
+            raise ParentReviewError(
+                "PARENT_REVIEW_INVALID_SCHEMA",
+                "response_parse",
+                error,
+                response_digest=response_digest,
+            ) from error
+        try:
+            return bind_parent_semantic_review_payload(
+                payload,
+                request=request,
+                record_id=identifier("parent-semantic-review-result"),
+                run_id=self.run_id,
+                created_at=now(),
+            )
+        except (TypeError, ValueError) as error:
+            from .review_diagnostics import ReviewCode
+
+            code: ReviewCode = "PARENT_REVIEW_CONTRACT_MISMATCH"
+            if payload.reviewed_criterion_ids != tuple(sorted(request.criterion_ids)):
+                code = "PARENT_REVIEW_CRITERIA_MISMATCH"
+            elif payload.reviewed_node_ids != request.node_ids:
+                code = "PARENT_REVIEW_NODES_MISMATCH"
+            raise ParentReviewError(
+                code,
+                "response_contract",
+                error,
+                response_digest=response_digest,
+                expected_criteria=len(request.criterion_ids),
+                received_criteria=len(payload.reviewed_criterion_ids),
+                expected_nodes=len(request.node_ids),
+                received_nodes=len(payload.reviewed_node_ids),
+            ) from error
 
     def _argv(self) -> tuple[str, ...]:
         schema = parent_semantic_review_schema_json().decode()

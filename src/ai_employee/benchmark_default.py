@@ -4,22 +4,25 @@ import argparse
 import json
 import math
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ai_employee.benchmark_adapter import make_harness
 from ai_employee.config import OperatorConfig
-from ai_employee.domain.evaluation import EvaluationEvidenceLedger
-from ai_employee.domain.v2 import WorkerAvailability, WorkerBoundaryDiagnostic
+from ai_employee.diagnostic_bundle import (
+    DiagnosticCollector,
+    project,
+    record_export_error,
+    snapshot,
+)
 from ai_employee.execution_profile import inspect_profile
 from ai_employee.goal_acceptance import GoalChecks
-from ai_employee.model_progress import ModelProgressRecord
-from ai_employee.model_usage import ModelProcessDiagnostic, inspect_usage
-from ai_employee.parent_review import ParentSemanticReviewDecision, ParentSemanticReviewResult
-from ai_employee.plan_review import PlanReviewFailureEvidence
+from ai_employee.model_usage import inspect_usage
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_observation import exact_hosts
 
@@ -126,7 +129,9 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
         cwd=root,
         deadline=deadline,
     )
+    run_id = "benchmark-" + uuid4().hex
     with (
+        DiagnosticCollector(home / ".fleet/fleet.db", logs, run_id),
         (logs / "fleet-result.json").open("w") as stdout,
         (logs / "fleet.stderr").open("w") as stderr,
     ):
@@ -140,6 +145,8 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
                 "--operator-config",
                 str(operator),
                 "--non-interactive",
+                "--run-id",
+                run_id,
                 "--json",
                 *acceptance_args,
             ],
@@ -157,6 +164,9 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
             file=sys.stderr,
         )
         return 75 if quota_stopped else 1
+    if not isinstance(emitted, dict) or emitted.get("run_id") not in (None, run_id):
+        print("Fleet returned an unbound structured outcome", file=sys.stderr)
+        return 75 if quota_stopped else 1
     print(
         json.dumps(
             {
@@ -169,82 +179,40 @@ def run(request: dict[str, Any], root: Path, home: Path, logs: Path) -> int:
     )
     usage_complete = False
     if emitted.get("run_id"):
-        with SQLiteStore(home / ".fleet/fleet.db") as store:
-            usage = inspect_usage(store, [emitted["run_id"]])
-            details = {
-                "parent_review_results": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "parent_semantic_review_result_v2",
-                        ParentSemanticReviewResult,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                "parent_review_decisions": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "parent_semantic_review_decision_v2",
-                        ParentSemanticReviewDecision,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                "evaluation_evidence_ledgers": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "evaluation_evidence_ledger_v2",
-                        EvaluationEvidenceLedger,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                # This connection owns a fresh trial-private DB. Availability records
-                # may belong to its child node runs, so retain those identities too.
-                "worker_availability": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records("worker_availability_v2", WorkerAvailability)
-                ],
-                "model_process_diagnostics": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "model_process_diagnostic_v2",
-                        ModelProcessDiagnostic,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                "worker_boundary_diagnostics": [
-                    record.model_dump(mode="json", exclude={"exception_message"})
-                    for record in store.list_records(
-                        "worker_boundary_diagnostic_v2",
-                        WorkerBoundaryDiagnostic,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                "plan_review_failures": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "plan_review_failure_evidence_v2",
-                        PlanReviewFailureEvidence,
-                        run_id=emitted["run_id"],
-                    )
-                ],
-                "usage": usage,
-                "profile": inspect_profile(store, emitted["run_id"]),
-                "progress": [
-                    record.model_dump(mode="json")
-                    for record in store.list_records(
-                        "model_progress_v2", ModelProgressRecord, run_id=emitted["run_id"]
-                    )
-                ],
-            }
-        (logs / "fleet-diagnostics.json").write_text(json.dumps(details, indent=2))
-        invocations = usage["invocation_details"]
-        usage_complete = (
-            isinstance(invocations, list)
-            and bool(invocations)
-            and all(
-                isinstance(invocation, dict) and invocation.get("complete") is True
-                for invocation in invocations
+        try:
+            with SQLiteStore(home / ".fleet/fleet.db") as store:
+                usage = inspect_usage(store, [emitted["run_id"]])
+                bundle = snapshot((home / ".fleet/fleet.db").resolve(), emitted["run_id"])
+                aliases = {
+                    "parent_review_results": "parent_semantic_review_result_v2",
+                    "parent_review_decisions": "parent_semantic_review_decision_v2",
+                    "parent_review_failures": "parent_review_failure_v2",
+                    "evaluation_evidence_ledgers": "evaluation_evidence_ledger_v2",
+                    "worker_availability": "worker_availability_v2",
+                    "model_process_diagnostics": "model_process_diagnostic_v2",
+                    "worker_boundary_diagnostics": "worker_boundary_diagnostic_v2",
+                    "plan_review_failures": "plan_review_failure_evidence_v2",
+                    "progress": "model_progress_v2",
+                }
+                details: dict[str, Any] = {
+                    name: [item["record"] for item in bundle["records"] if item["kind"] == kind]
+                    for name, kind in aliases.items()
+                }
+                details["usage"] = usage
+                details["profile"] = project(inspect_profile(store, emitted["run_id"]))
+                details["omissions"] = bundle["omissions"]
+            (logs / "fleet-diagnostics.json").write_text(json.dumps(details, indent=2))
+            invocations = usage["invocation_details"]
+            usage_complete = (
+                isinstance(invocations, list)
+                and bool(invocations)
+                and all(
+                    isinstance(invocation, dict) and invocation.get("complete") is True
+                    for invocation in invocations
+                )
             )
-        )
+        except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
+            record_export_error(logs)
     # Numeric records come from the native transport; this event adds no tokens.
     print(json.dumps({"type": "pocket.usage", "usage": {}, "complete": usage_complete}))
     if quota_stopped:

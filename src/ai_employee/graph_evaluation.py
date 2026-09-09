@@ -50,6 +50,7 @@ from .parent_review import (
     decide_parent_semantic_review,
     validate_parent_semantic_review_result,
 )
+from .review_diagnostics import ParentReviewError, ParentReviewFailure, exception_kind
 from .serialization import canonical_digest, project_harness_digest, versioned_digest
 from .services_v2._common import identifier, now
 from .storage import SQLiteStore
@@ -511,7 +512,8 @@ class GraphCandidateEvaluator:
                     tuple(semantic_artifacts[digest] for digest in sorted(semantic_artifacts)),
                 )
                 resumed_request = self._resumable_semantic_request(semantic_request)
-            except (KeyError, OSError, TypeError, ValueError):
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                self._record_review_failure(request, error, binding=True)
                 return self._finish(
                     request,
                     decision=EvaluationDecision.FAIL,
@@ -531,7 +533,8 @@ class GraphCandidateEvaluator:
             semantic_result: ParentSemanticReviewResult | None = None
             try:
                 semantic_result, semantic_decision = self._review_semantics(semantic_request)
-            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+                self._record_review_failure(semantic_request, error)
                 if semantic_result is not None:
                     self.store.put(
                         "stale_parent_semantic_review_result_v2",
@@ -891,6 +894,50 @@ class GraphCandidateEvaluator:
             )
             for node in nodes
         )
+
+    def _record_review_failure(
+        self,
+        request: ParentSemanticReviewRequest | ParentCandidateEvaluationRequest,
+        error: Exception,
+        *,
+        binding: bool = False,
+    ) -> None:
+        diagnostic = error if isinstance(error, ParentReviewError) else None
+        record = ParentReviewFailure(
+            id=identifier("parent-review-failure"),
+            run_id=request.run_id,
+            created_at=now(),
+            request_digest=_required(request.content_digest),
+            candidate_digest=(
+                request.candidate_digest
+                if isinstance(request, ParentSemanticReviewRequest)
+                else _required(request.candidate.content_digest)
+            ),
+            candidate_artifact_digest=(
+                request.candidate_artifact_digest
+                if isinstance(request, ParentSemanticReviewRequest)
+                else request.candidate_artifact.artifact_digest
+            ),
+            generation=(
+                request.generation
+                if isinstance(request, ParentSemanticReviewRequest)
+                else request.accepted_revision.revision_number
+            ),
+            review_attempt=(
+                request.review_attempt if isinstance(request, ParentSemanticReviewRequest) else None
+            ),
+            stage=diagnostic.stage if diagnostic else ("request_binding" if binding else "review"),
+            code=diagnostic.code
+            if diagnostic
+            else ("PARENT_REVIEW_REQUEST_BINDING_FAILED" if binding else "PARENT_REVIEW_FAILED"),
+            exception_kind=diagnostic.exception_kind if diagnostic else exception_kind(error),
+            response_digest=diagnostic.response_digest if diagnostic else None,
+            expected_criteria=diagnostic.expected_criteria if diagnostic else None,
+            received_criteria=diagnostic.received_criteria if diagnostic else None,
+            expected_nodes=diagnostic.expected_nodes if diagnostic else None,
+            received_nodes=diagnostic.received_nodes if diagnostic else None,
+        )
+        self.store.put("parent_review_failure_v2", record, run_id=request.run_id)
 
     def _review_semantics(
         self,

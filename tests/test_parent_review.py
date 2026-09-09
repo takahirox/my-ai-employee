@@ -745,3 +745,70 @@ def test_parent_observer_rejects_foreign_run_before_reading_stdout() -> None:
         reviewer.review(request)
 
     assert stdout_reads == []
+
+
+@pytest.mark.parametrize(
+    "response,code,stage",
+    [
+        ("not-json SECRET-CANARY", "PARENT_REVIEW_INVALID_JSON", "response_parse"),
+        ('{"unknown":"SECRET-CANARY"}', "PARENT_REVIEW_INVALID_SCHEMA", "response_parse"),
+        (
+            json.dumps(
+                {
+                    "schema_version": "2",
+                    "findings": [],
+                    "reviewed_criterion_ids": ["foreign"],
+                    "reviewed_node_ids": ["a", "b"],
+                    "limitations": ["SECRET-CANARY"],
+                }
+            ),
+            "PARENT_REVIEW_CRITERIA_MISMATCH",
+            "response_contract",
+        ),
+    ],
+)
+def test_parent_review_failure_is_safe_and_survives_database_removal(
+    tmp_path, response, code, stage
+):
+    from ai_employee.diagnostic_bundle import snapshot
+    from ai_employee.review_diagnostics import ParentReviewError, ParentReviewFailure
+
+    request = _request()
+    candidate = b"diff --git a/a.py b/a.py\n+INTEGRATED = False\n"
+    reviewer = CliParentSemanticReviewer(
+        _Executor(),
+        lambda _: response.encode(),
+        lambda _: candidate,
+        _allow,
+        run_id=RUN,
+        strategy=request.reviewer_strategy,
+        executable="ollama",
+        cwd=".",
+        prompt_writer=lambda _: "8" * 64,
+    )
+    database = tmp_path / "trial.db"
+    with SQLiteStore(database) as store:
+        store.put("parent_semantic_review_request_v2", request, run_id=RUN)
+        evaluator = object.__new__(GraphCandidateEvaluator)
+        evaluator.store = store
+        with pytest.raises(ParentReviewError) as failure:
+            reviewer.review(request)
+        evaluator._record_review_failure(request, failure.value)
+        records = store.list_records("parent_review_failure_v2", ParentReviewFailure, run_id=RUN)
+        assert records[0].code == code
+        assert records[0].stage == stage
+        assert records[0].response_digest == "9" * 64
+        assert records[0].candidate_digest == request.candidate_digest
+        assert "SECRET-CANARY" not in records[0].model_dump_json()
+        bundle = snapshot(database, RUN)
+    database.unlink()
+    encoded = json.dumps(bundle)
+    assert "SECRET-CANARY" not in encoded
+    record = next(
+        item["record"] for item in bundle["records"] if item["kind"] == "parent_review_failure_v2"
+    )
+    assert record["code"] == code
+    assert record["request_digest"] == request.content_digest
+    assert record["candidate_artifact_digest"] == request.candidate_artifact_digest
+    if stage == "response_contract":
+        assert record["expected_criteria"] == record["received_criteria"] == 1
