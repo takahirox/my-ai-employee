@@ -289,3 +289,18 @@ def test_expired_reservation_factory_rolls_back_all_claims(tmp_path):
         for table in ("graph_reservations_v2", "graph_claims_v2"):
             assert store._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         assert store.list_records("node_reservation_v2", Reservation, run_id="run") == ()
+
+
+def test_stale_work_writer_cannot_replace_newer_checkpoint(tmp_path):
+    path = tmp_path / "stale.db"
+    original = _work_run()
+    with SQLiteStore(path) as first, SQLiteStore(path) as second:
+        first.save_work_run(original)
+        stale = second.get_work_run(original.id)
+        current = original.model_copy(update={"generation": 1, "status": "completed"})
+        first.save_work_run(current)
+        with pytest.raises(ValueError, match="stale WorkRun generation"):
+            second.save_work_run(stale)
+        assert second.get_work_run(original.id) == current
+        assert second.load_work_checkpoint(original.id)[0] == current.generation
+        assert second.load_work_checkpoint(original.id)[1]["status"] == "completed"

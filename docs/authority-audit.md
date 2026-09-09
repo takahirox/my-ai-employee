@@ -50,8 +50,9 @@ under `tests/`; each source path below is under `src/ai_employee/` unless stated
 
 All durable projections retain their old serialization. WorkRun and its checkpoint
 are committed together; a fault between the two SQL writes rolls back both. Existing
-inconsistent checkpoints still fail closed; this change does not silently migrate or
-repair operator history. Read-only inspection/replay never calls `save_work_run`.
+generation/policy-mismatched checkpoints still fail closed; unused historical cache
+fields never override WorkRun. Stale WorkRun generations cannot replace a newer
+checkpoint. This change does not silently migrate or repair operator history. Read-only inspection/replay never calls `save_work_run`.
 
 ## Historical incident classification
 

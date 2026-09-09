@@ -1088,6 +1088,13 @@ class SQLiteStore:
         # never a second independently produced lifecycle state.
         self.migrate_v2()
         with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            latest = self._connection.execute(
+                "SELECT MAX(revision) FROM records WHERE kind='work_run_v2' AND record_id=?",
+                (run.id,),
+            ).fetchone()[0]
+            if latest is not None and int(latest) > int(run.generation) + 1:
+                raise ValueError("stale WorkRun generation cannot replace its checkpoint")
             self._connection.execute(
                 "INSERT OR REPLACE INTO records(kind,record_id,run_id,revision,payload) "
                 "VALUES('work_run_v2',?,?,?,?)",
