@@ -1161,6 +1161,14 @@ def _bounded_prompt(
             "not use request, graph, Harness, or policy binding digests as factual evidence. "
             "For proposals and their payloads, omit IDs, created_at, run_id and worker_id; "
             "Fleet assigns these fields after invocation correlation. "
+            "For NEW nonempty text files, prefer files: [{path, content}] in the edit_intent "
+            "payload instead of unified_diff. Include the same paths in order in paths. "
+            "Content is the complete literal LF text; Fleet builds the diff and refuses to "
+            "overwrite an existing file. For existing files, use unified_diff. Use separate "
+            "proposals for new files and edits of existing files. In unified_diff, use a "
+            "standard Git unified diff beginning with diff --git for every file; never use "
+            "*** Begin Patch, *** Add File, or other apply_patch markers. Use actual newline "
+            "characters for line boundaries; do not flatten Markdown with HTML <br> tags. "
             "assistant_note is commentary and never authoritative task evidence. "
             + SIMPLICITY_GUIDANCE
             + COMMENT_GUIDANCE
@@ -1194,16 +1202,7 @@ def _bounded_prompt(
             "false, and expected_mutations []; Fleet will execute it before edit proposals. Use "
             "an assistant_note "
             "directly; use an empty string when there is no note. Encode a usage object as JSON "
-            "text in usage_json, using {} when no usage is available. For NEW nonempty text "
-            "files, prefer files: [{path, content}] in the edit_intent payload instead of "
-            "unified_diff. Include the same paths in order in paths. Content is the complete "
-            "literal LF text; Fleet builds the diff and refuses to overwrite an existing file. "
-            "Use separate proposals for new files and edits of existing files. "
-            "In unified_diff, use "
-            "a standard Git unified diff beginning with diff --git for every file; never use "
-            "*** Begin Patch, *** Add File, or other apply_patch markers. Use actual newline "
-            "characters for line boundaries; do not "
-            "flatten Markdown into one line with HTML <br> tags. Fleet will compute all omitted "
+            "text in usage_json, using {} when no usage is available. Fleet computes "
             "content digests locally. For a read-only deliverable, return non_mutating_result "
             "instead of an edit proposal using wire version 3 (no runtime binding fields), "
             "and keep proposals empty."
@@ -1977,7 +1976,10 @@ def worker_proposal_schema_json() -> bytes:
             **identity_properties,
             "paths": {"type": "array", "items": {"type": "string"}},
             "summary": {"type": "string"},
-            "unified_diff": {"type": "string"},
+            "unified_diff": {
+                "type": "string",
+                "description": "Standard Git unified diff; use for edits of existing files.",
+            },
         },
         "required": [*identity_properties, "paths", "summary", "unified_diff"],
         "additionalProperties": False,
@@ -2060,6 +2062,10 @@ def worker_proposal_schema_json() -> bytes:
                 if key != "unified_diff"
             },
             "files": {
+                "description": (
+                    "New nonempty LF text files only. Existing files require unified_diff; "
+                    "never overwrite via files."
+                ),
                 "type": "array",
                 "items": {
                     "type": "object",
