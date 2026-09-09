@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 
+import pytest
+
 from ai_employee.cli import _next_actions
 from ai_employee.domain import (
     Budget,
@@ -361,8 +363,10 @@ def test_malformed_patch_protocol_failure_gets_one_bound_correction_turn(
     assert requests[1].accepted_feedback_digests == repair.evidence_digests
 
 
+@pytest.mark.parametrize("unavailable", [False, True])
 def test_failed_parent_evaluation_resumes_one_writing_node_with_exact_feedback(
     tmp_path: Path,
+    unavailable: bool,
 ) -> None:
     criterion = CompletionCriterion(
         id="criterion-patch",
@@ -433,7 +437,14 @@ def test_failed_parent_evaluation_resumes_one_writing_node_with_exact_feedback(
             available_capabilities=("edit_intent",),
         )
         failed = first.model_copy(
-            update={"status": "failed", "failure_code": "PARENT_VERIFICATION_FAILED"}
+            update={
+                "status": "failed",
+                "failure_code": (
+                    "PARENT_SEMANTIC_REVIEW_UNAVAILABLE"
+                    if unavailable
+                    else "PARENT_VERIFICATION_FAILED"
+                ),
+            }
         )
         store.put("graph_run_v2", failed, run_id=failed.id, revision=1)
         evaluation = ParentCandidateEvaluationRecord(
@@ -451,10 +462,23 @@ def test_failed_parent_evaluation_resumes_one_writing_node_with_exact_feedback(
             goal_evaluator_digest=ZERO,
             decision=EvaluationDecision.FAIL,
             status="failed",
-            failure_code="PARENT_VERIFICATION_FAILED",
+            failure_code=(
+                "PARENT_SEMANTIC_REVIEW_UNAVAILABLE"
+                if unavailable
+                else "PARENT_VERIFICATION_FAILED"
+            ),
         )
         store.put("parent_candidate_evaluation_v2", evaluation, run_id=failed.id)
 
+        if unavailable:
+            assert not orchestrator.prepare_parent_repair(
+                failed.id, evaluation.content_digest or ZERO
+            )
+            replay = orchestrator.replay(failed.id)
+            assert len(requests) == 1
+            assert not any(item.action is LoopAction.REPAIR for item in replay.loop_transitions)
+            assert replay.nodes[0].status == "passed"
+            return
         assert orchestrator.prepare_parent_repair(failed.id, evaluation.content_digest or ZERO)
         resumed = orchestrator.run(
             goal,
@@ -849,9 +873,18 @@ class _StaleTaskReviewer(_ScriptedTaskReviewer):
         return valid.model_copy(update={"attempt": request.attempt + 1})
 
 
-def test_stale_task_review_result_is_rejected_and_recorded(tmp_path: Path) -> None:
+@pytest.mark.parametrize("protocol_failure", [False, True])
+def test_stale_task_review_result_is_rejected_and_recorded(
+    tmp_path: Path, protocol_failure: bool
+) -> None:
+    from ai_employee.stage_contract import StageContractError
+
+    class ProtocolFailureReviewer(_StaleTaskReviewer):
+        def review(self, request: TaskReviewRequest) -> TaskReviewResult:
+            raise StageContractError("TASK_REVIEW_REFERENCE_MISMATCH")
+
     goal, graph, _node = _inputs(max_repairs=1)
-    reviewer = _StaleTaskReviewer({0: ()})
+    reviewer = (ProtocolFailureReviewer if protocol_failure else _StaleTaskReviewer)({0: ()})
 
     def runner(
         _node: Node, request: WorkerRequest, _strategy: ExecutionStrategy
@@ -865,8 +898,10 @@ def test_stale_task_review_result_is_rejected_and_recorded(tmp_path: Path) -> No
         replay = orchestrator.replay("task-review-stale")
 
     assert run.status == "failed"
-    assert replay.task_review_decisions[0].reason_code == "TASK_REVIEW_FAILED"
-    assert len(replay.stale_task_review_results) == 1
+    assert replay.task_review_decisions[0].reason_code == (
+        "TASK_REVIEW_REFERENCE_MISMATCH" if protocol_failure else "TASK_REVIEW_FAILED"
+    )
+    assert len(replay.stale_task_review_results) == (0 if protocol_failure else 1)
     assert replay.loop_transitions[0].action is LoopAction.FAIL
 
 

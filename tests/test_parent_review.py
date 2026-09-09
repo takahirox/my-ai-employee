@@ -66,7 +66,6 @@ from ai_employee.parent_review import (
     ParentSemanticSeverity,
     bind_parent_semantic_review_payload,
     decide_parent_semantic_review,
-    parent_semantic_review_schema_json,
     parse_parent_semantic_review_payload,
     validate_parent_semantic_review_result,
 )
@@ -679,7 +678,9 @@ def test_parent_observer_receives_only_exact_patch_and_body_free_other_descripto
             "redaction_state",
         }
     assert canary not in prompts[0].decode()
-    assert prompt["response_schema"] == json.loads(parent_semantic_review_schema_json())
+    assert prompt["response_schema"]["properties"]["reviewed_criterion_ids"]["items"]["enum"] == [
+        "criterion"
+    ]
 
 
 def test_parent_observer_disables_tools_and_sessions() -> None:
@@ -741,7 +742,7 @@ def test_parent_observer_rejects_foreign_run_before_reading_stdout() -> None:
         prompt_writer=lambda _value: "8" * 64,
     )
 
-    with pytest.raises(ValueError, match="invocation failed"):
+    with pytest.raises(ValueError, match="PARENT_REVIEW_REQUEST_BINDING_FAILED"):
         reviewer.review(request)
 
     assert stdout_reads == []

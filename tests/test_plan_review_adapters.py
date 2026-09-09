@@ -20,7 +20,6 @@ from ai_employee.plan_review import (
     PlanReviewInvocationError,
     PlanReviewPayload,
     decide_plan_review_action,
-    plan_review_schema_json,
 )
 from ai_employee.serialization import canonical_digest, canonical_json
 from ai_employee.task_planning import ProposedGraph
@@ -128,7 +127,9 @@ def test_reviewer_process_is_fresh_bounded_and_receives_only_declared_context() 
     assert prompt["goal"] == goal.model_dump(mode="json")  # type: ignore[union-attr]
     assert prompt["proposed_graph"] == proposal.graph.model_dump(mode="json")
     assert prompt["available_capabilities"] == ["process"]
-    assert prompt["response_schema"] == json.loads(plan_review_schema_json())
+    assert prompt["response_schema"]["$defs"]["PlanReviewFinding"]["properties"][
+        "affected_node_ids"
+    ]["items"]["enum"] == sorted(node.id for node in proposal.graph.nodes)
     assert {"repository", "files", "tools", "worker_results"}.isdisjoint(prompt)
     request = executor.requests[0]
     assert request.purpose == "obtain a strict non-authoritative PlanReviewPayload"

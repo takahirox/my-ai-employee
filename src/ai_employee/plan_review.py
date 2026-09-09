@@ -27,6 +27,12 @@ from .prompt_transport import prompt_json
 from .run_budget import check_wall_budget, remaining_timeout
 from .serialization import canonical_digest, canonical_json
 from .services_v2._common import identifier, now
+from .stage_contract import (
+    ReferenceContract,
+    StageContractError,
+    schema_argv,
+    validate_stage_result,
+)
 from .stage_control import StageCancellation
 from .task_planning import ProposedGraph, _strict_schema
 from .worker_adapters import cli_inherit_environment
@@ -62,6 +68,7 @@ class PlanReviewFailureKind(StableStrEnum):
     PROCESS_FAILURE = "process_failure"
     STALE_BINDING = "stale_binding"
     REVIEWER_ERROR = "reviewer_error"
+    CONTRACT_MISMATCH = "contract_mismatch"
 
 
 class PlanReviewInvocationError(ValueError):
@@ -363,7 +370,9 @@ def validate_plan_review(
             )
         )
 
-    node_ids = {node.id for node in proposed_graph.graph.nodes}
+    node_ids = set(
+        ReferenceContract(nodes=tuple(node.id for node in proposed_graph.graph.nodes)).nodes
+    )
     for finding in payload.findings:
         for node_id in finding.affected_node_ids:
             if node_id not in node_ids:
@@ -470,6 +479,8 @@ class CliPlanReviewer:
         if max_nodes < 1 or max_wall_seconds <= 0:
             raise ValueError("plan-review bounds must be positive")
         allowed = tuple(dict.fromkeys(available_capabilities))
+        contract = ReferenceContract(nodes=tuple(node.id for node in proposed_graph.graph.nodes))
+        response_schema = contract.schema(plan_review_schema_json())
         prompt = prompt_json(
             {
                 "protocol": "fleet-plan-review/2",
@@ -502,38 +513,42 @@ class CliPlanReviewer:
                     "max_nodes": max_nodes,
                     "max_wall_seconds": max_wall_seconds,
                 },
-                "response_schema": json.loads(plan_review_schema_json()),
+                "response_contract": contract.prompt(),
+                "response_schema": json.loads(response_schema),
             }
         ).encode()
         stdin_digest = self.prompt_writer(prompt)
-        request = ProcessRequest(
-            id=identifier("plan-review-process"),
-            run_id=self.run_id,
-            created_at=now(),
-            argv=self._argv(),
-            cwd=self.cwd,
-            inherit_environment=cli_inherit_environment(self.strategy.backend),
-            stdin_artifact_digest=stdin_digest,
-            timeout_seconds=remaining_timeout(self.timeout_seconds),
-            stdout_bytes=100_000,
-            stderr_bytes=100_000,
-            budget_class="worker",
-            purpose="obtain a strict non-authoritative PlanReviewPayload",
-        )
-        decision = self.policy_decider(request)
-        try:
-            self._validate_decision(request, decision, proposed_graph.effective_policy_digest)
-        except ValueError as error:
-            raise PlanReviewInvocationError(
-                PlanReviewFailureKind.REVIEWER_ERROR, str(error)
-            ) from error
-        result = self.executor.execute(request, decision, StageCancellation())
+        with schema_argv(self._argv(schema_json=response_schema), response_schema) as argv:
+            request = ProcessRequest(
+                id=identifier("plan-review-process"),
+                run_id=self.run_id,
+                created_at=now(),
+                argv=argv,
+                cwd=self.cwd,
+                inherit_environment=cli_inherit_environment(self.strategy.backend),
+                stdin_artifact_digest=stdin_digest,
+                timeout_seconds=remaining_timeout(self.timeout_seconds),
+                stdout_bytes=100_000,
+                stderr_bytes=100_000,
+                budget_class="worker",
+                purpose="obtain a strict non-authoritative PlanReviewPayload",
+            )
+            decision = self.policy_decider(request)
+            try:
+                self._validate_decision(request, decision, proposed_graph.effective_policy_digest)
+            except ValueError as error:
+                raise PlanReviewInvocationError(
+                    PlanReviewFailureKind.REVIEWER_ERROR, str(error)
+                ) from error
+            result = self.executor.execute(request, decision, StageCancellation())
         check_wall_budget()
-        if result.request_digest != request.content_digest:
+        try:
+            validate_stage_result(request, result)
+        except StageContractError as error:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.STALE_BINDING,
                 "plan-review result is bound to another request",
-            )
+            ) from error
         if result.status != "succeeded" or result.stdout_artifact_digest is None:
             message = (
                 result.failure.message
@@ -551,6 +566,14 @@ class CliPlanReviewer:
         except (KeyError, TypeError, ValueError) as error:
             raise PlanReviewInvocationError(
                 PlanReviewFailureKind.MALFORMED_OUTPUT,
+                str(error),
+                stdout_artifact_digest=result.stdout_artifact_digest,
+            ) from error
+        try:
+            contract.validate(payload.model_dump())
+        except StageContractError as error:
+            raise PlanReviewInvocationError(
+                PlanReviewFailureKind.CONTRACT_MISMATCH,
                 str(error),
                 stdout_artifact_digest=result.stdout_artifact_digest,
             ) from error
@@ -587,8 +610,8 @@ class CliPlanReviewer:
                 f"plan-review policy did not allow execution: {decision.outcome.value}"
             )
 
-    def _argv(self) -> tuple[str, ...]:
-        schema = plan_review_schema_json().decode()
+    def _argv(self, *, schema_json: bytes | None = None) -> tuple[str, ...]:
+        schema = (schema_json or plan_review_schema_json()).decode()
         if self.strategy.backend == "codex_cli":
             assert self.output_schema_path is not None
             return (
