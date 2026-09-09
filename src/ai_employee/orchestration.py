@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
@@ -719,7 +720,11 @@ class WorkCoordinator:
 
     def resume(self, run_id: str) -> WorkRun:
         run = self.store.get_work_run(run_id)
-        if not run.capture_patch or run.worker_request_digest is None:
+        if (
+            run.status in {"completed", "failed", "ready_to_promote"}
+            or not run.capture_patch
+            or run.worker_request_digest is None
+        ):
             return self._resume(run_id)
         requests = {
             item.content_digest: item
@@ -746,10 +751,33 @@ class WorkCoordinator:
             or current_policy_digest != run.effective_policy_digest
         ):
             raise ValueError("stale checkpoint or policy rejected")
+        if run.status in {"completed", "failed", "ready_to_promote"}:
+            return run
         if self.store.control(run_id) == "cancel":
             self.store.clear_control(run_id)
             if run.status != "cancelled":
                 return self._update(run, status="cancelled", generation=run.generation + 1)
+        # A start receipt is durable before a service can cause effects. Only the
+        # committed WorkRun completion projection establishes that it is safe to
+        # skip that operation and proceed. Missing completion is uncertainty, not
+        # permission to repeat an effect (even if an unaccepted result was saved).
+        started = Counter(
+            event.request_digest
+            for event in self.store.work_events(run.id)
+            if event.kind == "action_started"
+        )
+        completed_requests: Counter[str | None] = Counter()
+        if run.worker_result_id is not None:
+            result = self.store.get("worker_result_v2", run.worker_result_id, WorkerResult)
+            completed_requests.update(
+                {
+                    proposal.content_digest: proposal.payload.content_digest
+                    for proposal in result.proposals
+                    if proposal.content_digest in run.completed_action_digests
+                }.values()
+            )
+        if started - completed_requests:
+            return self._update(run, status="failed", failure_code="ACTION_OUTCOME_UNKNOWN")
         if run.status == "waiting_approval":
             if run.pending_approval_id is None:
                 raise ValueError("waiting run has no approval")
@@ -1714,15 +1742,6 @@ class WorkCoordinator:
     def _update(self, run: WorkRun, **changes: object) -> WorkRun:
         updated = run.model_copy(update=changes)
         self.store.save_work_run(updated)
-        self.store.checkpoint_work(
-            updated.id,
-            updated.generation,
-            {
-                "status": updated.status,
-                "policy_digest": updated.effective_policy_digest,
-                "completed_action_digests": updated.completed_action_digests,
-            },
-        )
         self._event(updated.id, "run_status", "runtime", details={"status": updated.status})
         return updated
 

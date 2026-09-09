@@ -1,6 +1,7 @@
 import pytest
 from pydantic import BaseModel
 
+from ai_employee.run_budget import RunWallBudget, WallTimeExceeded
 from ai_employee.storage import SQLiteStore
 
 
@@ -24,7 +25,11 @@ def reserve(store, attempt, seconds, **overrides):
         record_factory=lambda remaining: Reservation(
             id=f"reservation-{attempt}", remaining=remaining
         ),
-        shared_wall_seconds=seconds,
+        wall_budget=(
+            None
+            if seconds is None
+            else RunWallBudget("run", 180.0, 180.0 - seconds, 0.0, lambda: 0.0)
+        ),
         **overrides,
     )
 
@@ -45,10 +50,8 @@ def test_serial_repair_uses_remaining_deadline_without_resetting_other_counters(
 
 def test_shared_wall_admission_requires_a_live_bounded_remainder(tmp_path):
     with SQLiteStore(tmp_path / "state.db") as store:
-        assert reserve(store, 0, 0.0) is None
-        for invalid in (-1.0, 181.0, float("nan"), float("inf")):
-            with pytest.raises(ValueError):
-                reserve(store, 0, invalid)
+        with pytest.raises(WallTimeExceeded):
+            reserve(store, 0, 0.0)
         assert reserve(store, 0, 1.0) is not None
 
 

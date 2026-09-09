@@ -1,5 +1,8 @@
 # Trust Kernel architecture
 
+The [run fact ownership audit](authority-audit.md) maps the current records, writers,
+projections and recovery rules.
+
 The authority boundary is intentionally narrow:
 
 1. generators or external workers produce a candidate `Graph` or `NodeProposal`;

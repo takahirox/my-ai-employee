@@ -1003,7 +1003,13 @@ def test_codex_worker_decodes_edit_transport() -> None:
         }
     )
 
-    decoded = json.loads(adapter._extract_payload(output))
+    from ai_employee.worker_adapters import _attribute_worker_proposals
+
+    decoded = json.loads(
+        _attribute_worker_proposals(
+            adapter._extract_payload(output), worker_request(), adapter.adapter
+        )
+    )
 
     proposal_id = decoded["proposals"][0]["id"]
     request_id = decoded["proposals"][0]["payload"]["id"]
@@ -1065,7 +1071,13 @@ def test_codex_worker_orders_existing_lock_install_before_edits() -> None:
         }
     )
 
-    decoded = json.loads(adapter._extract_payload(output))
+    from ai_employee.worker_adapters import _attribute_worker_proposals
+
+    decoded = json.loads(
+        _attribute_worker_proposals(
+            adapter._extract_payload(output), worker_request(), adapter.adapter
+        )
+    )
 
     assert [proposal["kind"] for proposal in decoded["proposals"]] == [
         "install",

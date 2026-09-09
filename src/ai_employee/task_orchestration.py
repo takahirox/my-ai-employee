@@ -86,7 +86,7 @@ from .routing import (
     select_strategy,
 )
 from .routing_history import VerifiedRoutingHistory, load_verified_routing_history
-from .run_budget import WallTimeExceeded, check_wall_budget, current_wall_budget, wall_budget_scope
+from .run_budget import WallTimeExceeded, check_wall_budget, require_wall_budget, wall_budget_scope
 from .run_ownership import (
     OwnerFenceViolationRecord,
     RunCancellationRequested,
@@ -1741,7 +1741,7 @@ class TaskOrchestrator:
                 float,
             ],
         ] = {}
-        run_started_at = min(ensure_utc(item.created_at) for item in records.values())
+        active_budget = require_wall_budget(run_id)
         timeout_profiles: dict[Future[NodeExecutionResult], WorkerTimeoutProfileRecord] = {}
         attempt_supervisors: dict[Future[NodeExecutionResult], WorkerAttemptSupervisor] = {}
         required_retry_strategies: dict[str, ExecutionStrategy] = {}
@@ -1761,12 +1761,8 @@ class TaskOrchestrator:
         ) as pool:
             while active or any(item.status == "pending" for item in records.values()):
                 self._heartbeat_run_owner_if_due()
-                budget = current_wall_budget()
-                if (
-                    budget is not None
-                    and budget.remaining_seconds <= 0
-                    and self.store.control(run_id) != "cancel"
-                ):
+                budget = require_wall_budget(run_id)
+                if budget.remaining_seconds <= 0 and self.store.control(run_id) != "cancel":
                     if self._run_owner is not None:
                         self._propagate_owner_interruption(self._run_owner)
                     for completed_future, active_item in active.items():
@@ -1949,16 +1945,7 @@ class TaskOrchestrator:
                     timeout_rule = self.worker_supervision_policy.select(
                         scope, reasoning_class, route.assessment.scale
                     )
-                    elapsed_run_seconds = max(
-                        0.0,
-                        (ensure_utc(self.clock()) - run_started_at).total_seconds(),
-                    )
-                    active_budget = current_wall_budget()
-                    remaining_wall_seconds = (
-                        max(0.0, graph_run.max_wall_seconds - elapsed_run_seconds)
-                        if active_budget is None
-                        else active_budget.remaining_seconds
-                    )
+                    remaining_wall_seconds = active_budget.remaining_seconds
                     remaining_wall_seconds = max(
                         0.0,
                         remaining_wall_seconds
@@ -2056,9 +2043,7 @@ class TaskOrchestrator:
                         artifact_bytes=node.resource_budget.artifact_bytes,
                         limits=limits,
                         record_factory=create_reservation,
-                        shared_wall_seconds=(
-                            remaining_wall_seconds if active_budget is not None else None
-                        ),
+                        wall_budget=active_budget,
                     )
                     if reservation is None:
                         records[node_id] = self._advance(
@@ -2489,26 +2474,12 @@ class TaskOrchestrator:
                                     else f"{timeout_code}:CLEANUP_UNCONFIRMED"
                                 ),
                             )
-                            active_budget = current_wall_budget()
                             recovery_context = TimeoutRecoveryContext(
                                 source="scheduler" if scheduler_timeout else "adapter",
                                 worker_request_digest=_required_digest(request.content_digest),
                                 worker_result_digest=_required_digest(worker_result.content_digest),
                                 cleanup_confirmed=cleanup_confirmed,
-                                remaining_run_seconds=(
-                                    active_budget.remaining_seconds
-                                    if active_budget is not None
-                                    else max(
-                                        0.0,
-                                        graph_run.max_wall_seconds
-                                        - max(
-                                            0.0,
-                                            (
-                                                ensure_utc(self.clock()) - run_started_at
-                                            ).total_seconds(),
-                                        ),
-                                    )
-                                ),
+                                remaining_run_seconds=active_budget.remaining_seconds,
                                 minimum_retry_seconds=timeout_profiles[
                                     future
                                 ].profile_minimum_seconds,
@@ -3617,23 +3588,32 @@ class TaskOrchestrator:
             return False
         if self._run_owner is not None:
             raise RunOwnershipLost("parent repair must begin after the prior owned invocation")
-        owned_run = run.model_copy(update={"execution_attempt": run.execution_attempt + 1})
-        self._acquire_run_owner(owned_run)
-        assert self._run_owner is not None
-        try:
-            if not self.store.put_owned_graph_run(
-                self._run_owner, owned_run, observed_at=self.clock()
-            ):
-                raise RunOwnershipLost("parent repair lost its exact acquisition")
-            return self._prepare_parent_repair(run_id, evaluation_digest)
-        finally:
-            owner = self._run_owner
-            if owner is not None:
-                current = self.store.current_run_owner(run_id)
-                if current is not None and current["status"] == "active":
-                    self._save_run(self.store.get("graph_run_v2", run_id, GraphRunRecord))
-            self._run_owner = None
-            self._next_heartbeat_at = None
+        with wall_budget_scope(
+            self.store,
+            run_id,
+            run.max_wall_seconds,
+            clock=self.wall_clock,
+            utc_clock=self.clock,
+        ) as budget:
+            if budget.remaining_seconds <= 0:
+                return False
+            owned_run = run.model_copy(update={"execution_attempt": run.execution_attempt + 1})
+            self._acquire_run_owner(owned_run)
+            assert self._run_owner is not None
+            try:
+                if not self.store.put_owned_graph_run(
+                    self._run_owner, owned_run, observed_at=self.clock()
+                ):
+                    raise RunOwnershipLost("parent repair lost its exact acquisition")
+                return self._prepare_parent_repair(run_id, evaluation_digest)
+            finally:
+                owner = self._run_owner
+                if owner is not None:
+                    current = self.store.current_run_owner(run_id)
+                    if current is not None and current["status"] == "active":
+                        self._save_run(self.store.get("graph_run_v2", run_id, GraphRunRecord))
+                self._run_owner = None
+                self._next_heartbeat_at = None
 
     def _prepare_parent_repair(
         self,
@@ -5364,13 +5344,13 @@ class TaskOrchestrator:
         self._heartbeat_run_owner_if_due()
         observed_at = ensure_utc(self.clock())
         if run.status in _OWNED_TERMINAL_GRAPH_STATES:
-            closure = self.store.terminalize_owned_graph_run(
-                owner,
-                run,
-                lambda heartbeat_digest: RunLeaseClosureRecord(
+
+            def close(heartbeat_digest: str) -> RunLeaseClosureRecord:
+                closed_at = ensure_utc(self.clock())
+                return RunLeaseClosureRecord(
                     id=identifier("run-closure"),
                     run_id=run.id,
-                    created_at=observed_at,
+                    created_at=closed_at,
                     graph_run_id=run.id,
                     accepted_graph_revision_digest=run.accepted_graph_revision_digest,
                     generation=owner.generation,
@@ -5379,11 +5359,18 @@ class TaskOrchestrator:
                     owner_record_id=owner.id,
                     owner_record_digest=_required_digest(owner.content_digest),
                     final_heartbeat_digest=heartbeat_digest,
-                    closed_at=observed_at,
+                    closed_at=closed_at,
                     terminal_graph_status=cast(Any, run.status),
                     reason=run.failure_code or run.status,
-                ),
+                )
+
+            closure = self.store.terminalize_owned_graph_run(
+                owner,
+                run,
+                close,
                 observed_at=observed_at,
+                wall_budget=require_wall_budget(run.id),
+                clock=self.clock,
             )
             if closure is None:
                 self._record_owner_fence("terminalize", observed_at)
@@ -5452,16 +5439,12 @@ def _node_resources_remain(
     node: Node,
     remaining: Mapping[str, int | float],
 ) -> bool:
-    wall_budget = current_wall_budget()
+    wall_budget = require_wall_budget()
     return (
         int(remaining["node_attempts"]) > 0
         and int(remaining["worker_turns"]) >= node.resource_budget.worker_turns
         and int(remaining["processes"]) >= node.resource_budget.processes
-        and (
-            wall_budget.remaining_seconds > 0
-            if wall_budget is not None
-            else float(remaining["wall_seconds"]) >= node.resource_budget.wall_seconds
-        )
+        and wall_budget.remaining_seconds > 0
         and int(remaining["artifact_bytes"]) >= node.resource_budget.artifact_bytes
     )
 

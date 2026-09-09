@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -38,6 +38,9 @@ from .run_ownership import (
     RunOrphanRecoveryRecord,
 )
 from .serialization import canonical_json
+
+if TYPE_CHECKING:
+    from .run_budget import RunWallBudget
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -652,13 +655,18 @@ class SQLiteStore:
         closure_factory: Callable[[str], RunLeaseClosureRecord],
         *,
         observed_at: object,
+        wall_budget: RunWallBudget | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> RunLeaseClosureRecord | None:
         """Atomically append a terminal parent state and close its exact owner lease."""
 
+        if wall_budget is not None and wall_budget.run_id != owner.run_id:
+            raise ValueError("terminal wall budget belongs to another run")
         self.migrate_v2()
         connection = self._connection
         try:
             connection.execute("BEGIN IMMEDIATE")
+            observed_at = observed_at if clock is None else clock()
             row = connection.execute(
                 "SELECT * FROM run_execution_owners_v2 WHERE run_id=?", (owner.run_id,)
             ).fetchone()
@@ -675,6 +683,16 @@ class SQLiteStore:
             ):
                 raise RunCancellationRequested()
             closure = closure_factory(str(row["heartbeat_digest"]))
+            # The factory may perform work; sample live eligibility immediately
+            # before the guarded publication, not before entering the transaction.
+            if clock is not None and not _owner_row_matches(row, owner, observed_at=clock()):
+                connection.rollback()
+                return None
+            if wall_budget is not None and getattr(run, "status", None) in {
+                "completed",
+                "ready_to_promote",
+            }:
+                wall_budget.check()
             _put_graph_run_in_transaction(connection, run, owner.run_id)
             connection.execute(
                 "INSERT INTO records(kind,record_id,run_id,revision,payload) "
@@ -1066,8 +1084,30 @@ class SQLiteStore:
             self._connection.execute("DELETE FROM controls WHERE run_id=?", (run_id,))
 
     def save_work_run(self, run: Any) -> None:
+        # The checkpoint is a compatibility projection of this exact WorkRun,
+        # never a second independently produced lifecycle state.
         self.migrate_v2()
-        self.put("work_run_v2", run, run_id=str(run.id), revision=int(run.generation) + 1)
+        with self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO records(kind,record_id,run_id,revision,payload) "
+                "VALUES('work_run_v2',?,?,?,?)",
+                (run.id, run.id, int(run.generation) + 1, canonical_json(run)),
+            )
+            self._connection.execute(
+                "INSERT OR REPLACE INTO work_checkpoints_v2(run_id,generation,payload) "
+                "VALUES(?,?,?)",
+                (
+                    run.id,
+                    run.generation,
+                    canonical_json(
+                        {
+                            "status": run.status,
+                            "policy_digest": run.effective_policy_digest,
+                            "completed_action_digests": run.completed_action_digests,
+                        }
+                    ),
+                ),
+            )
 
     def get_work_run(self, run_id: str) -> Any:
         from .orchestration import WorkRun
@@ -1160,15 +1200,6 @@ class SQLiteStore:
         )
         return tuple(WorkEvent.model_validate_json(row["payload"], strict=True) for row in rows)
 
-    def checkpoint_work(self, run_id: str, generation: int, payload: object) -> None:
-        self.migrate_v2()
-        with self._connection:
-            self._connection.execute(
-                "INSERT OR REPLACE INTO work_checkpoints_v2(run_id,generation,payload) "
-                "VALUES(?,?,?)",
-                (run_id, generation, canonical_json(payload)),
-            )
-
     def claim_graph_node(self, run_id: str, node_id: str, *, max_claims: int) -> bool:
         """Atomically reserve one unique node claim within the aggregate attempt cap."""
 
@@ -1198,19 +1229,14 @@ class SQLiteStore:
         artifact_bytes: int,
         limits: dict[str, int | float],
         record_factory: Callable[[dict[str, int | float]], BaseModel],
-        shared_wall_seconds: float | None = None,
+        wall_budget: RunWallBudget | None = None,
     ) -> BaseModel | None:
         """Atomically claim one attempt, reserve all resources, and record the snapshot."""
 
-        if shared_wall_seconds is not None:
-            import math
-
-            if (
-                not math.isfinite(shared_wall_seconds)
-                or shared_wall_seconds < 0
-                or shared_wall_seconds > float(limits["wall_seconds"])
-            ):
-                raise ValueError("invalid shared wall remainder")
+        if wall_budget is not None and (
+            wall_budget.run_id != run_id or wall_budget.limit > float(limits["wall_seconds"])
+        ):
+            raise ValueError("invalid shared wall authority")
         self.migrate_v2()
         requested = {
             "worker_turns": worker_turns,
@@ -1221,6 +1247,9 @@ class SQLiteStore:
         connection = self._connection
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if wall_budget is not None:
+                wall_budget.check()
+            shared_wall_seconds = None if wall_budget is None else wall_budget.remaining_seconds
             duplicate = connection.execute(
                 "SELECT 1 FROM graph_reservations_v2 "
                 "WHERE run_id=? AND node_id=? AND generation=? AND attempt=?",
@@ -1282,6 +1311,8 @@ class SQLiteStore:
             record_id = getattr(record, "id", None)
             if record_id is None:
                 raise ValueError("reservation record requires an id")
+            if wall_budget is not None:
+                wall_budget.check()
             connection.execute(
                 "INSERT INTO records(kind,record_id,run_id,revision,payload) "
                 "VALUES('node_reservation_v2',?,?,1,?)",

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_employee.domain.v2 import ExecutionResult, WorkerResult
+from ai_employee.domain.v2 import ActionProposal, ExecutionResult, WorkerResult
 from ai_employee.storage import SQLiteStore
 from ai_employee.worker_adapters import CodexCliWorkerAdapter, worker_proposal_schema_json
 from tests.test_work_orchestration_v2 import NOW, allow_worker, worker_request
@@ -156,3 +156,78 @@ def test_runtime_timestamps_replace_legacy_metadata(legacy_timestamp, monkeypatc
     assert attributed.created_at == attributed.payload.created_at == NOW
     assert attributed.run_id == attributed.payload.run_id == "run-1"
     assert attributed.worker_id == "codex_cli"
+
+
+@pytest.mark.parametrize("backend", ["claude", "ollama"])
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_other_cli_workers_share_runtime_attribution(
+    tmp_path, monkeypatch, backend, legacy_metadata
+):
+    from ai_employee.worker_adapters import ClaudeCodeCliWorkerAdapter, OllamaCliWorkerAdapter
+
+    monkeypatch.setattr("ai_employee.worker_adapters.now", lambda: NOW)
+    output = transport(new_file=False, legacy_ids=legacy_metadata)
+    output["usage"] = json.loads(output.pop("usage_json"))
+    proposal = output["proposals"][0]
+    for record in (proposal, proposal["payload"]):
+        if legacy_metadata:
+            record["created_at"] = "invalid-model-timestamp"
+        else:
+            for key in ("id", "created_at", "run_id", "worker_id"):
+                record.pop(key, None)
+    encoded = json.dumps({"structured_output": output} if backend == "claude" else output).encode()
+    cls = ClaudeCodeCliWorkerAdapter if backend == "claude" else OllamaCliWorkerAdapter
+    adapter = cls(Executor(), lambda _: encoded, allow_worker, run_id="run-1", model="fixture")
+    channel = Channel()
+    result = adapter.propose(worker_request(), channel)
+    assert result.status == "succeeded", result.failure
+    accepted = channel.proposals[0]
+    assert accepted.id.startswith("proposal-")
+    assert accepted.payload.id.startswith("request-")
+    assert accepted.run_id == accepted.payload.run_id == "run-1"
+    assert accepted.created_at == accepted.payload.created_at == NOW
+    assert accepted.worker_id == adapter.adapter
+    with SQLiteStore(tmp_path / "attributed.db") as store:
+        store.put("action_proposal_v2", accepted, run_id=accepted.run_id)
+        assert store.get("action_proposal_v2", accepted.id, ActionProposal) == accepted
+
+
+def test_generic_model_contract_omits_only_runtime_metadata():
+    from ai_employee.worker_adapters import _envelope_schema
+
+    schema = _envelope_schema()
+    for name in (
+        "ActionProposal",
+        "ProcessRequest",
+        "DownloadRequest",
+        "InstallRequest",
+        "EditIntentRequest",
+        "ReviewRequest",
+    ):
+        record = schema["$defs"][name]
+        assert not {
+            "id",
+            "run_id",
+            "created_at",
+            "worker_id",
+            "content_digest",
+            "digest_metadata",
+        } & set(record["properties"])
+    assert "paths" in schema["$defs"]["EditIntentRequest"]["properties"]
+    assert "argv" in schema["$defs"]["ProcessRequest"]["properties"]
+
+
+@pytest.mark.parametrize("backend", ["claude", "ollama"])
+def test_common_attribution_does_not_authorize_invalid_paths(backend):
+    from ai_employee.worker_adapters import ClaudeCodeCliWorkerAdapter, OllamaCliWorkerAdapter
+
+    output = transport(new_file=False, legacy_ids=False)
+    output["usage"] = json.loads(output.pop("usage_json"))
+    output["proposals"][0]["payload"]["paths"] = ["../escape"]
+    cls = ClaudeCodeCliWorkerAdapter if backend == "claude" else OllamaCliWorkerAdapter
+    encoded = json.dumps({"structured_output": output} if backend == "claude" else output).encode()
+    adapter = cls(Executor(), lambda _: encoded, allow_worker, run_id="run-1", model="fixture")
+    channel = Channel()
+    result = adapter.propose(worker_request(), channel)
+    assert result.status == "failed"
+    assert not channel.proposals
