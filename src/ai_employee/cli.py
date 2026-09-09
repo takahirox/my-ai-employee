@@ -2566,15 +2566,6 @@ def _promote_work(store: SQLiteStore, args: argparse.Namespace) -> int:
     store.put("promotion_v2", promotion, run_id=run.id)
     completed = run.model_copy(update={"status": "completed", "generation": run.generation + 1})
     store.save_work_run(completed)
-    store.checkpoint_work(
-        completed.id,
-        completed.generation,
-        {
-            "status": completed.status,
-            "policy_digest": completed.effective_policy_digest,
-            "completed_action_digests": completed.completed_action_digests,
-        },
-    )
     print(canonical_json({"schema_version": "2", "run_id": run.id, "status": "completed"}))
     return 0
 

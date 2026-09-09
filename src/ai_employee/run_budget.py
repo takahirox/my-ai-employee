@@ -96,6 +96,14 @@ def current_wall_budget() -> RunWallBudget | None:
     return _CURRENT.get()
 
 
+def require_wall_budget(run_id: str | None = None) -> RunWallBudget:
+    """Return the owned run allowance; scheduler state cannot invent a fallback."""
+    budget = current_wall_budget()
+    if budget is None or (run_id is not None and budget.run_id != run_id):
+        raise ValueError("active wall budget is missing or belongs to another run")
+    return budget
+
+
 def check_wall_budget() -> None:
     budget = _CURRENT.get()
     if budget is not None:

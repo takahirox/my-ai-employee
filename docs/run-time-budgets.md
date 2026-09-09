@@ -70,3 +70,11 @@ clock/identity fields, the ProcessExecutor's actual timeout, pre-acceptance CLI
 failure persistence, expired parent verification, and a late 80-second Task Review
 under a 60-second graph limit. Existing timeout-recovery tests separately exercise
 per-attempt timeouts with remaining global allowance.
+
+## Authority at publication
+
+Graph admission and terminal success read the live run budget inside their SQLite
+write transaction. Copied remaining-time fields are diagnostic snapshots. Scheduler
+recovery and parent repair preparation use the same persisted active-time authority;
+node creation timestamps cannot supply a fallback allowance. See the
+[ownership audit](authority-audit.md) for the acceptance boundary and compatibility rules.

@@ -743,12 +743,15 @@ def test_policy_auto_approval_is_explicit_bound_and_still_requires_promote(
                 "execution_attempt": crashed_run.execution_attempt + 1,
             }
         )
-        recovery_owner._acquire_run_owner(verifying_run)
-        recovery_owner._save_run(verifying_run)
-        recovered_run = recovery_service._recover_policy_approval_pointer(verifying_run)
-        assert recovered_run is not None
-        assert store.get("graph_run_v2", run_id, GraphRunRecord) == verifying_run
-        recovery_owner._save_run(recovered_run)
+        from ai_employee.run_budget import wall_budget_scope
+
+        with wall_budget_scope(store, run_id, run.max_wall_seconds):
+            recovery_owner._acquire_run_owner(verifying_run)
+            recovery_owner._save_run(verifying_run)
+            recovered_run = recovery_service._recover_policy_approval_pointer(verifying_run)
+            assert recovered_run is not None
+            assert store.get("graph_run_v2", run_id, GraphRunRecord) == verifying_run
+            recovery_owner._save_run(recovered_run)
         assert store.current_run_owner(run_id)["status"] == "closed"
         assert recovered_run.status == "ready_to_promote"
         assert recovered_run.parent_evaluation_digest == evaluation.content_digest
