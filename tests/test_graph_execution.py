@@ -1045,6 +1045,24 @@ def test_bounded_fork_join_executes_composes_and_replays_without_promotion(
                 GraphPatchCompositionRecord,
             )
             if semantic_retry:
+                from ai_employee.review_diagnostics import ParentReviewFailure
+
+                failures = store.list_records(
+                    "parent_review_failure_v2", ParentReviewFailure, run_id=run.id
+                )
+                assert len(failures) == 1
+                assert failures[0].code == "PARENT_REVIEW_FAILED"
+                assert failures[0].exception_kind == "ValueError"
+                assert "temporary reviewer outage" not in failures[0].model_dump_json()
+                assert parent_evaluator.replay(parent_record.id).process_invocations == 0
+                assert (
+                    len(
+                        store.list_records(
+                            "parent_review_failure_v2", ParentReviewFailure, run_id=run.id
+                        )
+                    )
+                    == 1
+                )
                 original_runtime = store.list_records(
                     "verification_result_v2", ExecutionResult, run_id=run.id
                 )[0]

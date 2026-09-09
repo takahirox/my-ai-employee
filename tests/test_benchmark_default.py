@@ -10,6 +10,7 @@ from ai_employee import benchmark_default as connection
 def test_default_connection_deducts_setup_and_keeps_live_failure_output(
     tmp_path, monkeypatch, capsys, completeness
 ):
+    monkeypatch.setattr(connection, "uuid4", lambda: SimpleNamespace(hex="fixture"))
     root, home, logs = (tmp_path / name for name in ("repo", "home", "logs"))
     root.mkdir()
     (home / "pocket").mkdir(parents=True)
@@ -32,7 +33,9 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
         assert harness["budgets"]["wall_seconds"] == 168.0
         assert harness["worker"]["adaptive_routing"] is True
         assert "capture_output" not in kwargs
-        kwargs["stdout"].write('{"run_id":"fixture-run","status":"failed","stable_code":"TIMEOUT"}')
+        kwargs["stdout"].write(
+            '{"run_id":"benchmark-fixture","status":"failed","stable_code":"TIMEOUT"}'
+        )
         kwargs["stdout"].flush()
         assert json.loads((logs / "fleet-result.json").read_text())["status"] == "failed"
         from ai_employee.domain.base import freeze_json
@@ -42,9 +45,9 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
 
         diagnostic = ModelProcessDiagnostic(
             id="process-fixture",
-            run_id="fixture-run",
+            run_id="benchmark-fixture",
             created_at=now(),
-            graph_run_id="fixture-run",
+            graph_run_id="benchmark-fixture",
             stage="worker",
             request_digest="0" * 64,
             process_result_digest="1" * 64,
@@ -55,7 +58,7 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
             transport_failures=("transport",),
         )
         with SQLiteStore(home / ".fleet/fleet.db") as store:
-            store.put_once("model_process_diagnostic_v2", diagnostic, run_id="fixture-run")
+            store.put_once("model_process_diagnostic_v2", diagnostic, run_id="benchmark-fixture")
             from ai_employee.domain import EvaluationDecision, ExecutionStrategy, RoutingMode
             from ai_employee.parent_review import (
                 ParentSemanticReviewDecision,
@@ -72,7 +75,7 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
             )
             review = ParentSemanticReviewResult(
                 id="review-fixture",
-                run_id="fixture-run",
+                run_id="benchmark-fixture",
                 created_at=now(),
                 request_digest="0" * 64,
                 accepted_graph_revision_digest="1" * 64,
@@ -87,7 +90,7 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
             )
             decision = ParentSemanticReviewDecision(
                 id="decision-fixture",
-                run_id="fixture-run",
+                run_id="benchmark-fixture",
                 created_at=now(),
                 request_digest=review.request_digest,
                 result_digest=review.content_digest,
@@ -99,8 +102,10 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
                 action=EvaluationDecision.ESCALATE,
                 reason_code="PARENT_SEMANTIC_COVERAGE_LIMITED",
             )
-            store.put_once("parent_semantic_review_result_v2", review, run_id="fixture-run")
-            store.put_once("parent_semantic_review_decision_v2", decision, run_id="fixture-run")
+            store.put_once("parent_semantic_review_result_v2", review, run_id="benchmark-fixture")
+            store.put_once(
+                "parent_semantic_review_decision_v2", decision, run_id="benchmark-fixture"
+            )
         kwargs["stderr"].write("diagnostic fixture")
         return SimpleNamespace(returncode=7)
 
@@ -115,9 +120,8 @@ def test_default_connection_deducts_setup_and_keeps_live_failure_output(
     diagnostic = details["model_process_diagnostics"][0]
     assert diagnostic["resource_usage"] == {"stdout_bytes": 42}
     assert diagnostic["transport_failures"] == ["transport"]
-    assert details["parent_review_results"][0]["limitations"] == [
-        "criterion requires execution evidence not supplied"
-    ]
+    assert "limitations" not in details["parent_review_results"][0]
+    assert "free_text_and_artifact_bodies" in details["omissions"]
     assert details["parent_review_decisions"][0]["action"] == "ESCALATE"
     assert details["parent_review_decisions"][0]["candidate_digest"] == "2" * 64
 
