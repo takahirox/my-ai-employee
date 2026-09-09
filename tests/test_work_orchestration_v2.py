@@ -803,7 +803,8 @@ def test_worker_proposal_schema_is_canonical_json() -> None:
         "enum": ["edit_intent"],
     }
     assert edit_proposal["properties"]["payload"]["anyOf"][0]["properties"]["unified_diff"] == {
-        "type": "string"
+        "type": "string",
+        "description": "Standard Git unified diff; use for edits of existing files.",
     }
     assert edit_proposal["properties"]["expected_artifact_kinds"]["items"] == {
         "type": "string",
@@ -1100,8 +1101,8 @@ def test_codex_prompt_describes_edit_transport() -> None:
     assert "existing_lock" in prompt["transport_instruction"]
     assert "non_mutating_result" in prompt["transport_instruction"]
     assert "no runtime binding fields" in prompt["transport_instruction"]
-    assert "diff --git" in prompt["transport_instruction"]
-    assert "never use *** Begin Patch" in prompt["transport_instruction"]
+    assert "diff --git" in prompt["instruction"]
+    assert "never use *** Begin Patch" in prompt["instruction"]
 
 
 def test_ollama_prompt_can_include_pydantic_schema_for_json_mode() -> None:
@@ -3404,3 +3405,86 @@ def test_codex_omits_only_runtime_owned_read_only_binding(kind):
     assert "wire version 3" in codex["transport_instruction"]
     assert "binding digests as factual evidence" in codex["instruction"]
     assert canonical_json(request) == original
+
+
+@pytest.mark.parametrize("codex", [False, True])
+def test_edit_contract_is_shared_by_worker_prompts(codex):
+    prompt = json.loads(_bounded_prompt(worker_request(), codex_edit_transport=codex))
+    assert "For existing files, use unified_diff" in prompt["instruction"]
+    assert "*** Begin Patch" in prompt["instruction"]
+    assert "actual newline" in prompt["instruction"]
+    assert "Existing files require unified_diff" in json.dumps(_claude_envelope_schema())
+
+
+@pytest.mark.parametrize("collision", ["file", "directory", "symlink", "dangling_symlink"])
+def test_claude_new_file_collision_and_diff_repair(tmp_path, collision):
+    manager, snapshot = _headerless_workspace(tmp_path)
+    isolated = Path(snapshot.isolated_worktree)
+    target = isolated / "first.txt"
+    if collision != "file":
+        target.unlink()
+        if collision == "directory":
+            target.mkdir()
+        else:
+            target.symlink_to("second.txt" if collision == "symlink" else "absent.txt")
+    envelope = json.loads(_edit_envelope("", ("fresh.txt", "first.txt")))
+    proposal = envelope["proposals"][0]
+    for value in (proposal, proposal["payload"]):
+        for key in ("id", "created_at", "worker_id", "run_id"):
+            value.pop(key, None)
+    proposal["payload"].pop("unified_diff")
+    proposal["payload"]["files"] = [
+        {"path": "fresh.txt", "content": "new\n"},
+        {"path": "first.txt", "content": "private-body-canary\n"},
+    ]
+    output = json.dumps({"structured_output": envelope}).encode()
+    executor = SuccessfulExecutor()
+    executor.execute = lambda request, _decision, _cancel: ExecutionResult(
+        id="process-success",
+        run_id=request.run_id,
+        created_at=NOW,
+        request_digest=request.content_digest or "",
+        status="succeeded",
+        duration_seconds=0.01,
+        stdout_artifact_digest="1" * 64,
+    )
+    results = []
+
+    class WorkspaceChannel:
+        def submit(self, value):
+            assert value.run_id == "run-1"
+            assert value.worker_id == "claude_code_cli"
+            assert value.id.startswith("proposal-")
+            assert value.payload.id.startswith("request-")
+            assert value.payload.run_id == "run-1"
+            results.append(
+                manager.apply_edit(
+                    snapshot, value.payload, allow_worker(value.payload), _NotCancelled()
+                )
+            )
+
+    adapter = ClaudeCodeCliWorkerAdapter(executor, lambda _: output, allow_worker, run_id="run-1")
+    result = adapter.propose(worker_request(), WorkspaceChannel())
+    assert result.status == "succeeded"
+    failure = results[-1].failure
+    assert failure.code is StableFailureCode.PATCH_PREFLIGHT_FAILED
+    assert failure.details["cause"] == "existing_path_in_new_file_proposal"
+    assert "unified_diff" in failure.details["remediation"]
+    assert "private-body-canary" not in failure.model_dump_json()
+    assert not (isolated / "fresh.txt").exists()
+    assert (isolated / "second.txt").read_text() == "before two\n"
+    if collision == "file":
+        assert target.read_text() == "before one\n"
+        repaired = json.loads(
+            _edit_envelope(_HEADERLESS_TWO_FILE_PATCH, _HEADERLESS_TWO_FILE_PATHS)
+        )
+        output = json.dumps({"structured_output": repaired}).encode()
+        assert adapter.propose(worker_request(), WorkspaceChannel()).status == "succeeded"
+        assert results[-1].status == "succeeded"
+        assert target.read_text() == "after one\n"
+        proposal["payload"]["paths"] = ["fresh.txt"]
+        proposal["payload"]["files"] = [{"path": "fresh.txt", "content": "new\n"}]
+        output = json.dumps({"structured_output": envelope}).encode()
+        assert adapter.propose(worker_request(), WorkspaceChannel()).status == "succeeded"
+        assert results[-1].status == "succeeded"
+        assert (isolated / "fresh.txt").read_text() == "new\n"

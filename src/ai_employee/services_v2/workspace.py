@@ -225,6 +225,32 @@ class GitWorkspaceManager:
                 StableFailureCode.INVALID_REQUEST,
                 "unified diff paths must exactly match declared edit paths",
             )
+        # Inspect canonical declared paths before Git can replace an empty
+        # directory. Do not follow links outside the owned candidate workspace.
+        additions = set()
+        lines = request.unified_diff.splitlines()
+        in_header = False
+        previous = ""
+        for current in lines:
+            if current.startswith("diff --git "):
+                in_header = True
+            elif current.startswith("@@"):
+                in_header = False
+            if in_header and previous == "--- /dev/null" and current.startswith("+++ b/"):
+                value = current[6:]
+                path = PurePosixPath(value)
+                if (
+                    value in declared
+                    and not path.is_absolute()
+                    and ".." not in path.parts
+                    and path.as_posix() == value
+                ):
+                    candidate = isolated / path
+                    if candidate.parent.resolve().is_relative_to(isolated.resolve()) and (
+                        candidate.exists() or candidate.is_symlink()
+                    ):
+                        additions.add(value)
+            previous = current
         check = run_git_command(
             (
                 "git",
@@ -241,14 +267,28 @@ class GitWorkspaceManager:
             capture_output=True,
             check=False,
         )
-        if check.returncode:
+        if additions or check.returncode:
+            cause = (
+                "existing_path_in_new_file_proposal" if additions else "stale_workspace_baseline"
+            )
+            remediation = (
+                "Use unified_diff against the current candidate for existing files; files is "
+                "only for new files. Fleet did not apply or reset files."
+                if additions
+                else "Regenerate the edit against the captured base tree and resubmit it; "
+                "Fleet did not apply or reset files."
+            )
             return self._edit_failure(
                 request,
                 StableFailureCode.PATCH_PREFLIGHT_FAILED,
-                "patch does not apply to the captured workspace baseline",
+                (
+                    "new-file patch targets an existing workspace path"
+                    if additions
+                    else "patch does not apply to the captured workspace baseline"
+                ),
                 details=freeze_json(
                     {
-                        "cause": "stale_workspace_baseline",
+                        "cause": cause,
                         "captured_source_head": snapshot.head_commit,
                         "captured_base_tree": snapshot.base_tree,
                         "workspace_id": snapshot.id,
@@ -257,10 +297,7 @@ class GitWorkspaceManager:
                         "hunk_count": sum(
                             1 for line in request.unified_diff.splitlines() if line.startswith("@@")
                         ),
-                        "remediation": (
-                            "Regenerate the edit against the captured base tree and resubmit it; "
-                            "Fleet did not apply or reset files."
-                        ),
+                        "remediation": remediation,
                     }
                 ),
             )
