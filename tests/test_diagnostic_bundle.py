@@ -219,3 +219,39 @@ def test_node_execution_links_include_legacy_children_and_nested_runs(tmp_path):
         diagnostics.reference(name) for name in ("parent", "child", "legacy", "nested")
     }
     assert sum(item["kind"] == "worker_boundary_diagnostic_v2" for item in bundle["records"]) == 2
+
+
+def test_safe_profile_projection_preserves_routing_and_timing():
+    profile = {
+        "choice": {"profile": "adaptive", "routing_mode": "adaptive"},
+        "adaptive_execution": {
+            "path": "direct",
+            "decision_digest": "a" * 64,
+            "reason": "SECRET-CANARY",
+            "recommendation": {"path": "direct", "reason": "SECRET-CANARY"},
+        },
+        "effective_stages": [
+            {"stage": "planning", "disposition": "omitted", "reason": "SECRET-CANARY"}
+        ],
+        "timings": [{"phase": "invocation", "seconds": 3.5}],
+        "completed_invocation_wall_seconds": 3.5,
+        "timing_complete": True,
+    }
+    projected = diagnostics.project(profile)
+    assert projected["choice"] == profile["choice"]
+    assert projected["adaptive_execution"]["path"] == "direct"
+    assert projected["effective_stages"] == [{"stage": "planning", "disposition": "omitted"}]
+    assert projected["timings"] == profile["timings"]
+    assert projected["timing_complete"] is True
+    assert "SECRET-CANARY" not in json.dumps(projected)
+
+
+def test_database_disappearing_during_collection_preserves_last_evidence(tmp_path):
+    database = fixture_db(tmp_path)
+    collector = diagnostics.DiagnosticCollector(database, tmp_path, "parent")
+    collector.collect()
+    saved = (tmp_path / "fleet-diagnostic-bundle.json").read_bytes()
+    database.unlink()
+    collector.collect("controller_finished")
+    assert (tmp_path / "fleet-diagnostic-bundle.json").read_bytes() == saved
+    assert (tmp_path / "fleet-diagnostic-export-error.json").exists()

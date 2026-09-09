@@ -49,6 +49,9 @@ KINDS = frozenset(
         "node_evidence_v2",
         "node_evaluator_v2",
         "graph_patch_composition_v2",
+        "execution_profile_v2",
+        "execution_profile_timing_v2",
+        "adaptive_execution_decision_v2",
     }
 )
 CODES = {value.value for value in StableFailureCode} | {
@@ -79,6 +82,25 @@ CODES = {value.value for value in StableFailureCode} | {
     "stale_workspace_baseline",
 }
 ENUMS = {
+    "lightweight",
+    "adaptive",
+    "fixed",
+    "direct",
+    "planned",
+    "selected",
+    "required",
+    "omitted",
+    "goal_assessment",
+    "planning",
+    "node_assessment",
+    "task_review",
+    "artifact_review",
+    "verification_and_approval",
+    "invocation_start",
+    "before_first_worker",
+    "invocation",
+    "read_only_or_local_reversible",
+    "external_or_protected_change",
     "succeeded",
     "failed",
     "cancelled",
@@ -143,6 +165,12 @@ ENUMS = {
     "process_stderr",
 } | CODES
 CONTAINERS = {
+    "choice",
+    "adaptive_execution",
+    "effective_stages",
+    "timings",
+    "stages",
+    "recommendation",
     "failure",
     "details",
     "resource_usage",
@@ -164,6 +192,15 @@ CONTAINERS = {
     "evidence",
 }
 NUMBERS = {
+    "seconds",
+    "timing_complete",
+    "active_invocation_wall_seconds",
+    "completed_invocation_wall_seconds",
+    "elapsed_through_last_invocation_seconds",
+    "scope_clear",
+    "criteria_clear",
+    "coordinated_work_required",
+    "planning_requested",
     "generation",
     "attempt",
     "review_attempt",
@@ -191,6 +228,11 @@ NUMBERS = {
     "effective_timeout_seconds",
 }
 STRINGS = {
+    "profile",
+    "routing_mode",
+    "path",
+    "phase",
+    "effect_scope",
     "status",
     "stage",
     "code",
@@ -207,6 +249,13 @@ STRINGS = {
     "disposition",
 }
 REFERENCES = {
+    "decision_digest",
+    "assessment_digest",
+    "profile_digest",
+    "execution_profile_digest",
+    "operator_config_digest",
+    "initial_worker_strategy_id",
+    "fixed_strategy_id",
     "id",
     "run_id",
     "graph_run_id",
@@ -458,6 +507,7 @@ class DiagnosticCollector:
     def __init__(self, database: Path, logs: Path, run_id: str, *, interval: float = 2.0):
         self.database, self.logs, self.run_id = database.resolve(), logs, run_id
         self.interval = interval
+        self.has_collected = False
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -469,11 +519,15 @@ class DiagnosticCollector:
     def collect(self, state: str = "running") -> None:
         try:
             bundle = snapshot(self.database, self.run_id)
+            if bundle["collection_status"] == "database_not_created" and self.has_collected:
+                record_export_error(self.logs)
+                return
             bundle["state"] = state
             target = self.logs / "fleet-diagnostic-bundle.json"
             temporary = target.with_suffix(".tmp")
             temporary.write_text(json.dumps(bundle, separators=(",", ":")))
             temporary.replace(target)
+            self.has_collected = bundle["collection_status"] != "database_not_created"
         except (OSError, sqlite3.Error, ValueError, TypeError, RecursionError):
             # Do not replace good evidence with an empty snapshot or leak exception text.
             record_export_error(self.logs)
