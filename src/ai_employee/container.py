@@ -227,10 +227,12 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
         if uncertain:
             raise ValueError("RESOURCE_CREATION_UNCERTAIN")
 
-    def apply_authority(self, workspace: Path, authority: Authority) -> None:
+    def apply_authority(
+        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+    ) -> None:
         self._validate(authority)
         with self._candidate(
-            workspace, 30, lambda: False, models=False, authority=authority
+            workspace, min(30, timeout), cancelled, models=False, authority=authority
         ) as candidate:
             self._native_probe(candidate, authority)
 

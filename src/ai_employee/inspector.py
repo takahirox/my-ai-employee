@@ -89,7 +89,8 @@ def create_server(journal: Journal, port: int = 0) -> tuple[ThreadingHTTPServer,
                 content_type = "text/html; charset=utf-8"
             else:
                 if not hmac.compare_digest(
-                    self.headers.get("Authorization", ""), "Bearer " + token
+                    self.headers.get("Authorization", "").encode("utf-8"),
+                    ("Bearer " + token).encode("ascii"),
                 ):
                     self.send_error(403)
                     return

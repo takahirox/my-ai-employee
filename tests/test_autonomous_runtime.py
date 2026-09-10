@@ -60,7 +60,9 @@ class OfflineModel:
     def reconcile(self, run_directory: Path) -> None:
         pass
 
-    def apply_authority(self, workspace: Path, authority: Authority) -> None:
+    def apply_authority(
+        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+    ) -> None:
         assert workspace.is_dir()
 
     def __init__(
@@ -294,7 +296,9 @@ class AuthorityModel(OfflineModel):
         self.requested = False
         self.apply_fails = apply_fails
 
-    def apply_authority(self, workspace: Path, authority: Authority) -> None:
+    def apply_authority(
+        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+    ) -> None:
         if self.apply_fails:
             raise ValueError("ENVIRONMENT_APPLICATION_FAILED")
 
@@ -354,7 +358,10 @@ def test_failed_authority_application_does_not_resume(tmp_path: Path) -> None:
     waiting = engine.journal.events(run)[-1]
     with pytest.raises(ValueError, match="ENVIRONMENT_APPLICATION_FAILED"):
         engine.approve_authority(run, waiting["body"]["attempt"], approve=True)
-    assert engine.journal.events(run)[-1]["kind"] == "authority_approved"
+    kinds = [event["kind"] for event in engine.journal.events(run)]
+    assert "authority_approved" in kinds
+    assert "authority_applied" not in kinds
+    assert kinds[-1] == "settled"
     calls = len(model.calls)
     engine.execute(run)
     assert len(model.calls) == calls
@@ -607,3 +614,156 @@ def test_goal_revision_cannot_automatically_restart_a_usage_limited_run(tmp_path
         engine.revise_goal(run, "Try again")
     assert len(engine.journal.runs()) == 1
     assert model.calls == ["Clarification"]
+
+
+@pytest.mark.parametrize("crash_at", ["candidate", "accepted"])
+def test_completed_worker_survives_controller_crash_without_reexecution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_at: str
+) -> None:
+    model = OfflineModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    append = engine.journal.append
+
+    def interrupted(run_id: str, kind: str, **body: Any) -> None:
+        if kind == crash_at:
+            raise RuntimeError("simulated controller crash")
+        append(run_id, kind, **body)
+
+    monkeypatch.setattr(engine.journal, "append", interrupted)
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        engine.execute(run)
+    assert model.workers == 1
+    monkeypatch.undo()
+    engine.execute(run)
+    assert model.workers == 1
+    assert engine.journal.events(run)[-1]["kind"] == "completed"
+    assert any(event["kind"] == "candidate_reused" for event in engine.journal.events(run))
+
+
+def test_external_completion_crash_does_not_repeat_unverified_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = ExternalModel()
+    engine, source = runtime(tmp_path, model)
+    cfg = config().model_copy(
+        update={"authority_ceiling": Authority(external_writes=True), "security": "balanced"}
+    )
+    run = engine.prepare("Write result", cfg, source)
+    append = engine.journal.append
+
+    def interrupted(run_id: str, kind: str, **body: Any) -> None:
+        if kind == "candidate":
+            raise RuntimeError("simulated controller crash")
+        append(run_id, kind, **body)
+
+    monkeypatch.setattr(engine.journal, "append", interrupted)
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        engine.execute(run)
+    monkeypatch.undo()
+    engine.execute(run)
+    assert model.workers == 1
+    assert engine.journal.events(run)[-1]["kind"] == "uncertain"
+    engine.execute(run)
+    assert model.workers == 1
+
+
+def test_authority_application_obeys_remaining_budget_and_cancellation(tmp_path: Path) -> None:
+    model = AuthorityModel()
+    engine, source = runtime(tmp_path, model)
+    cfg = config().model_copy(
+        update={"authority_ceiling": Authority(network_hosts=("example.com",))}
+    )
+    run = engine.start("Write result", cfg, source)
+    attempt = engine.journal.events(run)[-1]["body"]["attempt"]
+    observed: list[float] = []
+
+    def apply(
+        workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+    ) -> None:
+        observed.append(timeout)
+        engine.journal.stop(run, "OPERATOR_CANCELLED")
+        assert cancelled()
+
+    model.apply_authority = apply  # type: ignore[method-assign]
+    with pytest.raises(Stopped):
+        engine.approve_authority(run, attempt, approve=True)
+    assert 0 < observed[0] <= cfg.limits.invocation_seconds
+    events = engine.journal.events(run)
+    assert not any(e["kind"] == "authority_applied" for e in events)
+    reserve = next(
+        e
+        for e in events
+        if e["kind"] == "reserved" and e["body"]["stage"] == "authority_application"
+    )
+    assert reserve["body"]["tokens"] == 0
+    assert reserve["body"]["cost"] == 0
+
+
+def test_quota_observation_survives_cleanup_failure(tmp_path: Path) -> None:
+    model = OfflineModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+
+    def lost_cleanup(*args: Any, **kwargs: Any) -> Any:
+        kwargs["observation"]({"event": "usage_limit", "source": "provider"})
+        raise RuntimeError("simulated cleanup failure")
+
+    model.generate = lost_cleanup  # type: ignore[method-assign]
+    with pytest.raises(Stopped, match="USAGE_LIMIT"):
+        engine.execute(run)
+    assert any(
+        e["kind"] == "stopped" and e["body"]["reason"] == "USAGE_LIMIT"
+        for e in engine.journal.events(run)
+    )
+    with pytest.raises(Stopped):
+        engine.execute(run)
+
+
+def test_authority_request_journal_group_rolls_back_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(), source)
+    event = engine.journal._event
+
+    def fail_wait(db: Any, run_id: str, kind: str, body: Any) -> None:
+        if kind == "approval_wait":
+            raise RuntimeError("simulated transaction interruption")
+        event(db, run_id, kind, body)
+
+    monkeypatch.setattr(engine.journal, "_event", fail_wait)
+    with pytest.raises(RuntimeError):
+        engine.journal.append_many(
+            run,
+            (
+                ("worker_result", {"attempt": "test"}),
+                ("authority_requested", {"attempt": "test"}),
+                ("approval_wait", {"attempt": "test"}),
+            ),
+        )
+    assert [e["kind"] for e in engine.journal.events(run)] == ["created", "input"]
+
+
+def test_accepted_task_crash_releases_lease_without_worker_reexecution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = OfflineModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+
+    def interrupted(run_id: str, task: str) -> None:
+        # Simulate an external lease retained between durable acceptance and release.
+        assert engine.journal.acquire_resources(run_id, task, Authority(external_writes=True))
+        raise RuntimeError("simulated controller crash")
+
+    monkeypatch.setattr(engine.journal, "release_resources", interrupted)
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        engine.execute(run)
+    monkeypatch.undo()
+    other = engine.journal.create("Other task", config())
+    assert not engine.journal.acquire_resources(other, "other", Authority(external_writes=True))
+    engine.execute(run)
+    assert model.workers == 1
+    assert engine.journal.events(run)[-1]["kind"] == "completed"
+    assert engine.journal.acquire_resources(other, "other", Authority(external_writes=True))

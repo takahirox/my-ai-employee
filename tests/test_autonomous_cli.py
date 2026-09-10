@@ -97,6 +97,10 @@ def test_inspector_http_requires_token_and_provides_no_mutation_route(tmp_path: 
         response = connection.getresponse()
         assert response.status == 403
         response.read()
+        connection.request("GET", "/api/runs", headers={"Authorization": "Bearer é"})
+        response = connection.getresponse()
+        assert response.status == 403
+        response.read()
         connection.request("GET", "/api/runs", headers={"Authorization": "Bearer " + token})
         response = connection.getresponse()
         assert response.status == 200

@@ -254,7 +254,7 @@ class Journal:
             self.stop(run, "RUN_BUDGET_EXHAUSTED")
             raise Stopped("RUN_BUDGET_EXHAUSTED")
 
-    def reserve(self, run: str, stage: str) -> tuple[str, float]:
+    def reserve(self, run: str, stage: str, *, model_usage: bool = True) -> tuple[str, float]:
         self.check(run)
         limits = self.config(run).limits
         reservation = "attempt-" + uuid4().hex
@@ -268,8 +268,8 @@ class Journal:
                 (run,),
             ).fetchone()
             seconds = min(limits.invocation_seconds, limits.active_seconds - usage[1])
-            tokens = limits.reservation_tokens if limits.tokens is not None else 0
-            cost = limits.reservation_cost if limits.cost is not None else 0.0
+            tokens = limits.reservation_tokens if model_usage and limits.tokens is not None else 0
+            cost = limits.reservation_cost if model_usage and limits.cost is not None else 0.0
             if (
                 usage[0] >= limits.attempts
                 or seconds <= 0

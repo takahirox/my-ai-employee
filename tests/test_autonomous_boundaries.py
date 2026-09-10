@@ -82,7 +82,9 @@ def test_strict_external_guarantees_fail_before_native_or_model_execution(tmp_pa
         with pytest.raises(ValueError, match="REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE"):
             from ai_employee.container import ContainerModel
 
-            ContainerModel(None).apply_authority(tmp_path, Authority(duplicate_prevention=True))
+            ContainerModel(None).apply_authority(
+                tmp_path, Authority(duplicate_prevention=True), 30, lambda: False
+            )
         process.assert_not_called()
 
 

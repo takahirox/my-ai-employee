@@ -27,6 +27,8 @@ jobs:
       - run: .venv/bin/ruff check .
       - run: .venv/bin/mypy src
       - run: .venv/bin/pytest -q
+        env:
+          FLEET_TEST_INSPECTOR_HTTP: "1"
       - run: .venv/bin/python -m build
 
   isolation:

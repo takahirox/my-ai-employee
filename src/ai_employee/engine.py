@@ -309,7 +309,7 @@ class Engine:
                 continue
             check_workspace = self._workspace(run, "check", candidate.tree)
             try:
-                reservation, timeout = self.journal.reserve(run, "check")
+                reservation, timeout = self.journal.reserve(run, "check", model_usage=False)
             except Stopped as error:
                 self.journal.stop(run, str(error))
                 raise
@@ -474,6 +474,112 @@ class Engine:
                 return config.worker_options[selection.index]
         raise ValueError("WORKER_SELECTION_REJECTED")
 
+    def _resume_completed_attempt(
+        self,
+        run: str,
+        context: TaskContext,
+        goal: Goal,
+        config: RunConfig,
+        policy: StagePolicy,
+    ) -> Candidate | None:
+        """Recover a completed worker without repeating its implementation or external effects."""
+        events = self.journal.events(run)
+        results = [
+            WorkerResult.model_validate(event["body"]["result"])
+            for event in events
+            if event["kind"] == "worker_result" and event["body"]["attempt"] == context.attempt_id
+        ]
+        if not results or results[-1].status != "completed":
+            return None
+        if any(
+            event["kind"] == "attempt_failed" and event["body"]["attempt"] == context.attempt_id
+            for event in events
+        ):
+            return None
+        if context.goal.digest != goal.digest:
+            raise ValueError("STALE_GOAL_CONTEXT")
+        frozen = [
+            Candidate.model_validate(event["body"]["candidate"])
+            for event in events
+            if event["kind"] == "candidate"
+            and event["body"]["candidate"]["attempt_id"] == context.attempt_id
+        ]
+        if frozen:
+            candidate = frozen[-1]
+            if (
+                candidate.task_digest != context.task.digest
+                or candidate.authority_version != context.authority_version
+                or candidate.upstream != tuple(item.digest for item in context.upstream)
+            ):
+                raise ValueError("CANDIDATE_CONTEXT_CHANGED")
+            self.candidates.manifest(candidate.tree)
+        else:
+            # A completed result is recorded only after the adapter returned its
+            # quiesced workspace. Capture may safely finish after controller failure.
+            candidate = self.candidates.freeze(context)
+            self.journal.append(run, "candidate", candidate=candidate.model_dump(mode="json"))
+        verified = [
+            event["body"]["passed"]
+            for event in events
+            if event["kind"] == "verification"
+            and not event["body"]["goal_level"]
+            and Candidate.model_validate(event["body"]["candidate"]) == candidate
+        ]
+        if verified:
+            accepted = verified[-1]
+        else:
+            reviewed, _ = self._review(
+                run,
+                policy,
+                "worker",
+                results[-1],
+                {
+                    "task": context.task.model_dump(mode="json"),
+                    "candidate": candidate.model_dump(mode="json"),
+                },
+                self._workspace(run, "worker-review", candidate.tree),
+                external=context.authority.external_writes,
+            )
+            accepted = reviewed and self._verify(
+                run, config, goal, context.task, candidate, results[-1]
+            )
+        if accepted:
+            self.journal.append_many(
+                run,
+                (
+                    (
+                        "accepted",
+                        {"task": context.task.id, "candidate": candidate.model_dump(mode="json")},
+                    ),
+                    (
+                        "candidate_reused",
+                        {
+                            "attempt": context.attempt_id,
+                            "candidate": candidate.digest,
+                            "reason": "completed_worker_recovered_without_reexecution",
+                        },
+                    ),
+                ),
+            )
+            self.journal.release_resources(run, context.task.digest)
+            return candidate
+        if context.authority.external_writes:
+            self.journal.append(
+                run,
+                "uncertain",
+                task_digest=context.task.digest,
+                attempt=context.attempt_id,
+                reason="EXTERNAL_RESULT_UNVERIFIED",
+            )
+            raise Waiting("UNVERIFIED_EXTERNAL_EFFECT")
+        self.journal.append(
+            run,
+            "attempt_failed",
+            attempt=context.attempt_id,
+            reason="RECOVERED_VERIFICATION_FAILED",
+        )
+        return None
+
     def _execute_task(
         self,
         run: str,
@@ -533,6 +639,13 @@ class Engine:
                 raise Stopped("WORKSPACE_UNAVAILABLE")
             if not applied:
                 authority, version = previous.authority, previous.authority_version
+            if previous.upstream != upstream or previous.task.digest != task.digest:
+                raise ValueError("STALE_UPSTREAM_LINEAGE")
+            resumed = self._resume_completed_attempt(
+                run, previous, goal, config, StagePolicy.model_validate(prior[-1]["body"]["worker"])
+            )
+            if resumed is not None:
+                return resumed
             # An externally writable invocation without an accepted result may
             # have committed remotely before controller/process failure.
             if previous.authority.external_writes:
@@ -744,7 +857,7 @@ class Engine:
             except Stopped as error:
                 self.journal.stop(run, str(error))
                 raise
-            except (ValueError, TimeoutError) as error:
+            except (ValueError, TimeoutError, RuntimeError) as error:
                 self.journal.append(run, "failed", reason=str(error)[:200])
                 raise
 
@@ -835,7 +948,22 @@ class Engine:
             # confirmed policy and the retained workspace on continuation.
             if not self.journal.acquire_resources(run, wait["task_digest"], authority):
                 raise Waiting("WAITING_FOR_EXTERNAL_RESOURCE")
-            self.model.apply_authority(workspace, authority)
+            try:
+                reservation, timeout = self.journal.reserve(
+                    run, "authority_application", model_usage=False
+                )
+            except Stopped as error:
+                self.journal.stop(run, str(error))
+                raise
+            started = time.monotonic()
+            try:
+                self.model.apply_authority(
+                    workspace, authority, timeout, lambda: self._cancelled(run)
+                )
+            finally:
+                self.journal.settle(
+                    run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
+                )
             self.journal.check(run)
             self.journal.append(
                 run,
@@ -892,6 +1020,9 @@ class Engine:
         )
         tasks = {task.id: task for task in plan.tasks}
         accepted = self._accepted(run, plan)
+        # Acceptance is durable even if the controller died before releasing its lease.
+        for candidate in accepted.values():
+            self.journal.release_resources(run, candidate.task_digest)
         pending = set(tasks) - set(accepted)
         while pending:
             self.journal.check(run)

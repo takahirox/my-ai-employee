@@ -105,7 +105,9 @@ def summarize_event(line: str) -> dict[str, Any] | None:
 class Model(Protocol):
     def reconcile(self, run_directory: Path) -> None: ...
 
-    def apply_authority(self, workspace: Path, authority: Authority) -> None: ...
+    def apply_authority(
+        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+    ) -> None: ...
 
     def generate(
         self,

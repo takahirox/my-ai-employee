@@ -64,7 +64,3 @@ strict = true
 packages = ["ai_employee"]
 mypy_path = "src"
 plugins = ["pydantic.mypy"]
-
-[[tool.mypy.overrides]]
-module = "yaml"
-ignore_missing_imports = true
