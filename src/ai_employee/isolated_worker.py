@@ -12,18 +12,18 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Literal
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .domain.services_v2 import Cancellation
+
+class Cancellation(Protocol):
+    def cancelled(self) -> bool: ...
 
 
 class IsolatedWorkerProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    backend: Literal["docker-codex-v1"] = "docker-codex-v1"
     image: str
     cpus: float = Field(default=2.0, gt=0, le=16, allow_inf_nan=False)
     memory_mb: int = Field(default=2048, ge=256, le=16384)
@@ -31,7 +31,6 @@ class IsolatedWorkerProfile(BaseModel):
     native_process_limit: int = Field(default=512, ge=1, le=1000)
     workspace_mb: int = Field(default=256, ge=16, le=4096)
     auth_file: str | None = None
-    resource_ledger: str | None = None
 
     @field_validator("image")
     @classmethod
@@ -40,7 +39,7 @@ class IsolatedWorkerProfile(BaseModel):
             raise ValueError("isolation requires an already-built immutable Docker image ID")
         return value
 
-    @field_validator("auth_file", "resource_ledger")
+    @field_validator("auth_file")
     @classmethod
     def _absolute_auth_file(cls, value: str | None) -> str | None:
         if value is not None and (not Path(value).is_absolute() or "\x00" in value):
@@ -48,24 +47,19 @@ class IsolatedWorkerProfile(BaseModel):
         return value
 
 
-def candidate_archive(root: Path, limit: int, *, include_untracked: bool = False) -> bytes:
-    """Export tracked candidate files only; never copy the host's .git or untracked secrets."""
-    names = (
-        subprocess.check_output(
-            [
-                "git",
-                "-C",
-                str(root),
-                "ls-files",
-                "-z",
-                "--cached",
-                *(["--others", "--exclude-standard"] if include_untracked else []),
-            ],
-            timeout=10,
-        )
-        .decode()
-        .split("\0")
-    )
+def candidate_archive(root: Path, limit: int) -> bytes:
+    """Export the prepared workspace as regular files, never host runtime metadata."""
+    names = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if any(
+            part in {".git", ".fleet", ".codex", ".claude", ".agents"} for part in relative.parts
+        ):
+            continue
+        if path.is_symlink():
+            raise ValueError("workspace archive does not accept symlinks")
+        if not path.is_dir():
+            names.append(relative.as_posix())
     output = io.BytesIO()
     size = 0
     directories: set[str] = set()
@@ -113,6 +107,26 @@ class NativeProcessBudgetExceeded(IsolatedBudgetExceeded):
     """No further native work or candidate submission is authorized."""
 
 
+def resource_missing(kind: str, name: str, error: bytes) -> bool:
+    message = error.decode(errors="replace").lower()
+    return f"no such {kind}: {name}" in message or (
+        kind == "network" and f"network {name} not found" in message
+    )
+
+
+def append_resource_event(path: Path | None, kind: str, name: str, state: str) -> None:
+    if path is None:
+        return
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(
+            descriptor, (json.dumps({"kind": kind, "name": name, "state": state}) + "\n").encode()
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class DockerCandidate:
     """One owner-controlled lifecycle; never silently fall back to host execution."""
 
@@ -124,35 +138,26 @@ class DockerCandidate:
         seconds: float,
         cancellation: Cancellation,
         output_limit: int = 1_000_000,
-        include_untracked: bool = False,
+        resource_ledger: Path | None = None,
+        service_hosts: tuple[str, ...] = (),
     ) -> None:
         self.profile, self.root, self.cancellation = profile, root.resolve(), cancellation
         self.deadline = time.monotonic() + seconds
         self.output_limit = output_limit
-        self.include_untracked = include_untracked
+        self.resource_ledger = resource_ledger
+        self.service_hosts = service_hosts
         self.name = "fleet-candidate-" + uuid.uuid4().hex
         self.created = False
         self.network: str | None = None
         self.proxy: str | None = None
         self.native_process_usage: dict[str, object] = {}
+        self.confirmed_resources: set[tuple[str, str]] = set()
 
     def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
         """Operator-only crash-recovery ledger; never copied into the worker."""
-        if self.profile.resource_ledger is None:
-            return
-        descriptor = os.open(
-            self.profile.resource_ledger,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
-            0o600,
-        )
-        try:
-            os.write(
-                descriptor,
-                (json.dumps({"kind": kind, "name": name, "state": state}) + "\n").encode(),
-            )
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        if state == "created":
+            self.confirmed_resources.add((kind, name))
+        append_resource_event(self.resource_ledger, kind, name, state)
 
     def _docker(self, *args: str, data: bytes | None = None) -> bytes:
         remaining = self.deadline - time.monotonic()
@@ -181,7 +186,7 @@ class DockerCandidate:
             inspected = json.loads(self._docker("image", "inspect", self.profile.image))[0]
             if inspected["Id"] != self.profile.image or inspected["Os"] != "linux":
                 raise ValueError("isolated worker requires the exact Linux runtime image")
-            if self.profile.auth_file:
+            if self.profile.auth_file or self.service_hosts:
                 self._start_model_gateway()
             self.created = True  # Also own cleanup if create's reply times out.
             self._record_resource("container", self.name)
@@ -220,7 +225,7 @@ class DockerCandidate:
                 self.profile.image,
                 "-I",
                 "-c",
-                "import time; time.sleep(86400)",
+                "import time; time.sleep(" + repr(max(1.0, self.deadline - time.monotonic())) + ")",
             )
             self._docker("start", self.name)
             self._docker(
@@ -237,22 +242,9 @@ class DockerCandidate:
                 data=candidate_archive(
                     self.root,
                     self.profile.workspace_mb * 1024**2,
-                    include_untracked=self.include_untracked,
                 ),
             )
-            self._docker("exec", self.name, "git", "-c", "init.defaultBranch=main", "init", "-q")
-            self._git("add", "--all")
-            self._git(
-                "-c",
-                "user.name=Fleet Candidate",
-                "-c",
-                "user.email=fleet@example.invalid",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "immutable invocation input",
-            )
-            self._git("config", "core.fileMode", "false")
+            self._docker("exec", self.name, "mkdir", "-m", "700", "/work/.git")
             self._probe()
             if self.profile.auth_file:
                 self._copy_auth()
@@ -260,20 +252,6 @@ class DockerCandidate:
         except BaseException:
             self.close()
             raise
-
-    def _git(self, *args: str) -> bytes:
-        return self._docker(
-            "exec",
-            "--user",
-            "0:0",
-            self.name,
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            *args,
-        )
 
     def _probe(self) -> None:
         config = json.loads(self._docker("inspect", self.name))[0]
@@ -308,6 +286,7 @@ class DockerCandidate:
         *,
         stdin: bytes = b"",
         observe: Callable[[dict[str, object]], None] | None = None,
+        supervise: Callable[[int], None] | None = None,
     ) -> tuple[int, bytes, bytes]:
         """Stream native events with a bounded output; cancellation kills the whole container."""
         import selectors
@@ -359,6 +338,8 @@ class DockerCandidate:
                 while selector.get_map():
                     if self.cancellation.cancelled() or time.monotonic() >= self.deadline:
                         raise TimeoutError("isolated execution cancelled or timed out")
+                    if supervise is not None:
+                        supervise(len(stdout) + len(stderr))
                     for key, _ in selector.select(timeout=0.05):
                         data = os.read(key.fd, 65536)
                         if not data:
@@ -400,6 +381,7 @@ class DockerCandidate:
         process_limit: int,
         stdin: bytes = b"",
         observe: Callable[[dict[str, object]], None] | None = None,
+        supervise: Callable[[int], None] | None = None,
     ) -> tuple[int, bytes, bytes]:
         """Admit cumulative native process creation before the syscall executes.
 
@@ -429,6 +411,7 @@ class DockerCandidate:
             ("python", "-I", "-c", PROCESS_GUARD_SOURCE, str(process_limit), report, *argv),
             stdin=stdin,
             observe=observe,
+            supervise=supervise,
         )
         if guard_code not in (0, 125):
             raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: no candidate accepted")
@@ -483,29 +466,6 @@ class DockerCandidate:
         )
         self._docker("exec", self.name, "python", "-I", "-c", probe)
 
-    def capture(self, generated_paths: tuple[str, ...] = ()) -> tuple[tuple[str, ...], bytes]:
-        self.quiesce()
-        untracked = (
-            self._git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
-        )
-        included = tuple(
-            p
-            for p in untracked
-            if p and not any(fnmatchcase(p, pattern) for pattern in generated_paths)
-        )
-        self._git("add", "--update")
-        if included:
-            self._git("add", "--", *included)
-        paths = tuple(
-            p
-            for p in self._git("diff", "--cached", "--name-only", "-z", "HEAD").decode().split("\0")
-            if p
-        )
-        patch = self._git("diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", "HEAD")
-        if len(patch) > self.output_limit:
-            raise IsolatedBudgetExceeded("captured patch exceeds artifact budget")
-        return paths, patch
-
     def _start_model_gateway(self) -> None:
         from .model_gateway import GATEWAY_SOURCE
 
@@ -538,6 +498,7 @@ class DockerCandidate:
             "-I",
             "-c",
             GATEWAY_SOURCE,
+            json.dumps(list(self.service_hosts)),
         )
         self._docker("network", "connect", "--alias", self.proxy, self.network, self.proxy)
 
@@ -585,14 +546,17 @@ class DockerCandidate:
                     timeout=15,
                     check=False,
                 )
-                if result.returncode and b"No such" not in result.stderr:
+                if result.returncode and not resource_missing(kind, name, result.stderr):
                     failures.append(name)
-                elif name == self.name:
-                    self.created = False
-                elif name == self.proxy:
-                    self.proxy = None
-                elif name == self.network:
-                    self.network = None
+                else:
+                    if (kind, name) in self.confirmed_resources:
+                        self._record_resource(kind, name, "removed")
+                    if name == self.name:
+                        self.created = False
+                    elif name == self.proxy:
+                        self.proxy = None
+                    elif name == self.network:
+                        self.network = None
         if failures:
             raise RuntimeError(
                 "isolated environment cleanup could not be confirmed: " + ", ".join(failures)

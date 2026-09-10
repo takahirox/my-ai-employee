@@ -1,15 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (unreleased)
 
-- Added generation-fenced top-level execution owners and expiring leases so Inspector Active
-  contains only live Fleet runs, plus read-only orphan/parent-terminalization diagnostics and
-  explicit idempotent `fleet recover` terminalization for expired runs.
-- Added deterministic single-run explanations through `fleet explain` and the local
-  Inspector, including graph position, persisted decision reasons, information flow,
-  failure paths, graph evolution, and final disposition without AI re-execution.
-- Added machine-local Operator Config support for explicit Codex and Claude Code
-  executable paths, deterministic runtime path entries, and executable provenance.
+- Replaced the proposal/reapplication runtime with immutable Goal clarification,
+  a unified Planner, autonomous Worker sessions, graph integration and independent
+  verification of content-addressed Candidates.
+- Added shared Run reservations, durable authority waits, exact upstream lineage,
+  bounded forward repair, worker selection/escalation and explicit uncertain outcomes.
+- Reused native Codex sandboxing with disposable Docker process containment so
+  detached children cannot outlive accepted workspace capture.
+- Switched the CLI, Inspector and benchmark connection to the same runtime.
+- Removed old action mediation, compatibility routes, obsolete checks/docs and
+  legacy Run/database migration support. This is an intentional breaking change.
 
 ## 0.2.1
 
