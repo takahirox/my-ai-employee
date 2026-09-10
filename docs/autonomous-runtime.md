@@ -1,53 +1,47 @@
-# Autonomous runtime implementation (#167)
+# Configuration and recovery
 
-The implementation under `ai_employee.autonomous` is in development. It is not
-yet the product's default execution path, and this document does not claim that
-Issue #167's acceptance criteria are complete.
+`fleet init` creates a JSON Run configuration. `schema_version` is `autonomous-1`.
+There is one runtime; this identifier does not select a compatibility path.
 
-The new contracts separate immutable Goal/Task definitions from runtime-owned
-attempt identities, authority versions and content-addressed Candidates. Workers
-edit real workspaces. Verification runs in separate copies, and successful file
-results can be published to a new directory without replaying worker edit actions.
+Each LLM-backed stage has the same policy fields: backend/model/effort,
+`review` (`never`, `always`, `conditional`), review conditions, reviewer backend/
+model/effort, revision count and optional supervision interval. Stages are
+`clarification`, `planning`, `selection`, `worker`, `verification`, and `recovery`.
+A fixed worker is the default. `worker_options` allows selection among configured
+choices; `worker_escalations` supplies ordered alternatives after ordinary failure.
+A Usage Limit never triggers selection, escalation or another provider.
 
-The runtime currently supports clarification, one-step planning, parallel ready
-tasks, explicit integration inputs, bounded task retries, forward graph extensions
-after task/goal verification failure, persisted worker selection, and a Run-wide
-reservation ledger. The journal records configuration, Goal, plans, attempts,
-lineage, verification and authority request/approval/application events. Inspection
-and completed-run replay do not call models. Unknown external effects and usage
-limits prevent automatic continuation.
+`checks` contains immutable operator command definitions; `mandatory_checks` binds
+those IDs to Goal acceptance. Worker-authored tests can contribute evidence, but
+cannot replace these commands. The default template enables clarification review.
+Unresolved questions produce `WAITING_FOR_CLARIFICATION`; answers are separate
+events and do not rewrite Original Input.
 
-Initial repository input contains tracked files only. Candidate capture rejects
-symlinks and special files and checks file identity while copying. Runtime metadata
-and integration input directories are excluded from published content. Mandatory
-check definitions come from the snapshotted operator configuration, not worker
-files. Native preflight failures never fall back to unrestricted execution.
+`limits` includes Run wall time, aggregate active time, per-invocation time,
+invocation count, per-task attempts, added tasks, replans and concurrency. Optional
+token/cost limits use transactional reservations across all stages. Missing usage
+is unknown, not zero. See [security.md](security.md) for the difference between
+admission reservations and provider-enforced spend caps.
 
-The native adapter uses Codex permission profiles with minimal filesystem reads;
-it does not grant host-wide read access. Claude uses restricted mode, mandatory
-sandboxing and disabled unsandboxed fallback. Native command verification currently
-uses the installed Codex sandbox command for either worker backend. Configuration
-references: [Codex permissions](https://learn.chatgpt.com/docs/permissions) and
-[Claude sandboxing](https://code.claude.com/docs/en/sandboxing).
+`approval_counts_wall` explicitly controls whether durable approval waiting counts
+toward the wall deadline. Waiting never holds an active worker invocation open.
+A request records a proposed authority version; approval records intent; native
+application must succeed before APPLIED is recorded. Resume never treats APPROVED
+as APPLIED. Rejection, cancellation and unknown external effects are durable states.
 
-## Development verification
+Ordinary worker or verification failure retains a workspace where safe, then uses
+configured escalation or a forward graph extension within the same remaining Run
+budget. Existing tasks retain exact definitions. New repairs use new IDs and may
+identify a superseded task. Accepted upstream work is reused with exact lineage;
+completed history is checked again before publication.
 
-Focused offline regressions use scripted model responses and real disposable
-workspaces/journals. These tests exercise the runtime's normal execution path, not
-the old typed proposal transport. They do not establish live-model quality or
-native sandbox enforcement. Run repository checks as documented in
-[development.md](development.md).
+`fleet revise` is an explicit human replacement, not an automatic recovery step.
+It creates a linked new Run, preserves both original inputs, invalidates publication
+of the predecessor, and requires fresh clarification and verification. Stopped or
+uncertain Runs cannot use this route to restart automatically.
 
-## Work remaining before switching the product default
-
-- Review and harden native backend enforcement, process cleanup, authority
-  application, concurrent interruption and crash recovery.
-- Extend regression coverage for multiple integrations, stale downstream results,
-  approval/revocation, verification evidence, and failure/recovery boundaries.
-- Complete operator CLI and Inspector integration, benchmark connections, and
-  configurable supervision/escalation behavior.
-- Run required checks and credential-free native isolation tests in supported
-  environments; keep live-model tests explicitly opt-in.
-- Switch the supported product entry points and remove obsolete proposal,
-  re-execution and compatibility paths, plus contradictory docs/tests, only after
-  the new path is accepted. Do not add a legacy migration subsystem.
+`--state` selects a journal/object/workspace directory; its default is
+`~/.fleet/autonomous`. Old history databases are rejected. `fleet inspect` and
+`fleet logs` read the event journal, and `fleet serve` opens the read-only Inspector.
+Record which optional native/container/live checks actually ran when reporting
+validation; ordinary unit tests do not establish live-model quality.

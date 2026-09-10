@@ -1,7 +1,7 @@
-"""My AI Employee deterministic Trust Kernel public API."""
+"""Goal-driven orchestration with autonomous, isolated Worker sessions."""
 
-from .domain import *  # noqa: F403
-from .domain import __all__ as _domain_all
+from .engine import Engine
+from .models import Candidate, Goal, Plan, RunConfig, Task
 
-__version__ = "0.2.1"
-__all__ = ["__version__", *_domain_all]
+__version__ = "0.3.0"
+__all__ = ["Candidate", "Engine", "Goal", "Plan", "RunConfig", "Task", "__version__"]

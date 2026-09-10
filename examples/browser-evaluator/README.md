@@ -1,19 +1,10 @@
-# Browser evaluator example
+# Browser application input
 
-This fixture combines an ordinary `process.harness` check with a
-`browser.playwright` evaluator. Fleet serves files from the candidate workspace at the
-declared loopback origin, clicks the button, and records screenshot, console, DOM, and
-accessibility artifacts. No development server or external network access is granted.
+This small application is a public fixture that can be used as input to a Fleet
+Goal. It contains only application files; it does not select a special Fleet
+browser evaluator or grant network access.
 
-Install the optional runtime and its isolated Chromium binary before running a graph-first
-`fleet work` flow against this directory:
-
-```console
-uv sync --extra browser
-uv run playwright install chromium
-```
-
-The evaluator uses a fresh browser context, rejects redirects and non-loopback or
-cross-origin requests, and tears down the page, context, browser, and driver after every
-terminal outcome. The Playwright package is optional; projects without browser evaluators do
-not import or require it.
+Prepare any browser binaries and libraries in the explicitly chosen worker image,
+and define required acceptance checks in the Run configuration. The worker decides
+how to inspect and repair the application inside that environment. See the root
+README and `docs/isolated-worker.md` for the supported execution boundary.

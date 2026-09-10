@@ -1,3 +1,5 @@
+> Historical benchmark report from before Issue #167. It does not describe the current runtime.
+
 # API worker overhead: bounded investigation
 
 ## Finding

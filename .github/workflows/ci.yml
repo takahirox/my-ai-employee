@@ -38,14 +38,13 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv sync --extra dev --python "3.12"
-      # Build context contains only the runtime recipe, never source/authentication.
-      - run: docker build -f docker/isolated-worker.Dockerfile -t fleet-isolation-test docker
-      - name: Credential-free kernel and native sandbox integration
+      # Build context contains only runtime recipes, never source or credentials.
+      - run: docker build -f docker/autonomous-worker.Dockerfile -t fleet-isolation-test docker
+      - name: Model-free process namespace and native boundary tests
         env:
-          # Ubuntu's default Docker LSM denies nested bubblewrap mount operations.
-          # Test explicit fail-closed startup here; do not disable host protections.
+          # Ubuntu's default Docker LSM may reject nested native namespaces.
+          # Verify explicit startup denial rather than relaxing host protections.
           FLEET_TEST_EXPECT_NATIVE_UNAVAILABLE: "1"
         run: |
           export FLEET_TEST_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' fleet-isolation-test)
-          .venv/bin/pytest tests/test_issue81_isolation.py tests/test_native_process_guard.py -q
-          .venv/bin/pytest tests/test_benchmark_adapter_docker.py::test_capture_excludes_only_untracked_writable_bytecode -q
+          .venv/bin/pytest tests/test_autonomous_container.py -q

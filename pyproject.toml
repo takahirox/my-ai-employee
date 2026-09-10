@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "my-ai-employee"
-version = "0.2.1"
-description = "Deterministic trust kernel for a goal-driven, graph-first AI fleet runtime"
+version = "0.3.0"
+description = "Goal-driven orchestration with autonomous sandboxed AI workers"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -21,7 +21,6 @@ classifiers = [
 ]
 dependencies = [
   "pydantic>=2.10,<3",
-  "PyYAML>=6.0.2,<7",
 ]
 
 [project.urls]
@@ -31,9 +30,6 @@ Issues = "https://github.com/takahirox/my-ai-employee/issues"
 Changelog = "https://github.com/takahirox/my-ai-employee/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-browser = [
-  "playwright>=1.62,<2",
-]
 dev = [
   "build>=1.2.2,<2",
   "mypy>=1.14,<2",
@@ -42,9 +38,8 @@ dev = [
 ]
 
 [project.scripts]
-fleet-bench-default = "ai_employee.benchmark_default:main"
 fleet = "ai_employee.cli:main"
-fleet-bench = "ai_employee.benchmark_adapter:main"
+fleet-bench = "ai_employee.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -7,14 +7,14 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import pytest
 
-from ai_employee.autonomous.candidates import Candidates
-from ai_employee.autonomous.engine import Engine
-from ai_employee.autonomous.history import Journal, Stopped
-from ai_employee.autonomous.models import (
+from ai_employee.candidates import Candidates
+from ai_employee.engine import Engine
+from ai_employee.history import Journal, Stopped
+from ai_employee.models import (
     Authority,
     Clarification,
     Contract,
@@ -31,7 +31,7 @@ from ai_employee.autonomous.models import (
     Verification,
     WorkerResult,
 )
-from ai_employee.autonomous.native import run_process
+from ai_employee.native import run_process
 
 T = TypeVar("T", bound=Contract)
 
@@ -57,6 +57,9 @@ def clarification() -> Clarification:
 
 
 class OfflineModel:
+    def reconcile(self, run_directory: Path) -> None:
+        pass
+
     def apply_authority(self, workspace: Path, authority: Authority) -> None:
         assert workspace.is_dir()
 
@@ -79,6 +82,8 @@ class OfflineModel:
         authority: Authority,
         timeout: float,
         cancelled: Callable[[], bool],
+        observer: Callable[[float, int], None] | None = None,
+        observation: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[T, Usage]:
         self.calls.append(schema.__name__)
         body = json.loads(prompt)
@@ -274,7 +279,8 @@ def test_process_quota_detection_stops_before_sleep(tmp_path: Path) -> None:
             (
                 sys.executable,
                 "-c",
-                "print('usage_limit_reached', flush=True); import time; time.sleep(10)",
+                "import json; print(json.dumps({'type':'error', 'error': "
+                "{'code':'usage_limit_reached'}}), flush=True); import time; time.sleep(10)",
             ),
             tmp_path,
             2,
@@ -301,6 +307,8 @@ class AuthorityModel(OfflineModel):
         authority: Authority,
         timeout: float,
         cancelled: Callable[[], bool],
+        observer: Callable[[float, int], None] | None = None,
+        observation: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[T, Usage]:
         if schema is WorkerResult and not self.requested:
             self.requested = True
@@ -362,6 +370,8 @@ class RepairModel(OfflineModel):
         authority: Authority,
         timeout: float,
         cancelled: Callable[[], bool],
+        observer: Callable[[float, int], None] | None = None,
+        observation: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[T, Usage]:
         body = json.loads(prompt)
         if (
@@ -408,7 +418,7 @@ def test_goal_failure_extends_graph_and_preserves_accepted_work(tmp_path: Path) 
     assert plans[0]["tasks"][0] == plans[1]["tasks"][0]
     assert model.workers == 2
     accepted = [event["body"]["candidate"] for event in events if event["kind"] == "accepted"]
-    from ai_employee.autonomous.models import Candidate
+    from ai_employee.models import Candidate
 
     assert accepted[1]["upstream"] == [Candidate.model_validate(accepted[0]).digest]
     assert events[-1]["kind"] == "completed"
@@ -421,3 +431,179 @@ def test_configured_replan_limit_prevents_new_model_attempt(tmp_path: Path) -> N
         engine.start("Write result", config(replans=0), source)
     assert model.calls.count("Plan") == 1
     assert model.workers == 1
+
+
+class ExternalModel(OfflineModel):
+    def generate(
+        self,
+        policy: StagePolicy,
+        prompt: str,
+        schema: type[T],
+        workspace: Path,
+        authority: Authority,
+        timeout: float,
+        cancelled: Callable[[], bool],
+        observer: Callable[[float, int], None] | None = None,
+        observation: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[T, Usage]:
+        result, usage = super().generate(
+            policy, prompt, schema, workspace, authority, timeout, cancelled, observer
+        )
+        if schema is Plan:
+            plan = Plan.model_validate(result.model_dump())
+            task = plan.tasks[0].model_copy(update={"authority": Authority(external_writes=True)})
+            return schema.model_validate(
+                plan.model_copy(update={"tasks": (task,)}).model_dump()
+            ), usage
+        return result, usage
+
+
+def test_unverified_external_effect_is_not_repeated_by_worker_retry(tmp_path: Path) -> None:
+    model = ExternalModel(fail_once=True)
+    engine, source = runtime(tmp_path, model)
+    cfg = config().model_copy(
+        update={"authority_ceiling": Authority(external_writes=True), "security": "balanced"}
+    )
+    run = engine.start("Write result", cfg, source)
+    assert model.workers == 1
+    assert engine.journal.events(run)[-1]["kind"] == "uncertain"
+    calls = len(model.calls)
+    engine.execute(run)
+    assert len(model.calls) == calls
+
+
+class GraphModel(OfflineModel):
+    def generate(
+        self,
+        policy: StagePolicy,
+        prompt: str,
+        schema: type[T],
+        workspace: Path,
+        authority: Authority,
+        timeout: float,
+        cancelled: Callable[[], bool],
+        observer: Callable[[float, int], None] | None = None,
+        observation: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[T, Usage]:
+        body = json.loads(prompt)
+        if schema is Plan:
+            tasks = tuple(
+                Task(
+                    id=key,
+                    description=key,
+                    criteria=clarification().criteria,
+                    verification_plan="inspect",
+                    dependencies=parents,
+                    kind="integration" if parents else "work",
+                )
+                for key, parents in (
+                    ("a", ()),
+                    ("b", ()),
+                    ("join", ("a", "b")),
+                    ("c", ()),
+                    ("final", ("join", "c")),
+                )
+            )
+            return schema.model_validate(
+                Plan(tasks=tasks, result_task="final").model_dump()
+            ), Usage(tokens=1)
+        if schema is WorkerResult:
+            key = body["context"]["task"]["id"]
+            inputs = workspace / ".fleet-inputs"
+            if inputs.exists():
+                for upstream in inputs.iterdir():
+                    for marker in upstream.glob("*.branch"):
+                        (workspace / marker.name).write_text(marker.read_text())
+            (workspace / (key + ".branch")).write_text(key)
+            if key == "final":
+                assert {path.stem for path in workspace.glob("*.branch")} == {
+                    "a",
+                    "b",
+                    "join",
+                    "c",
+                    "final",
+                }
+        return super().generate(
+            policy, prompt, schema, workspace, authority, timeout, cancelled, observer
+        )
+
+
+def test_multiple_integrations_materialize_exact_upstream_candidates(tmp_path: Path) -> None:
+    model = GraphModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.start("Write result", config(), source)
+    assert model.workers == 5
+    engine.promote(run, tmp_path / "published")
+    assert not (tmp_path / "published/.fleet-inputs").exists()
+    assert {path.stem for path in (tmp_path / "published").glob("*.branch")} == {
+        "a",
+        "b",
+        "join",
+        "c",
+        "final",
+    }
+
+
+def test_integration_resume_rejects_stale_upstream_identity(tmp_path: Path) -> None:
+    model = GraphModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.start("Write result", config(), source)
+    # Inject an otherwise valid accepted record with a different predecessor identity.
+    events = engine.journal.events(run)
+    records = [event for event in events if event["kind"] == "accepted"]
+    first = records[0]["body"]
+    candidate = dict(first["candidate"], attempt_id="foreign-attempt")
+    engine.journal.append(run, "accepted", task=first["task"], candidate=candidate)
+    # Completed history must also be checked before promotion, not just on worker resume.
+    with pytest.raises(ValueError, match="STALE_UPSTREAM_LINEAGE"):
+        engine.promote(run, tmp_path / "published")
+
+
+def test_revocation_prevents_resume_and_promotion(tmp_path: Path) -> None:
+    model = OfflineModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.start("Write result", config(), source)
+    engine.revoke_authority(run)
+    calls = list(model.calls)
+    with pytest.raises(Stopped):
+        engine.execute(run)
+    with pytest.raises(ValueError, match="PROMOTION_AUTHORITY_UNAVAILABLE"):
+        engine.promote(run, tmp_path / "published")
+    assert model.calls == calls
+    assert "authority_revoked" in [event["kind"] for event in engine.journal.events(run)]
+
+
+def test_strict_policy_blocks_coarse_external_grants_before_worker(tmp_path: Path) -> None:
+    model = ExternalModel()
+    engine, source = runtime(tmp_path, model)
+    configured = config().model_copy(update={"authority_ceiling": Authority(external_writes=True)})
+    with pytest.raises(ValueError, match="STRICT_OPERATION_BOUNDARY_REQUIRED"):
+        engine.start("Write result", configured, source)
+    assert model.workers == 0
+
+
+def test_explicit_goal_revision_keeps_provenance_and_invalidates_old_completion(
+    tmp_path: Path,
+) -> None:
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.start("Write result", config(), source)
+    successor = engine.revise_goal(run, "Write a different result")
+    assert engine.journal.original(run) == "Write result"
+    assert engine.journal.original(successor) == "Write a different result"
+    assert not any(event["kind"] == "verification" for event in engine.journal.events(successor))
+    with pytest.raises(ValueError, match="PROMOTION_AUTHORITY_UNAVAILABLE"):
+        engine.promote(run, tmp_path / "obsolete")
+    with pytest.raises(ValueError, match="GOAL_NOT_VERIFIED"):
+        engine.promote(successor, tmp_path / "unverified")
+
+
+def test_goal_revision_cannot_automatically_restart_a_usage_limited_run(tmp_path: Path) -> None:
+    model = OfflineModel(quota=True)
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    with pytest.raises(Stopped):
+        engine.execute(run)
+    with pytest.raises(Stopped):
+        engine.revise_goal(run, "Try again")
+    assert len(engine.journal.runs()) == 1
+    assert model.calls == ["Clarification"]
