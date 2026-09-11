@@ -301,11 +301,11 @@ class Journal:
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
-    def check(self, run: str) -> None:
+    def remaining_wall(self, run: str) -> float:
+        """Run wall allowance, excluding the union of approval waits when configured."""
         config = self.config(run)
         events = self.events(run)
-        if any(event["kind"] == "stopped" for event in events):
-            raise Stopped("RUN_STOPPED")
+        now = time.time()
         waiting = 0.0
         began: float | None = None
         pending: set[str] = set()
@@ -320,11 +320,19 @@ class Journal:
                     waiting += event["at"] - began
                     began = None
         if began is not None:
-            waiting += time.time() - began
-        elapsed = time.time() - events[0]["at"]
+            waiting += now - began
+        elapsed = now - float(events[0]["at"])
         if not config.limits.approval_counts_wall:
             elapsed -= waiting
-        if elapsed >= config.limits.wall_seconds:
+        return max(0.0, config.limits.wall_seconds - elapsed)
+
+    def check(self, run: str) -> None:
+        config = self.config(run)
+        events = self.events(run)
+        stopped = next((e for e in events if e["kind"] == "stopped"), None)
+        if stopped is not None:
+            raise Stopped(stopped["body"]["reason"])
+        if self.remaining_wall(run) <= 0:
             self.stop(run, "WALL_BUDGET_EXHAUSTED")
             raise Stopped("WALL_BUDGET_EXHAUSTED")
         with self.connect() as db:
@@ -371,7 +379,12 @@ class Journal:
                 "COALESCE(SUM(cost),0) FROM reservations WHERE run=?",
                 (run,),
             ).fetchone()
-            seconds = min(limits.invocation_seconds, limits.active_seconds - usage[1])
+            # Recheck after acquiring the write lock; waiting for a concurrent
+            # reservation must not admit work against a stale wall allowance.
+            wall = self.remaining_wall(run)
+            if wall <= 0:
+                raise Stopped("WALL_BUDGET_EXHAUSTED")
+            seconds = min(limits.invocation_seconds, limits.active_seconds - usage[1], wall)
             tokens = limits.reservation_tokens if model_usage and limits.tokens is not None else 0
             cost = limits.reservation_cost if model_usage and limits.cost is not None else 0.0
             if (

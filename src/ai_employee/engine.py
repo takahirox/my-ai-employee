@@ -160,7 +160,9 @@ class Engine:
                 )
                 if authority.external_writes:
                     self.journal.append(run, "uncertain", reason="INTERRUPTED_EXTERNAL_RESPONSE")
+                    self.journal.check(run)
                     raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
+                self.journal.check(run)
                 if not policy.transport_retries:
                     raise RuntimeError("TRANSPORT_RETRY_EXHAUSTED") from error
                 action = "transport"
@@ -285,10 +287,12 @@ class Engine:
                 policy_digest=contract.policy_digest,
                 result=preflight,
             )
-            timeout -= time.monotonic() - started
-            if timeout <= 0:
-                raise TimeoutError("PREFLIGHT_TIMEOUT")
             self.journal.check(run)
+            timeout = min(timeout - (time.monotonic() - started), self.journal.remaining_wall(run))
+            if timeout <= 0:
+                self.journal.check(run)
+                raise TimeoutError("PREFLIGHT_TIMEOUT")
+            observe({"event": "execution_budget", "phase": "after_preflight", "seconds": timeout})
             usage = Usage()  # Once launched, absent provider measurements stay unknown.
             result, returned_usage = self.model.generate(
                 policy,
@@ -673,11 +677,13 @@ class Engine:
                     task=None if task is None else task.id,
                     kind="check_failed",
                 )
+                self.journal.check(run)
                 raise
             finally:
                 self.journal.settle(
                     run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
                 )
+            self.journal.check(run)
             receipt = {
                 "check": check.id,
                 "evidence_kind": check.evidence_kind,
@@ -1364,6 +1370,9 @@ class Engine:
                 self.model.apply_authority(
                     workspace, authority, timeout, lambda: self._cancelled(run)
                 )
+            except (TimeoutError, ConnectionError):
+                self.journal.check(run)
+                raise
             finally:
                 self.journal.settle(
                     run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
