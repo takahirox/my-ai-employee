@@ -1091,7 +1091,17 @@ class Engine:
             try:
                 self.model.reconcile(self.root / run)
             except (ValueError, RuntimeError, OSError, TimeoutError) as error:
-                self.journal.append(run, "cleanup_failed", error_type=type(error).__name__)
+                known = {
+                    "INVALID_RESOURCE_LEDGER",
+                    "RESOURCE_CLEANUP_UNCONFIRMED",
+                    "RESOURCE_CREATION_UNCERTAIN",
+                }
+                self.journal.append(
+                    run,
+                    "cleanup_failed",
+                    error_type=type(error).__name__,
+                    reason=str(error) if str(error) in known else "RESOURCE_CLEANUP_UNCONFIRMED",
+                )
                 raise
             self.journal.append(run, "cleanup_confirmed")
 

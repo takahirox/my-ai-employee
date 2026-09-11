@@ -189,3 +189,44 @@ def test_cleanup_fences_a_resumed_failed_run_and_preserves_failure_display(tmp_p
     engine.cleanup(run)
     assert projection(engine.journal, run)["status"] == "failed"
     assert projection(engine.journal, run)["cleanup"] == "confirmed"
+
+
+def test_cli_cleanup_docker_timeout_is_durable_unconfirmed_error(tmp_path, capsys):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(), source)
+    directory = tmp_path / "workspaces" / run
+    directory.mkdir(parents=True)
+    (directory / "fixture.resources.jsonl").write_text(
+        json.dumps(
+            {
+                "kind": "container",
+                "name": "fleet-candidate-" + "a" * 32,
+                "state": "created",
+            }
+        )
+        + "\n"
+    )
+    with patch(
+        "ai_employee.container.subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 15)
+    ):
+        assert main(["--state", str(tmp_path), "cleanup", run]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "RESOURCE_CLEANUP_UNCONFIRMED"
+    view = projection(engine.journal, run)
+    assert view["cleanup"] == "unconfirmed"
+    assert view["events"][-1]["body"]["reason"] == "RESOURCE_CLEANUP_UNCONFIRMED"
+
+
+def test_cli_clarification_answer_resumes_same_run_and_gets_result(tmp_path, capsys):
+    model = OfflineModel(ambiguous=True)
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    with patch("ai_employee.cli.ContainerModel", return_value=model):
+        assert main(["--state", str(tmp_path), "resume", run]) == 2
+        assert json.loads(capsys.readouterr().out)["status"] == "waiting_for_clarification"
+        assert main(["--state", str(tmp_path), "answer", run, "Use the requested result"]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "ready_to_resume"
+        model.ambiguous = False
+        assert main(["--state", str(tmp_path), "resume", run]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "completed"
+        assert main(["--state", str(tmp_path), "result", run]) == 0
+        assert json.loads(capsys.readouterr().out)["run_id"] == run

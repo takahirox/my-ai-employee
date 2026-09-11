@@ -108,7 +108,7 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         status = "failed"
     cleanup = "not_requested"
     for event in events:
-        if event["kind"] in {"reserved", "authority_application_started"}:
+        if event["kind"] == "reserved":
             cleanup = "not_requested"
         elif event["kind"] == "cleanup_requested":
             cleanup = "pending"
