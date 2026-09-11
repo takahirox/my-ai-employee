@@ -33,3 +33,23 @@ For the same local check, provide those pinned files under
 with that environment variable set. Without the files, the two public-artifact
 tests explicitly skip; the remaining hermetic runtime/native-contract tests still
 run. Do not report a skipped public-artifact check as integration success.
+
+## Architecture canary
+
+`tests/test_autonomous_runtime.py::test_actual_worker_candidate_is_verified_published_and_replayed_without_work`
+is the simple production-path canary: one file-producing Task goes through the real
+Engine, Journal, immutable Candidate, independent verification and promotion. It
+checks one Worker, no human/authority waits or graph extension, and no new work on
+replay. Its current fixture policy disables optional reviews; the five model-boundary
+calls are a test baseline, not a universal product call-count invariant.
+
+The model boundary is a deterministic fixture that edits and checks actual files;
+the runtime is not mocked and no benchmark adapter is involved. This ordinary CI
+canary detects orchestration regressions, not real-model quality or Docker isolation.
+`test_configured_replan_limit_prevents_new_model_attempt` in the same file exercises
+a deliberately failing Candidate and verifies its durable failure evidence. Keep
+native-isolation and explicitly opted-in live-model validation separate.
+
+When the simple path gains calls, transitions or failure points, review the concrete
+requirement that needs them. Do not add a special production shortcut to satisfy the
+canary or remove necessary policy/verification boundaries to reduce its call count.

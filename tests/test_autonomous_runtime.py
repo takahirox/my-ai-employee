@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 import pytest
 
 from ai_employee.candidates import Candidates
+from ai_employee.cli import projection
 from ai_employee.engine import Engine
 from ai_employee.history import Journal, Stopped
 from ai_employee.models import (
@@ -172,6 +173,18 @@ def test_actual_worker_candidate_is_verified_published_and_replayed_without_work
     assert (tmp_path / "published/result.txt").read_text() == "correct"
     assert not (tmp_path / "published/verifier-output.txt").exists()
     assert model.verifications == 2
+    # Architecture canary: the ordinary runtime needs one Task and no recovery.
+    view = projection(engine.journal, run)
+    assert view["status"] == "completed"
+    assert len(view["plan"]["tasks"]) == 1
+    assert model.workers == 1
+    assert sum(e["kind"] == "plan" for e in view["events"]) == 1
+    assert model.calls == ["Clarification", "Plan", "WorkerResult", "Verification", "Verification"]
+    assert not {e["kind"] for e in view["events"]} & {
+        "clarification_wait",
+        "approval_wait",
+        "review_diagnostic",
+    }
     calls = len(model.calls)
     engine.execute(run)
     assert len(model.calls) == calls
@@ -483,6 +496,14 @@ def test_configured_replan_limit_prevents_new_model_attempt(tmp_path: Path) -> N
         engine.start("Write result", config(replans=0), source)
     assert model.calls.count("Plan") == 1
     assert model.workers == 1
+    run = engine.journal.runs()[0]
+    view = projection(engine.journal, run)
+    assert view["status"] == "failed"
+    assert any(
+        e["kind"] == "failed" and e["body"]["reason"] == "REPLAN_LIMIT_EXHAUSTED"
+        for e in view["events"]
+    )
+    assert not any(e["kind"] == "completed" for e in view["events"])
 
 
 class ExternalModel(OfflineModel):
