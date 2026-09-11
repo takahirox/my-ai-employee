@@ -24,6 +24,11 @@
   duplicated contracts, external responsibilities and added calls/transitions on the
   simple path. Preserve security/correctness boundaries; simplicity is not a line count.
 
+For issue-driven work, follow [development-workflow.md](docs/development-workflow.md).
+Treat the Issue's goal, design intent, acceptance criteria and non-goals as the implementation
+specification; review the PR against that specification, not only against tests or local code
+correctness.
+
 See [architecture.md](docs/architecture.md) for runtime boundaries and
 [development.md](docs/development.md#architecture-canary) for the architecture canary.
 
