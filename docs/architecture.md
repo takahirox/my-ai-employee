@@ -47,12 +47,30 @@ is no legacy runtime, compatibility profile router or database migration subsyst
 
 ## Stage contracts and execution readiness
 
-`stage_contracts.py` binds each invocation to `stage-contract-1`, its exact input
+`stage_contracts.py` binds each invocation to `stage-contract-2`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing
 references into native provider schemas, prompts, validation and repair feedback.
 A new DAG can define its own local IDs. Review findings must cover exactly the
 review/verification criterion namespace. Recovery cannot redefine historical tasks.
+
+The authority projection also carries field meanings, unsupported product controls,
+Run ceiling/security rules and registered external evidence routes. `capabilities.py`
+owns these admission rules; native schema descriptions, planner/recovery/reviewer
+context, Stage validation, readiness and repair read the same facts. Requirements
+remain expressible even when infeasible: schema descriptions explain unsupported
+values instead of forcing a needed control to false. Invalid proposals enter the
+existing output revision budget before acceptance; runtime and environment failures
+retain their stop/wait behavior. External Goal evidence routes cannot be replaced
+by artifact-only Plan criteria. This structural check does not prove equivalence
+of arbitrary natural-language requirements; configured semantic review and final
+protected evidence checks remain necessary layers.
+
+Authority repair feedback retains bounded Task/field/rule context in the existing
+rejection event; full rejected proposals stay in bounded diagnostic storage. Resume
+uses the same contract identity and durable reservation counter. The version bump
+rejects prior stage-contract-1 journals rather than giving their invocations fresh
+identities and accidentally resetting counters; no migration is provided.
 
 Malformed output and invalid references enter bounded response repair. Reviewer
 output faults remain in the reviewer; exhausting that repair is review unavailable,

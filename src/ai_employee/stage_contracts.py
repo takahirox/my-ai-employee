@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from .models import Clarification, Contract, Plan, RunConfig, Usage, Verification, WorkerChoice
 
-VERSION = "stage-contract-1"
+VERSION = "stage-contract-2"
 T = TypeVar("T", bound=Contract)
 
 
@@ -84,9 +84,12 @@ class StageContract:
     context_digest: str
     target_digest: str | None
     policy_digest: str
+    authority: dict[str, object]
 
     @classmethod
     def bind(cls, stage: str, prompt: dict[str, Any], config: RunConfig) -> StageContract:
+        from .capabilities import authority_projection
+
         context = {k: v for k, v in prompt.items() if k not in {"feedback", "review_feedback"}}
         criteria = None
         if stage.endswith("_review"):
@@ -101,6 +104,7 @@ class StageContract:
             digest(context),
             None if target is None else digest(target),
             config.digest,
+            authority_projection(config),
         )
 
     def projection(self) -> dict[str, Any]:
@@ -112,6 +116,7 @@ class StageContract:
             "context_digest": self.context_digest,
             "evaluation_target_digest": self.target_digest,
             "policy_digest": self.policy_digest,
+            "authority": self.authority,
             "reference_set_digest": digest({"checks": self.checks, "criteria": self.criteria}),
             "local_references": "Define criterion/task IDs locally; reference only definitions in "
             "this proposal. Existing task definitions must remain exact. Runtime identities, "
@@ -142,10 +147,33 @@ class StageContract:
                 )
             self._outcomes(value.criteria, config)
         if isinstance(value, Plan):
+            from .capabilities import AUTHORITY_RULES, task_violation
+
+            external_checks = {
+                check
+                for task in value.tasks
+                for criterion in task.criteria
+                if criterion.outcome == "external_effect"
+                for check in criterion.checks
+            }
+            for criterion in prompt.get("goal", {}).get("specification", {}).get("criteria", []):
+                if (
+                    criterion["outcome"] == "external_effect"
+                    and not set(criterion["checks"]) <= external_checks
+                ):
+                    raise OutputViolation(
+                        "EXTERNAL_GOAL_WEAKENED",
+                        details={
+                            **AUTHORITY_RULES["EXTERNAL_GOAL_WEAKENED"],
+                            "criterion": criterion["id"],
+                        },
+                    )
             historical = {t["id"]: t for t in prompt.get("historical_tasks", [])}
             for task in value.tasks:
                 self._checks(task.criteria)
-                self._outcomes(task.criteria, config)
+                violation = task_violation(task, config)
+                if violation:
+                    raise OutputViolation(str(violation["reason"]), details=violation)
                 if task.id in historical and task.model_dump(mode="json") != historical[task.id]:
                     raise OutputViolation("HISTORICAL_TASK_REWRITTEN")
                 if task.supersedes is not None and task.supersedes not in historical:

@@ -670,7 +670,7 @@ def test_strict_policy_blocks_coarse_external_grants_before_worker(tmp_path: Pat
     model = ExternalModel()
     engine, source = runtime(tmp_path, model)
     configured = config().model_copy(update={"authority_ceiling": Authority(external_writes=True)})
-    with pytest.raises(Stopped, match="STRICT_OPERATION_BOUNDARY_REQUIRED"):
+    with pytest.raises(RuntimeError, match="OUTPUT_REPAIR_EXHAUSTED"):
         engine.start("Write result", configured, source)
     assert model.workers == 0
 

@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from ai_employee.cli import projection
 from ai_employee.container import ContainerModel
 from ai_employee.diagnostics import CheckOutput, capture
-from ai_employee.history import Journal, Stopped
+from ai_employee.history import Journal
 from ai_employee.models import (
     Authority,
     Check,
@@ -125,17 +125,20 @@ def test_unaccepted_plan_and_exact_authority_failure_survive_reopen(tmp_path):
 
     model = Unsupported()
     engine, source = runtime(tmp_path, model)
-    with pytest.raises(Stopped, match="REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE"):
+    with pytest.raises(RuntimeError, match="OUTPUT_REPAIR_EXHAUSTED"):
         engine.start("Write result", config(), source)
     view = reopened_cli(tmp_path, engine.journal.runs()[0])
     assert view["plan"] is None and model.workers == 0
     plans = [e for e in diagnostics(view, "model_response") if e["stage"] == "planning"]
     plan = payload(plans[0])
-    failure = diagnostics(view, "readiness_failed")[0]
+    failures = diagnostics(view, "output_rejected")
+    assert len(failures) == 2
+    failure = failures[0]
     assert plan["tasks"][0]["authority"]["operation_approval"] is True
     assert payload(failure)["unsupported_fields"] == ["operation_approval"]
-    assert json.loads(failure["context"]["text"])["task"] == "write"
-    assert json.loads(failure["context"]["text"])["target"] == Plan.model_validate(plan).digest
+    assert payload(failure)["task"] == "write"
+    assert payload(failure)["task_digest"] == Plan.model_validate(plan).tasks[0].digest
+    assert payload(failure)["reason"] == "REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE"
 
 
 def test_invalid_reference_details_and_each_repair_attempt_remain_observable(tmp_path):

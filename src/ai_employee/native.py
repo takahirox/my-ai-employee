@@ -282,6 +282,10 @@ def provider_schema(
     result = schema.model_json_schema()
     if binding is not None:
         definitions = result.get("$defs", {})
+        authority = definitions.get("Authority")
+        if authority is not None:
+            for name, constraints in binding["authority"]["properties"].items():
+                authority["properties"][name].update(constraints)
         criterion = definitions.get("Criterion")
         if criterion is not None:
             checks = criterion["properties"]["checks"]

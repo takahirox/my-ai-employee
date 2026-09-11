@@ -272,7 +272,7 @@ def test_external_plan_without_verification_path_stops_before_worker(tmp_path: P
     cfg = config().model_copy(
         update={"security": "balanced", "authority_ceiling": Authority(external_writes=True)}
     )
-    with pytest.raises(Stopped, match="EXTERNAL_VERIFICATION_PATH_UNAVAILABLE"):
+    with pytest.raises(RuntimeError, match="OUTPUT_REPAIR_EXHAUSTED"):
         engine.start("Write result", cfg, source)
     assert model.workers == 0
 
@@ -456,10 +456,17 @@ def test_offline_artifact_does_not_complete_external_goal_when_receipt_check_fai
                 body = result.model_dump(mode="json")
                 body["criteria"][0].update(outcome="external_effect", checks=["remote"])
                 return schema.model_validate(body), usage
+            if schema is Plan:
+                body = result.model_dump(mode="json")
+                body["tasks"][0]["criteria"][0].update(outcome="external_effect", checks=["remote"])
+                return schema.model_validate(body), usage
             return result, usage
 
+        check_calls = 0
+
         def check(self, *args, **kwargs):
-            return False, "no valid external receipt"
+            self.check_calls += 1
+            return self.check_calls == 1, "external evidence absent on final Goal check"
 
     model = ExternalGoal()
     engine, source = runtime(tmp_path, model)
