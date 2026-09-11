@@ -14,9 +14,18 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
-from .models import Clarification, Contract, Plan, RunConfig, Usage, Verification, WorkerChoice
+from .models import (
+    CLARIFICATION_RULES,
+    Clarification,
+    Contract,
+    Plan,
+    RunConfig,
+    Usage,
+    Verification,
+    WorkerChoice,
+)
 
-VERSION = "stage-contract-2"
+VERSION = "stage-contract-3"
 T = TypeVar("T", bound=Contract)
 
 
@@ -47,6 +56,7 @@ def validation_code(error: ValidationError) -> str:
         "INVALID_GRAPH_IDENTITY",
         "CYCLIC_OR_MISSING_DEPENDENCY",
         "UNCONNECTED_RESULT",
+        "CLARIFICATION_QUESTION_ACTION_MISMATCH",
     }
     for item in error.errors(include_input=False, include_context=False, include_url=False):
         message = item["msg"].removeprefix("Value error, ")
@@ -117,6 +127,11 @@ class StageContract:
             "evaluation_target_digest": self.target_digest,
             "policy_digest": self.policy_digest,
             "authority": self.authority,
+            **(
+                {"clarification": Clarification.semantics()}
+                if self.stage in {"clarification", "clarification_review"}
+                else {}
+            ),
             "reference_set_digest": digest({"checks": self.checks, "criteria": self.criteria}),
             "local_references": "Define criterion/task IDs locally; reference only definitions in "
             "this proposal. Existing task definitions must remain exact. Runtime identities, "
@@ -129,6 +144,23 @@ class StageContract:
 
     def validate(self, value: T, prompt: dict[str, Any], config: RunConfig) -> T:
         if isinstance(value, Clarification):
+            for index, need in enumerate(value.unresolved):
+                if need.original_fragment not in prompt["original_input"]:
+                    raise OutputViolation(
+                        "FOREIGN_CLARIFICATION_REFERENCE",
+                        details={
+                            **CLARIFICATION_RULES["FOREIGN_CLARIFICATION_REFERENCE"],
+                            "index": index,
+                        },
+                    )
+                if need.action == "repair":
+                    raise OutputViolation(
+                        "CLARIFICATION_REQUIRES_INVESTIGATION",
+                        details={
+                            **CLARIFICATION_RULES["CLARIFICATION_REQUIRES_INVESTIGATION"],
+                            "index": index,
+                        },
+                    )
             self._checks(value.criteria)
             if any(r.original_fragment not in prompt["original_input"] for r in value.requirements):
                 raise OutputViolation(

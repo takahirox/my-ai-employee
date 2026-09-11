@@ -351,6 +351,7 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                     }
                 )
             body = json.loads(prompt)
+            body["execution_workspace"] = "/work"
             if isinstance(body.get("context"), dict):
                 body["context"]["workspace"] = "/work"
             prompt = json.dumps(body, ensure_ascii=False)

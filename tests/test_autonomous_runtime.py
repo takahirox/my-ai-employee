@@ -19,6 +19,7 @@ from ai_employee.models import (
     Authority,
     Check,
     Clarification,
+    ClarificationNeed,
     Contract,
     Criterion,
     Finding,
@@ -107,7 +108,19 @@ class OfflineModel:
         result: Contract
         if schema is Clarification:
             result = clarification().model_copy(
-                update={"unresolved": ("Which result?",) if self.ambiguous else ()}
+                update={
+                    "unresolved": (
+                        ClarificationNeed(
+                            kind="human_input",
+                            question="Which result?",
+                            reason="The result is unspecified",
+                            original_fragment="Write result",
+                            evidence="Input does not select an intended result",
+                        ),
+                    )
+                    if self.ambiguous
+                    else ()
+                }
             )
         elif schema is Plan:
             result = Plan(
