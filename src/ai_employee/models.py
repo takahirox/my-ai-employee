@@ -33,6 +33,7 @@ class Criterion(Contract):
     description: Text
     # Check IDs resolve only against operator-owned definitions in RunConfig.
     checks: tuple[Key, ...] = ()
+    outcome: Literal["artifact", "external_effect"] = "artifact"
 
 
 class Requirement(Contract):
@@ -178,6 +179,7 @@ class Check(Contract):
     id: Key
     argv: tuple[Text, ...] = Field(min_length=1)
     timeout: float = Field(default=60, gt=0)
+    evidence_kind: Literal["artifact", "external_effect"] = "artifact"
 
 
 class StagePolicy(Contract):

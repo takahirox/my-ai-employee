@@ -51,7 +51,15 @@ def readiness(task: Task, config: RunConfig) -> dict[str, object]:
     # Generic model prose cannot prove a remote mutation. A protected operator
     # check must provide the external evidence until a service reader exists.
     checks = {key for criterion in task.criteria for key in criterion.checks}
-    if task.authority.external_writes and not checks:
+    external_checks = {
+        check.id for check in config.checks if check.evidence_kind == "external_effect"
+    }
+    if task.authority.external_writes and not checks & external_checks:
+        raise Stopped("EXTERNAL_VERIFICATION_PATH_UNAVAILABLE")
+    if any(
+        criterion.outcome == "external_effect" and not set(criterion.checks) & external_checks
+        for criterion in task.criteria
+    ):
         raise Stopped("EXTERNAL_VERIFICATION_PATH_UNAVAILABLE")
     return {
         "task_digest": task.digest,
@@ -62,6 +70,7 @@ def readiness(task: Task, config: RunConfig) -> dict[str, object]:
         "criteria": [
             {
                 "criterion": criterion.id,
+                "outcome": criterion.outcome,
                 "checks": criterion.checks,
                 "method": "protected_check_and_independent_review"
                 if criterion.checks

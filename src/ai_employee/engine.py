@@ -413,6 +413,10 @@ class Engine:
                     "Before asking a question, inspect permitted original files and evidence. "
                     "Resolve factual questions (columns, values, existing files) yourself. "
                     "Only unresolved user intent, scope or authority needs a human. "
+                    "Mark each criterion outcome as artifact or external_effect. Creating a script "
+                    "does not complete its external operation unless the original explicitly "
+                    "requests that artifact/deferred execution route. External effects require "
+                    "operator checks with external_effect evidence_kind. "
                     "Report unresolved ambiguity; do not invent authority.",
                     "original_input": original,
                     "clarification_answers": [
@@ -464,6 +468,8 @@ class Engine:
                     "instruction": "Plan one Task or a DAG. Use integration Tasks where branches "
                     "converge. Every Task must contribute to result_task. Define exact "
                     "success criteria, verification plan and required evidence. "
+                    "Preserve Goal outcome kinds: artifact creation never substitutes for "
+                    "external_effect completion. "
                     "Check IDs refer only to available operator checks.",
                     "goal": goal.model_dump(mode="json"),
                     "feedback": feedback,
@@ -527,6 +533,7 @@ class Engine:
                 )
             receipt = {
                 "check": check.id,
+                "evidence_kind": check.evidence_kind,
                 "passed": passed,
                 "evidence": evidence,
                 "candidate": candidate.digest,
@@ -534,7 +541,7 @@ class Engine:
             receipts.append(receipt)
             self.journal.append(run, "check_result", **receipt)
         events = self.journal.events(run)
-        external = any(
+        external = any(criterion.outcome == "external_effect" for criterion in criteria) or any(
             event["kind"] == "attempt_started"
             and event["body"]["context"]["authority"]["external_writes"]
             and (task is None or event["body"]["context"]["attempt_id"] == candidate.attempt_id)
@@ -595,7 +602,12 @@ class Engine:
                 # Generic TLS observation cannot attest remote operation semantics.
                 # Without a real service read provider, require an operator-owned
                 # evidence check (e.g. signed receipt validation), never only prose.
-                if external and not (receipts or prior_checks):
+                external_receipts = [
+                    item
+                    for item in (*receipts, *prior_checks)
+                    if item.get("evidence_kind") == "external_effect" and item["passed"]
+                ]
+                if external and not external_receipts:
                     passed = False
                     self.journal.append(
                         run, "external_evidence_missing", candidate=candidate.digest

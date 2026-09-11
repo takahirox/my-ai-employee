@@ -24,7 +24,7 @@ from ai_employee.models import (
     WorkerResult,
 )
 from ai_employee.native import decode_response, provider_schema
-from ai_employee.stage_contracts import StageContract
+from ai_employee.stage_contracts import OutputViolation, StageContract
 
 from .test_autonomous_runtime import ExternalModel, OfflineModel, clarification, config, runtime
 from .test_autonomous_stage_policy import ReviewModel
@@ -246,7 +246,7 @@ def test_malformed_output_after_external_effect_does_not_repeat_work(tmp_path: P
         update={
             "security": "balanced",
             "authority_ceiling": Authority(external_writes=True),
-            "checks": (Check(id="receipt", argv=("true",)),),
+            "checks": (Check(id="receipt", argv=("true",), evidence_kind="external_effect"),),
         }
     )
     run = engine.start("Write result", cfg, source)
@@ -389,3 +389,87 @@ def test_observed_usage_survives_adapter_cleanup_failure(tmp_path: Path):
         engine.execute(run)
     assert engine.journal.budget(run)["measured_usage"]["tokens"] == 17
     assert not any(e["kind"] == "stage_result" for e in engine.journal.events(run))
+
+
+def test_artifact_check_cannot_establish_external_goal_even_for_offline_worker(tmp_path: Path):
+    from ai_employee.models import Criterion
+
+    cfg = config().model_copy(update={"checks": (Check(id="syntax", argv=("true",)),)})
+    criterion = Criterion(
+        id="remote",
+        description="ticket created remotely",
+        checks=("syntax",),
+        outcome="external_effect",
+    )
+    task = Task(
+        id="create",
+        description="create ticket",
+        criteria=(criterion,),
+        verification_plan="check completion",
+    )
+    with pytest.raises(Stopped, match="EXTERNAL_VERIFICATION_PATH_UNAVAILABLE"):
+        readiness(task, cfg)
+    body = clarification().model_dump(mode="json")
+    body["criteria"][0].update(outcome="external_effect", checks=["syntax"])
+    parsed, _ = decode_response(stream(body), Clarification)
+    binding = StageContract.bind("clarification", {"original_input": "Write result"}, cfg)
+    with pytest.raises(OutputViolation, match="MISSING_EXTERNAL_EVIDENCE_CHECK"):
+        binding.validate(parsed, {"original_input": "Write result"}, cfg)
+
+
+def test_explicit_external_evidence_route_is_ready_without_future_evidence():
+    from ai_employee.models import Criterion
+
+    cfg = config().model_copy(
+        update={
+            "checks": (Check(id="signed-receipt", argv=("true",), evidence_kind="external_effect"),)
+        }
+    )
+    task = Task(
+        id="observe",
+        description="verify remote result",
+        criteria=(
+            Criterion(
+                id="remote",
+                description="remote completion",
+                outcome="external_effect",
+                checks=("signed-receipt",),
+            ),
+        ),
+        verification_plan="validate signed receipt",
+        dependencies=("produce-receipt",),
+    )
+    result = readiness(task, cfg)
+    assert result["state"] == "conditionally_plannable"
+    assert result["future_evidence_is_observed"] is False
+
+
+def test_offline_artifact_does_not_complete_external_goal_when_receipt_check_fails(tmp_path: Path):
+    class ExternalGoal(OfflineModel):
+        def generate(
+            self, policy, prompt, schema, workspace, authority, timeout, cancelled, **kwargs
+        ):
+            result, usage = super().generate(
+                policy, prompt, schema, workspace, authority, timeout, cancelled
+            )
+            if schema is Clarification:
+                body = result.model_dump(mode="json")
+                body["criteria"][0].update(outcome="external_effect", checks=["remote"])
+                return schema.model_validate(body), usage
+            return result, usage
+
+        def check(self, *args, **kwargs):
+            return False, "no valid external receipt"
+
+    model = ExternalGoal()
+    engine, source = runtime(tmp_path, model)
+    cfg = config(replans=0).model_copy(
+        update={"checks": (Check(id="remote", argv=("true",), evidence_kind="external_effect"),)}
+    )
+    with pytest.raises(ValueError, match="REPLAN_LIMIT_EXHAUSTED"):
+        engine.start("Write result", cfg, source)
+    run = engine.journal.runs()[0]
+    assert model.workers == 1
+    assert not any(e["kind"] == "completed" for e in engine.journal.events(run))
+    results = [e["body"] for e in engine.journal.events(run) if e["kind"] == "verification"]
+    assert results[-1]["goal_level"] and not results[-1]["passed"]

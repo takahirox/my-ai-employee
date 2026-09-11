@@ -109,10 +109,12 @@ class StageContract:
                 c for item in value.criteria for c in item.checks
             }:
                 raise OutputViolation("MANDATORY_CHECK_OMITTED")
+            self._outcomes(value.criteria, config)
         if isinstance(value, Plan):
             historical = {t["id"]: t for t in prompt.get("historical_tasks", [])}
             for task in value.tasks:
                 self._checks(task.criteria)
+                self._outcomes(task.criteria, config)
                 if task.id in historical and task.model_dump(mode="json") != historical[task.id]:
                     raise OutputViolation("HISTORICAL_TASK_REWRITTEN")
                 if task.supersedes is not None and task.supersedes not in historical:
@@ -128,3 +130,9 @@ class StageContract:
     def _checks(self, criteria: Any) -> None:
         if any(not set(item.checks) <= set(self.checks) for item in criteria):
             raise OutputViolation("UNDECLARED_VERIFICATION_CHECK")
+
+    @staticmethod
+    def _outcomes(criteria: Any, config: RunConfig) -> None:
+        external = {c.id for c in config.checks if c.evidence_kind == "external_effect"}
+        if any(c.outcome == "external_effect" and not set(c.checks) & external for c in criteria):
+            raise OutputViolation("MISSING_EXTERNAL_EVIDENCE_CHECK")

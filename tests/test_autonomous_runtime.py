@@ -374,7 +374,7 @@ def test_authority_approval_applies_before_resume_and_preserves_workspace(tmp_pa
         update={
             "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
             "security": "balanced",
-            "checks": (Check(id="receipt", argv=("true",)),),
+            "checks": (Check(id="receipt", argv=("true",), evidence_kind="external_effect"),),
         }
     )
     run = engine.start("Write result", cfg, source)
@@ -396,7 +396,7 @@ def test_failed_authority_application_does_not_resume(tmp_path: Path) -> None:
         update={
             "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
             "security": "balanced",
-            "checks": (Check(id="receipt", argv=("true",)),),
+            "checks": (Check(id="receipt", argv=("true",), evidence_kind="external_effect"),),
         }
     )
     run = engine.start("Write result", cfg, source)
@@ -531,7 +531,9 @@ def test_unverified_external_effect_is_not_repeated_by_worker_retry(tmp_path: Pa
         update={
             "authority_ceiling": Authority(external_writes=True),
             "security": "balanced",
-            "checks": (Check(id="external-evidence", argv=("true",)),),
+            "checks": (
+                Check(id="external-evidence", argv=("true",), evidence_kind="external_effect"),
+            ),
         }
     )
     run = engine.start("Write result", cfg, source)
@@ -713,7 +715,9 @@ def test_external_completion_crash_does_not_repeat_unverified_effect(
         update={
             "authority_ceiling": Authority(external_writes=True),
             "security": "balanced",
-            "checks": (Check(id="external-evidence", argv=("true",)),),
+            "checks": (
+                Check(id="external-evidence", argv=("true",), evidence_kind="external_effect"),
+            ),
         }
     )
     run = engine.prepare("Write result", cfg, source)
@@ -742,7 +746,7 @@ def test_authority_application_obeys_remaining_budget_and_cancellation(tmp_path:
         update={
             "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
             "security": "balanced",
-            "checks": (Check(id="receipt", argv=("true",)),),
+            "checks": (Check(id="receipt", argv=("true",), evidence_kind="external_effect"),),
         }
     )
     run = engine.start("Write result", cfg, source)
