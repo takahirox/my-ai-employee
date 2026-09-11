@@ -59,6 +59,11 @@ content hashes when read or materialized. Reserved runtime metadata is excluded.
 Verification-side changes never become Candidate bytes. Publication requires a new
 destination and rechecks identity, lineage and terminal authority state.
 
+The private journal also retains bounded proposal/review/check diagnostic text,
+including rejected responses. Credential-pattern redaction is best effort; ordinary
+task content remains sensitive. See [retention rules](run-interface.md#diagnostic-retention).
+These records carry no execution or acceptance authority and do not reset budgets.
+
 Workers cannot access the journal or Candidate store. Digest chaining detects
 accidental or partial history changes; it is not cryptographic authentication
 against a malicious operator who can rewrite both data and hashes.

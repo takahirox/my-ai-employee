@@ -21,6 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from .candidates import Candidates
+from .diagnostics import CheckOutput
 from .history import Stopped
 from .isolated_worker import (
     DockerCandidate,
@@ -418,9 +419,7 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
 
     def check(
         self, argv: tuple[str, ...], workspace: Path, timeout: float, cancelled: Callable[[], bool]
-    ) -> tuple[bool, str]:
-        import hashlib
-
+    ) -> tuple[bool, CheckOutput]:
         with self._candidate(workspace, timeout, cancelled, models=False) as candidate:
             self._native_probe(candidate)
             command = (
@@ -438,4 +437,4 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 command,
                 process_limit=candidate.profile.native_process_limit,
             )
-            return code == 0, hashlib.sha256(stdout + stderr).hexdigest()
+            return code == 0, CheckOutput(code, stdout, stderr)

@@ -27,9 +27,9 @@ flushed before execution, then a final projection or error.
 
 `status`, `inspect` and `logs` return the same Run projection: status, events,
 stage_diagnostics, stage_invocations, budget, goal, plan and cleanup. Events are ordered and carry timestamps. Budget contains measured usage and unknown usage;
-missing token/cost measurements must not be converted to zero. A stored diagnostic
-may be only a classification/digest; the interface does not reconstruct discarded
-model text. `history` returns an object with a `runs` array.
+missing token/cost measurements must not be converted to zero. `history` returns an
+object with a `runs` array. Diagnostic retention is described below; old histories
+remain readable, but text already discarded by older versions cannot be recovered.
 
 `result` returns `candidate` and `candidate_digest`, after validating final Goal
 verification, lineage, stored file hashes and publication authority. It does not
@@ -114,3 +114,50 @@ adapter in evaluator-owned tooling only when repeated use warrants maintenance.
 Evaluate connections after product-specific glue is removed, record the tested
 versions/conditions, and distinguish protocol success from task success. Model-free
 contract tests do not establish live-model quality or isolation.
+
+
+## Diagnostic retention
+
+Investigation uses the existing private history database, public `inspect` / `logs`
+projection and authenticated Inspector. `stage_diagnostics` includes diagnostic-only
+records alongside existing validation classifications. The Inspector renders their
+text, redaction counts and truncation state; it does not interpret text as HTML.
+
+For new invocations the runtime retains completed structured model responses before
+contract validation or acceptance: clarification proposals, plans, review summaries
+and finding evidence, Worker results, selection and verification responses. This
+includes rejected proposals and each repair attempt. Schema-invalid responses retain
+recognized top-level schema fields and error paths/types; unknown top-level fields
+and non-object payloads are omitted with explicit counts/flags. Native stream
+commentary, incomplete/non-JSON messages, tool traces and authentication files are
+not captured. A process killed before capture cannot guarantee a complete response;
+this is not a transcript of every internal model/tool action.
+
+Readiness failures include the Task ID/digest, proposed Plan digest, authority
+request/ceiling, unsupported boundary fields, security mode, criteria and eligible
+external checks. Protected check results include exit code and stdout/stderr;
+check exceptions record the error type/reason and explicitly mark output unavailable.
+Check receipt digests and deterministic acceptance rules remain unchanged. Correlate
+model responses with existing stage invocations by reservation and contract identity;
+review targets and response digests connect proposals with their reviews.
+
+Each event's `record.text` is sanitized JSON, capped at 1,000,000 UTF-8 bytes.
+`format: json` describes the original serialization; truncation can leave an invalid
+JSON prefix. `original_bytes`, `stored_bytes`, `redactions`, `truncated` and the original
+SHA-256 digest make transformations visible. Once accumulated diagnostic event bodies
+reach 16,000,000 bytes for a Run, subsequent payload text is omitted. Remaining
+capacity can truncate the event that crosses the threshold. Small omission metadata
+and up to 8,192 bytes of sanitized linking context per event are still retained, so
+this is a payload retention threshold, not a total database file-size quota. Existing
+runtime invocation/attempt limits still bound event production. No automatic history
+expiry is introduced; caller-owned state remains available after `cleanup`.
+
+Common credential fields and text patterns (authorization/cookies, password/API and
+access/refresh tokens, private-key blocks, Bearer/Basic credentials and recognized
+provider tokens) are replaced before truncation. This is best-effort credential
+redaction, not general personal-data anonymization: ordinary task text, filenames,
+review evidence and check output can remain sensitive. The database is mode 0600;
+keep its state directory and exported CLI JSON private. Inspector authentication
+is required for data access. Do not publish diagnostic exports without reviewing
+retained content. Diagnostic records are never accepted Goal/Plan/Candidate inputs,
+permission grants, retry instructions or authority evidence, even after a Run stops.

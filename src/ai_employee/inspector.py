@@ -44,7 +44,12 @@ for(const m of r.goal.specification.requirements)
 node('p',m.original_fragment+' → '+m.criteria.join(', '),goal)}
 const diagnostics=node('details','',d);
 node('summary','Stage validation, review and readiness',diagnostics);
-node('pre',JSON.stringify(r.stage_diagnostics,null,2),diagnostics);
+for(const e of r.stage_diagnostics){const x=node('details','',diagnostics);
+node('summary',e.stage+' · '+(e.record?'Recorded diagnostic':'Validation result'),x);
+if(e.record){node('small','Diagnostic only · redactions: '+e.record.redactions+
+' · truncated: '+e.record.truncated+' · capacity exhausted: '+e.capacity_exhausted,x);
+node('pre',e.record.text,x);node('pre',JSON.stringify(e.context,null,2),x)}
+else node('pre',JSON.stringify(e,null,2),x)}
 const invocations=node('details','',d);
 node('summary','Invocation counts and contract bindings',invocations);
 node('pre',JSON.stringify(r.stage_invocations,null,2),invocations);

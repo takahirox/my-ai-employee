@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from ai_employee.cli import main, projection
+from ai_employee.history import Journal
 from ai_employee.inspector import create_server
 from ai_employee.models import RunConfig
 
@@ -87,8 +88,9 @@ def test_parallel_wait_projection_uses_attempt_identity(tmp_path: Path) -> None:
 )
 def test_inspector_http_requires_token_and_provides_no_mutation_route(tmp_path: Path) -> None:
     engine, source = runtime(tmp_path, OfflineModel())
-    engine.prepare("Private fixture goal", config(), source)
-    server, token = create_server(engine.journal)
+    run = engine.prepare("Private fixture goal", config(), source)
+    engine.journal.diagnostic(run, "check", {"stderr": "Expected 2 rows, got 1"}, check="rows")
+    server, token = create_server(Journal(engine.journal.path))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
@@ -105,6 +107,13 @@ def test_inspector_http_requires_token_and_provides_no_mutation_route(tmp_path: 
         response = connection.getresponse()
         assert response.status == 200
         assert json.loads(response.read())[0]["title"] == "Private fixture goal"
+        connection.request("GET", "/api/runs/" + run, headers={"Authorization": "Bearer " + token})
+        response = connection.getresponse()
+        assert response.status == 200
+        view = json.loads(response.read())
+        diagnostic = view["stage_diagnostics"][0]
+        assert diagnostic["authoritative"] is False
+        assert "Expected 2 rows, got 1" in diagnostic["record"]["text"]
         connection.request(
             "POST", "/api/runs", body="{}", headers={"Authorization": "Bearer " + token}
         )

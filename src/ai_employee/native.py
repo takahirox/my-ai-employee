@@ -19,10 +19,11 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import ValidationError
 
+from .diagnostics import CheckOutput
 from .history import Stopped
 from .models import Authority, Check, Contract, StagePolicy, Usage
 from .process_lifecycle import terminate_group
-from .stage_contracts import OutputViolation, validation_code
+from .stage_contracts import OutputViolation, validation_code, validation_details
 
 T = TypeVar("T", bound=Contract)
 _OFFLINE = Authority()
@@ -141,7 +142,7 @@ class Model(Protocol):
         workspace: Path,
         timeout: float,
         cancelled: Callable[[], bool],
-    ) -> tuple[bool, str]: ...
+    ) -> tuple[bool, str | CheckOutput]: ...
 
 
 def run_process(
@@ -394,4 +395,6 @@ def decode_response(output: str, schema: type[T]) -> tuple[T, Usage]:
     try:
         return schema.model_validate(payload), usage
     except ValidationError as error:
-        raise OutputViolation(validation_code(error), usage) from None
+        raise OutputViolation(
+            validation_code(error), usage, details=validation_details(error, payload, schema)
+        ) from None

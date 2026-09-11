@@ -29,9 +29,10 @@ def digest(value: Any) -> str:
 class OutputViolation(ValueError):
     """Only response faults enter output repair; never arbitrary adapter errors."""
 
-    def __init__(self, code: str, usage: Usage | None = None) -> None:
+    def __init__(self, code: str, usage: Usage | None = None, *, details: Any = None) -> None:
         super().__init__(code)
         self.usage = usage or Usage()
+        self.details = details
 
 
 def validation_code(error: ValidationError) -> str:
@@ -52,6 +53,27 @@ def validation_code(error: ValidationError) -> str:
         if message in known:
             return message
     return "INVALID_STRUCTURED_OUTPUT"
+
+
+def validation_details(
+    error: ValidationError, payload: Any, schema: type[Contract]
+) -> dict[str, Any]:
+    # Unknown top-level fields are not a proposal. Do not retain their arbitrary values.
+    fields = schema.model_fields
+    selected = (
+        {k: v for k, v in payload.items() if k in fields} if isinstance(payload, dict) else None
+    )
+    return {
+        "payload": selected,
+        "omitted_unknown_fields": len(set(payload) - set(fields))
+        if isinstance(payload, dict)
+        else 0,
+        "non_object_payload_omitted": not isinstance(payload, dict),
+        "errors": [
+            {"path": e["loc"], "type": e["type"]}
+            for e in error.errors(include_input=False, include_context=False, include_url=False)
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -104,11 +126,20 @@ class StageContract:
         if isinstance(value, Clarification):
             self._checks(value.criteria)
             if any(r.original_fragment not in prompt["original_input"] for r in value.requirements):
-                raise OutputViolation("FOREIGN_REQUIREMENT_FRAGMENT")
+                raise OutputViolation(
+                    "FOREIGN_REQUIREMENT_FRAGMENT",
+                    details={"path": "requirements.original_fragment"},
+                )
             if not set(config.mandatory_checks) <= {
                 c for item in value.criteria for c in item.checks
             }:
-                raise OutputViolation("MANDATORY_CHECK_OMITTED")
+                raise OutputViolation(
+                    "MANDATORY_CHECK_OMITTED",
+                    details={
+                        "path": "criteria.checks",
+                        "mandatory_checks": config.mandatory_checks,
+                    },
+                )
             self._outcomes(value.criteria, config)
         if isinstance(value, Plan):
             historical = {t["id"]: t for t in prompt.get("historical_tasks", [])}
@@ -122,17 +153,41 @@ class StageContract:
         if isinstance(value, Verification) and self.criteria is not None:
             ids = [f.criterion_id for f in value.findings]
             if len(ids) != len(self.criteria) or set(ids) != set(self.criteria):
-                raise OutputViolation("INVALID_FINDING_REFERENCES")
+                raise OutputViolation(
+                    "INVALID_FINDING_REFERENCES",
+                    details={
+                        "path": "findings.criterion_id",
+                        "expected": self.criteria,
+                        "received": ids,
+                    },
+                )
         if isinstance(value, WorkerChoice) and value.index >= len(prompt["options"]):
             raise OutputViolation("WORKER_SELECTION_OUT_OF_RANGE")
         return value
 
     def _checks(self, criteria: Any) -> None:
-        if any(not set(item.checks) <= set(self.checks) for item in criteria):
-            raise OutputViolation("UNDECLARED_VERIFICATION_CHECK")
+        for item in criteria:
+            unknown = sorted(set(item.checks) - set(self.checks))
+            if unknown:
+                raise OutputViolation(
+                    "UNDECLARED_VERIFICATION_CHECK",
+                    details={
+                        "path": "criteria.checks",
+                        "criterion": item.id,
+                        "unregistered_checks": unknown,
+                    },
+                )
 
     @staticmethod
     def _outcomes(criteria: Any, config: RunConfig) -> None:
         external = {c.id for c in config.checks if c.evidence_kind == "external_effect"}
-        if any(c.outcome == "external_effect" and not set(c.checks) & external for c in criteria):
-            raise OutputViolation("MISSING_EXTERNAL_EVIDENCE_CHECK")
+        for criterion in criteria:
+            if criterion.outcome == "external_effect" and not set(criterion.checks) & external:
+                raise OutputViolation(
+                    "MISSING_EXTERNAL_EVIDENCE_CHECK",
+                    details={
+                        "path": "criteria.checks",
+                        "criterion": criterion.id,
+                        "required_evidence_kind": "external_effect",
+                    },
+                )

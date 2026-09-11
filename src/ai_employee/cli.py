@@ -126,7 +126,8 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         "stage_diagnostics": [
             event["body"]
             for event in events
-            if event["kind"] in {"output_rejected", "review_diagnostic", "preflight", "readiness"}
+            if event["kind"]
+            in {"output_rejected", "review_diagnostic", "preflight", "readiness", "diagnostic"}
         ],
         "stage_invocations": [
             {key: event["body"].get(key) for key in ("stage", "call_key", "ordinal", "binding")}

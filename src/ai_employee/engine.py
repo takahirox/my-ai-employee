@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from .candidates import Candidates
 from .capabilities import policies, readiness, validate_policy
+from .diagnostics import CheckOutput
 from .history import Journal, Stopped
 from .models import (
     Authority,
@@ -32,7 +33,14 @@ from .models import (
     WorkerResult,
 )
 from .native import Model
-from .stage_contracts import VERSION, OutputViolation, StageContract, digest, validation_code
+from .stage_contracts import (
+    VERSION,
+    OutputViolation,
+    StageContract,
+    digest,
+    validation_code,
+    validation_details,
+)
 
 T = TypeVar("T", bound=Contract)
 _NO_AUTHORITY = Authority()
@@ -181,6 +189,7 @@ class Engine:
             raise
         started = time.monotonic()
         usage = Usage(tokens=0, cost=0)
+        response_payload: dict[str, Any] | None = None
 
         def observe(body: dict[str, Any]) -> None:
             nonlocal usage
@@ -259,6 +268,17 @@ class Engine:
                 tokens=returned_usage.tokens if returned_usage.tokens is not None else usage.tokens,
                 cost=returned_usage.cost if returned_usage.cost is not None else usage.cost,
             )
+            response_payload = result.model_dump(mode="json")
+            self.journal.diagnostic(
+                run,
+                stage,
+                response_payload,
+                reservation=reservation,
+                contract=contract.identity,
+                result_digest=result.digest,
+                target=contract.target_digest,
+                kind="model_response",
+            )
             # Fixtures and alternate adapters must pass the same validation as
             # native decoding; typed objects alone are not acceptance evidence.
             result = schema.model_validate(result.model_dump(mode="json"))
@@ -279,9 +299,30 @@ class Engine:
         except OutputViolation as error:
             if error.usage.tokens is not None or error.usage.cost is not None:
                 usage = error.usage
+            self.journal.diagnostic(
+                run,
+                stage,
+                error.details,
+                reservation=reservation,
+                contract=contract.identity,
+                target=contract.target_digest,
+                kind="output_rejected",
+                reason=str(error),
+            )
             raise
         except ValidationError as error:
-            raise OutputViolation(validation_code(error), usage) from None
+            details = validation_details(error, response_payload, schema)
+            self.journal.diagnostic(
+                run,
+                stage,
+                details,
+                reservation=reservation,
+                contract=contract.identity,
+                target=contract.target_digest,
+                kind="output_rejected",
+                reason=validation_code(error),
+            )
+            raise OutputViolation(validation_code(error), usage, details=details) from None
         except (TimeoutError, ConnectionError):
             raise
         except (ValueError, OSError) as error:
@@ -456,6 +497,46 @@ class Engine:
                 return goal
         raise ValueError("CLARIFICATION_REJECTED")
 
+    def _readiness(self, run: str, task: Task, config: RunConfig, plan: Plan) -> None:
+        try:
+            self.journal.append(run, "readiness", **readiness(task, config))
+        except Stopped as error:
+            self.journal.diagnostic(
+                run,
+                "readiness",
+                {
+                    "reason": str(error),
+                    "authority": task.authority.model_dump(mode="json"),
+                    "unsupported_fields": [
+                        name
+                        for name in ("credentials", "operation_approval", "duplicate_prevention")
+                        if getattr(task.authority, name)
+                    ],
+                    "authority_ceiling": config.authority_ceiling.model_dump(mode="json"),
+                    "security": config.security,
+                    "failure_path": {
+                        "AUTHORITY_EXCEEDS_POLICY": "authority",
+                        "REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE": "authority",
+                        "READ_ONLY_NETWORK_BOUNDARY_UNAVAILABLE": "authority.network_hosts",
+                        "STRICT_OPERATION_BOUNDARY_REQUIRED": (
+                            "authority.operation_approval/duplicate_prevention"
+                        ),
+                        "EXTERNAL_VERIFICATION_PATH_UNAVAILABLE": "criteria.checks",
+                    }.get(str(error)),
+                    "external_evidence_checks": [
+                        check.id
+                        for check in config.checks
+                        if check.evidence_kind == "external_effect"
+                    ],
+                    "criteria": [item.model_dump(mode="json") for item in task.criteria],
+                },
+                kind="readiness_failed",
+                task=task.id,
+                task_digest=task.digest,
+                target=plan.digest,
+            )
+            raise
+
     def _plan(self, run: str, goal: Goal, config: RunConfig, tree: str) -> Plan:
         workspace = self._workspace(run, "planner", tree)
         feedback = ""
@@ -479,7 +560,7 @@ class Engine:
                 workspace,
             )
             for task in plan.tasks:
-                self.journal.append(run, "readiness", **readiness(task, config))
+                self._readiness(run, task, config, plan)
                 self._check_ids(task.criteria, config)
                 self._authorize(run, config, task.authority, task.digest)
             accepted, feedback = self._review(
@@ -521,12 +602,42 @@ class Engine:
                 raise
             started = time.monotonic()
             try:
-                passed, evidence = self.model.check(
+                passed, output = self.model.check(
                     check.argv,
                     check_workspace,
                     min(check.timeout, timeout),
                     lambda: self._cancelled(run),
                 )
+                self.journal.diagnostic(
+                    run,
+                    "check",
+                    output.payload() if isinstance(output, CheckOutput) else output,
+                    reservation=reservation,
+                    check=check.id,
+                    candidate=candidate.digest,
+                    attempt=candidate.attempt_id,
+                    task=None if task is None else task.id,
+                    kind="check_output",
+                    passed=passed,
+                )
+                evidence = output.digest if isinstance(output, CheckOutput) else output
+            except (ValueError, RuntimeError, OSError, TimeoutError) as error:
+                self.journal.diagnostic(
+                    run,
+                    "check",
+                    {
+                        "error_type": type(error).__name__,
+                        "reason": str(error),
+                        "output_unavailable": True,
+                    },
+                    reservation=reservation,
+                    check=check.id,
+                    candidate=candidate.digest,
+                    attempt=candidate.attempt_id,
+                    task=None if task is None else task.id,
+                    kind="check_failed",
+                )
+                raise
             finally:
                 self.journal.settle(
                     run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
@@ -1422,7 +1533,7 @@ class Engine:
                 raise ValueError("HISTORICAL_TASK_REWRITTEN")
             if task.supersedes is not None and task.supersedes not in historical:
                 raise ValueError("FOREIGN_REPAIR_TARGET")
-            self.journal.append(run, "readiness", **readiness(task, config))
+            self._readiness(run, task, config, extension)
             self._check_ids(task.criteria, config)
             self._authorize(run, config, task.authority, task.digest)
         self.journal.append(
