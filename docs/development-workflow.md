@@ -23,7 +23,14 @@ that first exposed it.
 
 ## 1. Before implementation: read the Issue as the specification
 
-Read the full Issue, including later comments that refine the decision. Identify:
+Before implementation or review, also check for later changes explicitly agreed with the user in
+conversation or elsewhere. Those decisions supersede outdated Issue text; a suggestion or a newer
+comment alone does not establish agreement. Record the agreed change in the Issue body or a clear
+decision comment, identifying what it supersedes, so reviewers can follow the current specification
+without access to the original conversation. Do not request approval again for an already agreed
+change.
+
+Read the full Issue, including these recorded decisions and later comments. Identify:
 
 - the user-visible or runtime outcome that must change;
 - the root problem the Issue is trying to prevent, not only the observed symptom;
