@@ -101,7 +101,14 @@ cannot attest remote success. Preflight never performs the external operation.
 
 CLI and Inspector project the same journal, including repair failures, fixed review
 categories, preflight/readiness records, invocation counters and unknown usage.
-Rejected diagnostics contain bounded classifications and digests, not raw malformed
-responses or arbitrary reviewer evidence. They never become accepted execution
-inputs. Public contract tests, native isolation tests and live-model evaluation
+Completed model proposals and reviews are captured before validation/acceptance,
+including rejected plans and review summary/evidence. Readiness failures retain the
+Task, requested authority, policy and failure location; protected checks retain
+stdout/stderr separately from their acceptance receipt digest. These bounded,
+redacted `diagnostic` events are explicitly non-authoritative, including when added
+after a stop. Replay, acceptance and permission decisions do not read them. The
+existing invocation/reservation records link each response and repair attempt; no
+additional trace store or execution path is introduced. See
+[diagnostic retention](run-interface.md#diagnostic-retention) for limits and omissions.
+Public contract tests, native isolation tests and live-model evaluation
 remain distinct validation levels (see development and isolated-worker guides).

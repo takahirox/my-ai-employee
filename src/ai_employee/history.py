@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .diagnostics import RECORD_BYTES, RUN_BYTES, capture
 from .models import Authority, RunConfig, Usage
 from .stage_contracts import VERSION
 
@@ -251,6 +252,29 @@ class Journal:
             previous = expected
             result.append({"kind": row["kind"], "at": row["at"], "body": json.loads(row["body"])})
         return result
+
+    def diagnostic(self, run: str, stage: str, payload: Any, **context: Any) -> None:
+        """Append non-authoritative evidence even when acceptance has stopped."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            used = db.execute(
+                "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events "
+                "WHERE run=? AND kind='diagnostic'",
+                (run,),
+            ).fetchone()[0]
+            record = capture(payload, min(RECORD_BYTES, max(0, RUN_BYTES - used)))
+            self._event(
+                db,
+                run,
+                "diagnostic",
+                {
+                    "stage": stage,
+                    "authoritative": False,
+                    "record": record,
+                    "context": capture(context, 8192),
+                    "capacity_exhausted": used >= RUN_BYTES,
+                },
+            )
 
     def request_cleanup(self, run: str) -> None:
         """Fence unfinished work atomically without overwriting a terminal outcome."""
