@@ -12,7 +12,14 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .candidates import Candidates
-from .capabilities import policies, readiness, validate_policy
+from .capabilities import (
+    AUTHORITY_RULES,
+    authority_policy_failure,
+    policies,
+    readiness,
+    task_violation,
+    validate_policy,
+)
 from .diagnostics import CheckOutput
 from .history import Journal, Stopped
 from .models import (
@@ -100,6 +107,7 @@ class Engine:
             feedback = {
                 "code": previous_faults[-1]["reason"],
                 "instruction": "Repair against the unchanged stage contract.",
+                "violation": previous_faults[-1].get("violation"),
             }
         action = "output"
         # Counts are reserved durably before invocation. A new controller cannot
@@ -136,6 +144,24 @@ class Engine:
                     raise RuntimeError("TRANSPORT_RETRY_EXHAUSTED") from error
                 action = "transport"
             except OutputViolation as error:
+                # Persist only bounded rule identifiers/context for replay feedback.
+                # Full requested authority remains in redacted diagnostic storage.
+                violation = (
+                    {
+                        key: error.details[key]
+                        for key in (
+                            "reason",
+                            "path",
+                            "rule",
+                            "task",
+                            "criterion",
+                            "unsupported_fields",
+                        )
+                        if key in error.details
+                    }
+                    if str(error) in AUTHORITY_RULES and isinstance(error.details, dict)
+                    else None
+                )
                 self.journal.append(
                     run,
                     "output_rejected",
@@ -144,6 +170,7 @@ class Engine:
                     target=contract.target_digest,
                     reason=str(error),
                     authoritative=False,
+                    violation=violation,
                 )
                 if authority.external_writes:
                     self.journal.append(
@@ -155,6 +182,7 @@ class Engine:
                     raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
                 feedback = {
                     "code": str(error),
+                    "violation": violation,
                     "instruction": "Repair the response against the same contract. "
                     "Do not change accepted "
                     "criteria, policy or evaluation target. Inspect supplied files when needed.",
@@ -500,36 +528,11 @@ class Engine:
     def _readiness(self, run: str, task: Task, config: RunConfig, plan: Plan) -> None:
         try:
             self.journal.append(run, "readiness", **readiness(task, config))
-        except Stopped as error:
+        except Stopped:
             self.journal.diagnostic(
                 run,
                 "readiness",
-                {
-                    "reason": str(error),
-                    "authority": task.authority.model_dump(mode="json"),
-                    "unsupported_fields": [
-                        name
-                        for name in ("credentials", "operation_approval", "duplicate_prevention")
-                        if getattr(task.authority, name)
-                    ],
-                    "authority_ceiling": config.authority_ceiling.model_dump(mode="json"),
-                    "security": config.security,
-                    "failure_path": {
-                        "AUTHORITY_EXCEEDS_POLICY": "authority",
-                        "REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE": "authority",
-                        "READ_ONLY_NETWORK_BOUNDARY_UNAVAILABLE": "authority.network_hosts",
-                        "STRICT_OPERATION_BOUNDARY_REQUIRED": (
-                            "authority.operation_approval/duplicate_prevention"
-                        ),
-                        "EXTERNAL_VERIFICATION_PATH_UNAVAILABLE": "criteria.checks",
-                    }.get(str(error)),
-                    "external_evidence_checks": [
-                        check.id
-                        for check in config.checks
-                        if check.evidence_kind == "external_effect"
-                    ],
-                    "criteria": [item.model_dump(mode="json") for item in task.criteria],
-                },
+                task_violation(task, config),
                 kind="readiness_failed",
                 task=task.id,
                 task_digest=task.digest,
@@ -738,15 +741,7 @@ class Engine:
     def _authorize(
         self, run: str, config: RunConfig, authority: Authority, task_digest: str
     ) -> None:
-        reason = None
-        if not authority.within(config.authority_ceiling):
-            reason = "AUTHORITY_EXCEEDS_POLICY"
-        elif (
-            config.security == "strict"
-            and authority.external_writes
-            and not (authority.operation_approval and authority.duplicate_prevention)
-        ):
-            reason = "STRICT_OPERATION_BOUNDARY_REQUIRED"
+        reason = authority_policy_failure(authority, config)
         if reason is not None:
             self.journal.append(run, "policy_denied", task_digest=task_digest, reason=reason)
             raise Stopped(reason)

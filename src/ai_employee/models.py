@@ -82,11 +82,27 @@ class Goal(Contract):
 
 
 class Authority(Contract):
-    network_hosts: tuple[Text, ...] = ()
-    credentials: tuple[Key, ...] = ()
-    external_writes: bool = False
-    operation_approval: bool = False
-    duplicate_prevention: bool = False
+    network_hosts: tuple[Text, ...] = Field(
+        default=(),
+        description="HTTPS destination host grants; not URLs or per-operation permissions.",
+    )
+    credentials: tuple[Key, ...] = Field(
+        default=(),
+        description="Named service credentials required by the task, not model authentication.",
+    )
+    external_writes: bool = Field(
+        default=False,
+        description="Requires a write-capable external grant; "
+        "local workspace writes do not require this.",
+    )
+    operation_approval: bool = Field(
+        default=False, description="Requires enforced approval before each external operation."
+    )
+    duplicate_prevention: bool = Field(
+        default=False,
+        description="Requires enforced prevention of duplicate external side effects; "
+        "unrelated to deduplicating local data.",
+    )
 
     @model_validator(mode="after")
     def resource_names(self) -> Self:
