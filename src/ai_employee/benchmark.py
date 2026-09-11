@@ -26,14 +26,80 @@ from .native import Model
 
 class Request(Contract):
     protocol: Literal["pocket-agent-v1"]
-    operation: Literal["run"]
+    operation: Literal["run", "cleanup"]
     control_dir: Path
     workspace: Path
     public_checks: Path
     instruction: Text
-    seconds: float = Field(gt=0)
+    seconds: float = Field(ge=0)
     writable_roots: tuple[Literal["src"], Literal["output"]] = ("src", "output")
-    config: RunConfig
+    config: RunConfig | None = None
+    model: Text | None = None
+    effort: Text | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+    def configured(self) -> RunConfig:
+        if self.config is not None and self.settings:
+            raise ValueError("AMBIGUOUS_BENCHMARK_CONFIGURATION")
+        if set(self.settings) - {"config"}:
+            raise ValueError("UNSUPPORTED_BENCHMARK_SETTINGS")
+        selected = self.config or RunConfig.model_validate(self.settings.get("config"))
+        data = selected.model_dump(mode="json")
+
+        # Experimental model/effort are fixed across all model calls, including
+        # configured reviewers and recovery. Never infer a different provider.
+        def override(policy: dict[str, Any]) -> None:
+            if self.model is not None:
+                policy["model"] = self.model
+                policy["reviewer_model"] = self.model
+            if self.effort is not None:
+                policy["effort"] = self.effort
+                policy["reviewer_effort"] = self.effort
+
+        for key in ("clarification", "planning", "worker", "verification", "recovery", "selection"):
+            if data[key] is not None:
+                override(data[key])
+        for key in ("worker_options", "worker_escalations"):
+            for policy in data[key]:
+                override(policy)
+        return RunConfig.model_validate(data)
+
+
+def public_check(sources: dict[str, str]) -> Check:
+    # Execute exact public artifacts with their real module/script context. No
+    # implementation script is run by this structural check.
+    program = (
+        "import tempfile,runpy; from pathlib import Path; "
+        f"sources={sources!r}; "
+        "\nwith tempfile.TemporaryDirectory(prefix='fleet-public-') as directory:\n"
+        " root=Path(directory)\n"
+        " for name, source in sources.items(): (root/name).write_text(source)\n"
+        " runpy.run_path(str(root/'smoke.py'),run_name='__main__')\n"
+    )
+    return Check(id="benchmark-public-smoke", argv=("/usr/bin/python3", "-I", "-B", "-c", program))
+
+
+def cleanup(request: Request, model: Model | None = None) -> dict[str, Any]:
+    control = checked_directory(request.control_dir)
+    state = control / "fleet-autonomous"
+    if state.is_symlink():
+        raise ValueError("INVALID_BENCHMARK_STATE")
+    if state.exists():
+        workspaces = state / "workspaces"
+        if workspaces.is_symlink():
+            raise ValueError("INVALID_BENCHMARK_STATE")
+        journal = Journal(state / "history.db")
+        for run_id in journal.runs():
+            journal.stop(run_id, "BENCHMARK_CLEANUP")
+            with journal.controller(run_id):
+                configured = journal.config(run_id)
+                adapter = model or ContainerModel(configured.isolation)
+                adapter.reconcile(state / "workspaces" / run_id)
+    return {
+        "protocol": request.protocol,
+        "outcome": "cleaned",
+        "details": {"cleanup": "confirmed", "history_retained": state.exists()},
+    }
 
 
 def checked_directory(path: Path, parent: Path | None = None) -> Path:
@@ -46,6 +112,15 @@ def checked_directory(path: Path, parent: Path | None = None) -> Path:
 
 
 def run(request: Request, model: Model | None = None) -> dict[str, Any]:
+    if request.operation == "cleanup":
+        return cleanup(request, model)
+    if request.seconds <= 0:
+        return {
+            "protocol": request.protocol,
+            "outcome": "failed",
+            "details": {"failure": "BENCHMARK_BUDGET_EXHAUSTED"},
+        }
+    configured = request.configured()
     control = checked_directory(request.control_dir)
     workspace = checked_directory(request.workspace, control)
     checks = checked_directory(request.public_checks, control)
@@ -68,23 +143,17 @@ def run(request: Request, model: Model | None = None) -> dict[str, Any]:
         name: (candidates.root / check_tree / str(entry["blob"])).read_text()
         for name, entry in check_files.items()
     }
-    smoke = (
-        "import sys,types; module=types.ModuleType('execution'); "
-        "sys.modules['execution']=module; "
-        f"exec(compile({sources['execution.py']!r},'execution.py','exec'),module.__dict__); "
-        f"exec(compile({sources['smoke.py']!r},'smoke.py','exec'),{{'__name__':'__main__'}})"
-    )
-    public = Check(id="benchmark-public-smoke", argv=("/usr/bin/python3", "-I", "-B", "-c", smoke))
-    if public.id in {item.id for item in request.config.checks}:
+    public = public_check(sources)
+    if public.id in {item.id for item in configured.checks}:
         raise ValueError("BENCHMARK_CHECK_ID_CONFLICT")
     config = RunConfig.model_validate(
         {
-            **request.config.model_dump(mode="json"),
-            "checks": [item.model_dump(mode="json") for item in (*request.config.checks, public)],
-            "mandatory_checks": [*request.config.mandatory_checks, public.id],
+            **configured.model_dump(mode="json"),
+            "checks": [item.model_dump(mode="json") for item in (*configured.checks, public)],
+            "mandatory_checks": [*configured.mandatory_checks, public.id],
             "limits": {
-                **request.config.limits.model_dump(mode="json"),
-                "wall_seconds": min(request.seconds, request.config.limits.wall_seconds),
+                **configured.limits.model_dump(mode="json"),
+                "wall_seconds": min(request.seconds, configured.limits.wall_seconds),
             },
         }
     )
@@ -96,7 +165,7 @@ def run(request: Request, model: Model | None = None) -> dict[str, Any]:
     failure: str | None = None
     try:
         engine.execute(run_id)
-    except (Stopped, ValueError, TimeoutError, OSError) as error:
+    except (Stopped, ValueError, TimeoutError, OSError, RuntimeError) as error:
         failure = str(error)[:200]
     view = projection(journal, run_id)
     events = journal.events(run_id)

@@ -17,9 +17,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
+from pydantic import ValidationError
+
 from .history import Stopped
-from .models import Authority, Contract, StagePolicy, Usage
+from .models import Authority, Check, Contract, StagePolicy, Usage
 from .process_lifecycle import terminate_group
+from .stage_contracts import OutputViolation, validation_code
 
 T = TypeVar("T", bound=Contract)
 _OFFLINE = Authority()
@@ -103,6 +106,16 @@ def summarize_event(line: str) -> dict[str, Any] | None:
 
 
 class Model(Protocol):
+    def preflight(
+        self,
+        policy: StagePolicy,
+        workspace: Path,
+        authority: Authority,
+        timeout: float,
+        cancelled: Callable[[], bool],
+        checks: tuple[Check, ...] = (),
+    ) -> dict[str, Any]: ...
+
     def reconcile(self, run_directory: Path) -> None: ...
 
     def apply_authority(
@@ -262,8 +275,25 @@ def codex_permissions(workspace: Path, authority: Authority) -> tuple[str, ...]:
     return tuple(result)
 
 
-def provider_schema(schema: type[Contract]) -> dict[str, Any]:
+def provider_schema(
+    schema: type[Contract], binding: dict[str, Any] | None = None
+) -> dict[str, Any]:
     result = schema.model_json_schema()
+    if binding is not None:
+        definitions = result.get("$defs", {})
+        criterion = definitions.get("Criterion")
+        if criterion is not None:
+            checks = criterion["properties"]["checks"]
+            if binding["checks"]:
+                checks["items"] = {"type": "string", "enum": list(binding["checks"])}
+            else:
+                checks["maxItems"] = 0
+        finding = definitions.get("Finding")
+        if finding is not None and binding["criteria"] is not None:
+            finding["properties"]["criterion_id"] = {
+                "type": "string",
+                "enum": list(binding["criteria"]),
+            }
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
@@ -361,4 +391,7 @@ def decode_response(output: str, schema: type[T]) -> tuple[T, Usage]:
                     continue
         if event.get("type") == "turn.completed":
             usage = Usage(tokens=measured_tokens(event.get("usage")))
-    return schema.model_validate(payload), usage
+    try:
+        return schema.model_validate(payload), usage
+    except ValidationError as error:
+        raise OutputViolation(validation_code(error), usage) from None

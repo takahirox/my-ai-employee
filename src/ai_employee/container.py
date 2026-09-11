@@ -28,15 +28,17 @@ from .isolated_worker import (
     append_resource_event,
     resource_missing,
 )
-from .models import Authority, StagePolicy, Usage
+from .models import Authority, Check, StagePolicy, Usage
 from .native import (
     T,
     codex_permissions,
     decode_response,
+    measured_tokens,
     provider_schema,
     quota_error,
     summarize_event,
 )
+from .product_capabilities import CODEX_VERSION
 
 _OFFLINE = Authority()
 
@@ -53,14 +55,59 @@ class ContainerModel:
     def __init__(self, profile: IsolatedWorkerProfile | None) -> None:
         self.profile = profile
 
+    def preflight(
+        self,
+        policy: StagePolicy,
+        workspace: Path,
+        authority: Authority,
+        timeout: float,
+        cancelled: Callable[[], bool],
+        checks: tuple[Check, ...] = (),
+    ) -> dict[str, Any]:
+        from .capabilities import authority_supported, validate_policy
+
+        validate_policy(policy)
+        authority_supported(authority)
+        if self.profile is None:
+            raise Stopped("EXPLICIT_PROCESS_ISOLATION_PROFILE_REQUIRED")
+        auth = self.profile.auth_file
+        if auth is None or not Path(auth).is_file():
+            raise Stopped("EXPLICIT_DELEGATED_MODEL_AUTH_REQUIRED")
+        # Actual image/native boundary, without an LLM request or service mutation.
+        # Never cache across environment replacement, invocation or authority change.
+        with self._candidate(workspace, timeout, cancelled, models=False, authority=authority) as c:
+            version = c._docker("exec", c.name, "codex", "--version").decode().strip()
+            if version != CODEX_VERSION:
+                raise Stopped("UNSUPPORTED_NATIVE_VERSION")
+            c._docker(
+                "exec",
+                c.name,
+                "python",
+                "-I",
+                "-c",
+                "import shutil,sys; "
+                "sys.exit(any(shutil.which(name) is None for name in sys.argv[1:]))",
+                *(check.argv[0] for check in checks),
+            )
+            self._native_probe(c, authority)
+            return {
+                "version": version,
+                "backend": policy.backend,
+                "image": c.profile.image,
+                "environment": c.name,
+                "authority_digest": authority.digest,
+                "available": True,
+                "scope": "probe_only; invocation_rechecks",
+            }
+
     @staticmethod
     def _validate(authority: Authority) -> None:
-        # Coarse destination grants are implemented; semantic operation control
-        # and service credential provisioning require a real provider boundary.
-        if authority.credentials or authority.operation_approval or authority.duplicate_prevention:
-            raise ValueError("REQUIRED_AUTHORITY_BOUNDARY_UNAVAILABLE")
-        if authority.network_hosts and not authority.external_writes:
-            raise ValueError("READ_ONLY_NETWORK_BOUNDARY_UNAVAILABLE")
+        from .capabilities import authority_supported
+
+        try:
+            authority_supported(authority)
+        except Stopped as error:
+            raise ValueError(str(error)) from None
 
     def _candidate(
         self,
@@ -266,6 +313,10 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 if observation is not None:
                     observation({"event": "usage_limit", "source": "provider"})
                 raise Stopped("USAGE_LIMIT")
+            if event.get("type") == "turn.completed" and observation is not None:
+                observation(
+                    {"event": "usage_observed", "tokens": measured_tokens(event.get("usage"))}
+                )
             summary = summarize_event(encoded)
             if observation is not None and summary is not None and observation_count < 1000:
                 observation(summary)
@@ -310,7 +361,7 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 "import sys; from pathlib import Path; "
                 "Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
                 schema_path,
-                data=json.dumps(provider_schema(schema)).encode(),
+                data=json.dumps(provider_schema(schema, body.get("stage_contract"))).encode(),
             )
             command = (
                 "codex",

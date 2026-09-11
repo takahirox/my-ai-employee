@@ -17,6 +17,29 @@ from typing import Any
 from uuid import uuid4
 
 from .models import Authority, RunConfig, Usage
+from .stage_contracts import VERSION
+
+# These events advance execution authority. Diagnostic observations and usage may
+# still arrive after cancellation, but none of these decisions may do so.
+DECISIONS = frozenset(
+    {
+        "goal",
+        "plan",
+        "accepted",
+        "completed",
+        "stage_result",
+        "attempt_started",
+        "worker_selected",
+        "worker_result",
+        "candidate",
+        "verification",
+        "authority_applied",
+        "authority_approved",
+        "clarification_wait",
+        "readiness",
+        "preflight",
+    }
+)
 
 
 class Stopped(RuntimeError):
@@ -91,6 +114,7 @@ class Journal:
             {
                 "config_digest": config.digest,
                 "original_digest": hashlib.sha256(original.encode()).hexdigest(),
+                "contract_version": VERSION,
             },
         )
         return run
@@ -148,14 +172,41 @@ class Journal:
     def append(self, run: str, kind: str, **body: Any) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if kind in DECISIONS:
+                self._decision_guard(db, run)
+                if kind in {"accepted", "completed"}:
+                    prior = db.execute(
+                        "SELECT body FROM events WHERE run=? AND kind=?", (run, kind)
+                    ).fetchall()
+                    if any(json.loads(row[0]) == body for row in prior):
+                        return
             self._event(db, run, kind, body)
+
+    @staticmethod
+    def _decision_guard(db: sqlite3.Connection, run: str) -> None:
+        if db.execute(
+            "SELECT 1 FROM events WHERE run=? "
+            "AND kind IN ('stopped','authority_revocation_requested')",
+            (run,),
+        ).fetchone():
+            raise Stopped("RUN_STOPPED")
+        row = db.execute(
+            "SELECT body FROM events WHERE run=? AND kind='created'", (run,)
+        ).fetchone()
+        if row is None or json.loads(row[0]).get("contract_version") != VERSION:
+            raise Stopped("CONTRACT_VERSION_CHANGED")
 
     def append_many(self, run: str, entries: tuple[tuple[str, dict[str, Any]], ...]) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM events WHERE run=? AND kind='stopped'", (run,)).fetchone():
-                raise Stopped("RUN_STOPPED")
+            self._decision_guard(db, run)
             for kind, body in entries:
+                if kind in {"accepted", "completed"}:
+                    prior = db.execute(
+                        "SELECT body FROM events WHERE run=? AND kind=?", (run, kind)
+                    ).fetchall()
+                    if any(json.loads(row[0]) == body for row in prior):
+                        continue
                 self._event(db, run, kind, body)
 
     def budget(self, run: str) -> dict[str, Any]:
@@ -254,14 +305,30 @@ class Journal:
             self.stop(run, "RUN_BUDGET_EXHAUSTED")
             raise Stopped("RUN_BUDGET_EXHAUSTED")
 
-    def reserve(self, run: str, stage: str, *, model_usage: bool = True) -> tuple[str, float]:
+    def reserve(
+        self,
+        run: str,
+        stage: str,
+        *,
+        model_usage: bool = True,
+        binding: dict[str, Any] | None = None,
+        call_key: str | None = None,
+        call_limit: int | None = None,
+    ) -> tuple[str, float]:
         self.check(run)
         limits = self.config(run).limits
         reservation = "attempt-" + uuid4().hex
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM events WHERE run=? AND kind='stopped'", (run,)).fetchone():
-                raise Stopped("RUN_STOPPED")
+            self._decision_guard(db, run)
+            ordinal = 0
+            if call_key is not None:
+                rows = db.execute(
+                    "SELECT body FROM events WHERE run=? AND kind='reserved'", (run,)
+                ).fetchall()
+                ordinal = sum(json.loads(row[0]).get("call_key") == call_key for row in rows)
+                if call_limit is not None and ordinal >= call_limit:
+                    raise Stopped("STAGE_INVOCATION_LIMIT")
             usage = db.execute(
                 "SELECT COUNT(*),COALESCE(SUM(seconds),0),COALESCE(SUM(tokens),0),"
                 "COALESCE(SUM(cost),0) FROM reservations WHERE run=?",
@@ -292,6 +359,10 @@ class Journal:
                     "seconds": seconds,
                     "tokens": tokens,
                     "cost": cost,
+                    "call_key": call_key,
+                    "ordinal": ordinal,
+                    "binding": binding,
+                    "start_intent": True,
                 },
             )
         return reservation, seconds
@@ -304,8 +375,20 @@ class Journal:
             row = db.execute(
                 "SELECT * FROM reservations WHERE id=? AND run=?", (reservation, run)
             ).fetchone()
-            if row is None or row["settled"]:
+            if row is None:
                 raise ValueError("FOREIGN_OR_SETTLED_RESERVATION")
+            if row["settled"]:
+                prior = db.execute(
+                    "SELECT body FROM events WHERE run=? AND kind='settled'", (run,)
+                ).fetchall()
+                expected = {
+                    "id": reservation,
+                    "seconds": seconds,
+                    "usage": usage.model_dump(mode="json"),
+                }
+                if any(json.loads(item[0]) == expected for item in prior):
+                    return
+                raise ValueError("CONFLICTING_USAGE_DELIVERY")
             # Missing data retains the full reservation, including after a crash.
             tokens = row["tokens"] if usage.tokens is None else usage.tokens
             cost = row["cost"] if usage.cost is None else usage.cost

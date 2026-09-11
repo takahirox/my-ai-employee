@@ -26,9 +26,21 @@ jobs:
       - run: .venv/bin/ruff format --check .
       - run: .venv/bin/ruff check .
       - run: .venv/bin/mypy src
+      - name: Pinned public integration artifacts (no graders or task solutions)
+        uses: actions/checkout@v6
+        with:
+          repository: takahirox/pocket-agent-bench
+          ref: cc4be01f8857d7c4c70630cb5fa87ba8884a15c8
+          path: .contract-fixtures/pocket-agent-bench
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /src/pocket_bench/smoke.py
+            /src/pocket_bench/execution.py
+            /src/pocket_bench/connected_agent.py
       - run: .venv/bin/pytest -q
         env:
           FLEET_TEST_INSPECTOR_HTTP: "1"
+          FLEET_PUBLIC_CONTRACT_ROOT: .contract-fixtures/pocket-agent-bench
       - run: .venv/bin/python -m build
 
   isolation:

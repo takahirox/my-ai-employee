@@ -7,7 +7,10 @@ means the controller finished, not that the external grader found the result cor
 
 The request has `protocol`, `operation: "run"`, absolute `control_dir`, `workspace`
 and `public_checks`, `instruction`, positive `seconds`, `writable_roots: ["src",
-"output"]`, and a complete current `config`. Both public input directories must be
+"output"]`, and a complete current configuration in `settings.config`.
+The standard optional `model` and `effort` fix all stage/reviewer selections for the
+experiment. Direct product callers may alternatively supply top-level `config`;
+supplying both configuration forms is rejected. Both public input directories must be
 inside the private control directory. The public workspace contains only `input`,
 `src` and `output`; the checks directory contains `smoke.py` and `execution.py`.
 
@@ -24,3 +27,15 @@ live evaluation; the regression tests use scripted models and disposable fixture
 
 Legacy benchmark profiles and controller entry points have been removed. There is
 no migration adapter for their configuration.
+
+`operation: "cleanup"` uses the same request (even when `seconds` has reached zero).
+It stops the disposable Run and reconciles only its owned resource ledgers, without
+model access. It returns `cleaned` only after confirmed cleanup, and is idempotent.
+History is retained for diagnosis. Missing Docker access or uncertain creation/
+cleanup leaves the state intact and fails explicitly. The benchmark separately
+terminates its controller process group; cleanup must not race an active controller.
+
+Protected public checks execute the original `smoke.py` and `execution.py` in a
+temporary directory with normal module/script context. Structural smoke validates
+an optional execution declaration but never runs its script. Creating an executable
+artifact is not proof that its external operation has already completed.

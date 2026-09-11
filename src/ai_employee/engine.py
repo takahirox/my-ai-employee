@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from .candidates import Candidates
+from .capabilities import policies, readiness, validate_policy
 from .history import Journal, Stopped
 from .models import (
     Authority,
@@ -29,6 +32,7 @@ from .models import (
     WorkerResult,
 )
 from .native import Model
+from .stage_contracts import VERSION, OutputViolation, StageContract, digest, validation_code
 
 T = TypeVar("T", bound=Contract)
 _NO_AUTHORITY = Authority()
@@ -70,15 +74,118 @@ class Engine:
         workspace: Path,
         authority: Authority = _NO_AUTHORITY,
     ) -> T:
+        config = self.journal.config(run)
+        # Non-worker stages may inspect/tool freely in a disposable copy, but
+        # neither a malformed reviewer nor a rejected planner may mutate the
+        # evidence seen by the next invocation.
+        input_tree = None if stage == "worker" else self.candidates.capture(workspace)
+        if input_tree is not None:
+            prompt = {**prompt, "input_tree": input_tree}
+        contract = StageContract.bind(stage, prompt, config)
+        feedback = None
+        previous_faults = [
+            e["body"]
+            for e in self.journal.events(run)
+            if e["kind"] == "output_rejected" and e["body"]["contract"] == contract.identity
+        ]
+        if previous_faults:
+            feedback = {
+                "code": previous_faults[-1]["reason"],
+                "instruction": "Repair against the unchanged stage contract.",
+            }
+        action = "output"
+        # Counts are reserved durably before invocation. A new controller cannot
+        # reset the stage-local limit, including after an uncertain process launch.
+        for _ in range(policy.revisions + policy.transport_retries + 1):
+            try:
+                return self._invoke(
+                    run,
+                    stage,
+                    policy,
+                    {
+                        **prompt,
+                        "stage_contract": contract.projection(),
+                        "contract_feedback": feedback,
+                    },
+                    schema,
+                    workspace if input_tree is None else self._workspace(run, stage, input_tree),
+                    authority,
+                    contract,
+                    action,
+                )
+            except (TimeoutError, ConnectionError) as error:
+                self.journal.append(
+                    run,
+                    "transport_failed",
+                    stage=stage,
+                    contract=contract.identity,
+                    reason=type(error).__name__,
+                )
+                if authority.external_writes:
+                    self.journal.append(run, "uncertain", reason="INTERRUPTED_EXTERNAL_RESPONSE")
+                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
+                if not policy.transport_retries:
+                    raise RuntimeError("TRANSPORT_RETRY_EXHAUSTED") from error
+                action = "transport"
+            except OutputViolation as error:
+                self.journal.append(
+                    run,
+                    "output_rejected",
+                    stage=stage,
+                    contract=contract.identity,
+                    target=contract.target_digest,
+                    reason=str(error),
+                    authoritative=False,
+                )
+                if authority.external_writes:
+                    self.journal.append(
+                        run,
+                        "uncertain",
+                        reason="INVALID_EXTERNAL_RESPONSE",
+                        contract=contract.identity,
+                    )
+                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
+                feedback = {
+                    "code": str(error),
+                    "instruction": "Repair the response against the same contract. "
+                    "Do not change accepted "
+                    "criteria, policy or evaluation target. Inspect supplied files when needed.",
+                }
+                action = "output"
+        if stage.endswith("_review"):
+            raise RuntimeError("REVIEW_UNAVAILABLE")
+        raise RuntimeError("OUTPUT_REPAIR_EXHAUSTED")
+
+    def _invoke(
+        self,
+        run: str,
+        stage: str,
+        policy: StagePolicy,
+        prompt: dict[str, Any],
+        schema: type[T],
+        workspace: Path,
+        authority: Authority,
+        contract: StageContract,
+        action: str,
+    ) -> T:
         try:
-            reservation, timeout = self.journal.reserve(run, stage)
+            reservation, timeout = self.journal.reserve(
+                run,
+                stage,
+                binding=contract.projection(),
+                call_key=contract.identity + ":" + action,
+                call_limit=policy.revisions + 1 if action == "output" else policy.transport_retries,
+            )
         except Stopped as error:
             self.journal.stop(run, str(error))
             raise
         started = time.monotonic()
-        usage = Usage()
+        usage = Usage(tokens=0, cost=0)
 
         def observe(body: dict[str, Any]) -> None:
+            nonlocal usage
+            if body.get("event") == "usage_observed":
+                usage = Usage(tokens=body.get("tokens"), cost=usage.cost)
             if body.get("event") == "usage_limit":
                 self.journal.stop(run, "USAGE_LIMIT")
             self.journal.append(
@@ -86,7 +193,42 @@ class Engine:
             )
 
         try:
-            result, usage = self.model.generate(
+            validate_policy(policy)
+            try:
+                preflight = self.model.preflight(
+                    policy,
+                    workspace,
+                    authority,
+                    timeout,
+                    lambda: self._cancelled(run),
+                    checks=self.journal.config(run).checks,
+                )
+            except (TimeoutError, ConnectionError):
+                raise
+            except (ValueError, OSError) as error:
+                self.journal.append(
+                    run,
+                    "preflight_failed",
+                    stage=stage,
+                    reason="ENVIRONMENT_UNAVAILABLE",
+                    error_type=type(error).__name__,
+                    contract=contract.identity,
+                )
+                raise Stopped("ENVIRONMENT_UNAVAILABLE") from error
+            self.journal.append(
+                run,
+                "preflight",
+                stage=stage,
+                contract=contract.identity,
+                policy_digest=contract.policy_digest,
+                result=preflight,
+            )
+            timeout -= time.monotonic() - started
+            if timeout <= 0:
+                raise TimeoutError("PREFLIGHT_TIMEOUT")
+            self.journal.check(run)
+            usage = Usage()  # Once launched, absent provider measurements stay unknown.
+            result, returned_usage = self.model.generate(
                 policy,
                 json.dumps(
                     {
@@ -113,10 +255,19 @@ class Engine:
                 ),
                 observation=observe,
             )
+            usage = Usage(
+                tokens=returned_usage.tokens if returned_usage.tokens is not None else usage.tokens,
+                cost=returned_usage.cost if returned_usage.cost is not None else usage.cost,
+            )
+            # Fixtures and alternate adapters must pass the same validation as
+            # native decoding; typed objects alone are not acceptance evidence.
+            result = schema.model_validate(result.model_dump(mode="json"))
+            result = contract.validate(result, prompt, self.journal.config(run))
             self.journal.check(run)
             self.journal.append(
                 run,
                 "stage_result",
+                contract=contract.projection(),
                 stage=stage,
                 reservation=reservation,
                 result_digest=result.digest,
@@ -125,6 +276,26 @@ class Engine:
                 effort=policy.effort,
             )
             return result
+        except OutputViolation as error:
+            if error.usage.tokens is not None or error.usage.cost is not None:
+                usage = error.usage
+            raise
+        except ValidationError as error:
+            raise OutputViolation(validation_code(error), usage) from None
+        except (TimeoutError, ConnectionError):
+            raise
+        except (ValueError, OSError) as error:
+            # Arbitrary adapter/environment/invariant errors are not model output
+            # violations. In particular, never send them into Worker graph repair.
+            self.journal.append(
+                run,
+                "stage_failed",
+                stage=stage,
+                reason="ENVIRONMENT_OR_INVARIANT_FAILURE",
+                error_type=type(error).__name__,
+                contract=contract.identity,
+            )
+            raise RuntimeError("ENVIRONMENT_OR_INVARIANT_FAILURE") from error
         except Stopped as error:
             self.journal.stop(run, str(error))
             raise
@@ -134,6 +305,13 @@ class Engine:
                 for event in self.journal.events(run)
             ):
                 raise Stopped("USAGE_LIMIT; ENVIRONMENT_CLEANUP_UNCONFIRMED") from error
+            if authority.external_writes:
+                self.journal.append(
+                    run,
+                    "uncertain",
+                    reason="EXTERNAL_INVOCATION_INTERRUPTED",
+                    contract=contract.identity,
+                )
             raise
         finally:
             self.journal.settle(run, reservation, time.monotonic() - started, usage)
@@ -185,9 +363,27 @@ class Engine:
             Verification,
             workspace,
         )
-        return review.accepts(
-            (Criterion(id="review", description="proposal is acceptable"),)
-        ), review.summary
+        accepted = review.accepts((Criterion(id="review", description="proposal is acceptable"),))
+        self.journal.append(
+            run,
+            "review_diagnostic",
+            stage=stage,
+            target=proposal.digest,
+            result_digest=review.digest,
+            accepted=accepted,
+            authoritative=False,
+            summary="proposal accepted" if accepted else "proposal rejected",
+            findings=[
+                {
+                    "criterion": item.criterion_id,
+                    "passed": item.passed,
+                    "category": item.category,
+                    "evidence_digest": digest(item.evidence),
+                }
+                for item in review.findings
+            ],
+        )
+        return accepted, review.summary
 
     def start(self, original: str, config: RunConfig, source: Path) -> str:
         run = self.prepare(original, config, source)
@@ -214,6 +410,9 @@ class Engine:
                 {
                     "instruction": "Clarify the goal. Do not drop or weaken explicit requirements. "
                     "Map exact original fragments to criteria. Preserve mandatory checks. "
+                    "Before asking a question, inspect permitted original files and evidence. "
+                    "Resolve factual questions (columns, values, existing files) yourself. "
+                    "Only unresolved user intent, scope or authority needs a human. "
                     "Report unresolved ambiguity; do not invent authority.",
                     "original_input": original,
                     "clarification_answers": [
@@ -238,7 +437,7 @@ class Engine:
                 workspace,
                 ambiguous=bool(proposal.unresolved),
             )
-            if proposal.unresolved:
+            if accepted and proposal.unresolved:
                 self.journal.append(
                     run, "clarification_wait", proposal=proposal.model_dump(mode="json")
                 )
@@ -274,6 +473,7 @@ class Engine:
                 workspace,
             )
             for task in plan.tasks:
+                self.journal.append(run, "readiness", **readiness(task, config))
                 self._check_ids(task.criteria, config)
                 self._authorize(run, config, task.authority, task.digest)
             accepted, feedback = self._review(
@@ -426,7 +626,7 @@ class Engine:
             reason = "STRICT_OPERATION_BOUNDARY_REQUIRED"
         if reason is not None:
             self.journal.append(run, "policy_denied", task_digest=task_digest, reason=reason)
-            raise ValueError(reason)
+            raise Stopped(reason)
         if authority.external_writes and config.security != "strict":
             self.journal.append(
                 run,
@@ -589,6 +789,13 @@ class Engine:
         upstream: tuple[Candidate, ...],
         base: str,
     ) -> Candidate:
+        # Scheduler inputs must be exact currently accepted upstream Candidates.
+        plans = [e["body"]["plan"] for e in self.journal.events(run) if e["kind"] == "plan"]
+        current = Plan.model_validate(plans[-1])
+        accepted_inputs = self._accepted(run, current)
+        if tuple(accepted_inputs.get(key) for key in task.dependencies) != upstream:
+            raise Stopped("STALE_UPSTREAM_LINEAGE")
+        readiness(task, config)
         prior = [
             event
             for event in self.journal.events(run)
@@ -857,7 +1064,7 @@ class Engine:
             except Stopped as error:
                 self.journal.stop(run, str(error))
                 raise
-            except (ValueError, TimeoutError, RuntimeError) as error:
+            except (ValueError, TimeoutError, RuntimeError, OSError) as error:
                 self.journal.append(run, "failed", reason=str(error)[:200])
                 raise
 
@@ -900,8 +1107,8 @@ class Engine:
         Repeating this command after it exits records mechanical completion.
         """
         self.journal.config(run)
-        self.journal.append(run, "authority_revocation_requested")
         self.journal.stop(run, "AUTHORITY_REVOKED")
+        self.journal.append(run, "authority_revocation_requested")
         with self.journal.controller(run):
             self.model.reconcile(self.root / run)
             self.journal.append(run, "authority_revoked", scope="all_task_sessions", resume=False)
@@ -936,7 +1143,18 @@ class Engine:
                 self.journal.stop(run, "AUTHORITY_REJECTED")
                 return
             authority = Authority.model_validate(request["requested"])
-            self._authorize(run, self.journal.config(run), authority, wait["task_digest"])
+            config = self.journal.config(run)
+            self._authorize(run, config, authority, wait["task_digest"])
+            contexts = [
+                TaskContext.model_validate(e["body"]["context"])
+                for e in events
+                if e["kind"] == "attempt_started" and e["body"]["context"]["attempt_id"] == attempt
+            ]
+            if not contexts:
+                raise Stopped("AUTHORITY_CONTEXT_MISSING")
+            # A newly requested external grant changes the evidence required to
+            # finish safely. Confirm that route before applying the grant.
+            readiness(contexts[-1].task.model_copy(update={"authority": authority}), config)
             workspace = Path(wait["workspace"])
             if not workspace.resolve().is_relative_to(self.root / run):
                 raise ValueError("FOREIGN_WORKSPACE")
@@ -976,7 +1194,11 @@ class Engine:
 
     def _execute(self, run: str) -> None:
         config = self.journal.config(run)
+        for policy in policies(config):
+            validate_policy(policy)
         events = self.journal.events(run)
+        if events[0]["body"].get("contract_version") != VERSION:
+            raise Stopped("CONTRACT_VERSION_CHANGED")
         if any(event["kind"] == "stopped" for event in events):
             raise Stopped("RUN_STOPPED")
         if any(event["kind"] == "completed" for event in events):
@@ -1111,6 +1333,11 @@ class Engine:
                     "accepted candidates; do not depend on permanently failed tasks.",
                     "goal": goal.model_dump(mode="json"),
                     "previous_plan": previous.model_dump(mode="json"),
+                    "historical_tasks": [
+                        t.model_dump(mode="json")
+                        for t in {t.id: t for p in plans for t in p.tasks}.values()
+                    ],
+                    "available_checks": [c.model_dump(mode="json") for c in config.checks],
                     "accepted": {
                         key: value.model_dump(mode="json") for key, value in accepted.items()
                     },
@@ -1148,6 +1375,7 @@ class Engine:
                 raise ValueError("HISTORICAL_TASK_REWRITTEN")
             if task.supersedes is not None and task.supersedes not in historical:
                 raise ValueError("FOREIGN_REPAIR_TARGET")
+            self.journal.append(run, "readiness", **readiness(task, config))
             self._check_ids(task.criteria, config)
             self._authorize(run, config, task.authority, task.digest)
         self.journal.append(

@@ -16,6 +16,7 @@ from ai_employee.engine import Engine
 from ai_employee.history import Journal, Stopped
 from ai_employee.models import (
     Authority,
+    Check,
     Clarification,
     Contract,
     Criterion,
@@ -57,6 +58,17 @@ def clarification() -> Clarification:
 
 
 class OfflineModel:
+    def preflight(
+        self,
+        policy: StagePolicy,
+        workspace: Path,
+        authority: Authority,
+        timeout: float,
+        cancelled: Callable[[], bool],
+        checks: tuple[Check, ...] = (),
+    ) -> dict[str, Any]:
+        return {"backend": policy.backend, "available": True, "environment": "hermetic-fixture"}
+
     def reconcile(self, run_directory: Path) -> None:
         pass
 
@@ -314,6 +326,29 @@ class AuthorityModel(OfflineModel):
         observer: Callable[[float, int], None] | None = None,
         observation: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[T, Usage]:
+        if schema is Plan:
+            result, usage = super().generate(
+                policy, prompt, schema, workspace, authority, timeout, cancelled
+            )
+            plan = Plan.model_validate(result.model_dump())
+            tasks = tuple(
+                task.model_copy(
+                    update={
+                        "criteria": tuple(
+                            c.model_copy(
+                                update={
+                                    "checks": tuple(json.loads(prompt)["stage_contract"]["checks"])
+                                }
+                            )
+                            for c in task.criteria
+                        )
+                    }
+                )
+                for task in plan.tasks
+            )
+            return schema.model_validate(
+                plan.model_copy(update={"tasks": tasks}).model_dump()
+            ), usage
         if schema is WorkerResult and not self.requested:
             self.requested = True
             (workspace / "retained.txt").write_text("useful progress")
@@ -321,7 +356,9 @@ class AuthorityModel(OfflineModel):
                 WorkerResult(
                     status="authority_requested",
                     summary="need network",
-                    authority_request=Authority(network_hosts=("example.com",)),
+                    authority_request=Authority(
+                        network_hosts=("example.com",), external_writes=True
+                    ),
                 ).model_dump()
             ), Usage(tokens=10)
         if schema is WorkerResult:
@@ -334,7 +371,11 @@ def test_authority_approval_applies_before_resume_and_preserves_workspace(tmp_pa
     model = AuthorityModel()
     engine, source = runtime(tmp_path, model)
     cfg = config().model_copy(
-        update={"authority_ceiling": Authority(network_hosts=("example.com",))}
+        update={
+            "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
+            "security": "balanced",
+            "checks": (Check(id="receipt", argv=("true",)),),
+        }
     )
     run = engine.start("Write result", cfg, source)
     waiting = engine.journal.events(run)[-1]
@@ -352,7 +393,11 @@ def test_failed_authority_application_does_not_resume(tmp_path: Path) -> None:
     model = AuthorityModel(apply_fails=True)
     engine, source = runtime(tmp_path, model)
     cfg = config().model_copy(
-        update={"authority_ceiling": Authority(network_hosts=("example.com",))}
+        update={
+            "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
+            "security": "balanced",
+            "checks": (Check(id="receipt", argv=("true",)),),
+        }
     )
     run = engine.start("Write result", cfg, source)
     waiting = engine.journal.events(run)[-1]
@@ -441,6 +486,11 @@ def test_configured_replan_limit_prevents_new_model_attempt(tmp_path: Path) -> N
 
 
 class ExternalModel(OfflineModel):
+    def check(
+        self, argv: tuple[str, ...], workspace: Path, timeout: float, cancelled: Callable[[], bool]
+    ) -> tuple[bool, str]:
+        return False, "remote receipt not established"
+
     def generate(
         self,
         policy: StagePolicy,
@@ -458,7 +508,16 @@ class ExternalModel(OfflineModel):
         )
         if schema is Plan:
             plan = Plan.model_validate(result.model_dump())
-            task = plan.tasks[0].model_copy(update={"authority": Authority(external_writes=True)})
+            checks = json.loads(prompt)["stage_contract"]["checks"]
+            task = plan.tasks[0].model_copy(
+                update={
+                    "authority": Authority(external_writes=True),
+                    "criteria": tuple(
+                        c.model_copy(update={"checks": tuple(checks)})
+                        for c in plan.tasks[0].criteria
+                    ),
+                }
+            )
             return schema.model_validate(
                 plan.model_copy(update={"tasks": (task,)}).model_dump()
             ), usage
@@ -469,7 +528,11 @@ def test_unverified_external_effect_is_not_repeated_by_worker_retry(tmp_path: Pa
     model = ExternalModel(fail_once=True)
     engine, source = runtime(tmp_path, model)
     cfg = config().model_copy(
-        update={"authority_ceiling": Authority(external_writes=True), "security": "balanced"}
+        update={
+            "authority_ceiling": Authority(external_writes=True),
+            "security": "balanced",
+            "checks": (Check(id="external-evidence", argv=("true",)),),
+        }
     )
     run = engine.start("Write result", cfg, source)
     assert model.workers == 1
@@ -584,7 +647,7 @@ def test_strict_policy_blocks_coarse_external_grants_before_worker(tmp_path: Pat
     model = ExternalModel()
     engine, source = runtime(tmp_path, model)
     configured = config().model_copy(update={"authority_ceiling": Authority(external_writes=True)})
-    with pytest.raises(ValueError, match="STRICT_OPERATION_BOUNDARY_REQUIRED"):
+    with pytest.raises(Stopped, match="STRICT_OPERATION_BOUNDARY_REQUIRED"):
         engine.start("Write result", configured, source)
     assert model.workers == 0
 
@@ -647,7 +710,11 @@ def test_external_completion_crash_does_not_repeat_unverified_effect(
     model = ExternalModel()
     engine, source = runtime(tmp_path, model)
     cfg = config().model_copy(
-        update={"authority_ceiling": Authority(external_writes=True), "security": "balanced"}
+        update={
+            "authority_ceiling": Authority(external_writes=True),
+            "security": "balanced",
+            "checks": (Check(id="external-evidence", argv=("true",)),),
+        }
     )
     run = engine.prepare("Write result", cfg, source)
     append = engine.journal.append
@@ -672,7 +739,11 @@ def test_authority_application_obeys_remaining_budget_and_cancellation(tmp_path:
     model = AuthorityModel()
     engine, source = runtime(tmp_path, model)
     cfg = config().model_copy(
-        update={"authority_ceiling": Authority(network_hosts=("example.com",))}
+        update={
+            "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
+            "security": "balanced",
+            "checks": (Check(id="receipt", argv=("true",)),),
+        }
     )
     run = engine.start("Write result", cfg, source)
     attempt = engine.journal.events(run)[-1]["body"]["attempt"]

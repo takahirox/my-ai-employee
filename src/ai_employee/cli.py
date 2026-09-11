@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .candidates import Candidates
+from .capabilities import SUPPORTED_BACKENDS
 from .container import ContainerModel
 from .engine import Engine, Waiting
 from .history import Journal, Stopped
@@ -26,7 +27,7 @@ def parser() -> argparse.ArgumentParser:
     inspector.add_argument("--port", type=int, default=8765)
     initialize = commands.add_parser("init", help="write an operator configuration template")
     initialize.add_argument("--model", required=True)
-    initialize.add_argument("--backend", choices=("codex",), default="codex")
+    initialize.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="codex")
     initialize.add_argument("--image", required=True, help="immutable prepared Docker image ID")
     initialize.add_argument(
         "--auth-file", type=Path, required=True, help="explicit delegated model authentication"
@@ -94,6 +95,16 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         "status": status,
         "external_outcome_uncertain": "uncertain" in kinds,
         "budget": journal.budget(run),
+        "stage_diagnostics": [
+            event["body"]
+            for event in events
+            if event["kind"] in {"output_rejected", "review_diagnostic", "preflight", "readiness"}
+        ],
+        "stage_invocations": [
+            {key: event["body"].get(key) for key in ("stage", "call_key", "ordinal", "binding")}
+            for event in events
+            if event["kind"] == "reserved"
+        ],
         "policy": config.model_dump(mode="json", exclude={"isolation", "checks"}),
         "goal": next(
             (event["body"]["goal"] for event in reversed(events) if event["kind"] == "goal"), None
