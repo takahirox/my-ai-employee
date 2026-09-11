@@ -23,6 +23,7 @@ from .capabilities import (
 from .diagnostics import CheckOutput
 from .history import Journal, Stopped
 from .models import (
+    CLARIFICATION_RULES,
     Authority,
     Candidate,
     Clarification,
@@ -96,6 +97,26 @@ class Engine:
         input_tree = None if stage == "worker" else self.candidates.capture(workspace)
         if input_tree is not None:
             prompt = {**prompt, "input_tree": input_tree}
+            if stage in {"clarification", "clarification_review"}:
+                manifest = self.candidates.manifest(input_tree)
+                files: list[str] = []
+                size = 0
+                for name in sorted(manifest):
+                    if len(files) >= 64 or size + len(name) > 4096:
+                        break
+                    files.append(name)
+                    size += len(name)
+                prompt["input_snapshot"] = {
+                    "tree": input_tree,
+                    "file_count": len(manifest),
+                    "files": files,
+                    "truncated": len(files) < len(manifest),
+                    "meaning": "Runtime snapshot inventory, not proof of content inspection. "
+                    "Paths are relative to the actual execution workspace. Inspect these "
+                    "files before declaring inputs unavailable; original-request paths may "
+                    "describe another environment. A truncated list omits valid paths; "
+                    "inspect the workspace. Never seek unrelated host files.",
+                }
         contract = StageContract.bind(stage, prompt, config)
         feedback = None
         previous_faults = [
@@ -156,12 +177,16 @@ class Engine:
                             "task",
                             "criterion",
                             "unsupported_fields",
+                            "index",
                         )
                         if key in error.details
                     }
-                    if str(error) in AUTHORITY_RULES and isinstance(error.details, dict)
+                    if str(error) in (AUTHORITY_RULES | CLARIFICATION_RULES)
+                    and isinstance(error.details, dict)
                     else None
                 )
+                if str(error) in CLARIFICATION_RULES:
+                    violation = {**CLARIFICATION_RULES[str(error)], **(violation or {})}
                 self.journal.append(
                     run,
                     "output_rejected",
@@ -479,14 +504,13 @@ class Engine:
                 {
                     "instruction": "Clarify the goal. Do not drop or weaken explicit requirements. "
                     "Map exact original fragments to criteria. Preserve mandatory checks. "
-                    "Before asking a question, inspect permitted original files and evidence. "
-                    "Resolve factual questions (columns, values, existing files) yourself. "
-                    "Only unresolved user intent, scope or authority needs a human. "
+                    "Use the shared clarification contract for investigation, unresolved needs "
+                    "and questions; inspect the supplied input snapshot. "
                     "Mark each criterion outcome as artifact or external_effect. Creating a script "
                     "does not complete its external operation unless the original explicitly "
                     "requests that artifact/deferred execution route. External effects require "
                     "operator checks with external_effect evidence_kind. "
-                    "Report unresolved ambiguity; do not invent authority.",
+                    "Do not invent authority.",
                     "original_input": original,
                     "clarification_answers": [
                         event["body"]["answer"]
@@ -508,9 +532,18 @@ class Engine:
                 proposal,
                 {"original_input": original, "mandatory_checks": config.mandatory_checks},
                 workspace,
-                ambiguous=bool(proposal.unresolved),
+                ambiguous=proposal.disposition == "wait",
             )
-            if accepted and proposal.unresolved:
+            if accepted and proposal.disposition == "stop":
+                self.journal.diagnostic(
+                    run,
+                    "clarification",
+                    proposal.model_dump(mode="json"),
+                    kind="clarification_environment_blocked",
+                    target=proposal.digest,
+                )
+                raise Stopped("CLARIFICATION_ENVIRONMENT_BLOCKED")
+            if accepted and proposal.disposition == "wait":
                 self.journal.append(
                     run, "clarification_wait", proposal=proposal.model_dump(mode="json")
                 )

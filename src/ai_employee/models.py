@@ -41,12 +41,114 @@ class Requirement(Contract):
     criteria: tuple[Key, ...] = Field(min_length=1)
 
 
+# One semantic definition for schema, stage context, review, repair and runtime decisions.
+CLARIFICATION_NEEDS = {
+    "human_input": {
+        "action": "wait",
+        "rule": "A concrete user decision or additional information is required by the original "
+        "request and cannot be obtained from permitted inputs. Ask a specific question and "
+        "explain the investigation/evidence. Missing input belongs here only when the user "
+        "must supply it; do not invent out-of-scope requirements.",
+    },
+    "investigation": {
+        "action": "repair",
+        "rule": "Inspect permitted inputs and repair this proposal within the existing revision "
+        "budget. Unknown columns, values or schema are not human questions. Ordinary later "
+        "work belongs in the goal/criteria or assumptions, not unresolved.",
+    },
+    "environment": {
+        "action": "stop",
+        "rule": "Report an input/access/environment blocker with observed evidence after "
+        "checking the supplied snapshot and actual execution workspace. This does not ask "
+        "the user to decide intent, grant authority, or waive isolation. A reported blocker "
+        "stops execution; model claims are not independently proven environment facts.",
+    },
+}
+CLARIFICATION_ACTION_ORDER = ("repair", "stop", "wait", "proceed")
+CLARIFICATION_RULES = {
+    "CLARIFICATION_QUESTION_ACTION_MISMATCH": {
+        "path": "unresolved.question",
+        "rule": "A specific question for the user is required only for human_input; "
+        "question must be null for investigation or environment.",
+    },
+    "CLARIFICATION_REQUIRES_INVESTIGATION": {
+        "path": "unresolved",
+        "rule": CLARIFICATION_NEEDS["investigation"]["rule"],
+    },
+    "FOREIGN_CLARIFICATION_REFERENCE": {
+        "path": "unresolved.original_fragment",
+        "rule": "Each unresolved need must cite an exact fragment of the original request. "
+        "Do not add questions for excluded or unrequested cases.",
+    },
+}
+
+
+class ClarificationNeed(Contract):
+    kind: Literal["human_input", "investigation", "environment"] = Field(
+        description=json.dumps(CLARIFICATION_NEEDS, sort_keys=True)
+    )
+    question: Text | None = Field(
+        description=CLARIFICATION_RULES["CLARIFICATION_QUESTION_ACTION_MISMATCH"]["rule"]
+    )
+    reason: Text = Field(description="Why this need blocks the original request.")
+    original_fragment: Text = Field(
+        description=CLARIFICATION_RULES["FOREIGN_CLARIFICATION_REFERENCE"]["rule"]
+    )
+    evidence: Text = Field(
+        description="Observed permitted-input investigation or facts supporting this need. "
+        "Distinguish inspected facts from assumptions; never claim an unperformed inspection."
+    )
+
+    @property
+    def action(self) -> str:
+        return CLARIFICATION_NEEDS[self.kind]["action"]
+
+    @model_validator(mode="after")
+    def question_matches_action(self) -> Self:
+        if (self.action == "wait") != (self.question is not None):
+            raise ValueError("CLARIFICATION_QUESTION_ACTION_MISMATCH")
+        return self
+
+
 class Clarification(Contract):
-    clarified_goal: Text
-    criteria: tuple[Criterion, ...] = Field(min_length=1)
-    requirements: tuple[Requirement, ...] = Field(min_length=1)
-    assumptions: tuple[Text, ...] = ()
-    unresolved: tuple[Text, ...] = ()
+    clarified_goal: Text = Field(description="Faithful goal preserving the original request.")
+    criteria: tuple[Criterion, ...] = Field(
+        min_length=1, description="Checkable success criteria, preserving required outcome kinds."
+    )
+    requirements: tuple[Requirement, ...] = Field(
+        min_length=1, description="Exact original fragments mapped to their success criteria."
+    )
+    assumptions: tuple[Text, ...] = Field(
+        default=(),
+        description="Disclosed interpretations and ordinary deferred work; "
+        "never hide a necessary user decision or waive requirements here.",
+    )
+    unresolved: tuple[ClarificationNeed, ...] = Field(
+        default=(),
+        description="Blocking needs with explicit resolution semantics. Empty when "
+        "the goal can proceed. Nonempty does not by itself authorize a human wait.",
+    )
+
+    @property
+    def disposition(self) -> str:
+        actions = {need.action for need in self.unresolved}
+        # Investigation must finish before deciding whether remaining needs require
+        # a stop or a human answer. Environment blockers take precedence over waiting.
+        return next(
+            (action for action in CLARIFICATION_ACTION_ORDER if action in actions), "proceed"
+        )
+
+    @classmethod
+    def semantics(cls) -> dict[str, object]:
+        return {
+            "fields": {name: field.description for name, field in cls.model_fields.items()},
+            "needs": CLARIFICATION_NEEDS,
+            "violations": CLARIFICATION_RULES,
+            "precedence": CLARIFICATION_ACTION_ORDER,
+            "review": "Review both the goal and every unresolved need against the original "
+            "request and permitted inputs. Reject misclassified, unsupported or unnecessary "
+            "human questions. Approval cannot convert investigation into a human wait.",
+        }
 
     @model_validator(mode="after")
     def unique_criteria(self) -> Self:
@@ -68,8 +170,12 @@ class Goal(Contract):
 
     @model_validator(mode="after")
     def accepted(self) -> Self:
-        if self.specification.unresolved:
-            raise ValueError("WAITING_FOR_CLARIFICATION")
+        if self.specification.disposition != "proceed":
+            raise ValueError(
+                "WAITING_FOR_CLARIFICATION"
+                if self.specification.disposition == "wait"
+                else "CLARIFICATION_NOT_READY"
+            )
         if any(
             item.original_fragment not in self.original_input
             for item in self.specification.requirements

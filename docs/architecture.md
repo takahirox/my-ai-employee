@@ -47,12 +47,36 @@ is no legacy runtime, compatibility profile router or database migration subsyst
 
 ## Stage contracts and execution readiness
 
-`stage_contracts.py` binds each invocation to `stage-contract-2`, its exact input
+`stage_contracts.py` binds each invocation to `stage-contract-3`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing
 references into native provider schemas, prompts, validation and repair feedback.
 A new DAG can define its own local IDs. Review findings must cover exactly the
 review/verification criterion namespace. Recovery cannot redefine historical tasks.
+
+Clarification uses structured `unresolved` needs whose meaning is owned by
+`models.py`: `human_input` requires a concrete question, a relevant original
+fragment, reason and investigation evidence; `investigation` enters existing
+bounded response repair; `environment` reports a blocker and stops after acceptance.
+Only accepted human-input needs cause durable `clarification_wait`. Pending
+inspection and ordinary deferred work do not become questions just because they
+are unresolved. Mixed needs are repaired first, then environmental stops take
+precedence over human waits. Goal acceptance uses the same disposition.
+
+The same definitions supply field descriptions/provider schema, clarification and
+review context, admission and repair feedback. Review remains governed by Run
+policy; no classifier call or new retry budget is added. Both clarification and its
+review see a bounded inventory from their actual immutable input snapshot. The
+native adapter identifies its execution workspace separately from paths in the
+original request. An inventory is not content-inspection evidence, and reported
+model evidence does not independently prove file absence or classify arbitrary
+natural language correctly. Existing semantic review, native preflight and
+protected verification remain distinct safeguards. Environment reports retain
+bounded diagnostics and never request an implicit permission expansion.
+
+Stage-contract-3 rejects older journals before resuming; legacy free-text needs are
+not reinterpreted or silently converted to human questions. Fresh malformed model
+responses instead use the existing bounded output repair path.
 
 The authority projection also carries field meanings, unsupported product controls,
 Run ceiling/security rules and registered external evidence routes. `capabilities.py`
@@ -68,9 +92,9 @@ protected evidence checks remain necessary layers.
 
 Authority repair feedback retains bounded Task/field/rule context in the existing
 rejection event; full rejected proposals stay in bounded diagnostic storage. Resume
-uses the same contract identity and durable reservation counter. The version bump
-rejects prior stage-contract-1 journals rather than giving their invocations fresh
-identities and accidentally resetting counters; no migration is provided.
+uses the same contract identity and durable reservation counter. Older contract journals
+are rejected rather than giving their invocations fresh identities and accidentally
+resetting counters; no migration is provided.
 
 Malformed output and invalid references enter bounded response repair. Reviewer
 output faults remain in the reviewer; exhausting that repair is review unavailable,
