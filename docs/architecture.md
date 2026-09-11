@@ -47,6 +47,23 @@ is no legacy runtime, compatibility profile router or database migration subsyst
 
 ## Stage contracts and execution readiness
 
+`Journal.remaining_wall` owns the wall-time definition, including the union of
+approval waits when policy excludes them. Admission caps each reservation by that
+remaining time, the per-invocation limit and shared active allowance; it rechecks
+wall time after acquiring the reservation lock. Concurrent calls share active
+charges but do not subtract each other's wall reservations. Resume keeps the
+original clock and existing charges.
+
+Preflight and native setup consume the invocation's existing deadline. The model's
+execution budget is reduced before dispatch, with bounded `execution_budget`
+observations recording the post-preflight and native-dispatch allowances. Protected
+checks and authority application use the same reservation rule. A Run stop takes
+precedence over transport retry classification; interrupted external operations
+still retain uncertainty. Late check output remains diagnostic evidence and cannot
+become an accepted check receipt after expiry. Mandatory verification, configured
+review and cleanup are unchanged; no fixed completion reserve or extra budget is
+introduced. These rules align deadlines, not guarantee task completion within them.
+
 `stage_contracts.py` binds each invocation to `stage-contract-3`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing

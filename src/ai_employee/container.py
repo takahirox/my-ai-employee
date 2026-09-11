@@ -354,7 +354,6 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
             body["execution_workspace"] = "/work"
             if isinstance(body.get("context"), dict):
                 body["context"]["workspace"] = "/work"
-            prompt = json.dumps(body, ensure_ascii=False)
             schema_path = "/tmp/fleet-output-schema.json"
             candidate._docker(
                 "exec",
@@ -389,6 +388,17 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 schema_path,
                 "-",
             )
+            # Native setup consumes the same deadline as the actual model process.
+            remaining = candidate.deadline - time.monotonic()
+            if remaining <= 0 or cancelled():
+                raise TimeoutError("NATIVE_SETUP_TIMEOUT")
+            if "execution_budget" in body:
+                body["execution_budget"]["reserved_active_seconds"] = remaining
+            if observation is not None:
+                observation(
+                    {"event": "execution_budget", "phase": "native_launch", "seconds": remaining}
+                )
+            prompt = json.dumps(body, ensure_ascii=False)
             code, stdout, stderr = candidate.run_guarded(
                 command,
                 process_limit=candidate.profile.native_process_limit,

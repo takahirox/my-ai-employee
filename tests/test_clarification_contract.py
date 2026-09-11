@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -262,6 +263,7 @@ def test_native_prompt_exposes_actual_workspace_without_rewriting_original(tmp_p
     profile = IsolatedWorkerProfile(image="sha256:" + "a" * 64, auth_file="/explicit-test-auth")
     model = ContainerModel(profile)
     candidate = MagicMock()
+    candidate.deadline = time.monotonic() + 10
     candidate.profile = profile
     candidate.proxy = None
     candidate.run_guarded.return_value = (
