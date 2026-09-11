@@ -1,114 +1,191 @@
-"""Execute pinned upstream public artifacts, without models, graders or networking.
-
-CI fetches only three public source files before pytest. Local runs may point
-FLEET_PUBLIC_CONTRACT_ROOT at an explicitly prepared copy of those same bytes.
-"""
+"""Generic public CLI lifecycle; no external evaluation protocol or live model."""
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import json
-import os
 import subprocess
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
-from ai_employee.benchmark import Request, cleanup, public_check, run
+from ai_employee.cli import PUBLIC_CONTRACT, main, projection
+from ai_employee.history import Journal, Stopped
+from ai_employee.models import Check, Clarification, Criterion, Usage
 
-from .test_autonomous_benchmark import BenchmarkModel, request
-from .test_autonomous_runtime import config
-
-HASHES = {
-    "smoke.py": "c736b7023939e7d3a723deb3559ac63823de65eb93353145feddc3a3ad196bee",
-    "execution.py": "1cbea6bd130122d241db92cde4cc5f0b4aeaeaefee201884d78eeb33c4984463",
-    "connected_agent.py": "bc80ad380c3cdcf7081afffcc125f8ee686217d9635bd6f97c82c37bb637f0e5",
-}
+from .test_autonomous_runtime import OfflineModel, clarification, config, runtime
 
 
-@pytest.fixture
-def public_sources() -> dict[str, str]:
-    root = os.environ.get("FLEET_PUBLIC_CONTRACT_ROOT")
-    if root is None:
-        pytest.skip("pinned public artifacts not supplied; CI supplies them")
-    result = {}
-    for name, expected in HASHES.items():
-        data = (Path(root) / "src/pocket_bench" / name).read_bytes()
-        assert hashlib.sha256(data).hexdigest() == expected, "public contract version changed"
-        result[name] = data.decode()
-    return result
+def test_separate_cli_processes_submit_inspect_cancel_cleanup_without_model(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "input.txt").write_text("original")
+    cfg = tmp_path / "policy.json"
+    cfg.write_text(config().model_dump_json())
+    state = tmp_path / "state"
+
+    def call(*args):
+        process = subprocess.run(
+            [sys.executable, "-m", "ai_employee", "--state", str(state), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert process.returncode == 0, process.stdout + process.stderr
+        result = json.loads(process.stdout)
+        assert result["contract_version"] == PUBLIC_CONTRACT
+        return result
+
+    run = call("submit", "Write result", "--config", str(cfg), "--root", str(source))["run_id"]
+    view = call("status", run)
+    assert view["goal"] is None and not view["stage_invocations"]
+    assert call("history")["runs"][0]["run_id"] == run
+    assert call("cancel", run)["cleanup"] == "not_requested"
+    assert call("cleanup", run)["cleanup"] == "confirmed"
+    assert call("cleanup", run)["status"] == "stopped"
+    assert call("logs", run)["events"]
+    assert (state / "history.db").exists()
+    assert (source / "input.txt").read_text() == "original"
 
 
-def test_real_public_smoke_has_file_context_and_never_executes_declared_script(
-    tmp_path: Path,
-    public_sources: dict[str, str],
-):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "output").mkdir()
-    (tmp_path / "src/program.py").write_text('raise RuntimeError("must not execute")\n')
-    (tmp_path / "output/execute.json").write_text('{"script":"src/program.py"}')
-    check = public_check({k: public_sources[k] for k in ("smoke.py", "execution.py")})
-    result = subprocess.run(check.argv, cwd=tmp_path, capture_output=True, timeout=10)
-    assert result.returncode == 0, result.stderr.decode()
-    (tmp_path / "output/execute.json").write_text('{"script":"../escape.py"}')
-    result = subprocess.run(check.argv, cwd=tmp_path, capture_output=True, timeout=10)
-    assert result.returncode != 0
+def test_public_result_cleanup_and_promotion_preserve_exact_completion(tmp_path, capsys):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.start("Write result", config(), source)
+    calls = len(engine.model.calls)
+    with patch("ai_employee.cli.ContainerModel", return_value=engine.model):
+        assert main(["--state", str(tmp_path), "result", run]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert main(["--state", str(tmp_path), "cleanup", run]) == 0
+        view = json.loads(capsys.readouterr().out)
+        assert view["status"] == "completed" and view["cleanup"] == "confirmed"
+        destination = tmp_path / "published"
+        assert (
+            main(["--state", str(tmp_path), "promote", run, "--destination", str(destination)]) == 0
+        )
+        view = json.loads(capsys.readouterr().out)
+        assert view["events"][-1]["body"]["candidate"] == result["candidate_digest"]
+        assert result["candidate"] == engine.result(run).model_dump(mode="json")
+        assert (destination / "result.txt").read_text() == "correct"
+        assert (
+            main(["--state", str(tmp_path), "promote", run, "--destination", str(destination)]) == 2
+        )
+    assert len(engine.model.calls) == calls
 
 
-def test_actual_upstream_request_expression_runs_and_cleanup_is_idempotent(
-    tmp_path: Path,
-    public_sources: dict[str, str],
-):
-    fixture = request(tmp_path)
-    for name in ("smoke.py", "execution.py"):
-        (fixture.public_checks / name).write_text(public_sources[name])
-    (fixture.workspace / "src/program.py").write_text("pass\n")
-    # Evaluate only the hash-pinned public request-construction expression, not
-    # upstream adapters, setup, grading or model execution.
-    module = ast.parse(public_sources["connected_agent.py"])
-    expression = next(
-        n.value
-        for n in ast.walk(module)
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "request" for t in n.targets)
-        and isinstance(n.value, ast.Dict)
+@pytest.mark.parametrize("terminal", ["failed", "uncertain", "stopped"])
+def test_cleanup_preserves_terminal_outcome_and_refuses_unverified_result(tmp_path, terminal):
+    model = OfflineModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    engine.journal.append(run, terminal, reason="fixture")
+    before = projection(engine.journal, run)["status"]
+    engine.cleanup(run)
+    engine.cleanup(run)
+    reopened = Journal(engine.journal.path)
+    assert projection(reopened, run)["status"] == before
+    assert projection(reopened, run)["cleanup"] == "confirmed"
+    with pytest.raises(ValueError):
+        engine.result(run)
+    assert not model.calls
+
+
+def test_busy_cleanup_requests_stop_but_never_claims_release(tmp_path):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(), source)
+    with engine.journal.controller(run):
+        with pytest.raises(Stopped, match="RUN_ALREADY_OWNED"):
+            engine.cleanup(run)
+        assert projection(engine.journal, run)["cleanup"] == "pending"
+        with pytest.raises(Stopped):
+            engine.journal.append(run, "completed", candidate={})
+    engine.cleanup(run)
+    assert projection(engine.journal, run)["cleanup"] == "confirmed"
+    assert not engine.model.calls
+
+
+def test_failed_cleanup_can_be_repeated_without_model_or_outcome_loss(tmp_path):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(), source)
+    engine.journal.append(run, "failed", reason="original failure")
+    with (
+        patch.object(
+            engine.model, "reconcile", side_effect=ValueError("RESOURCE_CLEANUP_UNCONFIRMED")
+        ),
+        pytest.raises(ValueError, match="RESOURCE_CLEANUP_UNCONFIRMED"),
+    ):
+        engine.cleanup(run)
+    assert projection(engine.journal, run)["status"] == "failed"
+    assert projection(engine.journal, run)["cleanup"] == "unconfirmed"
+    engine.cleanup(run)
+    assert projection(engine.journal, run)["cleanup"] == "confirmed"
+    assert not engine.model.calls
+
+
+def test_public_resume_usage_limit_remains_durable_and_never_retries(tmp_path, capsys):
+    model = OfflineModel(quota=True)
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    with patch("ai_employee.cli.ContainerModel", return_value=model):
+        for _ in range(2):
+            assert main(["--state", str(tmp_path), "resume", run]) == 2
+            assert json.loads(capsys.readouterr().out)["run_id"] == run
+        assert main(["--state", str(tmp_path), "inspect", run]) == 0
+        view = json.loads(capsys.readouterr().out)
+    assert model.calls == ["Clarification"]
+    assert any(
+        e["kind"] == "stopped" and "USAGE_LIMIT" in e["body"]["reason"] for e in view["events"]
     )
-    value = eval(
-        compile(ast.Expression(expression), "<pinned-public-request>", "eval"),
-        {
-            "PROTOCOL": "pocket-agent-v1",
-            "instruction": "Write result",
-            "workspace": fixture.workspace,
-            "control": tmp_path,
-            "checks": fixture.public_checks,
-            "WRITABLE_ROOTS": ("src", "output"),
-            "deadline": 60,
-            "time": SimpleNamespace(monotonic=lambda: 0),
-            "self": SimpleNamespace(
-                model_name="fixed-model",
-                effort="medium",
-                profile={"settings": {"config": config().model_dump(mode="json")}},
-            ),
-        },
-    )
-    parsed = Request.model_validate(value)
-    assert parsed.configured().worker.model == "fixed-model"
-    assert parsed.configured().verification.effort == "medium"
 
-    class RealCheck(BenchmarkModel):
+
+def test_operator_check_failure_blocks_publication_even_with_positive_model_review(tmp_path):
+    class Checked(OfflineModel):
+        def generate(self, policy, prompt, schema, *args, **kwargs):
+            if schema is Clarification:
+                return clarification().model_copy(
+                    update={
+                        "criteria": (
+                            Criterion(
+                                id="result", description="result exists", checks=("operator-check",)
+                            ),
+                        )
+                    }
+                ), Usage(tokens=0)
+            return super().generate(policy, prompt, schema, *args, **kwargs)
+
         def check(self, argv, workspace, timeout, cancelled):
             result = subprocess.run(argv, cwd=workspace, capture_output=True, timeout=timeout)
-            return result.returncode == 0, "public-check-exit-" + str(result.returncode)
+            return result.returncode == 0, "operator check exit " + str(result.returncode)
 
-    adapter = RealCheck()
-    response = run(parsed, adapter)
-    assert response["details"]["exported"]
-    value["operation"] = "cleanup"
-    value["seconds"] = 0
-    cleaned = Request.model_validate(value)
-    assert cleanup(cleaned, adapter)["outcome"] == "cleaned"
-    assert cleanup(cleaned, adapter)["outcome"] == "cleaned"
-    assert (tmp_path / "fleet-autonomous/history.db").is_file()
-    assert json.loads(json.dumps(response))["protocol"] == "pocket-agent-v1"
+    engine, source = runtime(tmp_path, Checked())
+    cfg = config(replans=0, task_attempts=1).model_copy(
+        update={
+            "checks": (
+                Check(
+                    id="operator-check", argv=(sys.executable, "-I", "-c", "raise SystemExit(1)")
+                ),
+            ),
+            "mandatory_checks": ("operator-check",),
+        }
+    )
+    run = engine.prepare("Write result", cfg, source)
+    with pytest.raises(ValueError):
+        engine.execute(run)
+    with pytest.raises(ValueError):
+        engine.promote(run, tmp_path / "unverified")
+    assert not (tmp_path / "unverified").exists()
+    assert not (source / "result.txt").exists()
+
+
+def test_cleanup_fences_a_resumed_failed_run_and_preserves_failure_display(tmp_path):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(), source)
+    engine.journal.append(run, "failed", reason="earlier attempt")
+    with engine.journal.controller(run):
+        with pytest.raises(Stopped, match="RUN_ALREADY_OWNED"):
+            engine.cleanup(run)
+        with pytest.raises(Stopped):
+            engine.journal.reserve(run, "worker")
+    engine.cleanup(run)
+    assert projection(engine.journal, run)["status"] == "failed"
+    assert projection(engine.journal, run)["cleanup"] == "confirmed"

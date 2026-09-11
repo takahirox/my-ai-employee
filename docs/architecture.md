@@ -42,7 +42,7 @@ and reaps task descendants before workspace capture, including detached processe
 The model gateway carries model traffic and permitted HTTPS destinations while
 recording bounded metadata. It does not interpret arbitrary encrypted operations.
 
-`cli.py`, `inspector.py`, and `benchmark.py` consume these same runtime facts. There
+`cli.py` and `inspector.py` consume these same runtime facts. There
 is no legacy runtime, compatibility profile router or database migration subsystem.
 
 ## Stage contracts and execution readiness

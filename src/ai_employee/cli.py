@@ -15,6 +15,12 @@ from .history import Journal, Stopped
 from .isolated_worker import IsolatedWorkerProfile
 from .models import RunConfig, StagePolicy
 
+PUBLIC_CONTRACT = "fleet-run-1"
+
+
+def emit(body: dict[str, object]) -> None:
+    print(json.dumps({"contract_version": PUBLIC_CONTRACT, **body}, ensure_ascii=False), flush=True)
+
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
@@ -33,11 +39,14 @@ def parser() -> argparse.ArgumentParser:
         "--auth-file", type=Path, required=True, help="explicit delegated model authentication"
     )
     initialize.add_argument("--output", type=Path, default=Path("fleet-run.json"))
-    work = commands.add_parser("work", help="clarify, plan, execute and verify a goal")
-    work.add_argument("goal")
-    work.add_argument("--config", type=Path, required=True)
-    work.add_argument("--root", type=Path, default=Path.cwd())
-    for name in ("inspect", "logs", "resume", "cancel", "revoke"):
+    for name in ("submit", "work"):
+        work = commands.add_parser(
+            name, help="create a Run" if name == "submit" else "create and execute a Run"
+        )
+        work.add_argument("goal")
+        work.add_argument("--config", type=Path, required=True)
+        work.add_argument("--root", type=Path, default=Path.cwd())
+    for name in ("inspect", "status", "logs", "result", "resume", "cancel", "cleanup", "revoke"):
         commands.add_parser(name).add_argument("run_id")
     revise = commands.add_parser("revise", help="explicitly replace the Goal in a linked new Run")
     revise.add_argument("run_id")
@@ -70,7 +79,14 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         kind for kind in kinds if kind in {"clarification_wait", "clarification_answer", "goal"}
     ]
     status = "running"
-    if "stopped" in kinds:
+    terminal_before_cleanup = False
+    stopped = False
+    for event in events:
+        if event["kind"] in {"failed", "uncertain"}:
+            terminal_before_cleanup = True
+        elif event["kind"] == "stopped":
+            stopped |= event["body"]["reason"] != "CLEANUP_REQUESTED" or not terminal_before_cleanup
+    if stopped:
         status = "stopped"
     elif "completed" in kinds:
         status = "completed"
@@ -90,9 +106,21 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         status = "waiting_for_resource"
     elif "failed" in kinds:
         status = "failed"
+    cleanup = "not_requested"
+    for event in events:
+        if event["kind"] in {"reserved", "authority_application_started"}:
+            cleanup = "not_requested"
+        elif event["kind"] == "cleanup_requested":
+            cleanup = "pending"
+        elif event["kind"] == "cleanup_confirmed":
+            cleanup = "confirmed"
+        elif event["kind"] == "cleanup_failed":
+            cleanup = "unconfirmed"
     return {
+        "contract_version": PUBLIC_CONTRACT,
         "run_id": run,
         "status": status,
+        "cleanup": cleanup,
         "external_outcome_uncertain": "uncertain" in kinds,
         "budget": journal.budget(run),
         "stage_diagnostics": [
@@ -121,7 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _command(args)
     except (Stopped, Waiting, ValueError, OSError, KeyError, RuntimeError) as error:
-        print(json.dumps({"error": str(error)[:300]}))
+        emit({"error": str(error)[:300]})
         return 2
 
 
@@ -140,7 +168,7 @@ def _command(args: argparse.Namespace) -> int:
         )
         with args.output.open("x") as stream:
             stream.write(config.model_dump_json(indent=2) + "\n")
-        print(json.dumps({"configuration": str(args.output)}))
+        emit({"configuration": str(args.output)})
         return 0
     root = args.state.resolve()
     journal = Journal(root / "history.db")
@@ -152,13 +180,13 @@ def _command(args: argparse.Namespace) -> int:
     if args.command == "history":
         from .inspector import run_list
 
-        print(json.dumps(run_list(journal), ensure_ascii=False))
+        emit({"runs": run_list(journal)})
         return 0
     run: str | None = getattr(args, "run_id", None)
     try:
         config = (
             RunConfig.model_validate_json(args.config.read_text())
-            if args.command == "work"
+            if args.command in {"submit", "work"}
             else journal.config(str(run))
         )
         engine = Engine(
@@ -167,10 +195,12 @@ def _command(args: argparse.Namespace) -> int:
             ContainerModel(config.isolation),
             root / "workspaces",
         )
-        if args.command == "work":
+        if args.command in {"submit", "work"}:
             run = engine.prepare(args.goal, config, args.root.resolve())
             # The ID is available even if native preflight/model startup fails.
-            print(json.dumps({"run_id": run}), flush=True)
+            emit({"run_id": run})
+            if args.command == "submit":
+                return 0
             engine.execute(run)
         else:
             assert run is not None
@@ -178,10 +208,22 @@ def _command(args: argparse.Namespace) -> int:
                 engine.execute(run)
             elif args.command == "revise":
                 run = engine.revise_goal(run, args.goal)
-                print(json.dumps({"run_id": run}), flush=True)
+                emit({"run_id": run})
                 engine.execute(run)
             elif args.command == "cancel":
                 journal.stop(run, "OPERATOR_CANCELLED")
+            elif args.command == "cleanup":
+                engine.cleanup(run)
+            elif args.command == "result":
+                candidate = engine.result(run)
+                emit(
+                    {
+                        "run_id": run,
+                        "candidate": candidate.model_dump(mode="json"),
+                        "candidate_digest": candidate.digest,
+                    }
+                )
+                return 0
             elif args.command == "revoke":
                 engine.revoke_authority(run)
             elif args.command == "answer":
@@ -192,15 +234,26 @@ def _command(args: argparse.Namespace) -> int:
                 engine.promote(run, args.destination)
         assert run is not None
         view = projection(journal, run)
-        print(json.dumps(view, ensure_ascii=False))
+        emit(view)
         return (
             0
             if view["status"] == "completed"
-            or args.command in {"inspect", "logs", "answer", "authority", "cancel", "revoke"}
+            or args.command
+            in {
+                "inspect",
+                "status",
+                "logs",
+                "answer",
+                "authority",
+                "cancel",
+                "cleanup",
+                "revoke",
+                "promote",
+            }
             else 2
         )
-    except (Stopped, Waiting, ValueError, OSError, KeyError) as error:
-        print(json.dumps({"run_id": run, "error": str(error)[:300]}))
+    except (Stopped, Waiting, ValueError, OSError, KeyError, RuntimeError) as error:
+        emit({"run_id": run, "error": str(error)[:300]})
         return 2
 
 
