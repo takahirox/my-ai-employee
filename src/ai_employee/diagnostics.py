@@ -12,7 +12,7 @@ RECORD_BYTES = 1_000_000
 RUN_BYTES = 16_000_000
 _SECRET_KEY = re.compile(
     r"(?i)^(?:authorization|cookie|set-cookie|password|passwd|api[_-]?key|access[_-]?token|"
-    r"refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key)$"
+    r"refresh[_-]?token|id[_-]?token|token|client[_-]?secret|private[_-]?key)$"
 )
 _PATTERNS = (
     re.compile(
@@ -20,6 +20,11 @@ _PATTERNS = (
     ),
     re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"),
+    re.compile(
+        r"""(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|"""
+        r"""client[_-]?secret|id[_-]?token|token|authorization|cookie)["']?\s*[=:]\s*"""
+        r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
+    ),
     re.compile(
         r"""(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|id[_-]?token|token|authorization|cookie)["']?\s*[=:]\s*["']?[^\s"',;]+"""
     ),

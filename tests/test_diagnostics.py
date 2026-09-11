@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from ai_employee.cli import projection
 from ai_employee.container import ContainerModel
@@ -222,6 +223,8 @@ def test_capacity_redaction_and_late_diagnostics_are_explicit(tmp_path):
         {"nested": {"refresh_token": "private-fixture"}},
         'api_key="private-fixture"',
         '{"password": "private-fixture"}',
+        'password="two words private-fixture"',
+        "token='two words private-fixture'",
         "Bearer private-fixture",
         "-----BEGIN PRIVATE KEY-----\nprivate-fixture\n-----END PRIVATE KEY-----",
     ],
@@ -265,3 +268,27 @@ def test_mandatory_check_omission_identifies_missing_reference(tmp_path):
     detail = payload(diagnostics(view, "output_rejected")[0])
     assert detail["path"] == "criteria.checks"
     assert detail["mandatory_checks"] == ["required"]
+
+
+def test_adapter_validation_error_before_return_preserves_usage_and_repairs(tmp_path):
+    class DirectError(OfflineModel):
+        failed = False
+
+        def generate(self, policy, prompt, schema, *args, **kwargs):
+            if not self.failed:
+                self.failed = True
+                kwargs["observation"]({"event": "usage_observed", "tokens": 17})
+                # Alternative adapters may raise Pydantic errors before returning a result.
+                schema.model_validate({})
+            return super().generate(policy, prompt, schema, *args, **kwargs)
+
+    with pytest.raises(ValidationError):
+        Clarification.model_validate({})
+    engine, source = runtime(tmp_path, DirectError())
+    run = engine.start("Write result", config(), source)
+    view = reopened_cli(tmp_path, run)
+    detail = payload(diagnostics(view, "output_rejected")[0])
+    assert detail["non_object_payload_omitted"] and detail["payload"] is None
+    assert view["status"] == "completed"
+    settlements = [e["body"] for e in view["events"] if e["kind"] == "settled"]
+    assert settlements[0]["usage"]["tokens"] == 17

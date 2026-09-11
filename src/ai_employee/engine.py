@@ -189,6 +189,7 @@ class Engine:
             raise
         started = time.monotonic()
         usage = Usage(tokens=0, cost=0)
+        response_payload: dict[str, Any] | None = None
 
         def observe(body: dict[str, Any]) -> None:
             nonlocal usage
@@ -267,10 +268,11 @@ class Engine:
                 tokens=returned_usage.tokens if returned_usage.tokens is not None else usage.tokens,
                 cost=returned_usage.cost if returned_usage.cost is not None else usage.cost,
             )
+            response_payload = result.model_dump(mode="json")
             self.journal.diagnostic(
                 run,
                 stage,
-                result.model_dump(mode="json"),
+                response_payload,
                 reservation=reservation,
                 contract=contract.identity,
                 result_digest=result.digest,
@@ -309,7 +311,7 @@ class Engine:
             )
             raise
         except ValidationError as error:
-            details = validation_details(error, result.model_dump(mode="json"), schema)
+            details = validation_details(error, response_payload, schema)
             self.journal.diagnostic(
                 run,
                 stage,
