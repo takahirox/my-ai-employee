@@ -262,11 +262,14 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
             for kind, name in sorted(latest, key=lambda item: item[0] == "network"):
                 if latest[kind, name] == "removed":
                     continue
-                result = subprocess.run(
-                    ["docker", kind, "rm", *(["-f"] if kind == "container" else []), name],
-                    capture_output=True,
-                    timeout=15,
-                )
+                try:
+                    result = subprocess.run(
+                        ["docker", kind, "rm", *(["-f"] if kind == "container" else []), name],
+                        capture_output=True,
+                        timeout=15,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise ValueError("RESOURCE_CLEANUP_UNCONFIRMED") from error
                 if result.returncode and not resource_missing(kind, name, result.stderr):
                     raise ValueError("RESOURCE_CLEANUP_UNCONFIRMED")
                 if latest[kind, name] == "created":

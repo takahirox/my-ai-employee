@@ -35,7 +35,8 @@ parent.append(e);return e}
 async function show(id){selected=id;const r=await api('/api/runs/'+id);
 if(selected!==id)return;const d=document.getElementById('detail');d.replaceChildren();
 const goal=node('article','',d);node('h2',r.goal?.specification.clarified_goal||id,goal);
-node('p',r.status+(r.external_outcome_uncertain?' · external outcome uncertain':''),goal);
+node('p',r.status+' · cleanup: '+r.cleanup+
+(r.external_outcome_uncertain?' · external outcome uncertain':''),goal);
 const budget=node('details','',d);node('summary','Run budget and accounting',budget);
 node('pre',JSON.stringify(r.budget,null,2),budget);if(r.goal){node('small',r.goal.original_input,goal);
 for(const c of r.goal.specification.criteria)node('p',c.id+': '+c.description,goal);

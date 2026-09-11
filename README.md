@@ -106,5 +106,5 @@ in Git.
 See [architecture](docs/architecture.md), [security](docs/security.md),
 [configuration and recovery](docs/autonomous-runtime.md),
 [isolation setup](docs/isolated-worker.md), and
-[benchmark transport](docs/benchmark-adapter.md). For development, follow
+[public Run interface](docs/run-interface.md). For development, follow
 [CONTRIBUTING.md](CONTRIBUTING.md) and [the verification sequence](docs/development.md).

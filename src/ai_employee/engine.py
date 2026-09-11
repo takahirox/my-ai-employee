@@ -1080,6 +1080,41 @@ class Engine:
                 self.journal.append(run, "failed", reason=str(error)[:200])
                 raise
 
+    def cleanup(self, run: str) -> None:
+        """Reconcile owned runtime resources without model calls or deleting history.
+
+        A busy controller observes the persisted stop. Call again after it exits;
+        a request is never reported as confirmed release.
+        """
+        self.journal.request_cleanup(run)
+        with self.journal.controller(run):
+            try:
+                self.model.reconcile(self.root / run)
+            except (ValueError, RuntimeError, OSError, TimeoutError) as error:
+                known = {
+                    "INVALID_RESOURCE_LEDGER",
+                    "RESOURCE_CLEANUP_UNCONFIRMED",
+                    "RESOURCE_CREATION_UNCERTAIN",
+                }
+                self.journal.append(
+                    run,
+                    "cleanup_failed",
+                    error_type=type(error).__name__,
+                    reason=str(error) if str(error) in known else "RESOURCE_CLEANUP_UNCONFIRMED",
+                )
+                raise
+            self.journal.append(run, "cleanup_confirmed")
+
+    def result(self, run: str) -> Candidate:
+        """Return the exact verified final Candidate under publication authority."""
+        with self.journal.controller(run):
+            if any(
+                event["kind"] in {"stopped", "uncertain", "authority_revoked"}
+                for event in self.journal.events(run)
+            ):
+                raise ValueError("PROMOTION_AUTHORITY_UNAVAILABLE")
+            return self._completion(run)
+
     def revise_goal(self, run: str, original: str) -> str:
         """An explicit human replacement starts a linked Run; automatic recovery cannot use it."""
         if not original.strip() or len(original) > 20000:

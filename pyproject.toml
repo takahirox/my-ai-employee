@@ -39,7 +39,6 @@ dev = [
 
 [project.scripts]
 fleet = "ai_employee.cli:main"
-fleet-bench = "ai_employee.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

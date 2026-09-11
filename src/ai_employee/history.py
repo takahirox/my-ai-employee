@@ -252,6 +252,19 @@ class Journal:
             result.append({"kind": row["kind"], "at": row["at"], "body": json.loads(row["body"])})
         return result
 
+    def request_cleanup(self, run: str) -> None:
+        """Fence unfinished work atomically without overwriting a terminal outcome."""
+        self.config(run)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            terminal = db.execute(
+                "SELECT 1 FROM events WHERE run=? AND kind IN ('completed','stopped')",
+                (run,),
+            ).fetchone()
+            if terminal is None:
+                self._event(db, run, "stopped", {"reason": "CLEANUP_REQUESTED"})
+            self._event(db, run, "cleanup_requested", {})
+
     def stop(self, run: str, reason: str) -> None:
         self.append(run, "stopped", reason=reason)
 
