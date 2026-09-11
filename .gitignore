@@ -10,3 +10,4 @@ dist/
 *.db
 /.fleet/
 .DS_Store
+/.contract-fixtures/

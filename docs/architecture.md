@@ -44,3 +44,64 @@ recording bounded metadata. It does not interpret arbitrary encrypted operations
 
 `cli.py`, `inspector.py`, and `benchmark.py` consume these same runtime facts. There
 is no legacy runtime, compatibility profile router or database migration subsystem.
+
+## Stage contracts and execution readiness
+
+`stage_contracts.py` binds each invocation to `stage-contract-1`, its exact input
+snapshot/context, Run policy, registered checks and evaluation target. Pydantic
+owns structural and proposal-local constraints; the binding projects existing
+references into native provider schemas, prompts, validation and repair feedback.
+A new DAG can define its own local IDs. Review findings must cover exactly the
+review/verification criterion namespace. Recovery cannot redefine historical tasks.
+
+Malformed output and invalid references enter bounded response repair. Reviewer
+output faults remain in the reviewer; exhausting that repair is review unavailable,
+not a finding that the proposal is incorrect. Content rejection goes back to the
+proposal stage. Original inputs are available for factual investigation before
+asking a human. Non-worker invocations receive fresh copies of the exact input
+snapshot, so review/repair cannot inherit mutations to the evaluation files.
+
+Reservations persist the contract binding, logical call identity, counter and start
+intent before process launch. Output attempts and optional transport retries have
+separate durable counters and share the Run budget. Reopening the controller does
+not refund an uncertain launch or reset its limits. No automatic environment or
+provider fallback is enabled for capability failures. Existing configured worker
+selection/escalation remains subject to product and Run policy checks; quota never
+selects another model/provider. External-write output/transport uncertainty blocks
+all ordinary continuation and retains resource leases. This adapter cannot recover
+trusted external receipts from malformed output, so it stops for reconciliation
+rather than attempting a response-only repair or repeating the external work.
+
+Authority-changing journal appends check cancellation/revocation and contract
+version in the same SQLite write transaction. Approval application is serialized
+with the controller. Accepted Candidates keep exact task/authority/upstream
+bindings; accepted work is reused after a crash before downstream scheduling.
+Duplicate identical acceptance/usage delivery is idempotent; conflicting usage is
+rejected. Late observations and usage may be recorded after stop without accepting
+the late result. Journals created without the current stage contract are not
+silently migrated or reinterpreted.
+
+`product_capabilities.py` publishes supported backend/version facts to schema,
+CLI and preflight. All configured stages, reviewers and worker alternatives are
+checked before the first model call. Each invocation performs model-free image,
+CLI version, check-executable and native-boundary preflight using its selected
+configuration and authority; probes and model calls share the reservation/deadline.
+The invocation rechecks its actual new environment. Probe results are diagnostic
+records, never cached authority or a substitute for runtime enforcement. Delegated
+authentication presence is checked, but successful provider authentication/model
+access cannot be guaranteed without a model request.
+
+Planning records each criterion's check/review method, evidence/plan digest,
+dependencies, policy and authority binding. Natural-language/research criteria can
+use independent artifact review. Dependencies are future prerequisites, not already
+observed evidence. The scheduler requires exact accepted upstream Candidates;
+pending authority requests require APPLIED, not APPROVED. A remote-effect Task
+needs an operator-owned verification check before starting; generic model prose
+cannot attest remote success. Preflight never performs the external operation.
+
+CLI and Inspector project the same journal, including repair failures, fixed review
+categories, preflight/readiness records, invocation counters and unknown usage.
+Rejected diagnostics contain bounded classifications and digests, not raw malformed
+responses or arbitrary reviewer evidence. They never become accepted execution
+inputs. Public contract tests, native isolation tests and live-model evaluation
+remain distinct validation levels (see development and isolated-worker guides).

@@ -41,6 +41,12 @@ node('pre',JSON.stringify(r.budget,null,2),budget);if(r.goal){node('small',r.goa
 for(const c of r.goal.specification.criteria)node('p',c.id+': '+c.description,goal);
 for(const m of r.goal.specification.requirements)
 node('p',m.original_fragment+' → '+m.criteria.join(', '),goal)}
+const diagnostics=node('details','',d);
+node('summary','Stage validation, review and readiness',diagnostics);
+node('pre',JSON.stringify(r.stage_diagnostics,null,2),diagnostics);
+const invocations=node('details','',d);
+node('summary','Invocation counts and contract bindings',invocations);
+node('pre',JSON.stringify(r.stage_invocations,null,2),invocations);
 const accepted=new Set(r.events.filter(e=>e.kind==='accepted').map(e=>e.body.task));
 for(const t of r.plan?.tasks||[]){const a=node('article','',d);
 a.className='task'+(accepted.has(t.id)?' passed':'');node('h3',t.description,a);
@@ -62,10 +68,13 @@ refresh();setInterval(refresh,3000);
 def run_list(journal: Journal) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for run in journal.runs():
-        view = projection(journal, run)
-        result.append(
-            {"run_id": run, "title": journal.original(run)[:200], "status": view["status"]}
-        )
+        try:
+            view = projection(journal, run)
+            title = journal.original(run)[:200]
+        except (ValueError, KeyError):
+            result.append({"run_id": run, "title": "Unreadable run", "status": "unreadable"})
+            continue
+        result.append({"run_id": run, "title": title, "status": view["status"]})
     return result
 
 

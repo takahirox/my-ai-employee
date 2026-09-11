@@ -10,6 +10,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .isolated_worker import IsolatedWorkerProfile
+from .product_capabilities import SUPPORTED_BACKENDS
 
 Text = Annotated[str, Field(min_length=1, max_length=20000, pattern=r"\S")]
 Key = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}$")]
@@ -32,6 +33,7 @@ class Criterion(Contract):
     description: Text
     # Check IDs resolve only against operator-owned definitions in RunConfig.
     checks: tuple[Key, ...] = ()
+    outcome: Literal["artifact", "external_effect"] = "artifact"
 
 
 class Requirement(Contract):
@@ -177,10 +179,15 @@ class Check(Contract):
     id: Key
     argv: tuple[Text, ...] = Field(min_length=1)
     timeout: float = Field(default=60, gt=0)
+    evidence_kind: Literal["artifact", "external_effect"] = "artifact"
 
 
 class StagePolicy(Contract):
-    backend: Literal["codex", "claude"] = "codex"
+    backend: Literal["codex", "claude"] = Field(
+        default="codex",
+        description="Only backends in x-supported-backends are runnable.",
+        json_schema_extra={"x-supported-backends": list(SUPPORTED_BACKENDS)},
+    )
     model: Text
     effort: Text = "high"
     review: Literal["never", "always", "conditional"] = "never"
@@ -189,6 +196,7 @@ class StagePolicy(Contract):
     reviewer_backend: Literal["codex", "claude"] | None = None
     reviewer_effort: Text | None = None
     revisions: int = Field(default=1, ge=0, le=10)
+    transport_retries: int = Field(default=0, ge=0, le=10)
     supervision_seconds: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
@@ -268,6 +276,15 @@ class Finding(Contract):
     criterion_id: Key
     passed: bool
     evidence: Text
+    category: Literal[
+        "satisfied",
+        "missing_evidence",
+        "omitted_requirement",
+        "weakened_requirement",
+        "unsupported_expansion",
+        "incorrect_result",
+        "unspecified",
+    ] = "unspecified"
 
 
 class Verification(Contract):

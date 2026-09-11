@@ -45,3 +45,21 @@ uncertain Runs cannot use this route to restart automatically.
 `fleet logs` read the event journal, and `fleet serve` opens the read-only Inspector.
 Record which optional native/container/live checks actually ran when reporting
 validation; ordinary unit tests do not establish live-model quality.
+
+`revisions` bounds output attempts beyond the initial call, including proposal
+content revisions. `transport_retries` defaults to zero and separately permits
+bounded timeout/connection retries after adapter cleanup. Both counters survive
+controller restart and consume the shared limits. Arbitrary environment/invariant
+failures, denied authority, quota and uncertain external effects are not response
+repair. Inspector exposes these distinctions alongside contract and target digests.
+Only the supported backend/version set is executable; a syntactically representable
+`claude` setting is rejected before model execution, including in a later stage.
+
+Each criterion declares `outcome: artifact` or `external_effect`. Operator checks
+have the corresponding `evidence_kind` (default `artifact`). An external-effect
+criterion requires an explicitly linked external-evidence check; a smoke/syntax
+check is insufficient, even if the Worker itself stayed offline. Original-intent
+review determines which outcome is requested. Once the Goal is accepted, planning
+and repair cannot replace external completion with merely producing a script.
+An operator may supply a protected signed-receipt validator; Fleet does not claim
+a built-in remote service reader or infer external success from model prose.
