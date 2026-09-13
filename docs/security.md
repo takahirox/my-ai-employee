@@ -17,7 +17,8 @@ Loss of its exclusive pipe triggers removal of the exact owned container, gatewa
 and network, including detached task processes. Normal work has no implicit lifetime;
 an explicitly configured invocation deadline also bounds the container's lifetime.
 The watcher repeats cleanup across a 30-second in-flight-creation window, using
-bounded Docker operations. Docker unavailability or uncertain creation is not proof
+bounded Docker operations, and continues beyond that window until all removals or
+absences are confirmed. Docker unavailability or uncertain creation is not proof
 of release: the durable resource ledger must reconcile before continuation. Failure
 of the watcher while the controller is alive fails the invocation closed.
 

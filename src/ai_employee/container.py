@@ -27,7 +27,6 @@ from .isolated_worker import (
     DockerCandidate,
     IsolatedWorkerProfile,
     append_resource_event,
-    resource_missing,
 )
 from .models import Authority, Check, StagePolicy, Usage
 from .native import (
@@ -39,6 +38,7 @@ from .native import (
     quota_error,
     summarize_event,
 )
+from .owner_watch import resource_missing
 from .product_capabilities import CODEX_VERSION
 from .time_budget import exhausted, minimum, remaining
 

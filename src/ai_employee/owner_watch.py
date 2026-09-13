@@ -12,8 +12,14 @@ import selectors
 import subprocess
 import sys
 import time
-from contextlib import suppress
 from pathlib import Path
+
+
+def resource_missing(kind: str, name: str, error: bytes) -> bool:
+    message = error.decode(errors="replace").lower()
+    return f"no such {kind}: {name}" in message or (
+        kind == "network" and f"network {name} not found" in message
+    )
 
 
 def start(name: str) -> subprocess.Popen[bytes]:
@@ -50,21 +56,27 @@ def watch(name: str) -> None:
     # These are control-plane cleanup bounds, never normal work deadlines.
     until = time.monotonic() + 30
     while True:
+        confirmed = True
         for kind, resource in (
             ("container", name),
             ("container", name + "-proxy"),
             ("network", name + "-network"),
         ):
-            # The durable resource ledger still requires reconciliation on failure.
-            with suppress(OSError, subprocess.TimeoutExpired):
-                subprocess.run(
+            try:
+                result = subprocess.run(
                     ["docker", kind, "rm", *(["-f"] if kind == "container" else []), resource],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=15,
                     check=False,
                 )
-        if time.monotonic() >= until:
+                if result.returncode and not resource_missing(kind, resource, result.stderr):
+                    confirmed = False
+            except (OSError, subprocess.TimeoutExpired):
+                confirmed = False
+        # Losing the daemon is not proof of release. Keep the cleanup owner alive
+        # until removal/absence is confirmed, even after the creation race window.
+        if time.monotonic() >= until and confirmed:
             return
         time.sleep(1)
 

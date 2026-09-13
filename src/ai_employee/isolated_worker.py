@@ -18,6 +18,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import owner_watch
+from .owner_watch import resource_missing
 from .time_budget import exhausted, minimum, remaining
 
 
@@ -108,13 +109,6 @@ class IsolatedBudgetExceeded(RuntimeError):
 
 class NativeProcessBudgetExceeded(IsolatedBudgetExceeded):
     """No further native work or candidate submission is authorized."""
-
-
-def resource_missing(kind: str, name: str, error: bytes) -> bool:
-    message = error.decode(errors="replace").lower()
-    return f"no such {kind}: {name}" in message or (
-        kind == "network" and f"network {name} not found" in message
-    )
 
 
 def append_resource_event(path: Path | None, kind: str, name: str, state: str) -> None:

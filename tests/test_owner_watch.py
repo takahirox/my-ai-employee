@@ -21,6 +21,7 @@ def test_watch_only_reaps_exact_owned_resources_on_eof(monkeypatch, done):
         patch.object(owner_watch.time, "sleep"),
         patch.object(owner_watch.subprocess, "run") as remove,
     ):
+        remove.return_value = subprocess.CompletedProcess([], 0, stderr=b"")
         owner_watch.watch(name)
     expected = [
         ["docker", "container", "rm", "-f", name],
@@ -29,6 +30,51 @@ def test_watch_only_reaps_exact_owned_resources_on_eof(monkeypatch, done):
     ]
     assert [call.args[0] for call in remove.call_args_list] == ([] if done else expected * 2)
     assert all(call.kwargs["timeout"] == 15 for call in remove.call_args_list)
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "timeout", "rejected"])
+def test_watch_keeps_cleanup_alive_until_docker_recovers(monkeypatch, failure):
+    name = "fleet-candidate-" + "b" * 32
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"")))
+    outcomes = {
+        "unavailable": OSError("daemon unavailable"),
+        "timeout": subprocess.TimeoutExpired("docker", 15),
+        "rejected": subprocess.CompletedProcess([], 1, stderr=b"daemon unavailable"),
+    }
+    removed = subprocess.CompletedProcess([], 0, stderr=b"")
+    with (
+        patch.object(owner_watch.time, "monotonic", side_effect=[0, 31, 32]),
+        patch.object(owner_watch.time, "sleep"),
+        patch.object(
+            owner_watch.subprocess,
+            "run",
+            side_effect=[outcomes[failure], removed, removed, removed, removed, removed],
+        ) as remove,
+    ):
+        owner_watch.watch(name)
+    assert remove.call_count == 6
+
+
+def test_watch_finishes_when_another_owner_already_removed_resources(monkeypatch):
+    name = "fleet-candidate-" + "c" * 32
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"")))
+    errors = [
+        f"No such container: {name}",
+        f"No such container: {name}-proxy",
+        f"network {name}-network not found",
+    ]
+    with (
+        patch.object(owner_watch.time, "monotonic", side_effect=[0, 31]),
+        patch.object(
+            owner_watch.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess([], 1, stderr=error.encode()) for error in errors
+            ],
+        ) as remove,
+    ):
+        owner_watch.watch(name)
+    assert remove.call_count == 3
 
 
 def test_no_environment_creation_without_ready_owner_watch(tmp_path):
