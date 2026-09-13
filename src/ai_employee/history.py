@@ -19,6 +19,7 @@ from uuid import uuid4
 from .diagnostics import RECORD_BYTES, RUN_BYTES, capture
 from .models import Authority, RunConfig, Usage
 from .stage_contracts import VERSION
+from .time_budget import exhausted, minimum
 
 # These events advance execution authority. Diagnostic observations and usage may
 # still arrive after cancellation, but none of these decisions may do so.
@@ -220,6 +221,7 @@ class Journal:
         }
         with self.connect() as db:
             rows = db.execute("SELECT * FROM reservations WHERE run=?", (run,)).fetchall()
+            active = self._usage(db, run)[1]
         known = {
             key: all(row["id"] in measured and measured[row["id"]][key] is not None for row in rows)
             for key in ("tokens", "cost")
@@ -228,7 +230,8 @@ class Journal:
             "limits": limits.model_dump(mode="json"),
             "invocations": len(rows),
             "open_reservations": sum(not row["settled"] for row in rows),
-            "active_seconds_charged": sum(row["seconds"] for row in rows),
+            "active_seconds_charged": active,
+            "elapsed_seconds": max(0.0, time.time() - events[0]["at"]),
             "admission_charges": {key: sum(row[key] for row in rows) for key in ("tokens", "cost")},
             "measured_usage": {
                 key: sum(row[key] for row in rows) if known[key] else None
@@ -301,9 +304,23 @@ class Journal:
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
-    def remaining_wall(self, run: str) -> float:
+    @staticmethod
+    def _usage(db: sqlite3.Connection, run: str) -> sqlite3.Row:
+        # An open call charges elapsed time, not an exclusive claim on future time.
+        # This is shared by admission, live cancellation and Inspector accounting.
+        row: sqlite3.Row = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN settled=1 THEN seconds "
+            "ELSE MAX(0, ?-started) END),0), COALESCE(SUM(tokens),0), "
+            "COALESCE(SUM(cost),0) FROM reservations WHERE run=?",
+            (time.time(), run),
+        ).fetchone()
+        return row
+
+    def remaining_wall(self, run: str) -> float | None:
         """Run wall allowance, excluding the union of approval waits when configured."""
         config = self.config(run)
+        if config.limits.wall_seconds is None:
+            return None
         events = self.events(run)
         now = time.time()
         waiting = 0.0
@@ -332,20 +349,16 @@ class Journal:
         stopped = next((e for e in events if e["kind"] == "stopped"), None)
         if stopped is not None:
             raise Stopped(stopped["body"]["reason"])
-        if self.remaining_wall(run) <= 0:
+        if exhausted(self.remaining_wall(run)):
             self.stop(run, "WALL_BUDGET_EXHAUSTED")
             raise Stopped("WALL_BUDGET_EXHAUSTED")
         with self.connect() as db:
-            usage = db.execute(
-                "SELECT COALESCE(SUM(seconds),0), COALESCE(SUM(tokens),0), "
-                "COALESCE(SUM(cost),0) FROM reservations WHERE run=?",
-                (run,),
-            ).fetchone()
+            usage = self._usage(db, run)
         limits = config.limits
         if (
-            usage[0] > limits.active_seconds
-            or (limits.tokens is not None and usage[1] > limits.tokens)
-            or (limits.cost is not None and usage[2] > limits.cost)
+            (limits.active_seconds is not None and usage[1] >= limits.active_seconds)
+            or (limits.tokens is not None and usage[2] > limits.tokens)
+            or (limits.cost is not None and usage[3] > limits.cost)
         ):
             self.stop(run, "RUN_BUDGET_EXHAUSTED")
             raise Stopped("RUN_BUDGET_EXHAUSTED")
@@ -359,7 +372,7 @@ class Journal:
         binding: dict[str, Any] | None = None,
         call_key: str | None = None,
         call_limit: int | None = None,
-    ) -> tuple[str, float]:
+    ) -> tuple[str, float | None]:
         self.check(run)
         limits = self.config(run).limits
         reservation = "attempt-" + uuid4().hex
@@ -374,22 +387,22 @@ class Journal:
                 ordinal = sum(json.loads(row[0]).get("call_key") == call_key for row in rows)
                 if call_limit is not None and ordinal >= call_limit:
                     raise Stopped("STAGE_INVOCATION_LIMIT")
-            usage = db.execute(
-                "SELECT COUNT(*),COALESCE(SUM(seconds),0),COALESCE(SUM(tokens),0),"
-                "COALESCE(SUM(cost),0) FROM reservations WHERE run=?",
-                (run,),
-            ).fetchone()
+            usage = self._usage(db, run)
             # Recheck after acquiring the write lock; waiting for a concurrent
             # reservation must not admit work against a stale wall allowance.
             wall = self.remaining_wall(run)
-            if wall <= 0:
+            if exhausted(wall):
                 raise Stopped("WALL_BUDGET_EXHAUSTED")
-            seconds = min(limits.invocation_seconds, limits.active_seconds - usage[1], wall)
+            seconds = minimum(
+                limits.invocation_seconds,
+                None if limits.active_seconds is None else limits.active_seconds - usage[1],
+                wall,
+            )
             tokens = limits.reservation_tokens if model_usage and limits.tokens is not None else 0
             cost = limits.reservation_cost if model_usage and limits.cost is not None else 0.0
             if (
                 usage[0] >= limits.attempts
-                or seconds <= 0
+                or exhausted(seconds)
                 or (limits.tokens is not None and usage[2] + tokens > limits.tokens)
                 or (limits.cost is not None and usage[3] + cost > limits.cost)
             ):
@@ -397,7 +410,7 @@ class Journal:
             db.execute(
                 "INSERT INTO reservations(id,run,stage,started,seconds,tokens,cost) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (reservation, run, stage, time.time(), seconds, tokens, cost),
+                (reservation, run, stage, time.time(), 0.0, tokens, cost),
             )
             self._event(
                 db,
@@ -416,6 +429,31 @@ class Journal:
                 },
             )
         return reservation, seconds
+
+    def recover_reservations(self, run: str) -> None:
+        """After exclusive ownership AND resource reconciliation, close interrupted calls.
+
+        Their exact end time/usage is unknown. Charge through reconciliation as a
+        conservative upper bound, preserving monetary charges and invocation counts.
+        Never release external-effect authority leases on this evidence alone.
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT * FROM reservations WHERE run=? AND settled=0", (run,)
+            ).fetchall()
+            for row in rows:
+                seconds = max(0.0, time.time() - row["started"])
+                db.execute(
+                    "UPDATE reservations SET seconds=?,settled=1 WHERE id=?",
+                    (seconds, row["id"]),
+                )
+                self._event(
+                    db,
+                    run,
+                    "reservation_recovered",
+                    {"id": row["id"], "seconds": seconds, "timing": "upper_bound"},
+                )
 
     def settle(self, run: str, reservation: str, seconds: float, usage: Usage) -> None:
         if seconds < 0:

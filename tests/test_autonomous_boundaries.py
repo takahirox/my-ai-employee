@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,12 +89,15 @@ def test_strict_external_guarantees_fail_before_native_or_model_execution(tmp_pa
         process.assert_not_called()
 
 
-def test_supervision_observes_progress_without_restarting_the_process(tmp_path: Path) -> None:
+@pytest.mark.parametrize("timeout", [None, 2])
+def test_supervision_observes_progress_without_restarting_the_process(
+    tmp_path: Path, timeout
+) -> None:
     observations: list[tuple[float, int]] = []
     code, output = run_process(
         (sys.executable, "-c", "import time; print('progress',flush=True); time.sleep(.3)"),
         tmp_path,
-        2,
+        timeout,
         lambda: False,
         supervision_seconds=0.05,
         observer=lambda elapsed, size: observations.append((elapsed, size)),
@@ -102,7 +106,8 @@ def test_supervision_observes_progress_without_restarting_the_process(tmp_path: 
     assert observations and observations[-1][1] > 0
 
 
-def test_cancelled_process_cannot_finish_a_later_write(tmp_path: Path) -> None:
+@pytest.mark.parametrize("timeout", [None, 2])
+def test_cancelled_process_cannot_finish_a_later_write(tmp_path: Path, timeout) -> None:
     marker = tmp_path / "started"
     command = (
         sys.executable,
@@ -111,7 +116,7 @@ def test_cancelled_process_cannot_finish_a_later_write(tmp_path: Path) -> None:
         "Path('started').write_text('yes'); time.sleep(10); Path('late').write_text('bad')",
     )
     with pytest.raises(Stopped):
-        run_process(command, tmp_path, 2, marker.exists)
+        run_process(command, tmp_path, timeout, marker.exists)
     assert not (tmp_path / "late").exists()
 
 
@@ -132,7 +137,10 @@ def test_unsettled_reservation_survives_controller_restart(tmp_path: Path) -> No
     run = journal.create("Write result", config(active_seconds=5, invocation_seconds=5))
     journal.reserve(run, "worker")
     reopened = Journal(journal.path)
-    with pytest.raises(Stopped, match="RUN_BUDGET_EXHAUSTED"):
+    with (
+        patch("ai_employee.history.time.time", return_value=time.time() + 6),
+        pytest.raises(Stopped, match="RUN_BUDGET_EXHAUSTED"),
+    ):
         reopened.reserve(run, "repair")
 
 

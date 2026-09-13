@@ -10,7 +10,15 @@ import pytest
 from ai_employee.container import ContainerModel
 from ai_employee.history import Journal, Stopped
 from ai_employee.isolated_worker import IsolatedWorkerProfile
-from ai_employee.models import Authority, Check, Clarification, StagePolicy, Usage
+from ai_employee.models import (
+    Authority,
+    Check,
+    Clarification,
+    Limits,
+    RunConfig,
+    StagePolicy,
+    Usage,
+)
 
 from .test_autonomous_runtime import OfflineModel, clarification, config, runtime
 from .test_stage_contracts import stream
@@ -76,8 +84,10 @@ def test_parallel_reservations_share_active_but_not_additive_wall(tmp_path, cloc
     run = journal.create("Write result", config(wall_seconds=10, active_seconds=15))
     with ThreadPoolExecutor(max_workers=2) as pool:
         reserved = list(pool.map(lambda _: journal.reserve(run, "worker"), range(2)))
-    assert sorted(seconds for _, seconds in reserved) == [5, 10]
-    assert journal.remaining_wall(run) == 10
+    assert [seconds for _, seconds in reserved] == [10, 10]
+    clock.advance(7.5)
+    assert journal.budget(run)["active_seconds_charged"] == 15
+    assert journal.remaining_wall(run) == 2.5
     with pytest.raises(Stopped, match="RUN_BUDGET_EXHAUSTED"):
         journal.reserve(run, "worker")
 
@@ -186,13 +196,15 @@ def test_timeout_cannot_hide_stop_or_retry_and_external_uncertainty_is_retained(
     assert engine.journal.budget(run)["measured_usage"]["tokens"] is None
 
 
-@pytest.mark.parametrize("setup", [4, 10])
-def test_native_setup_reduces_prompt_budget_and_prevents_expired_launch(tmp_path, clock, setup):
+@pytest.mark.parametrize("setup,limit,expected", [(4, 10, 6), (10, 10, 0), (7200, None, None)])
+def test_native_setup_reduces_prompt_budget_and_prevents_expired_launch(
+    tmp_path, clock, setup, limit, expected
+):
     model = ContainerModel(
         IsolatedWorkerProfile(image="sha256:" + "a" * 64, auth_file="/test-auth")
     )
     candidate = MagicMock()
-    candidate.deadline = clock.now + 10
+    candidate.deadline = None if limit is None else clock.now + limit
     candidate.proxy = None
     candidate.run_guarded.return_value = (
         0,
@@ -208,25 +220,25 @@ def test_native_setup_reduces_prompt_budget_and_prevents_expired_launch(tmp_path
         factory.return_value.__enter__.return_value = candidate
         args = (
             config().clarification,
-            json.dumps({"execution_budget": {"reserved_active_seconds": 10}}),
+            json.dumps({"execution_budget": {"reserved_active_seconds": limit}}),
             Clarification,
             tmp_path,
             Authority(),
-            10,
+            limit,
             lambda: False,
         )
-        if setup == 10:
+        if expected == 0:
             with pytest.raises(TimeoutError, match="NATIVE_SETUP_TIMEOUT"):
                 model.generate(*args, observation=observations.append)
             candidate.run_guarded.assert_not_called()
         else:
             model.generate(*args, observation=observations.append)
             body = json.loads(candidate.run_guarded.call_args.kwargs["stdin"])
-            assert body["execution_budget"]["reserved_active_seconds"] == 6
+            assert body["execution_budget"]["reserved_active_seconds"] == expected
             assert observations[-1] == {
                 "event": "execution_budget",
                 "phase": "native_launch",
-                "seconds": 6,
+                "seconds": expected,
             }
 
 
@@ -283,3 +295,176 @@ def test_nonmodel_reservations_use_wall_without_model_usage(tmp_path, clock, sta
     assert event["tokens"] == 0 and event["cost"] == 0
     journal.settle(run, reservation, 1, Usage(tokens=0, cost=0))
     assert journal.budget(run)["measured_usage"] == {"tokens": 0, "cost": 0.0}
+
+
+def test_default_policy_roundtrip_and_unlimited_elapsed_accounting(tmp_path, clock):
+    cfg = config(active_seconds=None)
+    assert cfg.limits == Limits()
+    assert Check(id="check", argv=("true",)).timeout is None
+    assert StagePolicy(model="test").supervision_seconds is None
+    assert RunConfig.model_validate_json(cfg.canonical()) == cfg
+    journal = Journal(tmp_path / "history.db")
+    run = journal.create("Write result", cfg)
+    reservation, seconds = journal.reserve(run, "worker")
+    assert seconds is None
+    clock.advance(7200)
+    journal = Journal(journal.path)
+    journal.check(run)
+    assert journal.remaining_wall(run) is None
+    assert journal.budget(run)["elapsed_seconds"] == 7200
+    assert journal.budget(run)["active_seconds_charged"] == 7200
+    journal.settle(run, reservation, 7200, Usage(tokens=12, cost=0))
+    clock.advance(3600)
+    assert journal.budget(run)["active_seconds_charged"] == 7200
+    assert journal.reserve(run, "verification")[1] is None
+
+
+@pytest.mark.parametrize(
+    "limits,expected",
+    [
+        ({"wall_seconds": 9}, 9),
+        ({"active_seconds": 8}, 8),
+        ({"invocation_seconds": 7}, 7),
+        ({"wall_seconds": 9, "active_seconds": 8, "invocation_seconds": 7}, 7),
+        ({"wall_seconds": 6, "active_seconds": 8, "invocation_seconds": 7}, 6),
+        ({"wall_seconds": 9, "active_seconds": 5, "invocation_seconds": 7}, 5),
+    ],
+)
+def test_opt_in_limits_compose_and_persist(tmp_path, clock, limits, expected):
+    cfg = config(**{"active_seconds": None, **limits})
+    journal = Journal(tmp_path / "history.db")
+    run = journal.create("Write result", cfg)
+    journal = Journal(journal.path)
+    assert journal.config(run) == cfg
+    reservation, seconds = journal.reserve(run, "worker")
+    assert seconds == expected
+    clock.advance(2)
+    journal.settle(run, reservation, 2, Usage())
+    assert journal.reserve(run, "worker")[1] == min(
+        value - (0 if key == "invocation_seconds" else 2) for key, value in limits.items()
+    )
+
+
+def test_active_only_parallel_admission_settlement_and_exhaustion(tmp_path, clock):
+    journal = Journal(tmp_path / "history.db")
+    run = journal.create("Write result", config(active_seconds=12))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = list(pool.map(lambda _: journal.reserve(run, "worker"), range(2)))
+    assert [seconds for _, seconds in calls] == [12, 12]
+    clock.advance(3)
+    assert journal.budget(run)["active_seconds_charged"] == 6
+    journal.settle(run, calls[0][0], 3, Usage())
+    assert journal.reserve(run, "worker")[1] == 6
+    clock.advance(3)
+    with pytest.raises(Stopped, match="RUN_BUDGET_EXHAUSTED"):
+        journal.check(run)
+    assert journal.budget(run)["active_seconds_charged"] == 12
+    assert journal.events(run)[-1]["body"]["reason"] == "RUN_BUDGET_EXHAUSTED"
+
+
+@pytest.mark.parametrize("counts", [False, True])
+def test_approval_wait_without_wall_limit_is_unbounded(tmp_path, clock, counts):
+    journal = Journal(tmp_path / "history.db")
+    run = journal.create("Write result", config(active_seconds=None, approval_counts_wall=counts))
+    journal.append(run, "approval_wait", attempt="a")
+    clock.advance(86400)
+    journal.check(run)
+    assert journal.reserve(run, "authority_application", model_usage=False)[1] is None
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_resume_recovers_reservations_only_after_cleanup(tmp_path, clock, cleanup_fails):
+    engine, source = runtime(tmp_path, OfflineModel())
+    run = engine.prepare("Write result", config(active_seconds=100), source)
+    engine.journal.reserve(run, "worker")
+    clock.advance(3)
+    engine.journal = Journal(engine.journal.path)
+    if cleanup_fails:
+        with (
+            patch.object(engine.model, "reconcile", side_effect=ValueError("cleanup failed")),
+            pytest.raises(ValueError, match="cleanup failed"),
+        ):
+            engine.cleanup(run)
+        assert engine.journal.budget(run)["open_reservations"] == 1
+    else:
+        engine.execute(run)
+        budget = engine.journal.budget(run)
+        assert budget["open_reservations"] == 0
+        assert budget["active_seconds_charged"] == 3
+        recovery = [e for e in engine.journal.events(run) if e["kind"] == "reservation_recovered"]
+        assert len(recovery) == 1
+        assert recovery[0]["body"]["timing"] == "upper_bound"
+        clock.advance(20)
+        engine.execute(run)
+        assert engine.journal.budget(run)["active_seconds_charged"] == 3
+
+
+def test_long_productive_run_and_checks_have_no_implicit_timeout(tmp_path, clock):
+    class LongModel(OfflineModel):
+        def generate(self, policy, prompt, schema, workspace, authority, timeout, cancelled, **kw):
+            assert timeout is None
+            assert json.loads(prompt)["execution_budget"]["reserved_active_seconds"] is None
+            clock.advance(3601)
+            assert not cancelled()
+            result, usage = super().generate(
+                policy, prompt, schema, workspace, authority, timeout, cancelled, **kw
+            )
+            if schema is Clarification:
+                result = result.model_copy(
+                    update={
+                        "criteria": tuple(
+                            c.model_copy(update={"checks": ("protected",)}) for c in result.criteria
+                        )
+                    }
+                )
+            return result, usage
+
+        def check(self, argv, workspace, timeout, cancelled):
+            assert timeout is None
+            clock.advance(601)
+            assert not cancelled()
+            return True, "passed"
+
+    engine, source = runtime(tmp_path, LongModel())
+    cfg = config(active_seconds=None).model_copy(
+        update={
+            "checks": (Check(id="protected", argv=("true",)),),
+            "mandatory_checks": ("protected",),
+        }
+    )
+    run = engine.start("Write result", cfg, source)
+    assert engine.journal.events(run)[-1]["kind"] == "completed"
+    assert engine.journal.budget(run)["active_seconds_charged"] > 18000
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+def test_check_specific_limit_reaches_executor_without_global_limits(tmp_path, clock, limit):
+    class CheckModel(OfflineModel):
+        def generate(self, policy, prompt, schema, *args, **kwargs):
+            result, usage = super().generate(policy, prompt, schema, *args, **kwargs)
+            if schema is Clarification:
+                result = result.model_copy(
+                    update={
+                        "criteria": tuple(
+                            c.model_copy(update={"checks": ("protected",)}) for c in result.criteria
+                        )
+                    }
+                )
+            return result, usage
+
+        def check(self, argv, workspace, timeout, cancelled):
+            assert timeout == limit
+            raise TimeoutError("explicit test check timeout")
+
+    engine, source = runtime(tmp_path, CheckModel())
+    cfg = config(active_seconds=None).model_copy(
+        update={
+            "checks": (Check(id="protected", argv=("true",), timeout=limit),),
+            "mandatory_checks": ("protected",),
+        }
+    )
+    with pytest.raises(TimeoutError, match="explicit test check timeout"):
+        engine.start("Write result", cfg, source)
+    run = engine.journal.runs()[0]
+    assert engine.journal.budget(run)["open_reservations"] == 0
+    assert any(e["kind"] == "failed" for e in engine.journal.events(run))

@@ -36,6 +36,9 @@ def test_init_writes_current_schema_and_refuses_overwrite(
     ]
     assert main(args) == 0
     configured = RunConfig.model_validate_json(output.read_text())
+    assert configured.limits.wall_seconds is None
+    assert configured.limits.active_seconds is None
+    assert configured.limits.invocation_seconds is None
     assert configured.clarification.review == "always"
     assert configured.isolation is not None
     original = output.read_bytes()

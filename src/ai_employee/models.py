@@ -300,7 +300,7 @@ class Plan(Contract):
 class Check(Contract):
     id: Key
     argv: tuple[Text, ...] = Field(min_length=1)
-    timeout: float = Field(default=60, gt=0)
+    timeout: float | None = Field(default=None, gt=0)
     evidence_kind: Literal["artifact", "external_effect"] = "artifact"
 
 
@@ -329,9 +329,9 @@ class StagePolicy(Contract):
 
 
 class Limits(Contract):
-    wall_seconds: float = Field(default=1800, gt=0)
-    active_seconds: float = Field(default=1800, gt=0)
-    invocation_seconds: float = Field(default=300, gt=0)
+    wall_seconds: float | None = Field(default=None, gt=0)
+    active_seconds: float | None = Field(default=None, gt=0)
+    invocation_seconds: float | None = Field(default=None, gt=0)
     tokens: int | None = Field(default=None, gt=0)
     cost: float | None = Field(default=None, gt=0)
     reservation_tokens: int = Field(default=100000, gt=0)
