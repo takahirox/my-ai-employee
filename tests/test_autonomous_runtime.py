@@ -776,7 +776,7 @@ def test_external_completion_crash_does_not_repeat_unverified_effect(
 def test_authority_application_obeys_remaining_budget_and_cancellation(tmp_path: Path) -> None:
     model = AuthorityModel()
     engine, source = runtime(tmp_path, model)
-    cfg = config().model_copy(
+    cfg = config(invocation_seconds=300).model_copy(
         update={
             "authority_ceiling": Authority(network_hosts=("example.com",), external_writes=True),
             "security": "balanced",

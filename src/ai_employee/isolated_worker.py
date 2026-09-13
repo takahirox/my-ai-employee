@@ -17,6 +17,10 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from . import owner_watch
+from .owner_watch import resource_missing
+from .time_budget import exhausted, minimum, remaining
+
 
 class Cancellation(Protocol):
     def cancelled(self) -> bool: ...
@@ -107,13 +111,6 @@ class NativeProcessBudgetExceeded(IsolatedBudgetExceeded):
     """No further native work or candidate submission is authorized."""
 
 
-def resource_missing(kind: str, name: str, error: bytes) -> bool:
-    message = error.decode(errors="replace").lower()
-    return f"no such {kind}: {name}" in message or (
-        kind == "network" and f"network {name} not found" in message
-    )
-
-
 def append_resource_event(path: Path | None, kind: str, name: str, state: str) -> None:
     if path is None:
         return
@@ -135,14 +132,14 @@ class DockerCandidate:
         profile: IsolatedWorkerProfile,
         root: Path,
         *,
-        seconds: float,
+        seconds: float | None,
         cancellation: Cancellation,
         output_limit: int = 1_000_000,
         resource_ledger: Path | None = None,
         service_hosts: tuple[str, ...] = (),
     ) -> None:
         self.profile, self.root, self.cancellation = profile, root.resolve(), cancellation
-        self.deadline = time.monotonic() + seconds
+        self.deadline = None if seconds is None else time.monotonic() + seconds
         self.output_limit = output_limit
         self.resource_ledger = resource_ledger
         self.service_hosts = service_hosts
@@ -152,37 +149,60 @@ class DockerCandidate:
         self.proxy: str | None = None
         self.native_process_usage: dict[str, object] = {}
         self.confirmed_resources: set[tuple[str, str]] = set()
+        self.pending_creations: set[tuple[str, str]] = set()
+        self.owner_watch: subprocess.Popen[bytes] | None = None
 
     def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
         """Operator-only crash-recovery ledger; never copied into the worker."""
         if state == "created":
             self.confirmed_resources.add((kind, name))
+            self.pending_creations.discard((kind, name))
+        elif state == "intent":
+            self.pending_creations.add((kind, name))
         append_resource_event(self.resource_ledger, kind, name, state)
 
     def _docker(self, *args: str, data: bytes | None = None) -> bytes:
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0 or self.cancellation.cancelled():
+        self._check_owner()
+        seconds_left = remaining(self.deadline)
+        if exhausted(seconds_left) or self.cancellation.cancelled():
             raise TimeoutError("isolated candidate cancelled or deadline exhausted")
-        result = subprocess.run(
+        # Poll ownership/shared active consumption even during setup and capture.
+        # A second call may consume the active allowance after this operation starts.
+        deadline = minimum(self.deadline, time.monotonic() + 30)
+        process = subprocess.Popen(
             ["docker", *args],
-            input=data,
-            capture_output=True,
-            timeout=min(30, remaining),
-            check=False,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if result.returncode:
+        try:
+            while True:
+                self._check_owner()
+                if exhausted(remaining(deadline)) or self.cancellation.cancelled():
+                    raise TimeoutError("DOCKER_CONTROL_TIMEOUT")
+                try:
+                    stdout, stderr = process.communicate(input=data, timeout=0.05)
+                    break
+                except subprocess.TimeoutExpired:
+                    data = None  # communicate retains any unwritten input across polls.
+        except BaseException:
+            process.kill()
+            process.communicate(timeout=5)
+            self.close()
+            raise
+        if process.returncode:
             raise RuntimeError(
-                f"Docker operation {args[0]} failed: "
-                + result.stderr.decode(errors="replace")[:1000]
+                f"Docker operation {args[0]} failed: " + stderr.decode(errors="replace")[:1000]
             )
         if args[0] in ("create", "run") and "--name" in args:
             self._record_resource("container", args[args.index("--name") + 1], "created")
         elif args[:2] == ("network", "create"):
             self._record_resource("network", args[-1], "created")
-        return result.stdout
+        return stdout
 
     def __enter__(self) -> DockerCandidate:
         try:
+            self.owner_watch = owner_watch.start(self.name)
             inspected = json.loads(self._docker("image", "inspect", self.profile.image))[0]
             if inspected["Id"] != self.profile.image or inspected["Os"] != "linux":
                 raise ValueError("isolated worker requires the exact Linux runtime image")
@@ -225,7 +245,7 @@ class DockerCandidate:
                 self.profile.image,
                 "-I",
                 "-c",
-                "import time; time.sleep(" + repr(max(1.0, self.deadline - time.monotonic())) + ")",
+                "import threading; threading.Event().wait(" + repr(remaining(self.deadline)) + ")",
             )
             self._docker("start", self.name)
             self._docker(
@@ -287,11 +307,14 @@ class DockerCandidate:
         stdin: bytes = b"",
         observe: Callable[[dict[str, object]], None] | None = None,
         supervise: Callable[[int], None] | None = None,
+        timeout: float | None = None,
     ) -> tuple[int, bytes, bytes]:
         """Stream native events with a bounded output; cancellation kills the whole container."""
         import selectors
 
-        if self.cancellation.cancelled() or time.monotonic() >= self.deadline:
+        deadline = minimum(self.deadline, None if timeout is None else time.monotonic() + timeout)
+        self._check_owner()
+        if self.cancellation.cancelled() or exhausted(remaining(deadline)):
             self.close()
             raise TimeoutError("isolated execution cancelled or timed out before launch")
 
@@ -335,8 +358,9 @@ class DockerCandidate:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, stdout)
                 selector.register(process.stderr, selectors.EVENT_READ, stderr)
-                while selector.get_map():
-                    if self.cancellation.cancelled() or time.monotonic() >= self.deadline:
+                while selector.get_map() or process.poll() is None:
+                    self._check_owner()
+                    if self.cancellation.cancelled() or exhausted(remaining(deadline)):
                         raise TimeoutError("isolated execution cancelled or timed out")
                     if supervise is not None:
                         supervise(len(stdout) + len(stderr))
@@ -382,6 +406,7 @@ class DockerCandidate:
         stdin: bytes = b"",
         observe: Callable[[dict[str, object]], None] | None = None,
         supervise: Callable[[int], None] | None = None,
+        timeout: float | None = None,
     ) -> tuple[int, bytes, bytes]:
         """Admit cumulative native process creation before the syscall executes.
 
@@ -412,6 +437,7 @@ class DockerCandidate:
             stdin=stdin,
             observe=observe,
             supervise=supervise,
+            timeout=timeout,
         )
         if guard_code not in (0, 125):
             raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: no candidate accepted")
@@ -532,7 +558,32 @@ class DockerCandidate:
             data=stream.getvalue(),
         )
 
+    def _check_owner(self) -> None:
+        if self.owner_watch is not None and self.owner_watch.poll() is not None:
+            raise RuntimeError("OWNER_WATCH_LOST")
+
     def close(self) -> None:
+        confirmed = False
+        try:
+            self._close_resources()
+            confirmed = not self.pending_creations
+        finally:
+            watcher, self.owner_watch = self.owner_watch, None
+            if watcher is not None:
+                assert watcher.stdin
+                try:
+                    if confirmed:
+                        watcher.stdin.write(b"D")
+                        watcher.stdin.flush()
+                except BrokenPipeError:
+                    pass
+                finally:
+                    watcher.stdin.close()
+                if confirmed:
+                    watcher.wait(timeout=5)
+                # Uncertain cleanup leaves EOF recovery running independently.
+
+    def _close_resources(self) -> None:
         failures = []
         for kind, name in (
             ("container", self.name if self.created else None),

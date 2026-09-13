@@ -49,6 +49,7 @@ from .stage_contracts import (
     validation_code,
     validation_details,
 )
+from .time_budget import exhausted, minimum
 
 T = TypeVar("T", bound=Contract)
 _NO_AUTHORITY = Authority()
@@ -288,8 +289,11 @@ class Engine:
                 result=preflight,
             )
             self.journal.check(run)
-            timeout = min(timeout - (time.monotonic() - started), self.journal.remaining_wall(run))
-            if timeout <= 0:
+            timeout = minimum(
+                None if timeout is None else timeout - (time.monotonic() - started),
+                self.journal.remaining_wall(run),
+            )
+            if exhausted(timeout):
                 self.journal.check(run)
                 raise TimeoutError("PREFLIGHT_TIMEOUT")
             observe({"event": "execution_budget", "phase": "after_preflight", "seconds": timeout})
@@ -645,7 +649,7 @@ class Engine:
                 passed, output = self.model.check(
                     check.argv,
                     check_workspace,
-                    min(check.timeout, timeout),
+                    minimum(check.timeout, timeout),
                     lambda: self._cancelled(run),
                 )
                 self.journal.diagnostic(
@@ -1212,6 +1216,7 @@ class Engine:
         with self.journal.controller(run):
             try:
                 self.model.reconcile(self.root / run)
+                self.journal.recover_reservations(run)
                 self._execute(run)
             except Waiting:
                 return
@@ -1235,6 +1240,7 @@ class Engine:
         with self.journal.controller(run):
             try:
                 self.model.reconcile(self.root / run)
+                self.journal.recover_reservations(run)
             except (ValueError, RuntimeError, OSError, TimeoutError) as error:
                 known = {
                     "INVALID_RESOURCE_LEDGER",
@@ -1270,6 +1276,7 @@ class Engine:
             if any(event["kind"] in {"stopped", "uncertain"} for event in events):
                 raise Stopped("TERMINAL_RUN_CANNOT_BE_REVISED")
             self.model.reconcile(self.root / run)
+            self.journal.recover_reservations(run)
             completed = any(event["kind"] == "completed" for event in events)
             tree = (
                 self._completion(run).tree
@@ -1303,6 +1310,7 @@ class Engine:
         self.journal.append(run, "authority_revocation_requested")
         with self.journal.controller(run):
             self.model.reconcile(self.root / run)
+            self.journal.recover_reservations(run)
             self.journal.append(run, "authority_revoked", scope="all_task_sessions", resume=False)
 
     def approve_authority(self, run: str, attempt: str, *, approve: bool) -> None:
@@ -1351,6 +1359,7 @@ class Engine:
             if not workspace.resolve().is_relative_to(self.root / run):
                 raise ValueError("FOREIGN_WORKSPACE")
             self.model.reconcile(self.root / run)
+            self.journal.recover_reservations(run)
             self.journal.append(
                 run, "authority_approved", attempt=attempt, version=request["version"]
             )
@@ -1663,6 +1672,7 @@ class Engine:
     def promote(self, run: str, destination: Path) -> None:
         with self.journal.controller(run):
             self.model.reconcile(self.root / run)
+            self.journal.recover_reservations(run)
             if any(
                 event["kind"] in {"stopped", "uncertain", "authority_revoked"}
                 for event in self.journal.events(run)

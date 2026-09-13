@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -90,3 +92,86 @@ def test_timeout_removes_owned_namespace(tmp_path: Path) -> None:
         assert not candidate.created
         result = subprocess.run(["docker", "inspect", candidate.name], capture_output=True)
         assert result.returncode != 0
+
+
+def test_unlimited_invocation_cancellation_removes_descendants(tmp_path: Path) -> None:
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    cancelled = False
+    with configured()._candidate(workspace, None, lambda: cancelled, models=False) as candidate:
+        assert candidate.deadline is None
+
+        def cancel(_size):
+            nonlocal cancelled
+            cancelled = True
+
+        with pytest.raises(TimeoutError):
+            candidate.run_guarded(
+                ("python", "-I", "-c", "import time; time.sleep(30)"),
+                process_limit=100,
+                supervise=cancel,
+            )
+        assert subprocess.run(["docker", "inspect", candidate.name], capture_output=True).returncode
+
+
+def test_controller_sigkill_reaps_unlimited_namespace_gateway_and_network(tmp_path: Path) -> None:
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    ready = tmp_path / "ready.json"
+    script = """
+import json,os,time,sys
+from pathlib import Path
+from ai_employee.container import ContainerModel
+from ai_employee.isolated_worker import IsolatedWorkerProfile
+from ai_employee.models import Authority
+model=ContainerModel(IsolatedWorkerProfile(image=os.environ['FLEET_TEST_DOCKER_IMAGE']))
+workspace,ready=map(Path,sys.argv[1:])
+with model._candidate(workspace,None,lambda:False,models=False,
+                      authority=Authority(network_hosts=('example.com',))) as candidate:
+    candidate._docker('exec','-d','--user','1000:1000',candidate.name,'python','-I','-c',
+                      'import time; time.sleep(600)')
+    ready.write_text(json.dumps([candidate.name,candidate.proxy,candidate.network]))
+    time.sleep(600)
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-c", script, str(workspace), str(ready)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    names = []
+    try:
+        until = time.monotonic() + 45
+        while not ready.exists() and owner.poll() is None and time.monotonic() < until:
+            time.sleep(0.1)
+        assert ready.exists(), "test controller did not create disposable resources"
+        names = json.loads(ready.read_text())
+        owner.kill()
+        owner.wait(timeout=5)
+        until = time.monotonic() + 40
+        while time.monotonic() < until:
+            present = [
+                subprocess.run(
+                    ["docker", kind, "inspect", name], capture_output=True, timeout=5
+                ).returncode
+                == 0
+                for kind, name in zip(("container", "container", "network"), names, strict=True)
+            ]
+            if not any(present):
+                break
+            time.sleep(0.2)
+        assert not any(present), f"owned resources survived controller loss: {present}"
+        configured().reconcile(tmp_path)
+        # Reconciliation is repeatable and confirms the durable ledger after EOF cleanup.
+        configured().reconcile(tmp_path)
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.wait(timeout=5)
+        assert owner.stderr
+        owner.stderr.close()
+        for kind, name in zip(("container", "container", "network"), names, strict=False):
+            subprocess.run(
+                ["docker", kind, "rm", *(["-f"] if kind == "container" else []), name],
+                capture_output=True,
+                timeout=15,
+            )

@@ -47,12 +47,19 @@ is no legacy runtime, compatibility profile router or database migration subsyst
 
 ## Stage contracts and execution readiness
 
-`Journal.remaining_wall` owns the wall-time definition, including the union of
-approval waits when policy excludes them. Admission caps each reservation by that
-remaining time, the per-invocation limit and shared active allowance; it rechecks
-wall time after acquiring the reservation lock. Concurrent calls share active
-charges but do not subtract each other's wall reservations. Resume keeps the
-original clock and existing charges.
+Work time limits are opt-in: omitted/null wall, cumulative active, invocation and
+check durations impose no hard work deadline. `Journal.remaining_wall` owns the
+wall-time definition, including the union of approval waits when policy excludes
+them. Admission caps a call by the minimum of the configured remaining budgets;
+it rechecks under the reservation lock. Active time sums settled actual durations
+and elapsed time of every open call. A call never reserves future active seconds
+exclusively, so an active-only budget admits parallel work. Live cancellation checks
+the same shared sum; all calls stop at exhaustion (subject to process polling and
+cleanup latency). Token/cost admission reservations and invocation counts remain
+unchanged. Resume keeps the original clock and charges. After exclusive ownership
+and confirmed resource reconciliation, interrupted reservations close with elapsed
+time through reconciliation charged as a conservative upper bound, explicitly marked
+`reservation_recovered`. Unknown token/cost charges and external-effect leases remain.
 
 Preflight and native setup consume the invocation's existing deadline. The model's
 execution budget is reduced before dispatch, with bounded `execution_budget`
@@ -63,6 +70,10 @@ still retain uncertainty. Late check output remains diagnostic evidence and cann
 become an accepted check receipt after expiry. Mandatory verification, configured
 review and cleanup are unchanged; no fixed completion reserve or extra budget is
 introduced. These rules align deadlines, not guarantee task completion within them.
+Inspector budget data exposes elapsed and charged active seconds even when limits
+are unset. Optional supervision observes progress without imposing a work deadline.
+Docker API operations, individual native probes, ownership-watch startup and cleanup
+retain finite control-plane timeouts; they do not bound the productive session.
 
 `stage_contracts.py` binds each invocation to `stage-contract-3`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic

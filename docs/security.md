@@ -11,8 +11,16 @@ Production execution requires an explicitly prepared immutable Docker image. The
 container has no host bind mounts, host history, host Git metadata, Docker socket,
 or unrelated credentials. Its root filesystem is read-only; CPU, memory, process
 count and writable storage are bounded. The existing seccomp process admission
-supervisor kills and reaps task-UID processes before accepting a snapshot. Container
-lifetime also bounds an invocation after controller failure.
+supervisor kills and reaps task-UID processes before accepting a snapshot. Before
+creating resources, the controller starts an independent host ownership watcher.
+Loss of its exclusive pipe triggers removal of the exact owned container, gateway
+and network, including detached task processes. Normal work has no implicit lifetime;
+an explicitly configured invocation deadline also bounds the container's lifetime.
+The watcher repeats cleanup across a 30-second in-flight-creation window, using
+bounded Docker operations, and continues beyond that window until all removals or
+absences are confirmed. Docker unavailability or uncertain creation is not proof
+of release: the durable resource ledger must reconcile before continuation. Failure
+of the watcher while the controller is alive fails the invocation closed.
 
 Codex's native permission profile allows minimal runtime reads and task workspace
 writes. Runtime metadata is denied and integration inputs are read-only. A canary
@@ -68,8 +76,9 @@ Workers cannot access the journal or Candidate store. Digest chaining detects
 accidental or partial history changes; it is not cryptographic authentication
 against a malicious operator who can rewrite both data and hashes.
 
-Wall time, invocation time, task/attempt counts and graph growth provide stopping
-boundaries. Token/cost reservations control admission across concurrent calls.
+Explicitly configured wall, active, invocation and check time limits provide stopping
+boundaries; omitted limits do not. Task/attempt counts and graph growth stay bounded.
+Token/cost reservations control admission across concurrent calls.
 When backend accounting is absent, the reservation remains charged and usage is
 marked unknown. A reservation is not a provider-enforced per-call token/cost cap:
 actual spend can exceed the estimate before usage arrives. Exhaustion stops new

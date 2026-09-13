@@ -27,7 +27,6 @@ from .isolated_worker import (
     DockerCandidate,
     IsolatedWorkerProfile,
     append_resource_event,
-    resource_missing,
 )
 from .models import Authority, Check, StagePolicy, Usage
 from .native import (
@@ -39,7 +38,9 @@ from .native import (
     quota_error,
     summarize_event,
 )
+from .owner_watch import resource_missing
 from .product_capabilities import CODEX_VERSION
+from .time_budget import exhausted, minimum, remaining
 
 _OFFLINE = Authority()
 
@@ -61,7 +62,7 @@ class ContainerModel:
         policy: StagePolicy,
         workspace: Path,
         authority: Authority,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
         checks: tuple[Check, ...] = (),
     ) -> dict[str, Any]:
@@ -113,7 +114,7 @@ class ContainerModel:
     def _candidate(
         self,
         workspace: Path,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
         *,
         models: bool,
@@ -179,7 +180,7 @@ class ContainerModel:
             "else: raise AssertionError('native read boundary unavailable')\n",
         )
         code, _, _ = candidate.run_guarded(
-            command, process_limit=candidate.profile.native_process_limit
+            command, process_limit=candidate.profile.native_process_limit, timeout=15
         )
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
@@ -279,11 +280,15 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
             raise ValueError("RESOURCE_CREATION_UNCERTAIN")
 
     def apply_authority(
-        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+        self,
+        workspace: Path,
+        authority: Authority,
+        timeout: float | None,
+        cancelled: Callable[[], bool],
     ) -> None:
         self._validate(authority)
         with self._candidate(
-            workspace, min(30, timeout), cancelled, models=False, authority=authority
+            workspace, minimum(30, timeout), cancelled, models=False, authority=authority
         ) as candidate:
             self._native_probe(candidate, authority)
 
@@ -294,7 +299,7 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
         schema: type[T],
         workspace: Path,
         authority: Authority,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
         observer: Callable[[float, int], None] | None = None,
         observation: Callable[[dict[str, Any]], None] | None = None,
@@ -389,14 +394,14 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 "-",
             )
             # Native setup consumes the same deadline as the actual model process.
-            remaining = candidate.deadline - time.monotonic()
-            if remaining <= 0 or cancelled():
+            seconds_left = remaining(candidate.deadline)
+            if exhausted(seconds_left) or cancelled():
                 raise TimeoutError("NATIVE_SETUP_TIMEOUT")
             if "execution_budget" in body:
-                body["execution_budget"]["reserved_active_seconds"] = remaining
+                body["execution_budget"]["reserved_active_seconds"] = seconds_left
             if observation is not None:
                 observation(
-                    {"event": "execution_budget", "phase": "native_launch", "seconds": remaining}
+                    {"event": "execution_budget", "phase": "native_launch", "seconds": seconds_left}
                 )
             prompt = json.dumps(body, ensure_ascii=False)
             code, stdout, stderr = candidate.run_guarded(
@@ -429,7 +434,11 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
             return decode_response(stdout.decode(errors="replace"), schema)
 
     def check(
-        self, argv: tuple[str, ...], workspace: Path, timeout: float, cancelled: Callable[[], bool]
+        self,
+        argv: tuple[str, ...],
+        workspace: Path,
+        timeout: float | None,
+        cancelled: Callable[[], bool],
     ) -> tuple[bool, CheckOutput]:
         with self._candidate(workspace, timeout, cancelled, models=False) as candidate:
             self._native_probe(candidate)

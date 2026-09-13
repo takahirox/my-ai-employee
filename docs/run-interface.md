@@ -61,6 +61,23 @@ limits and the explicit delegated authentication path are snapshotted at submit.
 Runtime APIs inside the Python package remain implementation details, not a second
 promised integration interface.
 
+`fleet init` leaves `limits.wall_seconds`, `limits.active_seconds`,
+`limits.invocation_seconds` and each check's `timeout` unset (`null`). Omission has
+the same meaning: no hard time limit for that scope. Set positive seconds explicitly
+when required; the smallest applicable remaining limit bounds a call. For example,
+`"wall_seconds": 7200` limits the Run to two hours. `approval_counts_wall` affects
+only a configured wall limit. `active_seconds` sums concurrent invocation durations,
+not elapsed Run time. `supervision_seconds` is an observation interval, not a timeout.
+Cancellation, usage/attempt limits and mandatory verification still apply.
+
+Budget includes `elapsed_seconds` (time since Run creation) and
+`active_seconds_charged` with live open-call timing even without time limits.
+After an interrupted controller, reconciliation closes open calls with a conservative
+time charge through cleanup, recorded as `reservation_recovered` / `upper_bound`;
+it does not report unknown provider usage as zero or clear uncertain external effects.
+Existing submitted Runs retain their snapshotted explicit limits; changing a template
+does not change a submitted Run's policy.
+
 ## Durable interaction and resource ownership
 
 ```sh

@@ -24,6 +24,7 @@ from .history import Stopped
 from .models import Authority, Check, Contract, StagePolicy, Usage
 from .process_lifecycle import terminate_group
 from .stage_contracts import OutputViolation, validation_code, validation_details
+from .time_budget import minimum
 
 T = TypeVar("T", bound=Contract)
 _OFFLINE = Authority()
@@ -112,7 +113,7 @@ class Model(Protocol):
         policy: StagePolicy,
         workspace: Path,
         authority: Authority,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
         checks: tuple[Check, ...] = (),
     ) -> dict[str, Any]: ...
@@ -120,7 +121,11 @@ class Model(Protocol):
     def reconcile(self, run_directory: Path) -> None: ...
 
     def apply_authority(
-        self, workspace: Path, authority: Authority, timeout: float, cancelled: Callable[[], bool]
+        self,
+        workspace: Path,
+        authority: Authority,
+        timeout: float | None,
+        cancelled: Callable[[], bool],
     ) -> None: ...
 
     def generate(
@@ -130,7 +135,7 @@ class Model(Protocol):
         schema: type[T],
         workspace: Path,
         authority: Authority,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
         observer: Callable[[float, int], None] | None = None,
         observation: Callable[[dict[str, Any]], None] | None = None,
@@ -140,7 +145,7 @@ class Model(Protocol):
         self,
         argv: tuple[str, ...],
         workspace: Path,
-        timeout: float,
+        timeout: float | None,
         cancelled: Callable[[], bool],
     ) -> tuple[bool, str | CheckOutput]: ...
 
@@ -148,7 +153,7 @@ class Model(Protocol):
 def run_process(
     argv: tuple[str, ...],
     workspace: Path,
-    timeout: float,
+    timeout: float | None,
     cancelled: Callable[[], bool],
     *,
     stdin: str = "",
@@ -188,10 +193,10 @@ def run_process(
                 assert process.stdout is not None and process.stderr is not None
                 selector.register(process.stdout, selectors.EVENT_READ)
                 selector.register(process.stderr, selectors.EVENT_READ)
-                while selector.get_map():
+                while selector.get_map() or process.poll() is None:
                     if cancelled():
                         raise Stopped("RUN_STOPPED")
-                    if time.monotonic() - started >= timeout:
+                    if timeout is not None and time.monotonic() - started >= timeout:
                         raise TimeoutError("INVOCATION_TIMEOUT")
                     if (
                         supervision_seconds is not None
@@ -342,7 +347,7 @@ class NativeSandboxProbe:
         workspace: Path,
         cancelled: Callable[[], bool],
         authority: Authority = _OFFLINE,
-        timeout: float = 15,
+        timeout: float | None = 15,
     ) -> None:
         # No model access or operator credentials are required by this probe.
         with tempfile.TemporaryDirectory(prefix="fleet-probe-") as directory:
@@ -370,7 +375,7 @@ class NativeSandboxProbe:
                 "-c",
                 program,
             )
-            code, _ = run_process(argv, workspace, min(15, timeout), cancelled)
+            code, _ = run_process(argv, workspace, minimum(15, timeout), cancelled)
             if code:
                 raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
