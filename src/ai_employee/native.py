@@ -322,6 +322,13 @@ def provider_schema(
                 *([{"type": "string", "enum": list(historical)}] if historical else []),
                 {"type": "null"},
             ]
+        source = binding.get("original_source")
+        if source is not None:
+            for name in ("Requirement", "ClarificationNeed"):
+                if name in definitions:
+                    refs = definitions[name]["properties"]["original_refs"]
+                    refs["items"] = {"type": "string", "enum": list(source["fragments"])}
+                    refs["maxItems"] = len(source["fragments"])
 
     # Finding is nested, so the provider's supported anyOf form can express its
     # category/pass relationship without changing the public response shape.

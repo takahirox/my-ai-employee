@@ -13,7 +13,9 @@ from .container import ContainerModel
 from .engine import Engine, Waiting
 from .history import Journal, Stopped
 from .isolated_worker import IsolatedWorkerProfile
-from .models import RunConfig, StagePolicy
+from .models import Clarification, RunConfig, StagePolicy
+from .source_refs import original_source
+from .stage_contracts import VERSION
 
 PUBLIC_CONTRACT = "fleet-run-1"
 
@@ -116,6 +118,20 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
             cleanup = "confirmed"
         elif event["kind"] == "cleanup_failed":
             cleanup = "unconfirmed"
+    source_evidence = None
+    # Older contracts remain inspectable; never reinterpret their stored quotations as IDs.
+    if events[0]["body"].get("contract_version") == VERSION:
+        for event in reversed(events):
+            if event["kind"] in {"goal", "clarification_wait"}:
+                proposal = (
+                    event["body"]["goal"]["specification"]
+                    if event["kind"] == "goal"
+                    else event["body"]["proposal"]
+                )
+                source_evidence = Clarification.model_validate(proposal).source_evidence(
+                    journal.original(run)
+                )
+                break
     return {
         "contract_version": PUBLIC_CONTRACT,
         "run_id": run,
@@ -135,6 +151,8 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
             if event["kind"] == "reserved"
         ],
         "policy": config.model_dump(mode="json", exclude={"isolation", "checks"}),
+        "original_source": original_source(journal.original(run)),
+        "source_evidence": source_evidence,
         "goal": next(
             (event["body"]["goal"] for event in reversed(events) if event["kind"] == "goal"), None
         ),

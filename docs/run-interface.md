@@ -65,6 +65,16 @@ limits and the explicit delegated authentication path are snapshotted at submit.
 Runtime APIs inside the Python package remain implementation details, not a second
 promised integration interface.
 
+Current Goal requirements and unresolved clarification needs contain `original_refs`,
+an ordered list of IDs from `original_source.fragments`. `source_evidence` in Run
+projections contains their exact runtime-derived `fragments` for display, including
+pending human questions. Separate fragments are separate quotations, not an implied
+contiguous excerpt. The original remains unchanged, including line endings and
+Unicode. A source ID proves location, not interpretation. Old quotation-based
+histories remain inspectable; `stage-contract-5` rejects their execution rather
+than migrating references or resetting invocation budgets.
+
+
 `fleet init` leaves `limits.wall_seconds`, `limits.active_seconds`,
 `limits.invocation_seconds` and each check's `timeout` unset (`null`). Omission has
 the same meaning: no hard time limit for that scope. Set positive seconds explicitly

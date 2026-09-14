@@ -55,7 +55,7 @@ def clarification() -> Clarification:
     return Clarification(
         clarified_goal="Write result",
         criteria=(Criterion(id="result", description="result exists"),),
-        requirements=(Requirement(original_fragment="Write result", criteria=("result",)),),
+        requirements=(Requirement(original_refs=("s1",), criteria=("result",)),),
     )
 
 
@@ -114,7 +114,7 @@ class OfflineModel:
                             kind="human_input",
                             question="Which result?",
                             reason="The result is unspecified",
-                            original_fragment="Write result",
+                            original_refs=("s1",),
                             evidence="Input does not select an intended result",
                         ),
                     )
@@ -274,9 +274,14 @@ def test_journal_detects_changed_configuration_and_history(tmp_path: Path) -> No
         journal.events(run)
 
 
-def test_foreign_fragments_missing_mandatory_checks_and_cycle_are_rejected() -> None:
-    with pytest.raises(ValueError, match="FOREIGN_REQUIREMENT_FRAGMENT"):
-        Goal(original_input="other", specification=clarification())
+def test_foreign_references_missing_mandatory_checks_and_cycle_are_rejected() -> None:
+    with pytest.raises(ValueError, match="INVALID_ORIGINAL_REFERENCES"):
+        Goal(
+            original_input="Write result",
+            specification=clarification().model_copy(
+                update={"requirements": (Requirement(original_refs=("s2",), criteria=("result",)),)}
+            ),
+        )
     with pytest.raises(ValueError, match="MANDATORY_CHECK_OMITTED"):
         Goal(
             original_input="Write result",

@@ -1,6 +1,6 @@
 # Semantic contract audit (#197)
 
-This is the baseline reverse audit for `stage-contract-4`. Start at consequential
+This is the reverse audit updated for `stage-contract-5`. Start at consequential
 Engine, Journal, Candidate and native-adapter decisions, then trace their inputs
 back to generation. This table is an index to executable owners, not another
 definition of their meanings. Changes must repeat the reverse review in
@@ -21,8 +21,8 @@ in `tests/`; abbreviated module names have the `test_` prefix.
 
 | Consequential input / decision | Authoritative owner → producer projection | Review / deterministic validation → runtime consumer | Regression evidence / conclusion |
 | --- | --- | --- | --- |
-| Original fragments, criterion IDs and mappings → Goal acceptance/rejection | `models.Requirement`, `Clarification`; `semantics.RULES` → field descriptions, bound Original Input and criterion/check namespaces | Same original in clarification review; local uniqueness/mapping validators and `StageContract.validate` exact-fragment checks → `_clarify` | Updated: `clarification_contract`, `stage_contracts` cover foreign references, repair and immutable Goal boundaries. Natural-language completeness still requires configured semantic review. |
-| Clarification need kind, question, reason, evidence and fragment → repair/stop/human wait | `CLARIFICATION_NEEDS`, `CLARIFICATION_RULES`, `Clarification.semantics()` → schema and both clarification/review bindings | Need validators, bound fragment validation, `disposition` → `_clarify`, Goal acceptance | Audited: `clarification_contract` covers investigation repair, environment stop, actual human questions, mixed-needs priority and replay. |
+| Original source IDs, criterion IDs and mappings → Goal acceptance/rejection | `source_refs.py`, `Requirement`, `Clarification` → exact runtime fragments and ID enum in the bound provider schema | Shared resolver in clarification/Goal validation, derived quotation evidence in review and CLI/Inspector → `_clarify` | Updated for #201: `source_references` covers Unicode/line endings, bounded fragments, invalid/duplicate/reordered refs, review revision, repair, provenance, persistence and replay. Reference validity does not prove semantic support. |
+| Clarification need kind, question, reason, evidence and source references → repair/stop/human wait | `CLARIFICATION_NEEDS`, `CLARIFICATION_RULES`, `Clarification.semantics()` → schema and both clarification/review bindings | Need validators, shared bound source-reference validation, `disposition` → `_clarify`, Goal acceptance | Audited: `clarification_contract` covers investigation repair, environment stop, actual human questions, mixed-needs priority and replay. |
 | Optional/mandatory protected checks, required evidence, verification plan → proposal rejection / later verification | `EVIDENCE`, Criterion/Task descriptions; operator `RunConfig.checks` → shared semantics, registered IDs and mandatory-check binding | Same evidence timing in `_review`; `StageContract._checks` and mandatory coverage → readiness and `_verify` | Updated: `semantic_contracts` real Engine fixture accepts empty optional artifact checks and future evidence with reviews enabled; `authority_contract` and `stage_contracts` retain mandatory/registered-check negatives. Covers #192. |
 | Criterion outcome / Check evidence kind → external-evidence admission and acceptance | `OUTCOMES`, `external_evidence`, `AUTHORITY_RULES` → field descriptions and stage/authority projections | `Criterion.requires_external_evidence`, `Check.proves_external_effect`, `task_violation`, Goal preservation checks → readiness and `_verify` protected receipts | Updated: `stage_contracts` tests `artifact_check_cannot_establish_external_goal_even_for_offline_worker`, `explicit_external_evidence_route_is_ready_without_future_evidence`, and failed external receipts; artifact substitution remains rejected. |
 | Worker status + authority request → verify/retry/request/uncertainty/quota stop | `WORKER_STATES` and local WorkerResult relationship validator → status/request descriptions and worker/reviewer/verifier semantics | Same action table in validator and `WorkerResult.action` → `_task`, completed-attempt resume; malformed negative safety reports still stop/wait before repair | Updated: `semantic_contracts` covers every status/request combination, local/external action differences, malformed quota/uncertain responses without another call, bounded repair and replay. |
@@ -79,3 +79,18 @@ The pre-merge review additionally found and corrected three boundary gaps:
 `test_semantic_contracts.py` exercises complete-secret redaction, schema references
 and controller-loss/reopen behavior for both malformed safety statuses. These use
 existing redaction, journaling and schema paths without new runtime states.
+
+## Source-reference audit (#201)
+
+`Requirement` and `ClarificationNeed` both select runtime source IDs; the obsolete
+model-generated quotation fields are removed. IDs and source text are bound to
+Original Input, while displayed quotations are derived by the same resolver.
+Old histories remain readable and cannot execute under the new contract version.
+
+Candidate lineage is already runtime-owned; Findings/checks/supersedes select
+existing IDs. Authority requests and new Tasks/criteria are genuine proposals,
+not copies of an already-owned value. Historical Tasks included in recovery Plans
+still require full definition equality: this is a related copying risk identified
+by the audit, deliberately outside #201's source-reference change. Its historical
+identity/DAG invariants remain enforced. No additional classifier or model call is
+introduced by source resolution.

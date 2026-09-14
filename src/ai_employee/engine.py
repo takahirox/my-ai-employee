@@ -118,7 +118,9 @@ class Engine:
                     "describe another environment. A truncated list omits valid paths; "
                     "inspect the workspace. Never seek unrelated host files.",
                 }
-        contract = StageContract.bind(stage, prompt, config)
+        contract = StageContract.bind(
+            stage, prompt, config, original_input=self.journal.original(run)
+        )
         feedback = None
         previous_faults = [
             e["body"]
@@ -465,6 +467,11 @@ class Engine:
                 "evidence_semantics": EVIDENCE["proposal_review"],
                 "original": original,
                 "proposal": proposal.model_dump(mode="json"),
+                **(
+                    {"source_evidence": proposal.source_evidence(self.journal.original(run))}
+                    if isinstance(proposal, Clarification)
+                    else {}
+                ),
             },
             Verification,
             workspace,
@@ -515,7 +522,8 @@ class Engine:
                 config.clarification,
                 {
                     "instruction": "Clarify the goal. Do not drop or weaken explicit requirements. "
-                    "Map exact original fragments to criteria. Preserve mandatory checks. "
+                    "Map original_source reference IDs to criteria; do not copy quotations. "
+                    "Preserve mandatory checks. "
                     "Use the shared clarification contract for investigation, unresolved needs "
                     "and questions; inspect the supplied input snapshot. "
                     "Use the shared evidence/outcome semantics. "

@@ -5,7 +5,7 @@ Candidates, verification and history. The native worker owns its internal work.
 There is no action proposal vocabulary and no replay of implementation edits.
 
 `models.py` defines frozen, strict contracts. Original Input remains unchanged.
-Clarification records success criteria, exact requirement fragments, assumptions
+Clarification records success criteria, exact source references, assumptions
 and unresolved questions. Configured review compares that specification against the
 original; unresolved clarification cannot reach planning. Mandatory check IDs refer
 only to operator-owned commands in the snapshotted Run configuration.
@@ -75,7 +75,7 @@ are unset. Optional supervision observes progress without imposing a work deadli
 Docker API operations, individual native probes, ownership-watch startup and cleanup
 retain finite control-plane timeouts; they do not bound the productive session.
 
-`stage_contracts.py` binds each invocation to `stage-contract-4`, its exact input
+`stage_contracts.py` binds each invocation to `stage-contract-5`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing
 references into native provider schemas, prompts, validation and repair feedback.
@@ -84,12 +84,26 @@ review/verification criterion namespace. Recovery cannot redefine historical tas
 
 Clarification uses structured `unresolved` needs whose meaning is owned by
 `models.py`: `human_input` requires a concrete question, a relevant original
-fragment, reason and investigation evidence; `investigation` enters existing
+reference, reason and investigation evidence; `investigation` enters existing
 bounded response repair; `environment` reports a blocker and stops after acceptance.
 Only accepted human-input needs cause durable `clarification_wait`. Pending
 inspection and ordinary deferred work do not become questions just because they
 are unresolved. Mixed needs are repaired first, then environmental stops take
 precedence over human waits. Goal acceptance uses the same disposition.
+
+`source_refs.py` owns Original Input reference semantics. Runtime splits the exact
+original into line-preserving fragments, grouping consecutive lines when needed to
+keep at most 128 IDs. Requirements and unresolved needs select ordered, nonempty,
+unique `original_refs` (such as `s1`, `s2`); models do not reproduce quotations.
+StageContract binds the source digest and exact fragment map to every invocation;
+provider schemas constrain both reference fields to those IDs. The same resolver
+validates clarification and Goal acceptance, supplies exact separate quotations to
+clarification review, and derives CLI/Inspector source evidence from stored original
+input. No whitespace or Unicode normalization or semantic segmentation is applied.
+IDs are local to the bound original: the same short ID in another Run resolves only
+to that Run's source. Original Input provenance and contract-version checks protect
+resume; a valid reference does not establish that its criterion/need is semantically
+supported. That remains the role of independent review.
 
 The same definitions supply field descriptions/provider schema, clarification and
 review context, admission and repair feedback. Review remains governed by Run
@@ -102,9 +116,8 @@ natural language correctly. Existing semantic review, native preflight and
 protected verification remain distinct safeguards. Environment reports retain
 bounded diagnostics and never request an implicit permission expansion.
 
-Stage-contract-4 rejects older journals before resuming: earlier Worker/Finding
-combinations and legacy free-text needs are not silently reinterpreted under new
-validation. Older journals remain inspectable. Fresh malformed model responses
+Stage-contract-5 rejects older journals before resuming: legacy quotation strings
+are not silently reinterpreted as source reference IDs. Older journals remain inspectable. Fresh malformed model responses
 use the existing bounded output repair path.
 
 `semantics.py` owns the shared evidence, outcome, Worker status, Finding and graph

@@ -40,7 +40,7 @@ def need(kind="investigation", **changes):
             "reason": "The requested result needs a decision"
             if kind == "human_input"
             else "Input inspection is pending",
-            "original_fragment": "Write result",
+            "original_refs": ["s1"],
             "evidence": "Inspected the original request and permitted input listing",
             **changes,
         }
@@ -193,13 +193,11 @@ def test_unrequested_question_does_not_enter_human_wait():
     from ai_employee.stage_contracts import OutputViolation
 
     value = clarification().model_copy(
-        update={
-            "unresolved": (need("human_input", original_fragment="Handle conflicting duplicates"),)
-        }
+        update={"unresolved": (need("human_input", original_refs=("s2",)),)}
     )
     prompt = {"original_input": "Write result"}
     contract = StageContract.bind("clarification", prompt, config())
-    with pytest.raises(OutputViolation, match="FOREIGN_CLARIFICATION_REFERENCE"):
+    with pytest.raises(OutputViolation, match="INVALID_ORIGINAL_REFERENCES"):
         contract.validate(value, prompt, config())
 
 

@@ -40,8 +40,15 @@ node('p',r.status+' · cleanup: '+r.cleanup+
 const budget=node('details','',d);node('summary','Run budget and accounting',budget);
 node('pre',JSON.stringify(r.budget,null,2),budget);if(r.goal){node('small',r.goal.original_input,goal);
 for(const c of r.goal.specification.criteria)node('p',c.id+': '+c.description,goal);
-for(const m of r.goal.specification.requirements)
-node('p',m.original_fragment+' → '+m.criteria.join(', '),goal)}
+for(const m of r.source_evidence?.requirements||r.goal.specification.requirements){
+const item=node('div','',goal);
+if(m.fragments)for(const text of m.fragments)node('pre',text,item);
+else node('pre',m.original_fragment,item);
+node('p','→ '+m.criteria.join(', '),item)}}
+if(r.source_evidence?.unresolved.length){const needs=node('article','',d);
+node('h2','Clarification',needs);for(const n of r.source_evidence.unresolved){
+for(const text of n.fragments)node('pre',text,needs);
+node('p',n.question||n.reason,needs)}}
 const diagnostics=node('details','',d);
 node('summary','Stage validation, review and readiness',diagnostics);
 for(const e of r.stage_diagnostics){const x=node('details','',diagnostics);

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .source_refs import SOURCE_REFERENCE_RULE
+
 OUTCOMES: dict[str, dict[str, Any]] = {
     "artifact": {
         "external_evidence": False,
@@ -171,11 +173,7 @@ RULES: dict[str, dict[str, str]] = {
     "GRAPH_GROWTH_LIMIT": {"path": "tasks", "rule": GRAPH["recovery"]},
     "FAILED_DEPENDENCY": {"path": "tasks.dependencies", "rule": GRAPH["recovery"]},
     "WORKER_SELECTION_OUT_OF_RANGE": {"path": "index", "rule": SELECTION},
-    "FOREIGN_REQUIREMENT_FRAGMENT": {
-        "path": "requirements.original_fragment",
-        "rule": "Cite "
-        "an exact fragment of Original Input, not invented or paraphrased requirements.",
-    },
+    "INVALID_ORIGINAL_REFERENCES": {"rule": SOURCE_REFERENCE_RULE},
     "FOREIGN_REQUIREMENT_CRITERION": {
         "path": "requirements.criteria",
         "rule": "Map original fragments only to criterion IDs defined in this clarification.",
