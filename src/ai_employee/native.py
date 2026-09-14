@@ -324,7 +324,7 @@ def provider_schema(
             ]
         source = binding.get("original_source")
         if source is not None:
-            for name in ("Requirement", "ClarificationNeed"):
+            for name in ("Requirement", "ClarificationNeed", "DownstreamOutcome"):
                 if name in definitions:
                     refs = definitions[name]["properties"]["original_refs"]
                     refs["items"] = {"type": "string", "enum": list(source["fragments"])}

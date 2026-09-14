@@ -120,7 +120,7 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
             cleanup = "unconfirmed"
     source_evidence = None
     # Older contracts remain inspectable; never reinterpret their stored quotations as IDs.
-    if events[0]["body"].get("contract_version") == VERSION:
+    if events[0]["body"].get("contract_version") in {"stage-contract-5", VERSION}:
         for event in reversed(events):
             if event["kind"] in {"goal", "clarification_wait"}:
                 proposal = (

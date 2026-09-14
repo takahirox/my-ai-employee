@@ -26,10 +26,10 @@ from .models import (
     WorkerChoice,
     WorkerResult,
 )
-from .semantics import RULES, external_evidence, projection
+from .semantics import EXECUTION_CHECKS, RULES, external_evidence, lifecycle_context, projection
 from .source_refs import original_source, resolve_source_refs
 
-VERSION = "stage-contract-5"
+VERSION = "stage-contract-6"
 T = TypeVar("T", bound=Contract)
 
 
@@ -154,6 +154,7 @@ class StageContract:
     authority: dict[str, object]
     constraints: dict[str, Any]
     original_input: str | None
+    lifecycle: dict[str, Any]
 
     @classmethod
     def bind(
@@ -195,6 +196,7 @@ class StageContract:
             authority_projection(config),
             constraints,
             original_input if original_input is not None else source.get("original_input"),
+            lifecycle_context(stage, prompt),
         )
 
     def projection(self) -> dict[str, Any]:
@@ -208,6 +210,7 @@ class StageContract:
             "policy_digest": self.policy_digest,
             "authority": self.authority,
             "semantics": projection(self.stage),
+            "lifecycle": self.lifecycle,
             **(
                 {"original_source": original_source(self.original_input)}
                 if self.original_input is not None
@@ -231,7 +234,7 @@ class StageContract:
 
     def validate(self, value: T, prompt: dict[str, Any], config: RunConfig) -> T:
         if isinstance(value, Clarification):
-            for name in ("requirements", "unresolved"):
+            for name in ("requirements", "unresolved", "downstream_outcomes"):
                 for index, item in enumerate(getattr(value, name)):
                     try:
                         resolve_source_refs(self.original_input or "", item.original_refs)
@@ -250,17 +253,18 @@ class StageContract:
                         },
                     )
             self._checks(value.criteria)
-            if not set(config.mandatory_checks) <= {
-                c for item in value.criteria for c in item.checks
-            }:
-                raise OutputViolation(
-                    "MANDATORY_CHECK_OMITTED",
-                    details={
-                        "path": "criteria.checks",
-                        "mandatory_checks": config.mandatory_checks,
-                    },
-                )
-            self._outcomes(value.criteria, config)
+            if EXECUTION_CHECKS["required_by_disposition"][value.disposition]:
+                if not set(config.mandatory_checks) <= {
+                    c for item in value.criteria for c in item.checks
+                }:
+                    raise OutputViolation(
+                        "MANDATORY_CHECK_OMITTED",
+                        details={
+                            "path": "criteria.checks",
+                            "mandatory_checks": config.mandatory_checks,
+                        },
+                    )
+                self._outcomes(value.criteria, config)
         if isinstance(value, Plan):
             from .capabilities import AUTHORITY_RULES, task_violation
 

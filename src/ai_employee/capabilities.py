@@ -95,7 +95,8 @@ def authority_projection(config: RunConfig) -> dict[str, object]:
         "repair": "Repair proposals only within the unchanged Goal and policy. Never remove "
         "necessary controls or replace required external effects with local artifacts to fit "
         "these constraints. If a necessary capability is unavailable, do not claim feasibility; "
-        "retain the required authority/outcome so deterministic validation stops execution.",
+        "retain the required authority/outcome. In clarification, report the blocker using the "
+        "shared stop contract; execution proposals still fail deterministic admission checks.",
     }
 
 

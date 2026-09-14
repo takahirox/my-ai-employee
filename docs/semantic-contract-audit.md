@@ -1,6 +1,6 @@
 # Semantic contract audit (#197)
 
-This is the reverse audit updated for `stage-contract-5`. Start at consequential
+This is the reverse audit updated for `stage-contract-6`. Start at consequential
 Engine, Journal, Candidate and native-adapter decisions, then trace their inputs
 back to generation. This table is an index to executable owners, not another
 definition of their meanings. Changes must repeat the reverse review in
@@ -94,3 +94,18 @@ still require full definition equality: this is a related copying risk identifie
 by the audit, deliberately outside #201's source-reference change. Its historical
 identity/DAG invariants remain enforced. No additional classifier or model call is
 introduced by source resolution.
+
+## Lifecycle and completion responsibility (#200)
+
+| Contract / boundary | Authority and consumers | Evidence |
+| --- | --- | --- |
+| Fleet completion vs authorized downstream outcome | `COMPLETION`, `Clarification.downstream_outcomes`, `DownstreamOutcome` → schema, generation/review/verification/repair, Goal persistence and Inspector; existing criteria stay Fleet-owned | `test_lifecycle_contract`: generic executable handoff reaches actual verification and promotion before the receiving actor runs it; reopened history preserves Goal and no model calls repeat |
+| Source/criterion links for downstream outcomes | Existing source resolver plus `INVALID_DOWNSTREAM_CRITERIA` → native reference enums, clarification validation, Goal acceptance and repair | Unknown/duplicate/external criterion links and foreign source IDs rejected; ordinary source and canary tests retained |
+| Task verification → acceptance; Goal verification → completion; completion → promotion | `LIFECYCLE` event definitions consumed at Engine boundaries and StageContract inventory | Actual journal order and two verification scopes checked; malformed executable cannot be published; no new workflow transitions |
+| Reviewer evidence and responsibility | Actual invocation inputs → lifecycle inventory; `_verify` builds one context for generator and reviewer | Exact Goal/Task, WorkerResult, Candidate, current/accepted-upstream checks and scope equality; recovery evidence remains visible |
+| Clarification stop vs execution admission | `EXECUTION_CHECKS` → clarification contract and validator; existing disposition and Goal readiness enforce stop | Real Engine reviews and durably stops without output repair or work; mixed needs, unknown checks/references, mandatory omission on proceed and no resume work tested |
+
+Semantic review fixtures demonstrate the rejection/revision path for circular evidence
+and unauthorized weakening, not the accuracy of a live model. No classifier, new mandatory
+review call, benchmark-specific runtime path or relaxation of protected external receipts
+is introduced. Model-free tests do not establish live benchmark success.
