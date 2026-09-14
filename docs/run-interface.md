@@ -65,14 +65,27 @@ limits and the explicit delegated authentication path are snapshotted at submit.
 Runtime APIs inside the Python package remain implementation details, not a second
 promised integration interface.
 
-Current Goal requirements and unresolved clarification needs contain `original_refs`,
+Current Goal requirements, downstream outcomes and unresolved clarification needs contain
+`original_refs`,
 an ordered list of IDs from `original_source.fragments`. `source_evidence` in Run
 projections contains their exact runtime-derived `fragments` for display, including
 pending human questions. Separate fragments are separate quotations, not an implied
 contiguous excerpt. The original remains unchanged, including line endings and
 Unicode. A source ID proves location, not interpretation. Old quotation-based
-histories remain inspectable; `stage-contract-5` rejects their execution rather
+histories remain inspectable; `stage-contract-6` rejects older histories' execution rather
 than migrating references or resetting invocation budgets.
+
+
+`goal.specification.criteria` are Fleet's verified completion conditions.
+`goal.specification.downstream_outcomes` preserves explicitly authorized post-handoff
+requirements: description, external owner, `after: "handoff"`, original references and
+linked artifact criterion IDs. `status: "completed"` means Fleet's scope was verified;
+it does not assert those downstream outcomes occurred. Promotion publishes verified
+bytes; the receiving actor owns later execution. Inspectors display downstream
+requirements separately, and source evidence includes their exact original fragments.
+These fields survive journal replay; callers must not infer external completion from
+an executable deliverable. Existing histories remain readable but cannot resume under
+the new contract semantics.
 
 
 `fleet init` leaves `limits.wall_seconds`, `limits.active_seconds`,

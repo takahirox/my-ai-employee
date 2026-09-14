@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .isolated_worker import IsolatedWorkerProfile
 from .product_capabilities import SUPPORTED_BACKENDS
 from .semantics import (
+    COMPLETION,
     EVIDENCE,
+    EXECUTION_CHECKS,
     FINDING_CATEGORIES,
     FINDINGS,
     GRAPH,
@@ -126,16 +128,33 @@ class ClarificationNeed(Contract):
         return self
 
 
+class DownstreamOutcome(Contract):
+    description: Text = Field(description=COMPLETION["downstream"])
+    owner: Text = Field(description="External actor explicitly designated by Original Input.")
+    after: Literal["handoff"] = Field(default="handoff", description="After Fleet promotion.")
+    original_refs: tuple[Key, ...] = Field(
+        min_length=1, max_length=MAX_SOURCE_FRAGMENTS, description=SOURCE_REFERENCE_RULE
+    )
+    criteria: tuple[Key, ...] = Field(
+        min_length=1, description=RULES["INVALID_DOWNSTREAM_CRITERIA"]["rule"]
+    )
+
+
 class Clarification(Contract):
-    clarified_goal: Text = Field(description="Faithful goal preserving the original request.")
+    clarified_goal: Text = Field(description=COMPLETION["scope"])
     criteria: tuple[Criterion, ...] = Field(
         min_length=1,
-        description=RULES["DUPLICATE_CRITERION"]["rule"]
+        description=COMPLETION["scope"]
+        + " "
+        + RULES["DUPLICATE_CRITERION"]["rule"]
         + " "
         + RULES["UNMAPPED_CRITERION"]["rule"],
     )
     requirements: tuple[Requirement, ...] = Field(
         min_length=1, description="Original source references mapped to their success criteria."
+    )
+    downstream_outcomes: tuple[DownstreamOutcome, ...] = Field(
+        default=(), description=COMPLETION["downstream"]
     )
     assumptions: tuple[Text, ...] = Field(
         default=(),
@@ -158,7 +177,7 @@ class Clarification(Contract):
         )
 
     def source_evidence(self, original: str) -> dict[str, list[dict[str, object]]]:
-        """Resolve both kinds of references from the same bound, unchanged source."""
+        """Resolve all source references from the same bound, unchanged source."""
         return {
             name: [
                 {
@@ -167,7 +186,7 @@ class Clarification(Contract):
                 }
                 for item in getattr(self, name)
             ]
-            for name in ("requirements", "unresolved")
+            for name in ("requirements", "unresolved", "downstream_outcomes")
         }
 
     @classmethod
@@ -175,6 +194,7 @@ class Clarification(Contract):
         return {
             "fields": {name: field.description for name, field in cls.model_fields.items()},
             "needs": CLARIFICATION_NEEDS,
+            "execution_checks": EXECUTION_CHECKS,
             "violations": CLARIFICATION_RULES,
             "precedence": CLARIFICATION_ACTION_ORDER,
             "review": "Review both the goal and every unresolved need against the original "
@@ -192,6 +212,13 @@ class Clarification(Contract):
             raise ValueError("FOREIGN_REQUIREMENT_CRITERION")
         if mapped != ids:
             raise ValueError("UNMAPPED_CRITERION")
+        artifacts = {c.id for c in self.criteria if c.outcome == "artifact"}
+        for outcome in self.downstream_outcomes:
+            if (
+                len(set(outcome.criteria)) != len(outcome.criteria)
+                or not set(outcome.criteria) <= artifacts
+            ):
+                raise ValueError("INVALID_DOWNSTREAM_CRITERIA")
         return self
 
 

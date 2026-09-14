@@ -75,7 +75,7 @@ are unset. Optional supervision observes progress without imposing a work deadli
 Docker API operations, individual native probes, ownership-watch startup and cleanup
 retain finite control-plane timeouts; they do not bound the productive session.
 
-`stage_contracts.py` binds each invocation to `stage-contract-5`, its exact input
+`stage_contracts.py` binds each invocation to `stage-contract-6`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing
 references into native provider schemas, prompts, validation and repair feedback.
@@ -93,10 +93,10 @@ precedence over human waits. Goal acceptance uses the same disposition.
 
 `source_refs.py` owns Original Input reference semantics. Runtime splits the exact
 original into line-preserving fragments, grouping consecutive lines when needed to
-keep at most 128 IDs. Requirements and unresolved needs select ordered, nonempty,
+keep at most 128 IDs. Requirements, unresolved needs and downstream outcomes select ordered, nonempty,
 unique `original_refs` (such as `s1`, `s2`); models do not reproduce quotations.
 StageContract binds the source digest and exact fragment map to every invocation;
-provider schemas constrain both reference fields to those IDs. The same resolver
+provider schemas constrain all source reference fields to those IDs. The same resolver
 validates clarification and Goal acceptance, supplies exact separate quotations to
 clarification review, and derives CLI/Inspector source evidence from stored original
 input. No whitespace or Unicode normalization or semantic segmentation is applied.
@@ -116,9 +116,41 @@ natural language correctly. Existing semantic review, native preflight and
 protected verification remain distinct safeguards. Environment reports retain
 bounded diagnostics and never request an implicit permission expansion.
 
-Stage-contract-5 rejects older journals before resuming: legacy quotation strings
-are not silently reinterpreted as source reference IDs. Older journals remain inspectable. Fresh malformed model responses
-use the existing bounded output repair path.
+Stage-contract-6 rejects older journals before resuming: changed completion semantics
+are not silently applied to accepted Goals. Older journals remain inspectable, including
+source evidence for stage-contract-5 histories. Fresh malformed model responses use the
+existing bounded output repair path.
+
+`Clarification.clarified_goal` retains the user's final intent. Its `criteria` describe
+only Fleet-owned completion conditions: evidence must be available before completion
+and promotion. When Original Input explicitly authorizes execution after handoff,
+`downstream_outcomes` retains the outcome, external owner, fixed `after=handoff` timing,
+source references and links to artifact criteria for the verified deliverable. Links
+must be unique, existing artifact criteria; they cannot relabel external-effect
+criteria. No Task/Criterion-wide scope field or deferred execution state is added.
+Independent review assesses original authorization and timing; verification inspects
+the actual deliverable against the linked downstream requirements. The schema cannot
+prove arbitrary natural-language authorization or program correctness. Fleet does not
+execute or attest the downstream outcome; directly requested Fleet execution cannot be
+silently weakened to delivery.
+
+The `LIFECYCLE` definitions in `semantics.py` are consumed by Engine's existing
+verification/acceptance/completion/promotion boundaries and projected through
+StageContract. The lifecycle inventory comes from actual invocation inputs, including
+recovery evidence and each invocation's snapshot; presence does not prove inspection.
+Review identifies whether it assesses proposal feasibility or actual Candidate evidence,
+without inferring a global before/after-work phase. Verification and its review share
+one context containing Goal/Task scope, WorkerResult, Candidate, current checks and
+accepted upstream receipts. The completion and downstream definitions are shared by
+schema descriptions, generation, review, verification and repair.
+
+Clarification's shared execution-check applicability exempts only `disposition=stop`
+from mandatory-check coverage and protected external-evidence availability. Unknown
+checks, original references, mappings and other structural rules still apply. A stop
+must pass configured review and can never become an accepted Goal or start work.
+Mixed needs use the existing disposition precedence; wait/proceed retain admission
+checks. A missing execution capability is explained without output-repair exhaustion,
+not treated as permission to execute.
 
 `semantics.py` owns the shared evidence, outcome, Worker status, Finding and graph
 meanings used by model descriptions, StageContract projections, validation and

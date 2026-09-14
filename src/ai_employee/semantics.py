@@ -10,6 +10,85 @@ from typing import Any
 
 from .source_refs import SOURCE_REFERENCE_RULE
 
+# Successful boundary events, also consumed at Engine acceptance/publication boundaries.
+LIFECYCLE: dict[str, dict[str, Any]] = {
+    "task_verification": {"goal_level": False, "postcondition": "accepted"},
+    "goal_verification": {"goal_level": True, "postcondition": "completed"},
+    "promotion": {"precondition": "completed", "postcondition": "promoted"},
+}
+COMPLETION = {
+    "scope": "Preserve the user's final desired outcome in clarified_goal. criteria are only "
+    "Fleet-owned conditions independently verifiable before completion and promotion. "
+    "Task verification precedes Task acceptance; Goal verification precedes completion; "
+    "promotion requires completed, verified bytes. Neither verification runs after handoff.",
+    "downstream": "Only when Original Input explicitly allows execution after handoff, retain "
+    "that outcome, its external owner and original authorization in downstream_outcomes. "
+    "Link each to artifact criteria that verify the executable deliverable and execution "
+    "instructions before handoff. Preserve all downstream requirements in those deliverables. "
+    "Results first created by the external owner after promotion are not immediate Task/Goal "
+    "evidence and Fleet must not claim they occurred. Never move a requirement for Fleet itself "
+    "to execute or complete an external operation into downstream_outcomes. If infeasible, "
+    "report the blocker through clarification; do not silently substitute artifact delivery.",
+    "review": "Check original authorization, responsible actor, timing and feasible evidence "
+    "for the whole Goal and Plan. Reject circular conditions requiring post-handoff results "
+    "before promotion, lost downstream requirements, or weakened direct-execution requests. "
+    "During verification inspect actual deliverables against linked downstream requirements, "
+    "without requiring their external execution or attesting unperformed effects.",
+}
+# A stop is a report, never admission to execution. Other validation still applies.
+EXECUTION_CHECKS: dict[str, Any] = {
+    "required_by_disposition": {"proceed": True, "wait": True, "repair": True, "stop": False},
+    "rule": "Mandatory-check coverage and protected external-evidence availability are "
+    "execution-admission conditions. A clarification with disposition=stop may report their "
+    "absence without inventing checks. Source references, declared check IDs, criterion "
+    "mappings and all other structural rules still apply. Review the stop's grounds; an "
+    "approved stop cannot admit a Goal or launch work. Other dispositions retain these checks.",
+}
+
+
+def lifecycle_context(stage: str, prompt: dict[str, Any]) -> dict[str, Any]:
+    """Inventory the actual invocation, including review and recovery evidence.
+
+    Presence means supplied input, never proof of inspection or external completion.
+    No guessed global pre/post-work phase and no second workflow scheduler.
+    """
+    source = prompt.get("original", prompt) if stage.endswith("_review") else prompt
+    inputs = {
+        key
+        for key, value in source.items()
+        if value is not None and key not in {"instruction", "feedback", "review_feedback"}
+    }
+    inputs.update(
+        key
+        for key in ("input_tree", "input_snapshot", "proposal", "source_evidence")
+        if key in prompt
+    )
+    if isinstance(source.get("context"), dict):
+        inputs.update("context." + key for key in source["context"])
+    target = stage.removesuffix("_review")
+    return {
+        "boundaries": LIFECYCLE,
+        "available_inputs": sorted(inputs),
+        "snapshot_tree": prompt.get("input_tree"),
+        "assessment": (
+            "actual_candidate_evidence"
+            if target in {"worker", "verification"}
+            else "proposal_feasibility"
+        )
+        if stage.endswith("_review")
+        else None,
+        "verification_scope": source.get("verification_scope"),
+        "review_target": stage.removesuffix("_review") if stage.endswith("_review") else None,
+        "evidence_rule": "Postcondition events require accepted verification and applicable "
+        "reviews/checks; failed proposals use existing bounded repair/recovery. "
+        "Available inputs are bound context, not inspected facts. Use the "
+        "actual supplied Candidate, worker result, accepted upstream receipts and snapshot; "
+        "do not assume a repair/recovery invocation has no previous work. A proposal review "
+        "assesses feasibility; a Candidate review assesses available actual evidence. "
+        "Results requiring this Run's future promotion are not available at any model stage.",
+    }
+
+
 OUTCOMES: dict[str, dict[str, Any]] = {
     "artifact": {
         "external_evidence": False,
@@ -20,7 +99,8 @@ OUTCOMES: dict[str, dict[str, Any]] = {
     "external_effect": {
         "external_evidence": True,
         "rule": "Success requires an external effect, not a local script or Worker claim. "
-        "An explicitly linked operator external_effect check is required; planning and "
+        "For execution admission, an explicitly linked operator external_effect check is "
+        "required (see clarification execution_checks for stop reports); planning and "
         "repair must preserve the accepted Goal's external outcomes and check coverage.",
     },
 }
@@ -37,19 +117,22 @@ EVIDENCE = {
     "checks": "IDs of immutable operator-owned RunConfig.checks, not tests a Worker promises "
     "to add. Empty is allowed for artifact criteria unless a mandatory check is required. "
     "Only the operator can configure a missing protected check; never invent its ID.",
-    "mandatory_checks": "Operator-owned checks required for Goal acceptance. Clarification "
-    "must reference all of them. They cannot be replaced by Worker-authored tests or AI review.",
-    "required_evidence": "Task-specific evidence the Worker must produce or locate and the "
-    "independent verifier must assess after work. These strings are requirements, not "
+    "mandatory_checks": "Operator-owned checks required for Goal acceptance. They cannot be "
+    "replaced by Worker-authored tests or AI review. " + EXECUTION_CHECKS["rule"],
+    "required_evidence": "Evidence available before promotion that the Worker must produce or "
+    "locate and the independent verifier must assess after work. These strings are requirements, "
+    "not "
     "receipts, command definitions or proof that the work already happened.",
     "verification_plan": "Proposed method for independent verification after work; not an "
     "executed check or observed result. It may include inspecting artifacts or Worker tests.",
     "worker_evidence": "Untrusted Worker claims and pointers to inspect. Empty does not by "
     "itself fail artifact work; real evidence must be inspected by independent verification. "
     "Claims never grant authority or attest external completion.",
-    "proposal_review": "Before work, assess preservation of requirements and a feasible "
+    "proposal_review": "Use the bound lifecycle context to assess the proposal. Before work, "
+    "assess preservation of requirements and a feasible "
     "evidence route. Do not demand future artifacts, tests or passing receipts already exist. "
-    "Reject missing mandatory/external checks, not empty optional artifact checks. "
+    "Apply the shared clarification execution_checks conditions to missing mandatory/external "
+    "checks; empty optional artifact checks are valid. "
     "After work, assess actual Candidate evidence; a plan or claim is not proof.",
     "verification": "Inspect each exact criterion against the Candidate and required evidence. "
     "Protected checks prove only their named coverage and all executed checks must pass. "
@@ -174,6 +257,11 @@ RULES: dict[str, dict[str, str]] = {
     "FAILED_DEPENDENCY": {"path": "tasks.dependencies", "rule": GRAPH["recovery"]},
     "WORKER_SELECTION_OUT_OF_RANGE": {"path": "index", "rule": SELECTION},
     "INVALID_ORIGINAL_REFERENCES": {"rule": SOURCE_REFERENCE_RULE},
+    "INVALID_DOWNSTREAM_CRITERIA": {
+        "path": "downstream_outcomes.criteria",
+        "rule": "Each downstream outcome must link unique existing artifact criterion IDs "
+        "for Fleet's verified handoff, never external-effect criteria. " + COMPLETION["downstream"],
+    },
     "FOREIGN_REQUIREMENT_CRITERION": {
         "path": "requirements.criteria",
         "rule": "Map original fragments only to criterion IDs defined in this clarification.",
@@ -200,7 +288,7 @@ RULES: dict[str, dict[str, str]] = {
 
 def projection(stage: str) -> dict[str, Any]:
     """No model call or classifier: select meanings by the existing stage identity."""
-    result: dict[str, Any] = {"evidence": EVIDENCE, "outcomes": OUTCOMES}
+    result: dict[str, Any] = {"evidence": EVIDENCE, "outcomes": OUTCOMES, "completion": COMPLETION}
     if stage not in {"clarification", "clarification_review"}:
         result["graph"] = GRAPH
     if stage in {"worker", "worker_review", "task_verification", "goal_verification"}:

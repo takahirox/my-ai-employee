@@ -39,7 +39,7 @@ from .models import (
     WorkerResult,
 )
 from .native import Model
-from .semantics import EVIDENCE, GRAPH, WORKER_STATES, external_evidence
+from .semantics import EVIDENCE, GRAPH, LIFECYCLE, WORKER_STATES, external_evidence
 from .stage_contracts import (
     VERSION,
     OutputViolation,
@@ -724,23 +724,29 @@ class Engine:
             and event["body"]["passed"]
             and event["body"]["candidate"] in adopted
         ]
+        verification_stage = "goal_verification" if task is None else "task_verification"
+        boundary = LIFECYCLE[verification_stage]
+        verification_context = {
+            "verification_scope": verification_stage,
+            "goal": goal.model_dump(mode="json"),
+            "task": None if task is None else task.model_dump(mode="json"),
+            "criteria": [item.model_dump(mode="json") for item in criteria],
+            "candidate": candidate.model_dump(mode="json"),
+            "checks": receipts,
+            "upstream_check_evidence": prior_checks,
+            "worker_result": None if result is None else result.model_dump(mode="json"),
+        }
         feedback = ""
         passed = False
         for _ in range(config.verification.revisions + 1):
             verification = self._generate(
                 run,
-                "goal_verification" if task is None else "task_verification",
+                verification_stage,
                 config.verification,
                 {
                     "instruction": EVIDENCE["verification"],
-                    "goal": goal.model_dump(mode="json"),
-                    "task": None if task is None else task.model_dump(mode="json"),
-                    "criteria": [item.model_dump(mode="json") for item in criteria],
-                    "candidate": candidate.model_dump(mode="json"),
-                    "checks": receipts,
-                    "upstream_check_evidence": prior_checks,
+                    **verification_context,
                     "review_feedback": feedback,
-                    "worker_result": None if result is None else result.model_dump(mode="json"),
                 },
                 Verification,
                 self._workspace(run, "verification", candidate.tree),
@@ -750,11 +756,7 @@ class Engine:
                 config.verification,
                 "verification",
                 verification,
-                {
-                    "criteria": [item.model_dump(mode="json") for item in criteria],
-                    "candidate": candidate.model_dump(mode="json"),
-                    "checks": receipts,
-                },
+                verification_context,
                 self._workspace(run, "verification-review", candidate.tree),
                 external=external,
             )
@@ -779,7 +781,7 @@ class Engine:
             run,
             "verification",
             candidate=candidate.model_dump(mode="json"),
-            goal_level=task is None,
+            goal_level=boundary["goal_level"],
             passed=passed,
             result=verification.model_dump(mode="json"),
         )
@@ -896,6 +898,7 @@ class Engine:
                 "worker",
                 results[-1],
                 {
+                    "goal": goal.model_dump(mode="json"),
                     "task": context.task.model_dump(mode="json"),
                     "candidate": candidate.model_dump(mode="json"),
                 },
@@ -910,7 +913,7 @@ class Engine:
                 run,
                 (
                     (
-                        "accepted",
+                        LIFECYCLE["task_verification"]["postcondition"],
                         {"task": context.task.id, "candidate": candidate.model_dump(mode="json")},
                     ),
                     (
@@ -1143,6 +1146,7 @@ class Engine:
                     "worker",
                     result,
                     {
+                        "goal": goal.model_dump(mode="json"),
                         "task": task.model_dump(mode="json"),
                         "candidate": candidate.model_dump(mode="json"),
                     },
@@ -1151,7 +1155,10 @@ class Engine:
                 )
                 if reviewed and self._verify(run, config, goal, task, candidate, result):
                     self.journal.append(
-                        run, "accepted", task=task.id, candidate=candidate.model_dump(mode="json")
+                        run,
+                        LIFECYCLE["task_verification"]["postcondition"],
+                        task=task.id,
+                        candidate=candidate.model_dump(mode="json"),
                     )
                     self.journal.release_resources(run, task.digest)
                     return candidate
@@ -1487,7 +1494,10 @@ class Engine:
             return self._execute(run)
         self.journal.check(run)
         self.journal.append(
-            run, "completed", candidate=final.model_dump(mode="json"), goal_digest=goal.digest
+            run,
+            LIFECYCLE["goal_verification"]["postcondition"],
+            candidate=final.model_dump(mode="json"),
+            goal_digest=goal.digest,
         )
 
     def _recover(
@@ -1618,7 +1628,9 @@ class Engine:
 
     def _completion(self, run: str) -> Candidate:
         events = self.journal.events(run)
-        completed = [event for event in events if event["kind"] == "completed"]
+        completed = [
+            event for event in events if event["kind"] == LIFECYCLE["promotion"]["precondition"]
+        ]
         if not completed:
             raise ValueError("GOAL_NOT_VERIFIED")
         config = self.journal.config(run)
@@ -1662,5 +1674,8 @@ class Engine:
             candidate = self._completion(run)
             self.candidates.publish_directory(candidate, destination)
             self.journal.append(
-                run, "promoted", candidate=candidate.digest, destination=str(destination.resolve())
+                run,
+                LIFECYCLE["promotion"]["postcondition"],
+                candidate=candidate.digest,
+                destination=str(destination.resolve()),
             )

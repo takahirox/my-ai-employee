@@ -45,6 +45,12 @@ const item=node('div','',goal);
 if(m.fragments)for(const text of m.fragments)node('pre',text,item);
 else node('pre',m.original_fragment,item);
 node('p','→ '+m.criteria.join(', '),item)}}
+if(r.goal?.specification.downstream_outcomes?.length){const after=node('article','',d);
+node('h2','After handoff — not verified as completed by Fleet',after);
+for(const o of r.source_evidence?.downstream_outcomes||r.goal.specification.downstream_outcomes){
+node('p',o.owner+': '+o.description,after);
+node('p','Verified handoff criteria: '+o.criteria.join(', '),after);
+for(const text of o.fragments||[])node('pre',text,after)}}
 if(r.source_evidence?.unresolved.length){const needs=node('article','',d);
 node('h2','Clarification',needs);for(const n of r.source_evidence.unresolved){
 for(const text of n.fragments)node('pre',text,needs);
