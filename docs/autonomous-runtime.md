@@ -1,5 +1,10 @@
 # Configuration and recovery
 
+Cross-stage evidence, outcome, Worker result, Finding and graph meanings are owned
+by [`semantics.py`](../src/ai_employee/semantics.py) and projected into recorded
+Stage contracts. See the [semantic contract audit](semantic-contract-audit.md)
+for implementation and regression traceability; this guide explains usage.
+
 `fleet init` creates a JSON Run configuration. `schema_version` is `autonomous-1`.
 There is one runtime; this identifier does not select a compatibility path.
 

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
@@ -23,6 +24,7 @@ from .diagnostics import CheckOutput
 from .history import Stopped
 from .models import Authority, Check, Contract, StagePolicy, Usage
 from .process_lifecycle import terminate_group
+from .semantics import FINDING_CATEGORIES
 from .stage_contracts import OutputViolation, validation_code, validation_details
 from .time_budget import minimum
 
@@ -285,8 +287,8 @@ def provider_schema(
     schema: type[Contract], binding: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     result = schema.model_json_schema()
+    definitions = result.get("$defs", {})
     if binding is not None:
-        definitions = result.get("$defs", {})
         authority = definitions.get("Authority")
         if authority is not None:
             for name, constraints in binding["authority"]["properties"].items():
@@ -304,6 +306,38 @@ def provider_schema(
                 "type": "string",
                 "enum": list(binding["criteria"]),
             }
+            result["properties"]["findings"].update(
+                minItems=len(binding["criteria"]), maxItems=len(binding["criteria"])
+            )
+        if "index" in result.get("properties", {}) and "maximum_worker_index" in binding.get(
+            "constraints", {}
+        ):
+            result["properties"]["index"]["maximum"] = binding["constraints"][
+                "maximum_worker_index"
+            ]
+        task = definitions.get("Task")
+        if task is not None:
+            historical = binding.get("constraints", {}).get("historical_tasks", ())
+            task["properties"]["supersedes"]["anyOf"] = [
+                *([{"type": "string", "enum": list(historical)}] if historical else []),
+                {"type": "null"},
+            ]
+
+    # Finding is nested, so the provider's supported anyOf form can express its
+    # category/pass relationship without changing the public response shape.
+    finding = definitions.get("Finding")
+    if finding is not None:
+        variants = []
+        for passed in (False, True):
+            variant = deepcopy(finding)
+            variant["properties"]["passed"]["enum"] = [passed]
+            variant["properties"]["category"]["enum"] = [
+                name
+                for name, meaning in FINDING_CATEGORIES.items()
+                if meaning["passed"] is None or meaning["passed"] == passed
+            ]
+            variants.append(variant)
+        definitions["Finding"] = {"anyOf": variants}
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):

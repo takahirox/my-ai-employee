@@ -31,8 +31,8 @@ _PATTERNS = (
 )
 
 
-def capture(value: Any, limit: int = RECORD_BYTES) -> dict[str, Any]:
-    """Keep complete JSON/text within the cap; expose redaction and truncation."""
+def redact(value: Any) -> tuple[Any, int]:
+    """Redact complete values before a caller truncates their text or structure."""
     redactions = 0
 
     def text(value: str) -> str:
@@ -57,8 +57,15 @@ def capture(value: Any, limit: int = RECORD_BYTES) -> dict[str, Any]:
             return [clean(item) for item in value]
         return text(value) if isinstance(value, str) else value
 
+    result = clean(value)
+    return result, redactions
+
+
+def capture(value: Any, limit: int = RECORD_BYTES) -> dict[str, Any]:
+    """Keep complete JSON/text within the cap; expose redaction and truncation."""
     original = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
-    sanitized = json.dumps(clean(value), ensure_ascii=False, sort_keys=True).encode()
+    cleaned, redactions = redact(value)
+    sanitized = json.dumps(cleaned, ensure_ascii=False, sort_keys=True).encode()
     content = sanitized[: max(0, limit)].decode("utf-8", errors="ignore")
     return {
         "text": content,

@@ -75,7 +75,7 @@ are unset. Optional supervision observes progress without imposing a work deadli
 Docker API operations, individual native probes, ownership-watch startup and cleanup
 retain finite control-plane timeouts; they do not bound the productive session.
 
-`stage_contracts.py` binds each invocation to `stage-contract-3`, its exact input
+`stage_contracts.py` binds each invocation to `stage-contract-4`, its exact input
 snapshot/context, Run policy, registered checks and evaluation target. Pydantic
 owns structural and proposal-local constraints; the binding projects existing
 references into native provider schemas, prompts, validation and repair feedback.
@@ -102,9 +102,18 @@ natural language correctly. Existing semantic review, native preflight and
 protected verification remain distinct safeguards. Environment reports retain
 bounded diagnostics and never request an implicit permission expansion.
 
-Stage-contract-3 rejects older journals before resuming; legacy free-text needs are
-not reinterpreted or silently converted to human questions. Fresh malformed model
-responses instead use the existing bounded output repair path.
+Stage-contract-4 rejects older journals before resuming: earlier Worker/Finding
+combinations and legacy free-text needs are not silently reinterpreted under new
+validation. Older journals remain inspectable. Fresh malformed model responses
+use the existing bounded output repair path.
+
+`semantics.py` owns the shared evidence, outcome, Worker status, Finding and graph
+meanings used by model descriptions, StageContract projections, validation and
+runtime actions. Recovery generation and review receive the same historical Tasks,
+failed dependencies and remaining growth allowance. Inspector exposes the recorded
+binding, including these meanings and constraints. The
+[semantic contract audit](semantic-contract-audit.md) traces consequential inputs
+through their owners, producers, validators, runtime consumers and regression tests.
 
 The authority projection also carries field meanings, unsupported product controls,
 Run ceiling/security rules and registered external evidence routes. `capabilities.py`

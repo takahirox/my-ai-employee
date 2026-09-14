@@ -4,6 +4,10 @@ The supported external automation boundary is the `fleet` CLI. Callers do not ne
 Engine internals, direct SQLite access or an external system's protocol in the
 product package. CLI commands reuse the same runtime used by the Inspector.
 
+Stage invocations expose their recorded contract binding, including shared
+`semantics` and invocation-specific `constraints`. Their authoritative owners and
+runtime effects are indexed in the [semantic contract audit](semantic-contract-audit.md).
+
 ## Create, execute and observe
 
 Use an explicit private state directory and operator-approved configuration:
