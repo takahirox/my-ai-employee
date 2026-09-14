@@ -312,7 +312,11 @@ def test_invalid_question_shape_receives_the_same_semantic_rule_on_repair(tmp_pa
     engine.start("Write result", config(), source)
     feedback = model.prompts[1]["contract_feedback"]
     assert feedback["code"] == "CLARIFICATION_QUESTION_ACTION_MISMATCH"
-    assert feedback["violation"] == CLARIFICATION_RULES[feedback["code"]]
+    assert all(
+        feedback["violation"][key] == value
+        for key, value in CLARIFICATION_RULES[feedback["code"]].items()
+    )
+    assert feedback["violation"]["authoritative"] is False
     assert model.workers == 1
 
 

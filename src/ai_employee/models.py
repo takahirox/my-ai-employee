@@ -11,10 +11,22 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .isolated_worker import IsolatedWorkerProfile
 from .product_capabilities import SUPPORTED_BACKENDS
+from .semantics import (
+    EVIDENCE,
+    FINDING_CATEGORIES,
+    FINDINGS,
+    GRAPH,
+    OUTCOMES,
+    RULES,
+    SELECTION,
+    WORKER_STATES,
+    external_evidence,
+)
 
 Text = Annotated[str, Field(min_length=1, max_length=20000, pattern=r"\S")]
 Key = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}$")]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+AUTHORITY_HOST_PATTERN = r"^(?:\*|(?:\*\.)?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$"
 
 
 class Contract(BaseModel):
@@ -32,13 +44,19 @@ class Criterion(Contract):
     id: Key
     description: Text
     # Check IDs resolve only against operator-owned definitions in RunConfig.
-    checks: tuple[Key, ...] = ()
-    outcome: Literal["artifact", "external_effect"] = "artifact"
+    checks: tuple[Key, ...] = Field(default=(), description=EVIDENCE["checks"])
+    outcome: Literal["artifact", "external_effect"] = Field(
+        default="artifact", description=json.dumps(OUTCOMES, sort_keys=True)
+    )
+
+    @property
+    def requires_external_evidence(self) -> bool:
+        return external_evidence(self.outcome)
 
 
 class Requirement(Contract):
-    original_fragment: Text
-    criteria: tuple[Key, ...] = Field(min_length=1)
+    original_fragment: Text = Field(description=RULES["FOREIGN_REQUIREMENT_FRAGMENT"]["rule"])
+    criteria: tuple[Key, ...] = Field(min_length=1, description=RULES["UNMAPPED_CRITERION"]["rule"])
 
 
 # One semantic definition for schema, stage context, review, repair and runtime decisions.
@@ -113,7 +131,10 @@ class ClarificationNeed(Contract):
 class Clarification(Contract):
     clarified_goal: Text = Field(description="Faithful goal preserving the original request.")
     criteria: tuple[Criterion, ...] = Field(
-        min_length=1, description="Checkable success criteria, preserving required outcome kinds."
+        min_length=1,
+        description=RULES["DUPLICATE_CRITERION"]["rule"]
+        + " "
+        + RULES["UNMAPPED_CRITERION"]["rule"],
     )
     requirements: tuple[Requirement, ...] = Field(
         min_length=1, description="Exact original fragments mapped to their success criteria."
@@ -190,7 +211,10 @@ class Goal(Contract):
 class Authority(Contract):
     network_hosts: tuple[Text, ...] = Field(
         default=(),
-        description="HTTPS destination host grants; not URLs or per-operation permissions.",
+        description="HTTPS destination host grants; not per-operation permissions. "
+        + RULES["AUTHORITY_REQUIRES_HOST_NAMES_NOT_URLS_OR_PORTS"]["rule"]
+        + " "
+        + RULES["DUPLICATE_AUTHORITY_RESOURCE"]["rule"],
     )
     credentials: tuple[Key, ...] = Field(
         default=(),
@@ -219,10 +243,7 @@ class Authority(Contract):
         ) != len(self.network_hosts):
             raise ValueError("DUPLICATE_AUTHORITY_RESOURCE")
         for host in self.network_hosts:
-            if (
-                not re.fullmatch(r"(?:\*|(?:\*\.)?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)", host)
-                or ".." in host
-            ):
+            if not re.fullmatch(AUTHORITY_HOST_PATTERN, host) or ".." in host:
                 raise ValueError("AUTHORITY_REQUIRES_HOST_NAMES_NOT_URLS_OR_PORTS")
         return self
 
@@ -250,13 +271,19 @@ class Authority(Contract):
 class Task(Contract):
     id: Key
     description: Text
-    criteria: tuple[Criterion, ...] = Field(min_length=1)
-    verification_plan: Text
-    required_evidence: tuple[Text, ...] = ()
-    dependencies: tuple[Key, ...] = ()
+    criteria: tuple[Criterion, ...] = Field(
+        min_length=1, description=RULES["DUPLICATE_TASK_CRITERION"]["rule"]
+    )
+    verification_plan: Text = Field(description=EVIDENCE["verification_plan"])
+    required_evidence: tuple[Text, ...] = Field(
+        default=(), description=EVIDENCE["required_evidence"]
+    )
+    dependencies: tuple[Key, ...] = Field(default=(), description=GRAPH["dependencies"])
     authority: Authority = Authority()
-    kind: Literal["work", "integration", "repair"] = "work"
-    supersedes: Key | None = None
+    kind: Literal["work", "integration", "repair"] = Field(
+        default="work", description=GRAPH["kind"]
+    )
+    supersedes: Key | None = Field(default=None, description=GRAPH["supersedes"])
 
     @model_validator(mode="after")
     def unique_bindings(self) -> Self:
@@ -268,8 +295,16 @@ class Task(Contract):
 
 
 class Plan(Contract):
-    tasks: tuple[Task, ...] = Field(min_length=1, max_length=256)
-    result_task: Key
+    tasks: tuple[Task, ...] = Field(
+        min_length=1,
+        max_length=256,
+        description=RULES["INVALID_GRAPH_IDENTITY"]["rule"]
+        + " "
+        + GRAPH["dependencies"]
+        + " "
+        + GRAPH["result_task"],
+    )
+    result_task: Key = Field(description=GRAPH["result_task"])
 
     @model_validator(mode="after")
     def dag(self) -> Self:
@@ -301,7 +336,13 @@ class Check(Contract):
     id: Key
     argv: tuple[Text, ...] = Field(min_length=1)
     timeout: float | None = Field(default=None, gt=0)
-    evidence_kind: Literal["artifact", "external_effect"] = "artifact"
+    evidence_kind: Literal["artifact", "external_effect"] = Field(
+        default="artifact", description=json.dumps(OUTCOMES, sort_keys=True)
+    )
+
+    @property
+    def proves_external_effect(self) -> bool:
+        return external_evidence(self.evidence_kind)
 
 
 class StagePolicy(Contract):
@@ -370,7 +411,7 @@ class RunConfig(Contract):
 
 
 class Candidate(Contract):
-    tree: Digest
+    tree: Digest = Field(description=GRAPH["candidate"])
     task_digest: Digest
     attempt_id: Key
     upstream: tuple[Digest, ...]
@@ -388,16 +429,29 @@ class TaskContext(Contract):
 
 
 class WorkerResult(Contract):
-    status: Literal["completed", "failed", "authority_requested", "uncertain", "usage_limit"]
+    status: Literal["completed", "failed", "authority_requested", "uncertain", "usage_limit"] = (
+        Field(description=json.dumps(WORKER_STATES, sort_keys=True))
+    )
     summary: Text
-    evidence: tuple[Text, ...] = ()
-    authority_request: Authority | None = None
+    evidence: tuple[Text, ...] = Field(default=(), description=EVIDENCE["worker_evidence"])
+    authority_request: Authority | None = Field(
+        default=None, description=RULES["WORKER_AUTHORITY_REQUEST_MISMATCH"]["rule"]
+    )
+
+    def action(self, external_writes: bool) -> str:
+        return str(WORKER_STATES[self.status]["external_action" if external_writes else "action"])
+
+    @model_validator(mode="after")
+    def authority_matches_status(self) -> Self:
+        if WORKER_STATES[self.status]["request"] != (self.authority_request is not None):
+            raise ValueError("WORKER_AUTHORITY_REQUEST_MISMATCH")
+        return self
 
 
 class Finding(Contract):
-    criterion_id: Key
+    criterion_id: Key = Field(description=FINDINGS["references"])
     passed: bool
-    evidence: Text
+    evidence: Text = Field(description=FINDINGS["evidence"])
     category: Literal[
         "satisfied",
         "missing_evidence",
@@ -406,11 +460,18 @@ class Finding(Contract):
         "unsupported_expansion",
         "incorrect_result",
         "unspecified",
-    ] = "unspecified"
+    ] = Field(default="unspecified", description=json.dumps(FINDING_CATEGORIES, sort_keys=True))
+
+    @model_validator(mode="after")
+    def category_matches_passed(self) -> Self:
+        expected = FINDING_CATEGORIES[self.category]["passed"]
+        if expected is not None and self.passed != expected:
+            raise ValueError("FINDING_CATEGORY_MISMATCH")
+        return self
 
 
 class Verification(Contract):
-    findings: tuple[Finding, ...]
+    findings: tuple[Finding, ...] = Field(description=FINDINGS["references"])
     summary: Text
 
     def accepts(self, criteria: tuple[Criterion, ...]) -> bool:
@@ -427,5 +488,5 @@ class Usage(Contract):
 
 
 class WorkerChoice(Contract):
-    index: int = Field(ge=0)
+    index: int = Field(ge=0, description=SELECTION)
     reason: Text

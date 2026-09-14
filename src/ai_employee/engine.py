@@ -13,7 +13,6 @@ from pydantic import ValidationError
 
 from .candidates import Candidates
 from .capabilities import (
-    AUTHORITY_RULES,
     authority_policy_failure,
     policies,
     readiness,
@@ -23,7 +22,6 @@ from .capabilities import (
 from .diagnostics import CheckOutput
 from .history import Journal, Stopped
 from .models import (
-    CLARIFICATION_RULES,
     Authority,
     Candidate,
     Clarification,
@@ -41,11 +39,13 @@ from .models import (
     WorkerResult,
 )
 from .native import Model
+from .semantics import EVIDENCE, GRAPH, WORKER_STATES, external_evidence
 from .stage_contracts import (
     VERSION,
     OutputViolation,
     StageContract,
     digest,
+    repair_feedback,
     validation_code,
     validation_details,
 )
@@ -168,28 +168,7 @@ class Engine:
                     raise RuntimeError("TRANSPORT_RETRY_EXHAUSTED") from error
                 action = "transport"
             except OutputViolation as error:
-                # Persist only bounded rule identifiers/context for replay feedback.
-                # Full requested authority remains in redacted diagnostic storage.
-                violation = (
-                    {
-                        key: error.details[key]
-                        for key in (
-                            "reason",
-                            "path",
-                            "rule",
-                            "task",
-                            "criterion",
-                            "unsupported_fields",
-                            "index",
-                        )
-                        if key in error.details
-                    }
-                    if str(error) in (AUTHORITY_RULES | CLARIFICATION_RULES)
-                    and isinstance(error.details, dict)
-                    else None
-                )
-                if str(error) in CLARIFICATION_RULES:
-                    violation = {**CLARIFICATION_RULES[str(error)], **(violation or {})}
+                violation = repair_feedback(str(error), error.details)
                 self.journal.append(
                     run,
                     "output_rejected",
@@ -200,6 +179,20 @@ class Engine:
                     authoritative=False,
                     violation=violation,
                 )
+                # Negative safety reports remain stops even if another field is malformed.
+                payload = error.details.get("payload") if isinstance(error.details, dict) else None
+                reported = payload.get("status") if isinstance(payload, dict) else None
+                disposition = (
+                    WORKER_STATES.get(reported, {}).get("action")
+                    if schema is WorkerResult and isinstance(reported, str)
+                    else None
+                )
+                if disposition == "stop":
+                    self.journal.stop(run, "USAGE_LIMIT")
+                    raise Stopped("USAGE_LIMIT") from error
+                if disposition == "uncertain":
+                    self.journal.append(run, "uncertain", reason="INVALID_UNCERTAIN_RESPONSE")
+                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
                 if authority.external_writes:
                     self.journal.append(
                         run,
@@ -457,8 +450,9 @@ class Engine:
             reviewer,
             {
                 "instruction": "Independently review proposal against original. Reject omitted or "
-                "weakened requirements, unsupported expansion, missing checks or evidence. "
+                "weakened requirements or unsupported expansion. "
                 "Use criterion_id=review.",
+                "evidence_semantics": EVIDENCE["proposal_review"],
                 "original": original,
                 "proposal": proposal.model_dump(mode="json"),
             },
@@ -514,10 +508,7 @@ class Engine:
                     "Map exact original fragments to criteria. Preserve mandatory checks. "
                     "Use the shared clarification contract for investigation, unresolved needs "
                     "and questions; inspect the supplied input snapshot. "
-                    "Mark each criterion outcome as artifact or external_effect. Creating a script "
-                    "does not complete its external operation unless the original explicitly "
-                    "requests that artifact/deferred execution route. External effects require "
-                    "operator checks with external_effect evidence_kind. "
+                    "Use the shared evidence/outcome semantics. "
                     "Do not invent authority.",
                     "original_input": original,
                     "clarification_answers": [
@@ -593,9 +584,7 @@ class Engine:
                     "instruction": "Plan one Task or a DAG. Use integration Tasks where branches "
                     "converge. Every Task must contribute to result_task. Define exact "
                     "success criteria, verification plan and required evidence. "
-                    "Preserve Goal outcome kinds: artifact creation never substitutes for "
-                    "external_effect completion. "
-                    "Check IDs refer only to available operator checks.",
+                    "Use the shared graph and evidence/outcome semantics.",
                     "goal": goal.model_dump(mode="json"),
                     "feedback": feedback,
                     "available_checks": [check.model_dump(mode="json") for check in config.checks],
@@ -698,7 +687,7 @@ class Engine:
             receipts.append(receipt)
             self.journal.append(run, "check_result", **receipt)
         events = self.journal.events(run)
-        external = any(criterion.outcome == "external_effect" for criterion in criteria) or any(
+        external = any(criterion.requires_external_evidence for criterion in criteria) or any(
             event["kind"] == "attempt_started"
             and event["body"]["context"]["authority"]["external_writes"]
             and (task is None or event["body"]["context"]["attempt_id"] == candidate.attempt_id)
@@ -725,10 +714,7 @@ class Engine:
                 "goal_verification" if task is None else "task_verification",
                 config.verification,
                 {
-                    "instruction": "Independently verify actual candidate files against EACH exact "
-                    "criterion and required evidence. Worker claims alone are not proof. "
-                    "Checks prove only their named coverage. Missing evidence fails. "
-                    "Never repeat an external side effect to verify it.",
+                    "instruction": EVIDENCE["verification"],
                     "goal": goal.model_dump(mode="json"),
                     "task": None if task is None else task.model_dump(mode="json"),
                     "criteria": [item.model_dump(mode="json") for item in criteria],
@@ -762,7 +748,7 @@ class Engine:
                 external_receipts = [
                     item
                     for item in (*receipts, *prior_checks)
-                    if item.get("evidence_kind") == "external_effect" and item["passed"]
+                    if external_evidence(item.get("evidence_kind")) and item["passed"]
                 ]
                 if external and not external_receipts:
                     passed = False
@@ -819,9 +805,6 @@ class Engine:
                 WorkerChoice,
                 workspace,
             )
-            if selection.index >= len(config.worker_options):
-                feedback = "WORKER_SELECTION_OUT_OF_RANGE"
-                continue
             accepted, feedback = self._review(
                 run,
                 selector,
@@ -850,7 +833,7 @@ class Engine:
             for event in events
             if event["kind"] == "worker_result" and event["body"]["attempt"] == context.attempt_id
         ]
-        if not results or results[-1].status != "completed":
+        if not results or results[-1].action(context.authority.external_writes) != "verify":
             return None
         if any(
             event["kind"] == "attempt_failed" and event["body"]["attempt"] == context.attempt_id
@@ -1080,14 +1063,15 @@ class Engine:
                     workspace,
                     authority,
                 )
-                if result.status == "usage_limit":
+                action = result.action(authority.external_writes)
+                if action == "stop":
                     self.journal.stop(run, "USAGE_LIMIT")
                     raise Stopped("USAGE_LIMIT")
-                if result.status != "authority_requested":
+                if action != "request":
                     self.journal.append(
                         run, "worker_result", attempt=attempt, result=result.model_dump(mode="json")
                     )
-                if result.status == "uncertain":
+                if action == "uncertain":
                     self.journal.append(
                         run,
                         "uncertain",
@@ -1096,7 +1080,7 @@ class Engine:
                         result=result.model_dump(mode="json"),
                     )
                     raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
-                if result.status == "authority_requested":
+                if action == "request":
                     requested = result.authority_request
                     if requested is None or not requested.within(config.authority_ceiling):
                         raise ValueError("AUTHORITY_REQUEST_DENIED")
@@ -1126,16 +1110,7 @@ class Engine:
                         ),
                     )
                     raise Waiting("PAUSED_FOR_APPROVAL")
-                if result.status != "completed":
-                    if authority.external_writes:
-                        self.journal.append(
-                            run,
-                            "uncertain",
-                            task_digest=task.digest,
-                            attempt=attempt,
-                            reason="EXTERNAL_WORKER_FAILED",
-                        )
-                        raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
+                if action != "verify":
                     feedback = result.summary
                     self.journal.append(
                         run, "attempt_failed", attempt=attempt, reason="WORKER_FAILED"
@@ -1521,6 +1496,22 @@ class Engine:
             for event in events
             if event["kind"] in {"verification", "attempt_failed", "task_failed", "goal_rejected"}
         ][-20:]
+        recovery_context = {
+            "goal": goal.model_dump(mode="json"),
+            "previous_plan": previous.model_dump(mode="json"),
+            "original_task_ids": [task.id for task in plans[0].tasks],
+            "failed_tasks": sorted(
+                {e["body"]["task"] for e in events if e["kind"] == "task_failed"} - accepted.keys()
+            ),
+            "historical_tasks": [
+                t.model_dump(mode="json")
+                for t in {t.id: t for p in plans for t in p.tasks}.values()
+            ],
+            "available_checks": [c.model_dump(mode="json") for c in config.checks],
+            "accepted": {key: value.model_dump(mode="json") for key, value in accepted.items()},
+            "failure": failure,
+            "evidence": evidence,
+        }
         feedback = ""
         for _ in range(config.recovery.revisions + 1):
             extension = self._generate(
@@ -1528,25 +1519,8 @@ class Engine:
                 "recovery",
                 config.recovery,
                 {
-                    "instruction": "Extend the adopted graph forward to repair the failure. "
-                    "Return the full next adopted Plan. Existing task IDs must retain "
-                    "their exact definitions; introduce new IDs for repairs/reintegration. "
-                    "Reuse accepted upstream tasks, preserve their required ancestors, "
-                    "and remove superseded future paths from the adopted plan. "
-                    "Never weaken Goal Success Criteria. Repair tasks can depend on "
-                    "accepted candidates; do not depend on permanently failed tasks.",
-                    "goal": goal.model_dump(mode="json"),
-                    "previous_plan": previous.model_dump(mode="json"),
-                    "historical_tasks": [
-                        t.model_dump(mode="json")
-                        for t in {t.id: t for p in plans for t in p.tasks}.values()
-                    ],
-                    "available_checks": [c.model_dump(mode="json") for c in config.checks],
-                    "accepted": {
-                        key: value.model_dump(mode="json") for key, value in accepted.items()
-                    },
-                    "failure": failure,
-                    "evidence": evidence,
+                    "instruction": GRAPH["recovery"],
+                    **recovery_context,
                     "review_feedback": feedback,
                 },
                 Plan,
@@ -1557,11 +1531,7 @@ class Engine:
                 config.recovery,
                 "recovery",
                 extension,
-                {
-                    "goal": goal.model_dump(mode="json"),
-                    "previous_plan": previous.model_dump(mode="json"),
-                    "failure": failure,
-                },
+                recovery_context,
                 workspace,
                 external=any(task.authority.external_writes for task in extension.tasks),
             )
@@ -1571,14 +1541,7 @@ class Engine:
             raise ValueError("RECOVERY_REJECTED")
         historical = {task.id: task for plan in plans for task in plan.tasks}
         new = {task.id for task in extension.tasks} - historical.keys()
-        original = {task.id for task in plans[0].tasks}
-        if not new or len((historical.keys() | new) - original) > config.limits.added_tasks:
-            raise ValueError("GRAPH_GROWTH_LIMIT")
         for task in extension.tasks:
-            if task.id in historical and task.digest != historical[task.id].digest:
-                raise ValueError("HISTORICAL_TASK_REWRITTEN")
-            if task.supersedes is not None and task.supersedes not in historical:
-                raise ValueError("FOREIGN_REPAIR_TARGET")
             self._readiness(run, task, config, extension)
             self._check_ids(task.criteria, config)
             self._authorize(run, config, task.authority, task.digest)

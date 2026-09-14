@@ -14,6 +14,7 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
+from .diagnostics import capture
 from .models import (
     CLARIFICATION_RULES,
     Clarification,
@@ -23,9 +24,11 @@ from .models import (
     Usage,
     Verification,
     WorkerChoice,
+    WorkerResult,
 )
+from .semantics import RULES, external_evidence, projection
 
-VERSION = "stage-contract-3"
+VERSION = "stage-contract-4"
 T = TypeVar("T", bound=Contract)
 
 
@@ -47,22 +50,73 @@ class OutputViolation(ValueError):
 def validation_code(error: ValidationError) -> str:
     # Never include Pydantic's input values, arbitrary validator text or locations
     # controlled by a model. A bounded type-only finding is safe repair feedback.
-    known = {
-        "DUPLICATE_CRITERION",
-        "FOREIGN_REQUIREMENT_CRITERION",
-        "UNMAPPED_CRITERION",
-        "DUPLICATE_TASK_CRITERION",
-        "DUPLICATE_DEPENDENCY",
-        "INVALID_GRAPH_IDENTITY",
-        "CYCLIC_OR_MISSING_DEPENDENCY",
-        "UNCONNECTED_RESULT",
-        "CLARIFICATION_QUESTION_ACTION_MISMATCH",
-    }
+    known = RULES.keys() | CLARIFICATION_RULES.keys()
     for item in error.errors(include_input=False, include_context=False, include_url=False):
         message = item["msg"].removeprefix("Value error, ")
         if message in known:
             return message
     return "INVALID_STRUCTURED_OUTPUT"
+
+
+def repair_feedback(code: str, details: Any) -> dict[str, Any]:
+    """Project rules and safe context, never rejected proposals or authority objects."""
+    from .capabilities import AUTHORITY_RULES
+
+    rule = (RULES | AUTHORITY_RULES | CLARIFICATION_RULES).get(code, {})
+    allowed = {
+        "path",
+        "expected",
+        "received",
+        "errors",
+        "task",
+        "criterion",
+        "index",
+        "unsupported_fields",
+        "mandatory_checks",
+        "unregistered_checks",
+        "required_evidence_kind",
+        "expected_count",
+        "received_count",
+    }
+    context_truncated = False
+
+    def bound(value: Any, depth: int = 0) -> Any:
+        nonlocal context_truncated
+        if depth > 4:
+            context_truncated = True
+            return "[omitted]"
+        if isinstance(value, str):
+            context_truncated |= len(value) > 256
+            return value[:256]
+        if isinstance(value, (list, tuple)):
+            context_truncated |= len(value) > 32
+            return [bound(item, depth + 1) for item in value[:32]]
+        if isinstance(value, dict):
+            context_truncated |= len(value) > 8
+            return {key: bound(item, depth + 1) for key, item in list(value.items())[:8]}
+        return value if value is None or isinstance(value, (bool, int, float)) else "[omitted]"
+
+    context = (
+        {key: bound(value) for key, value in details.items() if key in allowed}
+        if isinstance(details, dict)
+        else {}
+    )
+    if context_truncated:
+        context.update(
+            context_truncated=True,
+            reference_source="Use the complete StageContract "
+            "and provider schema reference sets; this diagnostic context is partial.",
+        )
+    record = capture({**context, **rule, "authoritative": False}, 8192)
+    if record["truncated"]:
+        return {
+            **rule,
+            "authoritative": False,
+            "context_excerpt": record["text"],
+            "truncated": True,
+        }
+    result: dict[str, Any] = json.loads(record["text"])
+    return result
 
 
 def validation_details(
@@ -95,6 +149,7 @@ class StageContract:
     target_digest: str | None
     policy_digest: str
     authority: dict[str, object]
+    constraints: dict[str, Any]
 
     @classmethod
     def bind(cls, stage: str, prompt: dict[str, Any], config: RunConfig) -> StageContract:
@@ -107,6 +162,18 @@ class StageContract:
         elif "criteria" in prompt:
             criteria = tuple(item["id"] for item in prompt["criteria"])
         target = prompt.get("proposal", prompt.get("candidate"))
+        constraints: dict[str, Any] = {"mandatory_checks": config.mandatory_checks}
+        source = prompt.get("original", prompt) if stage.endswith("_review") else prompt
+        if stage in {"selection", "selection_review"}:
+            constraints["maximum_worker_index"] = len(source["options"]) - 1
+        if stage in {"recovery", "recovery_review"}:
+            historical = {task["id"] for task in source.get("historical_tasks", [])}
+            original = set(source.get("original_task_ids", historical))
+            constraints.update(
+                historical_tasks=tuple(sorted(historical)),
+                remaining_added_tasks=config.limits.added_tasks - len(historical - original),
+                failed_tasks=tuple(source.get("failed_tasks", ())),
+            )
         return cls(
             stage,
             tuple(check.id for check in config.checks),
@@ -115,6 +182,7 @@ class StageContract:
             None if target is None else digest(target),
             config.digest,
             authority_projection(config),
+            constraints,
         )
 
     def projection(self) -> dict[str, Any]:
@@ -127,6 +195,8 @@ class StageContract:
             "evaluation_target_digest": self.target_digest,
             "policy_digest": self.policy_digest,
             "authority": self.authority,
+            "semantics": projection(self.stage),
+            "constraints": self.constraints,
             **(
                 {"clarification": Clarification.semantics()}
                 if self.stage in {"clarification", "clarification_review"}
@@ -185,12 +255,12 @@ class StageContract:
                 check
                 for task in value.tasks
                 for criterion in task.criteria
-                if criterion.outcome == "external_effect"
+                if criterion.requires_external_evidence
                 for check in criterion.checks
             }
             for criterion in prompt.get("goal", {}).get("specification", {}).get("criteria", []):
                 if (
-                    criterion["outcome"] == "external_effect"
+                    external_evidence(criterion["outcome"])
                     and not set(criterion["checks"]) <= external_checks
                 ):
                     raise OutputViolation(
@@ -201,15 +271,44 @@ class StageContract:
                         },
                     )
             historical = {t["id"]: t for t in prompt.get("historical_tasks", [])}
+            if self.stage == "recovery":
+                added = {t.id for t in value.tasks} - historical.keys()
+                if not added or len(added) > self.constraints["remaining_added_tasks"]:
+                    raise OutputViolation(
+                        "GRAPH_GROWTH_LIMIT",
+                        details={
+                            "expected": {
+                                "minimum_new_tasks": 1,
+                                "maximum_new_tasks": self.constraints["remaining_added_tasks"],
+                            },
+                            "received": len(added),
+                        },
+                    )
             for task in value.tasks:
                 self._checks(task.criteria)
                 violation = task_violation(task, config)
                 if violation:
                     raise OutputViolation(str(violation["reason"]), details=violation)
                 if task.id in historical and task.model_dump(mode="json") != historical[task.id]:
-                    raise OutputViolation("HISTORICAL_TASK_REWRITTEN")
+                    raise OutputViolation("HISTORICAL_TASK_REWRITTEN", details={"task": task.id})
                 if task.supersedes is not None and task.supersedes not in historical:
-                    raise OutputViolation("FOREIGN_REPAIR_TARGET")
+                    raise OutputViolation(
+                        "FOREIGN_REPAIR_TARGET",
+                        details={
+                            "task": task.id,
+                            "received": task.supersedes,
+                            "expected": sorted(historical),
+                        },
+                    )
+                failed = set(task.dependencies) & set(self.constraints.get("failed_tasks", ()))
+                if failed:
+                    raise OutputViolation(
+                        "FAILED_DEPENDENCY",
+                        details={
+                            "task": task.id,
+                            "received": sorted(failed),
+                        },
+                    )
         if isinstance(value, Verification) and self.criteria is not None:
             ids = [f.criterion_id for f in value.findings]
             if len(ids) != len(self.criteria) or set(ids) != set(self.criteria):
@@ -219,10 +318,41 @@ class StageContract:
                         "path": "findings.criterion_id",
                         "expected": self.criteria,
                         "received": ids,
+                        "expected_count": len(self.criteria),
+                        "received_count": len(ids),
                     },
                 )
-        if isinstance(value, WorkerChoice) and value.index >= len(prompt["options"]):
-            raise OutputViolation("WORKER_SELECTION_OUT_OF_RANGE")
+        if (
+            isinstance(value, WorkerChoice)
+            and value.index > self.constraints["maximum_worker_index"]
+        ):
+            raise OutputViolation(
+                "WORKER_SELECTION_OUT_OF_RANGE",
+                details={
+                    "received": value.index,
+                    "expected": {"minimum": 0, "maximum": self.constraints["maximum_worker_index"]},
+                },
+            )
+        if isinstance(value, WorkerResult) and value.authority_request is not None:
+            from .capabilities import (
+                authority_policy_failure,
+                authority_support_failure,
+                task_violation,
+            )
+            from .models import Task
+
+            reason = authority_policy_failure(
+                value.authority_request, config
+            ) or authority_support_failure(value.authority_request)
+            if reason:
+                raise OutputViolation(reason, details={"path": "authority_request"})
+            if "context" in prompt:
+                task = Task.model_validate(prompt["context"]["task"]).model_copy(
+                    update={"authority": value.authority_request}
+                )
+                violation = task_violation(task, config)
+                if violation:
+                    raise OutputViolation(str(violation["reason"]), details=violation)
         return value
 
     def _checks(self, criteria: Any) -> None:
@@ -240,9 +370,9 @@ class StageContract:
 
     @staticmethod
     def _outcomes(criteria: Any, config: RunConfig) -> None:
-        external = {c.id for c in config.checks if c.evidence_kind == "external_effect"}
+        external = {c.id for c in config.checks if c.proves_external_effect}
         for criterion in criteria:
-            if criterion.outcome == "external_effect" and not set(criterion.checks) & external:
+            if criterion.requires_external_evidence and not set(criterion.checks) & external:
                 raise OutputViolation(
                     "MISSING_EXTERNAL_EVIDENCE_CHECK",
                     details={

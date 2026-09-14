@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .history import Stopped
-from .models import Authority, RunConfig, StagePolicy, Task
+from .models import AUTHORITY_HOST_PATTERN, Authority, RunConfig, StagePolicy, Task
 from .product_capabilities import SUPPORTED_BACKENDS as SUPPORTED_BACKENDS
 from .stage_contracts import digest
 
@@ -69,7 +69,7 @@ def authority_projection(config: RunConfig) -> dict[str, object]:
     for name, field in Authority.model_fields.items():
         # Keep requirements expressible, including infeasible ones. A false-only
         # schema would force the producer to erase a genuinely required control.
-        properties[name] = {
+        entry: dict[str, object] = {
             "description": f"{field.description} "
             + (
                 "Unsupported by this product; a nonempty/true request is rejected. "
@@ -80,15 +80,16 @@ def authority_projection(config: RunConfig) -> dict[str, object]:
             + str(getattr(config.authority_ceiling, name))
             + ". See the shared authority rules for conditional policy constraints."
         }
+        if name == "network_hosts":
+            entry["items"] = {"type": "string", "pattern": AUTHORITY_HOST_PATTERN}
+        properties[name] = entry
     return {
         "properties": properties,
         "unsupported_fields": UNSUPPORTED_AUTHORITY,
         "authority_ceiling": config.authority_ceiling.model_dump(mode="json"),
         "security": config.security,
         "rules": AUTHORITY_RULES,
-        "external_evidence_checks": [
-            c.id for c in config.checks if c.evidence_kind == "external_effect"
-        ],
+        "external_evidence_checks": [c.id for c in config.checks if c.proves_external_effect],
         "environment": "Actual environment availability is checked by invocation preflight; "
         "this contract does not assert a successful probe or authentication.",
         "repair": "Repair proposals only within the unchanged Goal and policy. Never remove "
@@ -128,12 +129,12 @@ def task_violation(task: Task, config: RunConfig) -> dict[str, object] | None:
     reason = authority_policy_failure(task.authority, config) or authority_support_failure(
         task.authority
     )
-    external_checks = {c.id for c in config.checks if c.evidence_kind == "external_effect"}
+    external_checks = {c.id for c in config.checks if c.proves_external_effect}
     checks = {key for criterion in task.criteria for key in criterion.checks}
     if reason is None and (
         (task.authority.external_writes and not checks & external_checks)
         or any(
-            c.outcome == "external_effect" and not set(c.checks) & external_checks
+            c.requires_external_evidence and not set(c.checks) & external_checks
             for c in task.criteria
         )
     ):
