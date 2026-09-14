@@ -315,6 +315,13 @@ def provider_schema(
             result["properties"]["index"]["maximum"] = binding["constraints"][
                 "maximum_worker_index"
             ]
+        task = definitions.get("Task")
+        if task is not None:
+            historical = binding.get("constraints", {}).get("historical_tasks", ())
+            task["properties"]["supersedes"]["anyOf"] = [
+                *([{"type": "string", "enum": list(historical)}] if historical else []),
+                {"type": "null"},
+            ]
 
     # Finding is nested, so the provider's supported anyOf form can express its
     # category/pass relationship without changing the public response shape.

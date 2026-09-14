@@ -43,7 +43,7 @@ in `tests/`; abbreviated module names have the `test_` prefix.
 
 ## Schema boundaries and review result
 
-The provider schema enforces known check/criterion IDs, exact Finding count,
+The provider schema enforces known check/criterion/historical supersedes IDs, exact Finding count,
 selection bounds, host syntax and nested Finding category/pass combinations.
 Unique coverage, DAG relationships, historical equality, dynamic evidence routes
 and the root WorkerResult status/request relationship retain deterministic
@@ -64,3 +64,18 @@ repair. Tests establish deterministic contract consistency, not perfect model
 understanding or live benchmark success. Inspector reads each recorded binding's
 `semantics` and `constraints`; documentation links these owners instead of
 maintaining a second status/action table.
+
+## PR review corrections
+
+The pre-merge review additionally found and corrected three boundary gaps:
+
+- Repair context now uses the existing diagnostics redactor before truncation, so
+  a long PEM value cannot lose its closing delimiter before secret detection.
+- Rejection and quota/uncertainty decisions use the existing atomic journal group;
+  a crash after committing the rejection cannot resume the model as a repair.
+- Known historical `supersedes` IDs are projected into the actual provider schema;
+  initial planning permits only null, while recovery permits historical IDs or null.
+
+`test_semantic_contracts.py` exercises complete-secret redaction, schema references
+and controller-loss/reopen behavior for both malformed safety statuses. These use
+existing redaction, journaling and schema paths without new runtime states.

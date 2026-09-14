@@ -291,3 +291,62 @@ def test_authority_host_schema_and_repair_share_local_contract():
             Authority(network_hosts=hosts)
         assert validation_code(fault.value) == code
         assert repair_feedback(code, {})["rule"] == RULES[code]["rule"]
+
+
+def test_repair_redacts_complete_secrets_before_truncating_context():
+    secret = "-----BEGIN PRIVATE KEY-----\n" + "private-key-canary\n" * 40
+    secret += "-----END PRIVATE KEY-----"
+    result = repair_feedback("INVALID_STRUCTURED_OUTPUT", {"received": secret})
+    assert result["received"] == "[REDACTED]"
+    assert "private-key-canary" not in json.dumps(result)
+
+
+def test_supersedes_provider_constraint_matches_historical_reference_validation():
+    for stage, context, expected in [
+        ("planning", {}, [{"type": "null"}]),
+        (
+            "recovery",
+            {"historical_tasks": [{"id": "old"}]},
+            [{"type": "string", "enum": ["old"]}, {"type": "null"}],
+        ),
+    ]:
+        binding = StageContract.bind(stage, context, config())
+        schema = provider_schema(Plan, binding.projection())
+        assert schema["$defs"]["Task"]["properties"]["supersedes"]["anyOf"] == expected
+
+
+@pytest.mark.parametrize("status", ["usage_limit", "uncertain"])
+def test_crash_after_rejected_safety_report_cannot_resume_model_work(tmp_path, monkeypatch, status):
+    from ai_employee.engine import Engine
+    from ai_employee.history import Journal
+
+    model = SemanticModel(status)
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", config(), source)
+    append = engine.journal.append
+    append_many = engine.journal.append_many
+
+    def crash_after_append(run, kind, **body):
+        append(run, kind, **body)
+        if kind == "output_rejected":
+            raise SystemExit("controller lost after rejection")
+
+    def crash_after_group(run, entries):
+        append_many(run, entries)
+        if any(kind == "output_rejected" for kind, _ in entries):
+            raise SystemExit("controller lost after rejection")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine.journal, "append", crash_after_append)
+        patch.setattr(engine.journal, "append_many", crash_after_group)
+        with pytest.raises(SystemExit, match="controller lost"):
+            engine.execute(run)
+    reopened = Engine(Journal(engine.journal.path), engine.candidates, model, engine.root)
+    if status == "usage_limit":
+        with pytest.raises(Stopped, match="RUN_STOPPED"):
+            reopened.execute(run)
+    else:
+        reopened.execute(run)
+        assert inspect_run(reopened.journal, run)["status"] == "uncertain"
+    assert model.workers == 1
+    assert reopened.journal.budget(run)["open_reservations"] == 0

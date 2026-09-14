@@ -14,7 +14,7 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
-from .diagnostics import capture
+from .diagnostics import capture, redact
 from .models import (
     CLARIFICATION_RULES,
     Clarification,
@@ -96,11 +96,13 @@ def repair_feedback(code: str, details: Any) -> dict[str, Any]:
             return {key: bound(item, depth + 1) for key, item in list(value.items())[:8]}
         return value if value is None or isinstance(value, (bool, int, float)) else "[omitted]"
 
-    context = (
-        {key: bound(value) for key, value in details.items() if key in allowed}
+    selected = (
+        {key: value for key, value in details.items() if key in allowed}
         if isinstance(details, dict)
         else {}
     )
+    sanitized, _ = redact(selected)
+    context = {key: bound(value) for key, value in sanitized.items()}
     if context_truncated:
         context.update(
             context_truncated=True,

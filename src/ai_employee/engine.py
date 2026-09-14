@@ -169,16 +169,19 @@ class Engine:
                 action = "transport"
             except OutputViolation as error:
                 violation = repair_feedback(str(error), error.details)
-                self.journal.append(
-                    run,
-                    "output_rejected",
-                    stage=stage,
-                    contract=contract.identity,
-                    target=contract.target_digest,
-                    reason=str(error),
-                    authoritative=False,
-                    violation=violation,
-                )
+                entries: list[tuple[str, dict[str, Any]]] = [
+                    (
+                        "output_rejected",
+                        {
+                            "stage": stage,
+                            "contract": contract.identity,
+                            "target": contract.target_digest,
+                            "reason": str(error),
+                            "authoritative": False,
+                            "violation": violation,
+                        },
+                    )
+                ]
                 # Negative safety reports remain stops even if another field is malformed.
                 payload = error.details.get("payload") if isinstance(error.details, dict) else None
                 reported = payload.get("status") if isinstance(payload, dict) else None
@@ -188,18 +191,25 @@ class Engine:
                     else None
                 )
                 if disposition == "stop":
-                    self.journal.stop(run, "USAGE_LIMIT")
-                    raise Stopped("USAGE_LIMIT") from error
-                if disposition == "uncertain":
-                    self.journal.append(run, "uncertain", reason="INVALID_UNCERTAIN_RESPONSE")
-                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
-                if authority.external_writes:
-                    self.journal.append(
-                        run,
-                        "uncertain",
-                        reason="INVALID_EXTERNAL_RESPONSE",
-                        contract=contract.identity,
+                    entries.append(("stopped", {"reason": "USAGE_LIMIT"}))
+                elif disposition == "uncertain" or authority.external_writes:
+                    entries.append(
+                        (
+                            "uncertain",
+                            {
+                                "reason": "INVALID_UNCERTAIN_RESPONSE"
+                                if disposition == "uncertain"
+                                else "INVALID_EXTERNAL_RESPONSE",
+                                "contract": contract.identity,
+                            },
+                        )
                     )
+                # A crash must not leave a durable rejection that resumes as a repair
+                # after the same response reported quota exhaustion or uncertain effects.
+                self.journal.append_many(run, tuple(entries))
+                if disposition == "stop":
+                    raise Stopped("USAGE_LIMIT") from error
+                if disposition == "uncertain" or authority.external_writes:
                     raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
                 feedback = {
                     "code": str(error),
