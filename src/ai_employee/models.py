@@ -22,6 +22,7 @@ from .semantics import (
     WORKER_STATES,
     external_evidence,
 )
+from .source_refs import MAX_SOURCE_FRAGMENTS, SOURCE_REFERENCE_RULE, resolve_source_refs
 
 Text = Annotated[str, Field(min_length=1, max_length=20000, pattern=r"\S")]
 Key = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}$")]
@@ -55,7 +56,9 @@ class Criterion(Contract):
 
 
 class Requirement(Contract):
-    original_fragment: Text = Field(description=RULES["FOREIGN_REQUIREMENT_FRAGMENT"]["rule"])
+    original_refs: tuple[Key, ...] = Field(
+        min_length=1, max_length=MAX_SOURCE_FRAGMENTS, description=SOURCE_REFERENCE_RULE
+    )
     criteria: tuple[Key, ...] = Field(min_length=1, description=RULES["UNMAPPED_CRITERION"]["rule"])
 
 
@@ -93,11 +96,6 @@ CLARIFICATION_RULES = {
         "path": "unresolved",
         "rule": CLARIFICATION_NEEDS["investigation"]["rule"],
     },
-    "FOREIGN_CLARIFICATION_REFERENCE": {
-        "path": "unresolved.original_fragment",
-        "rule": "Each unresolved need must cite an exact fragment of the original request. "
-        "Do not add questions for excluded or unrequested cases.",
-    },
 }
 
 
@@ -109,8 +107,8 @@ class ClarificationNeed(Contract):
         description=CLARIFICATION_RULES["CLARIFICATION_QUESTION_ACTION_MISMATCH"]["rule"]
     )
     reason: Text = Field(description="Why this need blocks the original request.")
-    original_fragment: Text = Field(
-        description=CLARIFICATION_RULES["FOREIGN_CLARIFICATION_REFERENCE"]["rule"]
+    original_refs: tuple[Key, ...] = Field(
+        min_length=1, max_length=MAX_SOURCE_FRAGMENTS, description=SOURCE_REFERENCE_RULE
     )
     evidence: Text = Field(
         description="Observed permitted-input investigation or facts supporting this need. "
@@ -137,7 +135,7 @@ class Clarification(Contract):
         + RULES["UNMAPPED_CRITERION"]["rule"],
     )
     requirements: tuple[Requirement, ...] = Field(
-        min_length=1, description="Exact original fragments mapped to their success criteria."
+        min_length=1, description="Original source references mapped to their success criteria."
     )
     assumptions: tuple[Text, ...] = Field(
         default=(),
@@ -158,6 +156,19 @@ class Clarification(Contract):
         return next(
             (action for action in CLARIFICATION_ACTION_ORDER if action in actions), "proceed"
         )
+
+    def source_evidence(self, original: str) -> dict[str, list[dict[str, object]]]:
+        """Resolve both kinds of references from the same bound, unchanged source."""
+        return {
+            name: [
+                {
+                    **item.model_dump(mode="json"),
+                    "fragments": list(resolve_source_refs(original, item.original_refs)),
+                }
+                for item in getattr(self, name)
+            ]
+            for name in ("requirements", "unresolved")
+        }
 
     @classmethod
     def semantics(cls) -> dict[str, object]:
@@ -197,11 +208,7 @@ class Goal(Contract):
                 if self.specification.disposition == "wait"
                 else "CLARIFICATION_NOT_READY"
             )
-        if any(
-            item.original_fragment not in self.original_input
-            for item in self.specification.requirements
-        ):
-            raise ValueError("FOREIGN_REQUIREMENT_FRAGMENT")
+        self.specification.source_evidence(self.original_input)
         checks = {check for item in self.specification.criteria for check in item.checks}
         if not set(self.mandatory_checks) <= checks:
             raise ValueError("MANDATORY_CHECK_OMITTED")

@@ -27,8 +27,9 @@ from .models import (
     WorkerResult,
 )
 from .semantics import RULES, external_evidence, projection
+from .source_refs import original_source, resolve_source_refs
 
-VERSION = "stage-contract-4"
+VERSION = "stage-contract-5"
 T = TypeVar("T", bound=Contract)
 
 
@@ -152,9 +153,17 @@ class StageContract:
     policy_digest: str
     authority: dict[str, object]
     constraints: dict[str, Any]
+    original_input: str | None
 
     @classmethod
-    def bind(cls, stage: str, prompt: dict[str, Any], config: RunConfig) -> StageContract:
+    def bind(
+        cls,
+        stage: str,
+        prompt: dict[str, Any],
+        config: RunConfig,
+        *,
+        original_input: str | None = None,
+    ) -> StageContract:
         from .capabilities import authority_projection
 
         context = {k: v for k, v in prompt.items() if k not in {"feedback", "review_feedback"}}
@@ -185,6 +194,7 @@ class StageContract:
             config.digest,
             authority_projection(config),
             constraints,
+            original_input if original_input is not None else source.get("original_input"),
         )
 
     def projection(self) -> dict[str, Any]:
@@ -198,6 +208,11 @@ class StageContract:
             "policy_digest": self.policy_digest,
             "authority": self.authority,
             "semantics": projection(self.stage),
+            **(
+                {"original_source": original_source(self.original_input)}
+                if self.original_input is not None
+                else {}
+            ),
             "constraints": self.constraints,
             **(
                 {"clarification": Clarification.semantics()}
@@ -216,15 +231,16 @@ class StageContract:
 
     def validate(self, value: T, prompt: dict[str, Any], config: RunConfig) -> T:
         if isinstance(value, Clarification):
+            for name in ("requirements", "unresolved"):
+                for index, item in enumerate(getattr(value, name)):
+                    try:
+                        resolve_source_refs(self.original_input or "", item.original_refs)
+                    except ValueError as error:
+                        raise OutputViolation(
+                            "INVALID_ORIGINAL_REFERENCES",
+                            details={"path": f"{name}.original_refs", "index": index},
+                        ) from error
             for index, need in enumerate(value.unresolved):
-                if need.original_fragment not in prompt["original_input"]:
-                    raise OutputViolation(
-                        "FOREIGN_CLARIFICATION_REFERENCE",
-                        details={
-                            **CLARIFICATION_RULES["FOREIGN_CLARIFICATION_REFERENCE"],
-                            "index": index,
-                        },
-                    )
                 if need.action == "repair":
                     raise OutputViolation(
                         "CLARIFICATION_REQUIRES_INVESTIGATION",
@@ -234,11 +250,6 @@ class StageContract:
                         },
                     )
             self._checks(value.criteria)
-            if any(r.original_fragment not in prompt["original_input"] for r in value.requirements):
-                raise OutputViolation(
-                    "FOREIGN_REQUIREMENT_FRAGMENT",
-                    details={"path": "requirements.original_fragment"},
-                )
             if not set(config.mandatory_checks) <= {
                 c for item in value.criteria for c in item.checks
             }:
