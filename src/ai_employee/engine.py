@@ -628,6 +628,51 @@ class Engine:
                 return plan
         raise ValueError("PLAN_REJECTED")
 
+    def _input_comparison(
+        self, run: str, config: RunConfig, goal: Goal, task: Task | None, candidate: Candidate
+    ) -> dict[str, Any] | None:
+        criteria = goal.specification.criteria if task is None else task.criteria
+        if not any(c.preserved_paths for c in criteria):
+            return None
+        initial = next(e["body"]["tree"] for e in self.journal.events(run) if e["kind"] == "input")
+        source = {
+            "run": run,
+            "initial_tree": initial,
+            "candidate": candidate.model_dump(mode="json"),
+            "goal": goal.model_dump(mode="json"),
+            "task": None if task is None else task.model_dump(mode="json"),
+            "criteria": [c.model_dump(mode="json") for c in criteria],
+        }
+        return {
+            "scope": StageContract.input_scope(source, config),
+            "results": {
+                c.id: self.candidates.compare_inputs(initial, candidate.tree, c.preserved_paths)
+                for c in criteria
+                if c.preserved_paths
+            },
+        }
+
+    def _check_saved_comparison(
+        self, run: str, goal: Goal, task: Task | None, candidate: Candidate
+    ) -> None:
+        expected = self._input_comparison(run, self.journal.config(run), goal, task, candidate)
+        if expected is None:
+            return
+        record: dict[str, Any] = next(
+            (
+                e["body"]
+                for e in reversed(self.journal.events(run))
+                if e["kind"] == "verification"
+                and e["body"]["goal_level"] == (task is None)
+                and e["body"]["candidate"] == candidate.model_dump(mode="json")
+            ),
+            {},
+        )
+        if record.get("input_comparison") != expected or not all(
+            r["matches"] for r in expected["results"].values()
+        ):
+            raise ValueError("INPUT_COMPARISON_CONTEXT_MISMATCH")
+
     def _verify(
         self,
         run: str,
@@ -736,6 +781,13 @@ class Engine:
             "upstream_check_evidence": prior_checks,
             "worker_result": None if result is None else result.model_dump(mode="json"),
         }
+        comparison = self._input_comparison(run, config, goal, task, candidate)
+        if comparison is not None:
+            verification_context.update(
+                run=run,
+                initial_tree=comparison["scope"]["initial_tree"],
+                input_comparison=comparison,
+            )
         feedback = ""
         passed = False
         for _ in range(config.verification.revisions + 1):
@@ -762,6 +814,8 @@ class Engine:
             )
             if reviewed:
                 passed = verification.accepts(criteria) and all(item["passed"] for item in receipts)
+                if comparison is not None:
+                    passed = passed and all(r["matches"] for r in comparison["results"].values())
                 # Generic TLS observation cannot attest remote operation semantics.
                 # Without a real service read provider, require an operator-owned
                 # evidence check (e.g. signed receipt validation), never only prose.
@@ -784,6 +838,7 @@ class Engine:
             goal_level=boundary["goal_level"],
             passed=passed,
             result=verification.model_dump(mode="json"),
+            **({"input_comparison": comparison} if comparison is not None else {}),
         )
         return passed
 
@@ -891,6 +946,8 @@ class Engine:
         ]
         if verified:
             accepted = verified[-1]
+            if accepted:
+                self._check_saved_comparison(run, goal, context.task, candidate)
         else:
             reviewed, _ = self._review(
                 run,
@@ -1624,6 +1681,7 @@ class Engine:
             ):
                 raise ValueError("CANDIDATE_NOT_VERIFIED")
             self.candidates.manifest(candidate.tree)
+            self._check_saved_comparison(run, context.goal, context.task, candidate)
         return accepted
 
     def _completion(self, run: str) -> Candidate:
@@ -1660,6 +1718,7 @@ class Engine:
             for event in events
         ):
             raise ValueError("GOAL_NOT_VERIFIED")
+        self._check_saved_comparison(run, goal, None, candidate)
         return candidate
 
     def promote(self, run: str, destination: Path) -> None:

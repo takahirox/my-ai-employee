@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from fnmatch import fnmatchcase
+from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -18,6 +19,7 @@ from .semantics import (
     FINDING_CATEGORIES,
     FINDINGS,
     GRAPH,
+    INPUT_PRESERVATION,
     OUTCOMES,
     RULES,
     SELECTION,
@@ -46,6 +48,25 @@ class Contract(BaseModel):
 class Criterion(Contract):
     id: Key
     description: Text
+    preserved_paths: tuple[Text, ...] = Field(
+        default=(), max_length=64, description=INPUT_PRESERVATION
+    )
+
+    @model_validator(mode="after")
+    def preservation_paths(self) -> Self:
+        if len(set(self.preserved_paths)) != len(self.preserved_paths) or any(
+            name != "."
+            and (
+                PurePosixPath(name).is_absolute()
+                or str(PurePosixPath(name)) != name
+                or ".." in PurePosixPath(name).parts
+                or any(char in name for char in "*?[]\\\x00")
+            )
+            for name in self.preserved_paths
+        ):
+            raise ValueError("INVALID_PRESERVATION_PATH")
+        return self
+
     # Check IDs resolve only against operator-owned definitions in RunConfig.
     checks: tuple[Key, ...] = Field(default=(), description=EVIDENCE["checks"])
     outcome: Literal["artifact", "external_effect"] = Field(
