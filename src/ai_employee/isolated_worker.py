@@ -12,12 +12,14 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import owner_watch
+from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
 from .time_budget import exhausted, minimum, remaining
 
@@ -151,6 +153,14 @@ class DockerCandidate:
         self.confirmed_resources: set[tuple[str, str]] = set()
         self.pending_creations: set[tuple[str, str]] = set()
         self.owner_watch: subprocess.Popen[bytes] | None = None
+        self.execution_diagnostic: dict[str, Any] = {"started": False}
+
+    def _snapshot(
+        self, stdout: bytes | bytearray, stderr: bytes | bytearray, **fields: Any
+    ) -> None:
+        self.execution_diagnostic = {"started": fields["started"], "capture": "unavailable"}
+        with suppress(Exception):
+            self.execution_diagnostic = execution_snapshot(stdout, stderr, **fields)
 
     def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
         """Operator-only crash-recovery ledger; never copied into the worker."""
@@ -312,6 +322,7 @@ class DockerCandidate:
         """Stream native events with a bounded output; cancellation kills the whole container."""
         import selectors
 
+        self._snapshot(b"", b"", started=False)
         deadline = minimum(self.deadline, None if timeout is None else time.monotonic() + timeout)
         self._check_owner()
         if self.cancellation.cancelled() or exhausted(remaining(deadline)):
@@ -354,6 +365,9 @@ class DockerCandidate:
             raise
         assert process.stdout and process.stderr
         stdout, stderr, pending = bytearray(), bytearray(), bytearray()
+        began = time.monotonic()
+        last_update: float | None = None
+        last_event: dict[str, object] | None = None
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, stdout)
@@ -370,6 +384,7 @@ class DockerCandidate:
                             selector.unregister(key.fileobj)
                             continue
                         key.data.extend(data)
+                        last_update = time.monotonic() - began
                         if len(stdout) + len(stderr) > self.output_limit:
                             raise IsolatedBudgetExceeded(
                                 "isolated execution output budget exceeded"
@@ -384,14 +399,45 @@ class DockerCandidate:
                                 except ValueError:
                                     continue
                                 if isinstance(event, dict):
+                                    item = event.get("item")
+                                    last_event = {"type": event.get("type")}
+                                    if isinstance(item, dict):
+                                        last_event["item"] = {
+                                            k: item[k]
+                                            for k in ("type", "status", "exit_code")
+                                            if k in item
+                                        }
                                     observe(event)
-            return process.wait(timeout=2), bytes(stdout), bytes(stderr)
-        except BaseException:
+            code = process.wait(timeout=2)
+            self._snapshot(
+                stdout,
+                stderr,
+                started=True,
+                exit_code=code,
+                last_event=last_event,
+                last_update_seconds=last_update,
+            )
+            return code, bytes(stdout), bytes(stderr)
+        except BaseException as error:
+            observed_exit = process.poll()
             try:
-                self.close()
+                try:
+                    self.close()
+                finally:
+                    process.kill()
+                    process.wait(timeout=5)
             finally:
-                process.kill()
-                process.wait(timeout=5)
+                # Stop/reap before diagnostic processing, retaining already-read buffers
+                # even if cleanup raises a replacement exception.
+                self._snapshot(
+                    stdout,
+                    stderr,
+                    started=True,
+                    exit_code=observed_exit,
+                    last_event=last_event,
+                    last_update_seconds=last_update,
+                )
+                attach_failure(error, self.execution_diagnostic)
             raise
         finally:
             input_file.close()
@@ -464,6 +510,7 @@ class DockerCandidate:
         ):
             raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: invalid final accounting")
         self.native_process_usage = usage
+        self.execution_diagnostic["native_exit_code"] = usage["root_exit"]
         if guard_code == 125:
             raise NativeProcessBudgetExceeded(
                 "BUDGET_EXCEEDED: native process admissions exhausted"

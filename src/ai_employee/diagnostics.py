@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 RECORD_BYTES = 1_000_000
 RUN_BYTES = 16_000_000
+FAILURE_STREAM_BYTES = 32_768
 _SECRET_KEY = re.compile(
     r"(?i)^(?:authorization|cookie|set-cookie|password|passwd|api[_-]?key|access[_-]?token|"
     r"refresh[_-]?token|id[_-]?token|token|client[_-]?secret|private[_-]?key)$"
@@ -75,6 +77,73 @@ def capture(value: Any, limit: int = RECORD_BYTES) -> dict[str, Any]:
         "redactions": redactions,
         "truncated": len(sanitized) > max(0, limit),
         "sha256": hashlib.sha256(original).hexdigest(),
+    }
+
+
+def execution_snapshot(
+    stdout: bytes | bytearray,
+    stderr: bytes | bytearray,
+    *,
+    started: bool,
+    exit_code: int | None = None,
+    last_event: dict[str, Any] | None = None,
+    last_update_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Observed native output only; redact whole buffered values before taking tails.
+
+    Input buffers already have the transport's hard output cap. No new I/O,
+    credentials, command argv, host files or process introspection is performed.
+    The exit code is the transport's code until guarded accounting identifies the
+    native root exit. Neither this snapshot nor its text can decide control flow.
+    """
+
+    def stream(data: bytes | bytearray) -> dict[str, Any]:
+        cleaned, redactions = redact(data.decode("utf-8", errors="replace"))
+        encoded = cleaned.encode("utf-8")
+        return {
+            "tail": encoded[-FAILURE_STREAM_BYTES:].decode("utf-8", errors="ignore"),
+            "observed_bytes": len(data),
+            "redactions": redactions,
+            "truncated": len(encoded) > FAILURE_STREAM_BYTES,
+        }
+
+    return {
+        "started": started,
+        "transport_exit_code": exit_code,
+        "native_exit_code": None,
+        "stdout": stream(stdout),
+        "stderr": stream(stderr),
+        "last_event": capture(last_event, 4096) if last_event is not None else None,
+        "last_update_seconds": last_update_seconds,
+        "network": "unknown; no additional collection after failure",
+    }
+
+
+def attach_failure(error: BaseException, snapshot: dict[str, Any]) -> None:
+    """Carry bounded diagnostic data without wrapping/changing the control exception."""
+    # Diagnostic failure must not replace timeout/cancellation/cleanup semantics.
+    with suppress(Exception):
+        error.fleet_execution_diagnostic = snapshot  # type: ignore[attr-defined]
+
+
+def failure_snapshots(
+    error: BaseException, *, boundary: BaseException | None = None
+) -> dict[str, Any]:
+    """Follow explicit and cleanup exception chains without their potentially secret text."""
+    failures: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while error is not boundary and id(error) not in seen and len(failures) < 8:
+        seen.add(id(error))
+        snapshot = getattr(error, "fleet_execution_diagnostic", None)
+        failures.append({"error_type": type(error).__name__, "execution": snapshot})
+        parent = error.__cause__ or error.__context__
+        if parent is None:
+            break
+        error = parent
+    return {
+        "failures": failures,
+        "chain_truncated": error is not boundary and id(error) not in seen,
+        "meaning": "diagnostic only; absent observations are unknown",
     }
 
 

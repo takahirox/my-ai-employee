@@ -14,14 +14,15 @@ import shutil
 import subprocess
 import tarfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
 from .candidates import Candidates
-from .diagnostics import CheckOutput
+from .diagnostics import CheckOutput, attach_failure
 from .history import Stopped
 from .isolated_worker import (
     DockerCandidate,
@@ -111,6 +112,7 @@ class ContainerModel:
         except Stopped as error:
             raise ValueError(str(error)) from None
 
+    @contextmanager
     def _candidate(
         self,
         workspace: Path,
@@ -119,7 +121,7 @@ class ContainerModel:
         *,
         models: bool,
         authority: Authority = _OFFLINE,
-    ) -> DockerCandidate:
+    ) -> Iterator[DockerCandidate]:
         if self.profile is None:
             raise ValueError("EXPLICIT_PROCESS_ISOLATION_PROFILE_REQUIRED")
         profile = self.profile.model_copy(
@@ -127,7 +129,7 @@ class ContainerModel:
                 "auth_file": self.profile.auth_file if models else None,
             }
         )
-        return DockerCandidate(
+        candidate = DockerCandidate(
             profile,
             workspace,
             seconds=timeout,
@@ -136,6 +138,12 @@ class ContainerModel:
             service_hosts=authority.network_hosts,
             output_limit=8_000_000,
         )
+        try:
+            with candidate:
+                yield candidate
+        except BaseException as error:
+            attach_failure(error, candidate.execution_diagnostic)
+            raise
 
     @staticmethod
     def _native_probe(candidate: DockerCandidate, authority: Authority = _OFFLINE) -> None:

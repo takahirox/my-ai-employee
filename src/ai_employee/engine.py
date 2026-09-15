@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -19,7 +21,7 @@ from .capabilities import (
     task_violation,
     validate_policy,
 )
-from .diagnostics import CheckOutput
+from .diagnostics import CheckOutput, failure_snapshots
 from .history import Journal, Stopped
 from .models import (
     Authority,
@@ -66,6 +68,22 @@ class Engine:
         self.model = model
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _failure_diagnostic(
+        self, run: str, stage: str, reservation: str, boundary: BaseException | None
+    ) -> None:
+        error = sys.exception()
+        if error is None:
+            return
+        # Unavailable diagnostic storage cannot replace the active control exception.
+        with suppress(Exception):
+            self.journal.diagnostic(
+                run,
+                stage,
+                failure_snapshots(error, boundary=boundary),
+                reservation=reservation,
+                kind="execution_failure",
+            )
 
     def _workspace(self, run: str, label: str, tree: str | None = None) -> Path:
         path = self.root / run / (label + "-" + uuid4().hex)
@@ -251,6 +269,8 @@ class Engine:
         started = time.monotonic()
         usage = Usage(tokens=0, cost=0)
         response_payload: dict[str, Any] | None = None
+        invocation_returned = False
+        diagnostic_boundary = sys.exception()
 
         def observe(body: dict[str, Any]) -> None:
             nonlocal usage
@@ -361,6 +381,7 @@ class Engine:
                 model=policy.model,
                 effort=policy.effort,
             )
+            invocation_returned = True
             return result
         except OutputViolation as error:
             if error.usage.tokens is not None or error.usage.cost is not None:
@@ -421,7 +442,11 @@ class Engine:
                 )
             raise
         finally:
-            self.journal.settle(run, reservation, time.monotonic() - started, usage)
+            try:
+                if not invocation_returned:
+                    self._failure_diagnostic(run, stage, reservation, diagnostic_boundary)
+            finally:
+                self.journal.settle(run, reservation, time.monotonic() - started, usage)
 
     def _check_ids(self, criteria: tuple[Criterion, ...], config: RunConfig) -> None:
         defined = {check.id for check in config.checks}
@@ -697,6 +722,8 @@ class Engine:
                 self.journal.stop(run, str(error))
                 raise
             started = time.monotonic()
+            check_recorded = False
+            diagnostic_boundary = sys.exception()
             try:
                 passed, output = self.model.check(
                     check.argv,
@@ -717,6 +744,7 @@ class Engine:
                     passed=passed,
                 )
                 evidence = output.digest if isinstance(output, CheckOutput) else output
+                check_recorded = True
             except (ValueError, RuntimeError, OSError, TimeoutError) as error:
                 self.journal.diagnostic(
                     run,
@@ -736,9 +764,13 @@ class Engine:
                 self.journal.check(run)
                 raise
             finally:
-                self.journal.settle(
-                    run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
-                )
+                try:
+                    if not check_recorded:
+                        self._failure_diagnostic(run, "check", reservation, diagnostic_boundary)
+                finally:
+                    self.journal.settle(
+                        run, reservation, time.monotonic() - started, Usage(tokens=0, cost=0)
+                    )
             self.journal.check(run)
             receipt = {
                 "check": check.id,
