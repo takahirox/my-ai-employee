@@ -604,7 +604,7 @@ class Engine:
                     "Preserve mandatory checks. "
                     "Use the shared clarification contract for investigation, unresolved needs "
                     "and questions; inspect the supplied input snapshot. "
-                    "Use the shared evidence/outcome semantics. "
+                    "Use the shared evidence/outcome and method_selection semantics. "
                     "Do not invent authority.",
                     "original_input": original,
                     "clarification_answers": [
@@ -680,7 +680,7 @@ class Engine:
                     "instruction": "Plan one Task or a DAG. Use integration Tasks where branches "
                     "converge. Every Task must contribute to result_task. Define exact "
                     "success criteria, verification plan and required evidence. "
-                    "Use the shared graph and evidence/outcome semantics.",
+                    "Use the shared graph, evidence/outcome and method_selection semantics.",
                     "goal": goal.model_dump(mode="json"),
                     "feedback": feedback,
                     "available_checks": [check.model_dump(mode="json") for check in config.checks],
