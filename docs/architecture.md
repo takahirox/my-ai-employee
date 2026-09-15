@@ -236,3 +236,29 @@ additional trace store or execution path is introduced. See
 [diagnostic retention](run-interface.md#diagnostic-retention) for limits and omissions.
 Public contract tests, native isolation tests and live-model evaluation
 remain distinct validation levels (see development and isolated-worker guides).
+
+## Input preservation evidence
+
+An explicit input-preservation criterion uses `preserved_paths` to name canonical
+workspace-relative files or directory subtrees (no globs). A directory comparison
+includes additions, deletions, content and executable flags; `.` selects the whole
+workspace. Each selection must contain a file in the initial snapshot. Empty
+directories are not represented by the existing Candidate store. Criteria without
+an input-preservation requirement leave this field empty.
+
+Fleet compares the Run's saved initial snapshot with the exact Candidate using
+authenticated manifests. The bounded comparison report is runtime-owned and bound
+to the Run, initial tree, Candidate (including attempt and upstream lineage), Goal,
+Task, policy and criterion paths. Verification and its optional review receive the
+same report through their existing shared context. A missing or mismatched reference
+is a runtime contract failure; actual differences prevent acceptance even if an LLM
+reports success. The result Task must retain the Goal's declared paths in planning
+and recovery. Natural-language interpretation of which inputs the user requires
+preserving remains part of clarification and its review.
+
+The verification event retains the report. Resume and publication recompute it
+against the immutable snapshots before reusing a successful verdict. No Worker
+baseline, extra model call or external check is needed. Equality proves only the
+two snapshots agree, not that no temporary change occurred during execution.
+Stage contract 7 introduces this field and evidence boundary; older histories remain
+inspectable but cannot resume under the new contract.

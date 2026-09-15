@@ -10,6 +10,19 @@ from typing import Any
 
 from .source_refs import SOURCE_REFERENCE_RULE
 
+INPUT_PRESERVATION = (
+    "For an explicit requirement to preserve input files, declare preserved_paths on the "
+    "criterion, not only in prose. Paths are canonical workspace-relative file or directory "
+    "names, without globs; '.' selects the entire workspace. A directory includes all its "
+    "descendants and detects additions as well as changes/deletions. Each selected path must "
+    "exist in the Run's initial snapshot. Fleet compares content and executable flags against "
+    "that immutable snapshot and supplies runtime-owned input_comparison to verification "
+    "and its review. This proves snapshot equality only, never that no transient write "
+    "occurred. Do not create a Worker baseline or seek .fleet-inputs/Git for this evidence. "
+    "Keep the Goal's preserved_paths on the Plan's result Task, including recovery. "
+    "Leave preserved_paths empty for criteria without this requirement."
+)
+
 # Successful boundary events, also consumed at Engine acceptance/publication boundaries.
 LIFECYCLE: dict[str, dict[str, Any]] = {
     "task_verification": {"goal_level": False, "postcondition": "accepted"},
@@ -224,6 +237,14 @@ SELECTION = (
 
 # Stable violation codes and meanings are also used for bounded repair feedback.
 RULES: dict[str, dict[str, str]] = {
+    "INVALID_PRESERVATION_PATH": {
+        "path": "criteria.preserved_paths",
+        "rule": INPUT_PRESERVATION,
+    },
+    "INPUT_PRESERVATION_WEAKENED": {
+        "path": "criteria.preserved_paths",
+        "rule": INPUT_PRESERVATION,
+    },
     "DUPLICATE_AUTHORITY_RESOURCE": {
         "path": "authority.network_hosts/credentials",
         "rule": "List each host and named "

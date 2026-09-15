@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from .diagnostics import capture, redact
 from .models import (
     CLARIFICATION_RULES,
+    Candidate,
     Clarification,
     Contract,
     Plan,
@@ -26,10 +27,17 @@ from .models import (
     WorkerChoice,
     WorkerResult,
 )
-from .semantics import EXECUTION_CHECKS, RULES, external_evidence, lifecycle_context, projection
+from .semantics import (
+    EXECUTION_CHECKS,
+    INPUT_PRESERVATION,
+    RULES,
+    external_evidence,
+    lifecycle_context,
+    projection,
+)
 from .source_refs import original_source, resolve_source_refs
 
-VERSION = "stage-contract-6"
+VERSION = "stage-contract-7"
 T = TypeVar("T", bound=Contract)
 
 
@@ -176,6 +184,8 @@ class StageContract:
         target = prompt.get("proposal", prompt.get("candidate"))
         constraints: dict[str, Any] = {"mandatory_checks": config.mandatory_checks}
         source = prompt.get("original", prompt) if stage.endswith("_review") else prompt
+        if stage in {"task_verification", "goal_verification", "verification_review"}:
+            cls._input_comparison(source, config)
         if stage in {"selection", "selection_review"}:
             constraints["maximum_worker_index"] = len(source["options"]) - 1
         if stage in {"recovery", "recovery_review"}:
@@ -217,6 +227,7 @@ class StageContract:
                 else {}
             ),
             "constraints": self.constraints,
+            "input_preservation": INPUT_PRESERVATION,
             **(
                 {"clarification": Clarification.semantics()}
                 if self.stage in {"clarification", "clarification_review"}
@@ -267,6 +278,23 @@ class StageContract:
                 self._outcomes(value.criteria, config)
         if isinstance(value, Plan):
             from .capabilities import AUTHORITY_RULES, task_violation
+
+            required_paths = {
+                path
+                for criterion in prompt.get("goal", {}).get("specification", {}).get("criteria", [])
+                for path in criterion.get("preserved_paths", [])
+            }
+            result_task = next(task for task in value.tasks if task.id == value.result_task)
+            if not required_paths <= {
+                path for criterion in result_task.criteria for path in criterion.preserved_paths
+            }:
+                raise OutputViolation(
+                    "INPUT_PRESERVATION_WEAKENED",
+                    details={
+                        "path": "criteria.preserved_paths",
+                        "expected": sorted(required_paths),
+                    },
+                )
 
             external_checks = {
                 check
@@ -371,6 +399,37 @@ class StageContract:
                 if violation:
                     raise OutputViolation(str(violation["reason"]), details=violation)
         return value
+
+    @staticmethod
+    def input_scope(source: dict[str, Any], config: RunConfig) -> dict[str, Any]:
+        """Runtime comparison identity, shared by the producer and contract boundary."""
+        return {
+            "run": source["run"],
+            "initial_tree": source["initial_tree"],
+            "candidate": Candidate.model_validate(source["candidate"]).digest,
+            "goal": digest(source["goal"]),
+            "task": None if source["task"] is None else digest(source["task"]),
+            "policy": config.digest,
+            "paths": {
+                c["id"]: c["preserved_paths"]
+                for c in source["criteria"]
+                if c.get("preserved_paths")
+            },
+        }
+
+    @classmethod
+    def _input_comparison(cls, source: dict[str, Any], config: RunConfig) -> None:
+        if not any(c.get("preserved_paths") for c in source.get("criteria", [])):
+            return
+        try:
+            evidence = source["input_comparison"]
+            scope = cls.input_scope(source, config)
+            valid = evidence["scope"] == scope and set(evidence["results"]) == set(scope["paths"])
+        except (KeyError, TypeError):
+            valid = False
+        if not valid:
+            # Missing runtime input is not a model response defect to repair.
+            raise ValueError("INPUT_COMPARISON_CONTEXT_MISMATCH")
 
     def _checks(self, criteria: Any) -> None:
         for item in criteria:

@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .models import Candidate, TaskContext
 
@@ -21,6 +22,31 @@ class Candidates:
         self.root = root.resolve()
         self.max_bytes = max_bytes
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def compare_inputs(
+        self, initial: str, candidate: str, paths: tuple[str, ...]
+    ) -> dict[str, Any]:
+        """Compare authenticated snapshots; bounded details never truncate the verdict."""
+        before, after = self.manifest(initial), self.manifest(candidate)
+
+        def selected(name: str, scope: str) -> bool:
+            return scope == "." or name == scope or name.startswith(scope + "/")
+
+        missing = [scope for scope in paths if not any(selected(p, scope) for p in before)]
+        names = sorted(
+            p for p in before.keys() | after.keys() if any(selected(p, s) for s in paths)
+        )
+        changed = [p for p in names if before.get(p) != after.get(p)]
+        return {
+            "matches": not missing and not changed,
+            "compared_paths": len(names),
+            "missing_initial_paths": missing,
+            "changed_count": len(changed),
+            "changes": [
+                {"path": p, "before": before.get(p), "after": after.get(p)} for p in changed[:64]
+            ],
+            "truncated": len(changed) > 64,
+        }
 
     @staticmethod
     def _safe(name: str) -> bool:
