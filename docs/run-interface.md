@@ -207,7 +207,8 @@ timeout, cancellation, Usage Limit, retry, acceptance or cleanup decisions.
 Readiness failures include the Task ID/digest, proposed Plan digest, authority
 request/ceiling, unsupported boundary fields, security mode, criteria and eligible
 external checks. Protected check results include exit code and stdout/stderr;
-check exceptions record the error type/reason and explicitly mark output unavailable.
+check exceptions retain their existing `check_failed` classification. Any partial
+native output appears separately in `execution_failure`, not as a successful check receipt.
 Check receipt digests and deterministic acceptance rules remain unchanged. Correlate
 model responses with existing stage invocations by reservation and contract identity;
 review targets and response digests connect proposals with their reviews.
