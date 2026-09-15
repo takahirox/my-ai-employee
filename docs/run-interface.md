@@ -176,12 +176,14 @@ and non-object payloads are omitted with explicit counts/flags. Successful nativ
 streams are not persisted as transcripts. A failed invocation or protected check
 additionally records `execution_failure`, linked to its Run, stage and reservation.
 Native stdout/stderr tails are redacted before being limited to 32,768 bytes each;
-they may include incomplete/non-JSON messages, tool activity or provider errors.
-Authentication files, command argv, stdin and unrelated host files are not collected.
+they may include incomplete/non-JSON messages, otherwise unrecognized response text,
+tool command text or provider errors. The structured-response omissions above do not
+filter these stream excerpts. Authentication files, host launch argv/stdin and
+unrelated host files are not inspected or collected.
 A process killed before capture cannot guarantee a complete response; this is not
 a transcript of every internal model/tool action.
 
-Execution snapshots include whether streaming started, observed stdout/stderr byte
+Execution snapshots include whether transport streaming started, observed stdout/stderr byte
 counts, the last parsed event's type/tool status, the last read time in seconds since
 stream reading began, and transport/native exit codes when known. An incomplete
 line may appear in the tail without a parsed event. Native exit codes are reported
@@ -190,11 +192,13 @@ followed by no final response identifies an observed waiting interval, not its
 provider-internal cause. Missing observations are unknown; no extra network-log
 collection is performed after a deadline. Already recorded network observations
 remain separate and their absence does not prove no communication occurred.
+`started` reports transport startup, not proof that the model/provider started.
 
 The native layer carries sanitized snapshots across exception boundaries without
 depending on Journal. Engine persists them through the existing private diagnostic
-path, including cleanup exception chains, stopping at the invocation's caller
-exception boundary. Only exception types are retained, not arbitrary exception
+path, including up to eight entries in cleanup exception chains, stopping at the
+invocation's caller exception boundary and marking truncation when needed. Only
+exception types are retained, not arbitrary exception
 messages or tracebacks. Process stop/reap precedes failure snapshot processing.
 Diagnostic capture/storage failures do not replace the active control exception,
 skip settlement, or turn successful work into failure. These records do not change
