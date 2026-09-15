@@ -43,3 +43,28 @@ native-isolation and explicitly opted-in live-model validation separate.
 When the simple path gains calls, transitions or failure points, review the concrete
 requirement that needs them. Do not add a special production shortcut to satisfy the
 canary or remove necessary policy/verification boundaries to reduce its call count.
+
+## Requirements and execution methods
+
+`semantics.METHOD_SELECTION` is the shared meaning of user requirements versus
+agent-selected methods. It is projected into every StageContract and the relevant
+Clarification/Plan provider field schemas. Clarification retains all user-authorized
+alternatives; choosing a route belongs in the Plan. A disclosed assumption cannot
+turn an agent preference into a mandatory user constraint. User-mandated or
+forbidden methods remain constraints.
+
+When the original request explicitly permits both direct execution and execution
+by a receiving actor after handoff, immediate Goal criteria describe the alternatives,
+not a requirement to do both. Conditional `downstream_outcomes` preserve that
+actor's result and authorization even before planning selects a route. Before
+promotion, verification inspects the actual executable deliverable and instructions;
+it neither demands post-handoff results early nor attests unperformed effects.
+Recovery may replace a failed method through existing Task/replan mechanisms while
+preserving the Goal, authority boundaries, and immutable historical definitions.
+
+`tests/test_method_selection.py` exercises semantic rejection/revision, alternative
+planning, recovery after an unavailable direct route, actual deliverable inspection,
+and independent receiver execution. Its deterministic reviewer proves the contract
+and runtime paths, not infallible natural-language interpretation by a live model.
+No generic static natural-language equivalence checker or additional review stage
+is introduced. Live evaluation remains a separate check.

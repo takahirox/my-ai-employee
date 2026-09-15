@@ -20,6 +20,7 @@ from .semantics import (
     FINDINGS,
     GRAPH,
     INPUT_PRESERVATION,
+    METHOD_SELECTION,
     OUTCOMES,
     RULES,
     SELECTION,
@@ -179,8 +180,7 @@ class Clarification(Contract):
     )
     assumptions: tuple[Text, ...] = Field(
         default=(),
-        description="Disclosed interpretations and ordinary deferred work; "
-        "never hide a necessary user decision or waive requirements here.",
+        description=METHOD_SELECTION["assumptions"],
     )
     unresolved: tuple[ClarificationNeed, ...] = Field(
         default=(),
@@ -220,7 +220,8 @@ class Clarification(Contract):
             "precedence": CLARIFICATION_ACTION_ORDER,
             "review": "Review both the goal and every unresolved need against the original "
             "request and permitted inputs. Reject misclassified, unsupported or unnecessary "
-            "human questions. Approval cannot convert investigation into a human wait.",
+            "human questions. Approval cannot convert investigation into a human wait. "
+            + METHOD_SELECTION["review"],
         }
 
     @model_validator(mode="after")
@@ -357,7 +358,9 @@ class Plan(Contract):
         + " "
         + GRAPH["dependencies"]
         + " "
-        + GRAPH["result_task"],
+        + GRAPH["result_task"]
+        + " "
+        + METHOD_SELECTION["planning"],
     )
     result_task: Key = Field(description=GRAPH["result_task"])
 

@@ -29,11 +29,49 @@ LIFECYCLE: dict[str, dict[str, Any]] = {
     "goal_verification": {"goal_level": True, "postcondition": "completed"},
     "promotion": {"precondition": "completed", "postcondition": "promoted"},
 }
+# A method chosen by the agent is not a new user requirement. This same contract
+# is used in field schemas, proposal review, execution, and recovery.
+METHOD_SELECTION = {
+    "requirements": "Separate the user's desired outcomes and explicit constraints from "
+    "agent-selected execution methods. Preserve every explicitly permitted alternative in "
+    "clarified_goal and its criteria. A choice of one method must not erase or prohibit "
+    "another authorized method. If the user requires or forbids a method, preserve that "
+    "constraint; permission to choose is not permission to weaken the outcome.",
+    "assumptions": "Record factual uncertainties and interpretations only. An agent's selected "
+    "execution route belongs in the Plan, not an assumption that changes acceptance. Merely "
+    "disclosing a choice here does not authorize narrowing the user's alternatives. "
+    "Never hide a necessary user decision or waive requirements in assumptions.",
+    "planning": "Choose execution methods in Task descriptions and verification plans using "
+    "the unchanged Goal's alternatives. Check known authority/environment constraints before "
+    "committing to a route. A ceiling is not a grant or proof of reachability; unknown "
+    "feasibility remains an assumption. Do not expand authority or perform unnecessary "
+    "external actions just to probe feasibility. Goal criteria describe success; Task "
+    "criteria may specialize the chosen authorized route without making it mandatory for "
+    "all future Plans.",
+    "review": "Compare Original Input, clarified_goal, criteria, assumptions and downstream "
+    "outcomes. Reject unsupported narrowing as unsupported_expansion: an agent-selected "
+    "route must not become a user requirement, including by omission of an authorized "
+    "alternative. Also reject removal of a user-required method or use of a forbidden one. "
+    "Review plans against the preserved alternatives, not a previous agent preference.",
+    "verification": "Assess the route actually represented by the Candidate against the "
+    "Goal's authorized alternatives and this Task's contract. For explicitly allowed "
+    "post-handoff execution, verify the executable deliverable and execution instructions "
+    "now, and retain the conditional downstream outcome for the designated actor. Do not "
+    "require results that actor can create only after handoff, or claim they already exist. "
+    "A declaration alone is not sufficient evidence that the deliverable meets the request.",
+    "recovery": "A failed execution method is not a failed user requirement. When an observed "
+    "environment/authority constraint defeats a route, reconsider the Goal's other permitted "
+    "methods instead of repeatedly asking for the same infeasible operation. Use existing "
+    "Task replacement/replanning and preserve the accepted Goal, history and safety bounds. "
+    "Never relax a genuine user restriction or relabel uncertain effects as safe to replay.",
+}
+
 COMPLETION = {
     "scope": "Preserve the user's final desired outcome in clarified_goal. criteria are only "
     "Fleet-owned conditions independently verifiable before completion and promotion. "
     "Task verification precedes Task acceptance; Goal verification precedes completion; "
-    "promotion requires completed, verified bytes. Neither verification runs after handoff.",
+    "promotion requires completed, verified bytes. Neither verification runs after handoff. "
+    + METHOD_SELECTION["requirements"],
     "downstream": "Only when Original Input explicitly allows execution after handoff, retain "
     "that outcome, its external owner and original authorization in downstream_outcomes. "
     "Link each to artifact criteria that verify the executable deliverable and execution "
@@ -41,12 +79,18 @@ COMPLETION = {
     "Results first created by the external owner after promotion are not immediate Task/Goal "
     "evidence and Fleet must not claim they occurred. Never move a requirement for Fleet itself "
     "to execute or complete an external operation into downstream_outcomes. If infeasible, "
-    "report the blocker through clarification; do not silently substitute artifact delivery.",
+    "report the blocker through clarification; do not silently substitute artifact delivery. "
+    "When handoff is one of multiple explicitly allowed routes, retain its conditional "
+    "downstream outcome even before planning chooses a route. Express immediate Goal "
+    "criteria as the authorized alternatives (direct result OR verified handoff), not "
+    "requirements to perform both. An agent preference for direct execution does not "
+    "remove the user's handoff authorization.",
     "review": "Check original authorization, responsible actor, timing and feasible evidence "
     "for the whole Goal and Plan. Reject circular conditions requiring post-handoff results "
     "before promotion, lost downstream requirements, or weakened direct-execution requests. "
     "During verification inspect actual deliverables against linked downstream requirements, "
-    "without requiring their external execution or attesting unperformed effects.",
+    "without requiring their external execution or attesting unperformed effects. "
+    + METHOD_SELECTION["review"],
 }
 # A stop is a report, never admission to execution. Other validation still applies.
 EXECUTION_CHECKS: dict[str, Any] = {
@@ -309,7 +353,12 @@ RULES: dict[str, dict[str, str]] = {
 
 def projection(stage: str) -> dict[str, Any]:
     """No model call or classifier: select meanings by the existing stage identity."""
-    result: dict[str, Any] = {"evidence": EVIDENCE, "outcomes": OUTCOMES, "completion": COMPLETION}
+    result: dict[str, Any] = {
+        "evidence": EVIDENCE,
+        "outcomes": OUTCOMES,
+        "completion": COMPLETION,
+        "method_selection": METHOD_SELECTION,
+    }
     if stage not in {"clarification", "clarification_review"}:
         result["graph"] = GRAPH
     if stage in {"worker", "worker_review", "task_verification", "goal_verification"}:
