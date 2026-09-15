@@ -40,3 +40,22 @@ Live-model evaluation is a separate explicit action, consumes the selected
 provider's allowance, and is not enabled by any ordinary or isolation test command.
 Stop on Usage Limit; never redeem tickets, buy allowance or switch providers to
 continue a test.
+
+### Temporary model capacity failures
+
+Fresh `fleet init` configurations allow two transport retries per stage. Existing
+saved configurations and an explicit `transport_retries: 0` remain unchanged.
+The known Codex terminal `turn.failed` message `Selected model is at capacity.
+Please try a different model.` is classified as `MODEL_AT_CAPACITY`, not as an
+invariant or model-output failure. The observed CLI format has no dedicated code;
+classification is limited to this exact error message and may need updating when
+Codex changes its output. Ordinary model/tool text cannot trigger it.
+
+Capacity retries keep the same model/backend, wait 5 then 10 seconds (further
+configured retries cap each wait at 60 seconds), and use the existing durable
+transport allowance and Run budgets. Cancellation and wall budgets remain active
+during waits; an invocation's own timeout covers that invocation, not a later wait.
+Owned environments are cleaned before recovery. Potentially completed external
+writes still require uncertainty resolution rather than automatic replay. Exhaustion
+reports `MODEL_AT_CAPACITY_RETRIES_EXHAUSTED`. Quota stops never trigger recovery,
+model switching, allowance purchases, or resets.

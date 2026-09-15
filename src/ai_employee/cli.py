@@ -178,7 +178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _command(args: argparse.Namespace) -> int:
     if args.command == "init":
-        stage = StagePolicy(backend=args.backend, model=args.model)
+        stage = StagePolicy(backend=args.backend, model=args.model, transport_retries=2)
         config = RunConfig(
             clarification=stage.model_copy(update={"review": "always"}),
             planning=stage,

@@ -40,7 +40,7 @@ from .models import (
     WorkerChoice,
     WorkerResult,
 )
-from .native import Model
+from .native import Model, ModelAtCapacity
 from .semantics import EVIDENCE, GRAPH, LIFECYCLE, WORKER_STATES, external_evidence
 from .stage_contracts import (
     VERSION,
@@ -152,6 +152,15 @@ class Engine:
                 "violation": previous_faults[-1].get("violation"),
             }
         action = "output"
+        failures = [
+            e
+            for e in self.journal.events(run)
+            if e["kind"] in {"transport_failed", "output_rejected"}
+            and e["body"].get("contract") == contract.identity
+        ]
+        if failures and failures[-1]["kind"] == "transport_failed":
+            self._transport_retry(run, stage, policy, contract, authority, failures[-1])
+            action = "transport"
         # Counts are reserved durably before invocation. A new controller cannot
         # reset the stage-local limit, including after an uncertain process launch.
         for _ in range(policy.revisions + policy.transport_retries + 1):
@@ -177,15 +186,17 @@ class Engine:
                     "transport_failed",
                     stage=stage,
                     contract=contract.identity,
-                    reason=type(error).__name__,
+                    reason="MODEL_AT_CAPACITY"
+                    if isinstance(error, ModelAtCapacity)
+                    else type(error).__name__,
                 )
-                if authority.external_writes:
-                    self.journal.append(run, "uncertain", reason="INTERRUPTED_EXTERNAL_RESPONSE")
-                    self.journal.check(run)
-                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT") from error
-                self.journal.check(run)
-                if not policy.transport_retries:
-                    raise RuntimeError("TRANSPORT_RETRY_EXHAUSTED") from error
+                failure = next(
+                    e
+                    for e in reversed(self.journal.events(run))
+                    if e["kind"] == "transport_failed"
+                    and e["body"].get("contract") == contract.identity
+                )
+                self._transport_retry(run, stage, policy, contract, authority, failure)
                 action = "transport"
             except OutputViolation as error:
                 violation = repair_feedback(str(error), error.details)
@@ -242,6 +253,48 @@ class Engine:
         if stage.endswith("_review"):
             raise RuntimeError("REVIEW_UNAVAILABLE")
         raise RuntimeError("OUTPUT_REPAIR_EXHAUSTED")
+
+    def _transport_retry(
+        self,
+        run: str,
+        stage: str,
+        policy: StagePolicy,
+        contract: StageContract,
+        authority: Authority,
+        failure: dict[str, Any],
+    ) -> None:
+        if authority.external_writes:
+            self.journal.append(run, "uncertain", reason="INTERRUPTED_EXTERNAL_RESPONSE")
+            self.journal.check(run)
+            raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
+        self.journal.check(run)
+        used = sum(
+            e["kind"] == "reserved"
+            and e["body"].get("call_key") == contract.identity + ":transport"
+            for e in self.journal.events(run)
+        )
+        capacity = failure["body"].get("reason") == "MODEL_AT_CAPACITY"
+        if used >= policy.transport_retries:
+            raise RuntimeError(
+                "MODEL_AT_CAPACITY_RETRIES_EXHAUSTED" if capacity else "TRANSPORT_RETRY_EXHAUSTED"
+            )
+        if capacity:
+            # Absolute target preserves the remaining delay across controller restart.
+            delay = min(5 * 2**used, 60)
+            until = failure["at"] + delay
+            self.journal.append(
+                run,
+                "transport_retry_wait",
+                stage=stage,
+                contract=contract.identity,
+                reason="MODEL_AT_CAPACITY",
+                retry=used + 1,
+                not_before=until,
+            )
+            while time.time() < until:
+                self.journal.check(run)
+                time.sleep(min(0.1, max(0.0, until - time.time())))
+            self.journal.check(run)
 
     def _invoke(
         self,

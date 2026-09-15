@@ -32,6 +32,28 @@ T = TypeVar("T", bound=Contract)
 _OFFLINE = Authority()
 
 
+class ModelAtCapacity(ConnectionError):
+    """Known transient provider failure; no model/backend substitution is authorized."""
+
+
+def capacity_error(output: str) -> bool:
+    """Only the terminal Codex event is authoritative, never nested tool/model text."""
+    terminal = None
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") in ("turn.failed", "turn.completed"):
+            terminal = event
+    if terminal is None or terminal.get("type") != "turn.failed":
+        return False
+    error = terminal.get("error")
+    return isinstance(error, dict) and error.get("message") == (
+        "Selected model is at capacity. Please try a different model."
+    )
+
+
 def quota_error(line: str, *, stderr: bool = False) -> bool:
     """Classify provider errors, never tool output quoting quota-related source code."""
     markers = (
