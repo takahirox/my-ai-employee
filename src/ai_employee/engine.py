@@ -313,6 +313,7 @@ class Engine:
                 run,
                 stage,
                 binding=contract.projection(),
+                policy=policy,
                 call_key=contract.identity + ":" + action,
                 call_limit=policy.revisions + 1 if action == "output" else policy.transport_retries,
             )
@@ -328,7 +329,9 @@ class Engine:
         def observe(body: dict[str, Any]) -> None:
             nonlocal usage
             if body.get("event") == "usage_observed":
-                usage = Usage(tokens=body.get("tokens"), cost=usage.cost)
+                usage = Usage.model_validate(
+                    {key: body[key] for key in Usage.model_fields if key in body}
+                )
             if body.get("event") == "usage_limit":
                 self.journal.stop(run, "USAGE_LIMIT")
             self.journal.append(
@@ -403,10 +406,7 @@ class Engine:
                 ),
                 observation=observe,
             )
-            usage = Usage(
-                tokens=returned_usage.tokens if returned_usage.tokens is not None else usage.tokens,
-                cost=returned_usage.cost if returned_usage.cost is not None else usage.cost,
-            )
+            usage = returned_usage.prefer(usage)
             response_payload = result.model_dump(mode="json")
             self.journal.diagnostic(
                 run,
@@ -437,8 +437,7 @@ class Engine:
             invocation_returned = True
             return result
         except OutputViolation as error:
-            if error.usage.tokens is not None or error.usage.cost is not None:
-                usage = error.usage
+            usage = error.usage.prefer(usage)
             self.journal.diagnostic(
                 run,
                 stage,
