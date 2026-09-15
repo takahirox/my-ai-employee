@@ -236,7 +236,8 @@ additional trace store or execution path is introduced. See
 [diagnostic retention](run-interface.md#diagnostic-retention) for limits and omissions.
 Public contract tests, native isolation tests and live-model evaluation
 remain distinct validation levels (see development and isolated-worker guides).
-# Input preservation evidence
+
+## Input preservation evidence
 
 An explicit input-preservation criterion uses `preserved_paths` to name canonical
 workspace-relative files or directory subtrees (no globs). A directory comparison

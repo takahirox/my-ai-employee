@@ -208,3 +208,45 @@ def test_absent_initial_scope_and_truncated_changes_never_prove_equality(tmp_pat
     assert result["changed_count"] == 70
     assert len(result["changes"]) == 64
     assert result["truncated"]
+
+
+def test_interrupted_acceptance_reuses_verified_comparison_without_repeating_worker(
+    tmp_path, monkeypatch
+):
+    model = PreservationModel()
+    engine, run, _ = prepared(tmp_path, model)
+    append = engine.journal.append
+
+    class ControllerCrash(BaseException):
+        pass
+
+    def interrupt(run_id, kind, **body):
+        if kind == "accepted":
+            raise ControllerCrash()
+        return append(run_id, kind, **body)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine.journal, "append", interrupt)
+        with pytest.raises(ControllerCrash):
+            engine.execute(run)
+    assert model.workers == 1
+    assert model.verifications == 1
+    engine.execute(run)
+    assert projection(engine.journal, run)["status"] == "completed"
+    assert model.workers == 1
+    assert model.verifications == 2
+    assert any(e["kind"] == "candidate_reused" for e in engine.journal.events(run))
+    engine.promote(run, tmp_path / "published")
+
+
+def test_corrupted_initial_blob_cannot_be_used_for_replayed_comparison(tmp_path):
+    model = PreservationModel()
+    engine, run, _ = prepared(tmp_path, model)
+    engine.execute(run)
+    tree = model.contexts[0]["initial_tree"]
+    manifest = engine.candidates.manifest(tree)
+    blob = engine.candidates.root / tree / manifest["documents/record.txt"]["blob"]
+    blob.chmod(0o600)
+    blob.write_text("corrupted runtime object")
+    with pytest.raises(ValueError, match="CANDIDATE_BYTES_CHANGED"):
+        engine.promote(run, tmp_path / "published")
