@@ -31,7 +31,9 @@ from .isolated_worker import (
 )
 from .models import Authority, Check, StagePolicy, Usage
 from .native import (
+    ModelAtCapacity,
     T,
+    capacity_error,
     codex_permissions,
     decode_response,
     measured_tokens,
@@ -438,6 +440,8 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                     )
             self._copy_workspace(candidate, workspace)
             if code:
+                if capacity_error(stdout.decode(errors="replace")):
+                    raise ModelAtCapacity("MODEL_AT_CAPACITY")
                 raise ValueError("WORKER_PROCESS_FAILED")
             return decode_response(stdout.decode(errors="replace"), schema)
 
