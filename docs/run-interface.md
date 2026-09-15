@@ -233,3 +233,47 @@ keep its state directory and exported CLI JSON private. Inspector authentication
 is required for data access. Do not publish diagnostic exports without reviewing
 retained content. Diagnostic records are never accepted Goal/Plan/Candidate inputs,
 permission grants, retry instructions or authority evidence, even after a Run stops.
+
+
+## Durable token usage
+
+`fleet status` exposes `budget.usage_details` with `invocations`, `stages`, and
+`total`. Each invocation is keyed by its reservation and stage, and records the
+selected backend, model, and effort before model execution (including failed
+attempts). Older records without that identity expose nulls; they are not relabeled
+using the current configuration. Successful historical stage results can supply
+identity when present.
+
+Usage fields are `tokens`, `input_tokens`, `output_tokens`, `cached_input_tokens`,
+`cache_creation_input_tokens`, `reasoning_output_tokens`, and `cost`. In the current
+Codex path, input includes cache reads/writes and output includes reasoning:
+`tokens = input_tokens + output_tokens`. Do not add cache or reasoning subsets
+again. Input minus cached input gives input not served from the read cache; any
+reported cache writes remain a separate pricing distinction. Missing, invalid,
+or unreported measurements remain null, never an assumed zero. The existing
+Claude total-count helper keeps its separate additive cache convention; Claude
+native execution is currently unavailable and this change does not enable it.
+
+The native adapter treats Codex `turn.completed` usage as an invocation snapshot:
+the latest snapshot replaces the earlier one. Observation and final return are
+copies of the same measurement, not additional usage. Distinct retry reservations
+are counted separately. Cleanup does not remove usage history. If a controller
+crashes before settlement, its last durable observation remains visible with
+`settled=false` and, after reconciliation, `recovered=true`; it does not establish
+complete final usage or release the conservative reservation charge.
+
+Every aggregate field has `value`, `observed_sum`, and `complete`. `value` is null
+unless all constituent invocations are settled and report that field.
+`observed_sum` sums available snapshots, but is not a complete bill. Empty groups
+sum to zero. These measured aggregates do not replace `admission_charges` or change
+budget reservation, cancellation, or recovery policy. Legacy totals remain readable,
+with unavailable breakdown fields null. No database rewrite is required.
+
+Usage is reported by the backend, not measured independently by Fleet. These
+counts allow comparisons such as different models and reasoning efforts, but do
+not prove actual subscription charges. A cost estimate must retain its currency,
+price source/version or effective date, model, and applicable pricing conditions
+(including cache and long-context/service-tier rules). This feature neither fetches
+price tables nor converts token counts to money. `cost` remains unknown unless
+supplied by the adapter. Provider fields absent from its usage report cannot be
+reconstructed from the total.

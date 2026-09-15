@@ -541,8 +541,34 @@ class Verification(Contract):
 
 
 class Usage(Contract):
+    """Inclusive input/output counts; cache and reasoning are subsets, never added twice."""
+
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    reasoning_output_tokens: int | None = Field(default=None, ge=0)
     tokens: int | None = Field(default=None, ge=0)
     cost: float | None = Field(default=None, ge=0)
+
+    def prefer(self, fallback: Usage) -> Usage:
+        """Merge two deliveries of the same snapshot, not two billable calls."""
+        # A changed snapshot must not inherit an earlier snapshot's breakdown.
+        changed = any(
+            key != "cost"
+            and value is not None
+            and getattr(fallback, key) is not None
+            and value != getattr(fallback, key)
+            for key, value in self.model_dump().items()
+        )
+        return Usage.model_validate(
+            {
+                key: value
+                if value is not None or (changed and key != "cost")
+                else getattr(fallback, key)
+                for key, value in self.model_dump().items()
+            }
+        )
 
 
 class WorkerChoice(Contract):

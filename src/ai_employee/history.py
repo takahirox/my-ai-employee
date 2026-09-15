@@ -17,7 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from .diagnostics import RECORD_BYTES, RUN_BYTES, capture
-from .models import Authority, RunConfig, Usage
+from .models import Authority, RunConfig, StagePolicy, Usage
 from .stage_contracts import VERSION
 from .time_budget import exhausted, minimum
 
@@ -237,6 +237,7 @@ class Journal:
                 key: sum(row[key] for row in rows) if known[key] else None
                 for key in ("tokens", "cost")
             },
+            "usage_details": usage_details(events),
         }
 
     def events(self, run: str) -> list[dict[str, Any]]:
@@ -370,6 +371,7 @@ class Journal:
         *,
         model_usage: bool = True,
         binding: dict[str, Any] | None = None,
+        policy: StagePolicy | None = None,
         call_key: str | None = None,
         call_limit: int | None = None,
     ) -> tuple[str, float | None]:
@@ -426,6 +428,17 @@ class Journal:
                     "ordinal": ordinal,
                     "binding": binding,
                     "start_intent": True,
+                    **(
+                        {
+                            "policy": {
+                                "backend": policy.backend,
+                                "model": policy.model,
+                                "effort": policy.effort,
+                            }
+                        }
+                        if policy is not None
+                        else {}
+                    ),
                 },
             )
         return reservation, seconds
@@ -474,8 +487,11 @@ class Journal:
                     "seconds": seconds,
                     "usage": usage.model_dump(mode="json"),
                 }
-                if any(json.loads(item[0]) == expected for item in prior):
-                    return
+                for item in prior:
+                    previous = json.loads(item[0])
+                    previous["usage"] = Usage.model_validate(previous["usage"]).model_dump()
+                    if previous == expected:
+                        return
                 raise ValueError("CONFLICTING_USAGE_DELIVERY")
             # Missing data retains the full reservation, including after a crash.
             tokens = row["tokens"] if usage.tokens is None else usage.tokens
@@ -556,3 +572,70 @@ class Journal:
                 yield
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def usage_details(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Project durable snapshots without mistaking reservations for measurements.
+
+    Last observation wins within an invocation. Settlement is authoritative when
+    present; interrupted observations remain visible but are not complete usage.
+    """
+    records: dict[str, dict[str, Any]] = {}
+    for event in events:
+        body, kind = event["body"], event["kind"]
+        if kind == "reserved":
+            records[body["id"]] = {
+                "reservation": body["id"],
+                "stage": body["stage"],
+                "backend": None,
+                "model": None,
+                "effort": None,
+                **body.get("policy", {}),
+                "settled": False,
+                "recovered": False,
+                "usage": Usage().model_dump(),
+            }
+            continue
+        identity = body.get("reservation", body.get("id"))
+        if identity not in records:
+            continue
+        record = records[identity]
+        if kind == "worker_observation" and not record["settled"]:
+            observation = body["observation"]
+            if observation.get("event") == "usage_observed":
+                record["usage"] = Usage.model_validate(
+                    {key: observation[key] for key in Usage.model_fields if key in observation}
+                ).model_dump()
+        elif kind == "settled":
+            record["usage"] = Usage.model_validate(body["usage"]).model_dump()
+            record["settled"] = True
+        elif kind == "reservation_recovered":
+            record["recovered"] = True
+        elif kind == "stage_result" and record["model"] is None:
+            for key in ("backend", "model", "effort"):
+                record[key] = body.get(key)
+
+    def aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
+        summary = {}
+        for key in Usage.model_fields:
+            values = [item["usage"][key] for item in items]
+            complete = all(item["settled"] for item in items) and all(
+                value is not None for value in values
+            )
+            observed = sum(value for value in values if value is not None)
+            summary[key] = {
+                "value": observed if complete else None,
+                "observed_sum": observed,
+                "complete": complete,
+            }
+        return summary
+
+    calls = list(records.values())
+    return {
+        "invocations": calls,
+        "total": aggregate(calls),
+        "stages": {
+            stage: aggregate([item for item in calls if item["stage"] == stage])
+            for stage in dict.fromkeys(item["stage"] for item in calls)
+        },
+    }

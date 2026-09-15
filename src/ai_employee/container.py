@@ -36,7 +36,7 @@ from .native import (
     capacity_error,
     codex_permissions,
     decode_response,
-    measured_tokens,
+    measured_usage,
     provider_schema,
     quota_error,
     summarize_event,
@@ -334,7 +334,7 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 raise Stopped("USAGE_LIMIT")
             if event.get("type") == "turn.completed" and observation is not None:
                 observation(
-                    {"event": "usage_observed", "tokens": measured_tokens(event.get("usage"))}
+                    {"event": "usage_observed", **measured_usage(event.get("usage")).model_dump()}
                 )
             summary = summarize_event(encoded)
             if observation is not None and summary is not None and observation_count < 1000:

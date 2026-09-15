@@ -384,15 +384,48 @@ def provider_schema(
     return result
 
 
+def measured_usage(raw: Any) -> Usage:
+    """Normalize a Codex snapshot; cache/reasoning are included in input/output."""
+    raw = raw if isinstance(raw, dict) else {}
+
+    def count(key: str) -> int | None:
+        value = raw.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    incoming, outgoing = count("input_tokens"), count("output_tokens")
+    cached = count("cached_input_tokens")
+    created = count("cache_creation_input_tokens")
+    reasoning = count("reasoning_output_tokens")
+    if incoming is not None:
+        if cached is not None and cached > incoming:
+            cached = None
+        if created is not None and created + (cached or 0) > incoming:
+            created = None
+    if outgoing is not None and reasoning is not None and reasoning > outgoing:
+        reasoning = None
+    return Usage(
+        input_tokens=incoming,
+        output_tokens=outgoing,
+        cached_input_tokens=cached,
+        cache_creation_input_tokens=created,
+        reasoning_output_tokens=reasoning,
+        tokens=incoming + outgoing if incoming is not None and outgoing is not None else None,
+    )
+
+
 def measured_tokens(raw: Any, *, claude: bool = False) -> int | None:
-    if not isinstance(raw, dict):
+    if not claude:
+        return measured_usage(raw).tokens
+    # Existing Claude accounting includes separately reported cache reads/writes.
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+    if not isinstance(raw, dict) or any(type(raw.get(k)) is not int or raw[k] < 0 for k in keys):
         return None
-    keys: tuple[str, ...] = ("input_tokens", "output_tokens")
-    if claude:
-        keys += ("cache_creation_input_tokens", "cache_read_input_tokens")
-    if any(type(raw.get(key)) is not int or raw[key] < 0 for key in keys):
-        return None
-    return sum(int(raw[key]) for key in keys)
+    return sum(int(raw[k]) for k in keys)
 
 
 class NativeSandboxProbe:
@@ -463,7 +496,7 @@ def decode_response(output: str, schema: type[T]) -> tuple[T, Usage]:
                     # the schema-constrained final agent message.
                     continue
         if event.get("type") == "turn.completed":
-            usage = Usage(tokens=measured_tokens(event.get("usage")))
+            usage = measured_usage(event.get("usage"))
     try:
         return schema.model_validate(payload), usage
     except ValidationError as error:
