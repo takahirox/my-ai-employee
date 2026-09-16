@@ -61,6 +61,10 @@ class Waiting(RuntimeError):
     """Durable user input boundary, not a failure eligible for automatic retry."""
 
 
+class DirectFallback(Exception):
+    """A bounded local attempt needs normal planning; never a Run-level stop."""
+
+
 class Engine:
     def __init__(self, journal: Journal, candidates: Candidates, model: Model, root: Path) -> None:
         self.journal = journal
@@ -308,7 +312,12 @@ class Engine:
         contract: StageContract,
         action: str,
     ) -> T:
-        capture_policy = self.journal.config(run).command_capture
+        config = self.journal.config(run)
+        capture_policy = config.command_capture
+        direct = stage == "worker" and self._direct_task(
+            run, prompt.get("context", {}).get("task", {}).get("id")
+        )
+        direct_seconds = self._direct_remaining(run, config) if direct else None
         capture_failed = False
         task_context = prompt.get("context", prompt)
         task = task_context.get("task") if isinstance(task_context, dict) else None
@@ -329,6 +338,7 @@ class Engine:
                 binding=contract.projection(),
                 policy=policy,
                 call_key=contract.identity + ":" + action,
+                seconds_limit=direct_seconds,
                 call_limit=policy.revisions + 1 if action == "output" else policy.transport_retries,
             )
         except Stopped as error:
@@ -373,6 +383,8 @@ class Engine:
             self.journal.append(
                 run, "worker_observation", reservation=reservation, stage=stage, observation=body
             )
+            if direct and body.get("event") == "usage_observed":
+                self._direct_remaining(run, config, usage.tokens or 0)
 
         try:
             validate_policy(policy)
@@ -443,6 +455,17 @@ class Engine:
                 observation=observe,
             )
             usage = returned_usage.prefer(usage)
+            if direct:
+                if isinstance(result, WorkerResult) and result.status == "usage_limit":
+                    raise Stopped("USAGE_LIMIT")
+                if isinstance(result, WorkerResult) and result.status == "uncertain":
+                    self.journal.append(run, "uncertain", reason="DIRECT_REPORTED_UNCERTAIN")
+                    raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
+                if usage.tokens is None:
+                    raise DirectFallback("direct_usage_unknown")
+                self._direct_remaining(run, config, usage.tokens)
+                if direct_seconds is not None and time.monotonic() - started >= direct_seconds:
+                    raise DirectFallback("direct_time_budget")
             response_payload = result.model_dump(mode="json")
             self.journal.diagnostic(
                 run,
@@ -498,7 +521,10 @@ class Engine:
                 reason=validation_code(error),
             )
             raise OutputViolation(validation_code(error), usage, details=details) from None
-        except (TimeoutError, ConnectionError):
+        except (TimeoutError, ConnectionError) as error:
+            if direct and isinstance(error, TimeoutError):
+                self.journal.check(run)
+                raise DirectFallback("direct_timeout") from error
             raise
         except (ValueError, OSError) as error:
             # Arbitrary adapter/environment/invariant errors are not model output
@@ -703,6 +729,213 @@ class Engine:
             )
             raise
 
+    def _direct_task(self, run: str, task_id: str | None) -> bool:
+        events = self.journal.events(run)
+        starts = [e["body"] for e in events if e["kind"] == "direct_started"]
+        plans = [e["body"]["plan"] for e in events if e["kind"] == "plan"]
+        return bool(
+            starts
+            and plans
+            and not any(e["kind"] == "direct_fallback" for e in events)
+            and starts[-1]["plan"] == plans[-1]
+            and task_id == plans[-1]["result_task"]
+        )
+
+    def _direct_remaining(self, run: str, config: RunConfig, observed: int = 0) -> float:
+        self.journal.check(run)
+        budget = config.direct_execution
+        if budget is None:
+            raise ValueError("DIRECT_CONFIGURATION_MISSING")
+        events = self.journal.events(run)
+        start = next(i for i, e in enumerate(events) if e["kind"] == "direct_started")
+        ids = {
+            e["body"]["id"]
+            for i, e in enumerate(events)
+            if i > start and e["kind"] == "reserved" and e["body"]["stage"] == "worker"
+        }
+        with self.journal.connect() as db:
+            rows = db.execute("SELECT * FROM reservations WHERE run=?", (run,)).fetchall()
+        # Recovered interrupted reservations remain charged; neither retries nor
+        # controller restart grant another local allowance.
+        seconds = sum(row["seconds"] for row in rows if row["id"] in ids and row["settled"])
+        tokens = sum(row["tokens"] for row in rows if row["id"] in ids and row["settled"])
+        if tokens + observed >= budget.tokens:
+            raise DirectFallback("direct_token_budget")
+        if seconds >= budget.seconds:
+            raise DirectFallback("direct_time_budget")
+        return float(budget.seconds - seconds)
+
+    def _start_direct(self, run: str, goal: Goal, config: RunConfig) -> Plan | None:
+        if (
+            config.direct_execution is None
+            or config.planning.review != "never"
+            or config.worker_options
+            or config.authority_ceiling != _NO_AUTHORITY
+            or any(c.requires_external_evidence for c in goal.specification.criteria)
+            or any(c.proves_external_effect for c in config.checks)
+        ):
+            return None
+        task = Task(
+            id="direct",
+            description=goal.specification.clarified_goal,
+            criteria=goal.specification.criteria,
+            verification_plan="Independently inspect the candidate against every Goal criterion "
+            "and all mandatory checks. Preserve the original authorized method alternatives.",
+        )
+        plan = Plan(tasks=(task,), result_task=task.id)
+        self._readiness(run, task, config, plan)
+        self._check_ids(task.criteria, config)
+        self.journal.append_many(
+            run,
+            (
+                (
+                    "direct_started",
+                    {
+                        "plan": plan.model_dump(mode="json"),
+                        "goal_digest": goal.digest,
+                        "policy_digest": config.digest,
+                    },
+                ),
+                ("plan", {"plan": plan.model_dump(mode="json")}),
+            ),
+        )
+        return plan
+
+    def _direct_handoff(self, run: str) -> dict[str, Any] | None:
+        return next(
+            (
+                e["body"]
+                for e in reversed(self.journal.events(run))
+                if e["kind"] == "direct_fallback"
+            ),
+            None,
+        )
+
+    def _fallback_direct(
+        self, run: str, goal: Goal, config: RunConfig, task: Task, reason: str, base: str
+    ) -> None:
+        self.journal.check(run)
+        events = self.journal.events(run)
+        if any(e["kind"] == "uncertain" for e in events):
+            raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
+        attempts = [
+            e["body"]["context"]
+            for e in events
+            if e["kind"] == "attempt_started" and e["body"]["task_digest"] == task.digest
+        ]
+        summary = "No worker result was returned. Partial artifacts are unverified."
+        if attempts:
+            context = TaskContext.model_validate(attempts[-1])
+            if context.authority != _NO_AUTHORITY:
+                raise Waiting("DIRECT_AUTHORITY_CHANGED")
+            workspace = Path(context.workspace)
+            if workspace.is_symlink() or not workspace.resolve().is_relative_to(self.root / run):
+                raise ValueError("WORKSPACE_UNAVAILABLE")
+            base = self.candidates.capture(workspace)
+            results = [
+                e["body"]["result"]
+                for e in events
+                if e["kind"] == "worker_result" and e["body"]["attempt"] == context.attempt_id
+            ]
+            if results:
+                summary = results[-1]["summary"][:2048]
+        self.candidates.manifest(base)
+        self.journal.append(
+            run,
+            "direct_fallback",
+            tree=base,
+            reason=reason,
+            summary=summary,
+            authoritative=False,
+            goal_digest=goal.digest,
+            policy_digest=config.digest,
+            instruction="Continue from safe but unverified partial artifacts. "
+            "Investigate the recorded failure; do not assume completion. "
+            "This is local routing, not evidence of task complexity.",
+        )
+        self.journal.release_resources(run, task.digest)
+
+    def _joint_eligible(
+        self, run: str, config: RunConfig, goal: Goal, task: Task, candidate: Candidate
+    ) -> bool:
+        starts = [e["body"] for e in self.journal.events(run) if e["kind"] == "direct_started"]
+        return bool(
+            self._direct_task(run, task.id)
+            and starts
+            and starts[-1]["goal_digest"] == goal.digest
+            and starts[-1]["policy_digest"] == config.digest
+            and len(starts[-1]["plan"]["tasks"]) == 1
+            and starts[-1]["plan"]["tasks"][0] == task.model_dump(mode="json")
+            and task.criteria == goal.specification.criteria
+            and set(goal.mandatory_checks) <= {key for c in task.criteria for key in c.checks}
+            and task.authority == _NO_AUTHORITY
+            and not task.dependencies
+            and candidate.task_digest == task.digest
+            and not candidate.upstream
+            and candidate.authority_version == 0
+            and not any(c.requires_external_evidence for c in task.criteria)
+        )
+
+    def _joint_record(
+        self, run: str, config: RunConfig, goal: Goal, task: Task, candidate: Candidate
+    ) -> dict[str, Any] | None:
+        if not self._joint_eligible(run, config, goal, task, candidate):
+            return None
+        events = self.journal.events(run)
+        for event in reversed(events):
+            b = event["body"]
+            if (
+                event["kind"] != "verification"
+                or b["goal_level"]
+                or b["candidate"] != candidate.model_dump(mode="json")
+            ):
+                continue
+            coverage = b.get("joint_coverage", {})
+            if (
+                not b["passed"]
+                or coverage.get("goal_digest") != goal.digest
+                or coverage.get("task_digest") != task.digest
+                or coverage.get("policy_digest") != config.digest
+                or not Verification.model_validate(b["result"]).accepts(goal.specification.criteria)
+            ):
+                return None
+            receipts = coverage.get("checks", [])
+            required = set(goal.mandatory_checks) | {key for c in task.criteria for key in c.checks}
+            if {item["check"] for item in receipts} != required or any(
+                not item["passed"]
+                or item["candidate"] != candidate.digest
+                or not any(
+                    e["kind"] == "check_result"
+                    and e["body"] == item
+                    and events.index(e) < events.index(event)
+                    for e in events
+                )
+                for item in receipts
+            ):
+                return None
+            self._check_saved_comparison(run, goal, task, candidate)
+            return event
+        return None
+
+    def _reuse_direct_verification(
+        self, run: str, config: RunConfig, goal: Goal, task: Task, candidate: Candidate
+    ) -> bool:
+        event = self._joint_record(run, config, goal, task, candidate)
+        if event is None:
+            return False
+        comparison = self._input_comparison(run, config, goal, None, candidate)
+        self.journal.append(
+            run,
+            "verification",
+            candidate=candidate.model_dump(mode="json"),
+            goal_level=True,
+            passed=True,
+            result=event["body"]["result"],
+            reused_from=digest(event),
+            **({"input_comparison": comparison} if comparison is not None else {}),
+        )
+        return True
+
     def _plan(self, run: str, goal: Goal, config: RunConfig, tree: str) -> Plan:
         workspace = self._workspace(run, "planner", tree)
         feedback = ""
@@ -717,6 +950,7 @@ class Engine:
                     "success criteria, verification plan and required evidence. "
                     "Use the shared graph, evidence/outcome and method_selection semantics.",
                     "goal": goal.model_dump(mode="json"),
+                    "direct_execution_handoff": self._direct_handoff(run),
                     "feedback": feedback,
                     "available_checks": [check.model_dump(mode="json") for check in config.checks],
                 },
@@ -891,6 +1125,7 @@ class Engine:
         ]
         verification_stage = "goal_verification" if task is None else "task_verification"
         boundary = LIFECYCLE[verification_stage]
+        joint = task is not None and self._joint_eligible(run, config, goal, task, candidate)
         verification_context = {
             "verification_scope": verification_stage,
             "goal": goal.model_dump(mode="json"),
@@ -901,6 +1136,13 @@ class Engine:
             "upstream_check_evidence": prior_checks,
             "worker_result": None if result is None else result.model_dump(mode="json"),
         }
+        if joint:
+            verification_context["joint_goal_coverage"] = {
+                "goal_digest": goal.digest,
+                "instruction": "Independently verify the entire Goal as well as this direct Task. "
+                "Their criteria are identical. One result supplies evidence for two separate "
+                "runtime acceptance decisions; do not attest future or external effects.",
+            }
         comparison = self._input_comparison(run, config, goal, task, candidate)
         if comparison is not None:
             verification_context.update(
@@ -959,6 +1201,18 @@ class Engine:
             passed=passed,
             result=verification.model_dump(mode="json"),
             **({"input_comparison": comparison} if comparison is not None else {}),
+            **(
+                {
+                    "joint_coverage": {
+                        "goal_digest": goal.digest,
+                        "task_digest": task.digest,
+                        "policy_digest": config.digest,
+                        "checks": receipts,
+                    }
+                }
+                if joint and task is not None
+                else {}
+            ),
         )
         return passed
 
@@ -1131,6 +1385,7 @@ class Engine:
         upstream: tuple[Candidate, ...],
         base: str,
     ) -> Candidate:
+        direct = self._direct_task(run, task.id)
         # Scheduler inputs must be exact currently accepted upstream Candidates.
         plans = [e["body"]["plan"] for e in self.journal.events(run) if e["kind"] == "plan"]
         current = Plan.model_validate(plans[-1])
@@ -1195,6 +1450,8 @@ class Engine:
             )
             if resumed is not None:
                 return resumed
+            if direct:
+                raise DirectFallback("interrupted_or_rejected_direct_attempt")
             # An externally writable invocation without an accepted result may
             # have committed remotely before controller/process failure.
             if previous.authority.external_writes:
@@ -1219,7 +1476,7 @@ class Engine:
             event["kind"] == "attempt_failed" and event["body"].get("attempt") in attempts
             for event in self.journal.events(run)
         )
-        for _ in range(len(prior), config.limits.task_attempts):
+        for _ in range(len(prior), 1 if direct else config.limits.task_attempts):
             if failures and config.worker_escalations:
                 worker_policy = config.worker_escalations[
                     min(failures - 1, len(config.worker_escalations) - 1)
@@ -1256,6 +1513,34 @@ class Engine:
                         "Stop on usage limit; never redeem resets or buy allowance.",
                         "context": context.model_dump(mode="json"),
                         "feedback": feedback,
+                        **(
+                            {
+                                "direct_execution": {
+                                    "instruction": "Complete the clarified Goal directly. "
+                                    "Choose among user-authorized methods without narrowing"
+                                    " requirements. "
+                                    "If you cannot finish within the local allowance, "
+                                    "return failed with "
+                                    "a concise progress summary; normal planning can "
+                                    "continue from safe "
+                                    "partial artifacts. Do not request extra authority in "
+                                    "this attempt.",
+                                    "budget": config.direct_execution.model_dump(mode="json"),
+                                    "clarification_observations": {
+                                        "input_tree": base,
+                                        "policy_digest": config.digest,
+                                        "authority": _NO_AUTHORITY.model_dump(mode="json"),
+                                        "source": "context.goal.specification.observations",
+                                        "authoritative": False,
+                                        "instruction": "Original-snapshot reports; "
+                                        "reuse relevant investigation, but recheck changed or "
+                                        "unsupported facts.",
+                                    },
+                                }
+                            }
+                            if direct and config.direct_execution is not None
+                            else {}
+                        ),
                     },
                     WorkerResult,
                     workspace,
@@ -1278,6 +1563,11 @@ class Engine:
                         result=result.model_dump(mode="json"),
                     )
                     raise Waiting("UNCERTAIN_EXTERNAL_EFFECT")
+                if action == "request" and direct:
+                    self.journal.append(
+                        run, "worker_result", attempt=attempt, result=result.model_dump(mode="json")
+                    )
+                    raise DirectFallback("direct_authority_required")
                 if action == "request":
                     requested = result.authority_request
                     if requested is None or not requested.within(config.authority_ceiling):
@@ -1387,6 +1677,8 @@ class Engine:
                 feedback = str(error)
                 self.journal.append(run, "attempt_failed", attempt=attempt, reason=feedback[:200])
                 failures += 1
+        if direct:
+            raise DirectFallback("direct_not_completed")
         raise ValueError("TASK_ATTEMPTS_EXHAUSTED")
 
     def execute(self, run: str) -> None:
@@ -1616,11 +1908,20 @@ class Engine:
         ):
             raise ValueError("GOAL_PROVENANCE_CHANGED")
         plans = [event for event in events if event["kind"] == "plan"]
-        plan = (
-            Plan.model_validate(plans[-1]["body"]["plan"])
-            if plans
-            else self._plan(run, goal, config, base)
-        )
+        if plans:
+            plan = Plan.model_validate(plans[-1]["body"]["plan"])
+        else:
+            plan = self._start_direct(run, goal, config) or self._plan(run, goal, config, base)
+        handoff = self._direct_handoff(run)
+        if handoff is not None:
+            if handoff["goal_digest"] != goal.digest or handoff["policy_digest"] != config.digest:
+                raise ValueError("DIRECT_HANDOFF_CONTEXT_CHANGED")
+            base = handoff["tree"]
+            current_events = self.journal.events(run)
+            last_plan = next(e for e in reversed(current_events) if e["kind"] == "plan")
+            fallback = next(e for e in reversed(current_events) if e["kind"] == "direct_fallback")
+            if current_events.index(last_plan) < current_events.index(fallback):
+                plan = self._plan(run, goal, config, base)
         tasks = {task.id: task for task in plan.tasks}
         accepted = self._accepted(run, plan)
         # Acceptance is durable even if the controller died before releasing its lease.
@@ -1652,6 +1953,9 @@ class Engine:
                         try:
                             accepted[key] = future.result()
                             pending.remove(key)
+                        except DirectFallback as error:
+                            self._fallback_direct(run, goal, config, tasks[key], str(error), base)
+                            return self._execute(run)
                         except (ValueError, TimeoutError) as error:
                             failure = str(error)
                             self.journal.append(run, "task_failed", task=key, reason=failure[:200])
@@ -1662,7 +1966,10 @@ class Engine:
                 self._recover(run, config, goal, plan, accepted, failure, base)
                 return self._execute(run)
         final = accepted[plan.result_task]
-        if not self._verify(run, config, goal, None, final, None):
+        if not (
+            self._reuse_direct_verification(run, config, goal, tasks[plan.result_task], final)
+            or self._verify(run, config, goal, None, final, None)
+        ):
             self.journal.append(run, "goal_rejected", candidate=final.model_dump(mode="json"))
             if any(task.authority.external_writes for task in plan.tasks):
                 self.journal.append(run, "uncertain", reason="EXTERNAL_GOAL_UNVERIFIED")
@@ -1838,6 +2145,22 @@ class Engine:
             for event in events
         ):
             raise ValueError("GOAL_NOT_VERIFIED")
+        goal_record = next(
+            e["body"]
+            for e in reversed(events)
+            if e["kind"] == "verification"
+            and e["body"]["goal_level"]
+            and e["body"]["candidate"] == candidate.model_dump(mode="json")
+        )
+        if "reused_from" in goal_record:
+            task = next(t for t in plan.tasks if t.id == plan.result_task)
+            source = self._joint_record(run, config, goal, task, candidate)
+            if (
+                source is None
+                or digest(source) != goal_record["reused_from"]
+                or source["body"]["result"] != goal_record["result"]
+            ):
+                raise ValueError("JOINT_VERIFICATION_CONTEXT_CHANGED")
         self._check_saved_comparison(run, goal, None, candidate)
         return candidate
 

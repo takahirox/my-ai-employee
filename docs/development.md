@@ -33,6 +33,12 @@ checks one Worker, no human/authority waits or graph extension, and no new work 
 replay. Its current fixture policy disables optional reviews; the five model-boundary
 calls are a test baseline, not a universal product call-count invariant.
 
+`tests/test_direct_execution.py` additionally exercises the fresh-config direct path:
+Clarification → WorkerResult → one independent Verification, with separate Task/Goal
+acceptance records and no work on completed replay. Required review policies add their
+normal calls. Historical configurations without `direct_execution` retain the ordinary
+planning path.
+
 The model boundary is a deterministic fixture that edits and checks actual files;
 the runtime is not mocked and no benchmark adapter is involved. This ordinary CI
 canary detects orchestration regressions, not real-model quality or Docker isolation.

@@ -14,7 +14,7 @@ from .container import ContainerModel
 from .engine import Engine, Waiting
 from .history import Journal, Stopped
 from .isolated_worker import IsolatedWorkerProfile
-from .models import Clarification, RunConfig, StagePolicy
+from .models import Clarification, DirectExecution, RunConfig, StagePolicy
 from .source_refs import original_source
 from .stage_contracts import VERSION
 
@@ -191,6 +191,7 @@ def _command(args: argparse.Namespace) -> int:
     if args.command == "init":
         stage = StagePolicy(backend=args.backend, model=args.model, transport_retries=2)
         config = RunConfig(
+            direct_execution=DirectExecution(),
             command_capture=CommandCapture(enabled=not args.no_command_capture),
             clarification=stage.model_copy(update={"review": "always"}),
             planning=stage,

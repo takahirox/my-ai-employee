@@ -6,9 +6,16 @@ import hashlib
 import json
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from .command_diagnostics import CommandCapture
 from .isolated_worker import IsolatedWorkerProfile
@@ -164,6 +171,21 @@ class DownstreamOutcome(Contract):
 
 
 class Clarification(Contract):
+    observations: tuple[Annotated[str, Field(min_length=1, max_length=1024)], ...] = Field(
+        default=(),
+        max_length=8,
+        description="Bounded relevant facts learned by inspecting the supplied input snapshot. "
+        "Include evidence references and distinguish observations from assumptions. "
+        "These are non-authoritative model reports for subsequent work, not proof of completion.",
+    )
+
+    @model_serializer(mode="wrap")
+    def serialize_observations(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        body: dict[str, Any] = handler(self)
+        if not self.observations:
+            body.pop("observations", None)
+        return body
+
     clarified_goal: Text = Field(description=COMPLETION["scope"])
     criteria: tuple[Criterion, ...] = Field(
         min_length=1,
@@ -444,12 +466,20 @@ class Limits(Contract):
     approval_counts_wall: bool = True
 
 
+class DirectExecution(Contract):
+    seconds: float = Field(default=60, gt=0, le=3600)
+    tokens: int = Field(default=100000, gt=0)
+
+
 class RunConfig(Contract):
+    direct_execution: DirectExecution | None = None
     command_capture: CommandCapture | None = None
 
     def canonical(self) -> str:
         # Absent capture settings preserve pre-feature configuration digests.
         body = self.model_dump(mode="json")
+        if self.direct_execution is None:
+            body.pop("direct_execution")
         if self.command_capture is None:
             body.pop("command_capture")
         return json.dumps(body, sort_keys=True, separators=(",", ":"))

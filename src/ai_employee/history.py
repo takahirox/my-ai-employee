@@ -42,6 +42,8 @@ DECISIONS = frozenset(
         "clarification_wait",
         "readiness",
         "preflight",
+        "direct_started",
+        "direct_fallback",
     }
 )
 
@@ -438,6 +440,7 @@ class Journal:
         policy: StagePolicy | None = None,
         call_key: str | None = None,
         call_limit: int | None = None,
+        seconds_limit: float | None = None,
     ) -> tuple[str, float | None]:
         self.check(run)
         limits = self.config(run).limits
@@ -460,6 +463,7 @@ class Journal:
             if exhausted(wall):
                 raise Stopped("WALL_BUDGET_EXHAUSTED")
             seconds = minimum(
+                seconds_limit,
                 limits.invocation_seconds,
                 None if limits.active_seconds is None else limits.active_seconds - usage[1],
                 wall,
