@@ -1,5 +1,12 @@
 # My AI Employee repository guidance
 
+## Communication
+
+Follow the English communication and template policy in
+[CONTRIBUTING.md](CONTRIBUTING.md#communication-and-templates) when creating or
+updating issues, pull requests, comments, and reviews, including through CLI/API
+tools. Preserve original diagnostics with an English explanation when needed.
+
 ## Design and review
 
 - Prefer the simplest implementation that satisfies the current acceptance criteria.
