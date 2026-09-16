@@ -118,3 +118,38 @@ failures, or `fleet purge-commands RUN_ID` to remove that Run's command bodies.
 opt in automatically. See [command diagnostics](docs/run-interface.md#command-diagnostics)
 for limits, retention, export, and the distinction between reported execution time
 and buffered event-reception time.
+
+### Bounded direct execution
+
+Fresh `fleet init` configurations include `direct_execution: {"seconds": 60, "tokens": 100000}`.
+After clarification and its configured review, local work can try one Worker directly,
+without a planning model call. This is an execution attempt, not a task-complexity classifier.
+Set `direct_execution` to `null` to use normal planning; existing configs without the field
+retain their old behavior and canonical digests.
+
+The direct Task preserves the entire clarified Goal. Bounded clarification observations
+are available as non-authoritative investigation context, with the original input snapshot
+and configuration/authority provenance. Workers must recheck changed or unsupported facts.
+
+A completed direct candidate still receives independent verification, mandatory checks and
+configured reviews. When the candidate, lineage, criteria and policy match exactly, the
+same verification evidence supports two separately checked Task and Goal acceptance events.
+Publication remains evidence-gated. Multi-task plans never use this evidence shortcut.
+
+Direct execution is conservatively disabled when planning review is configured, alternative
+worker selection is configured, any additional authority is available, or external-effect
+criteria/checks are present. These runs use the existing planning path.
+
+The local Worker allowance is cumulative across its model retries and charged to the Run.
+Time is bounded through the existing invocation timeout; tokens are checked when the provider
+reports usage, so they are a measured threshold, not a token-exact generation cap. Providers
+may report usage only at turn completion, and a single turn can exceed that threshold.
+Missing final token usage routes to normal planning. Global limits, cancellation and Usage
+Limit stops take precedence and never grant fallback a fresh budget.
+
+Local timeout, local allowance exhaustion, or unsuccessful direct work routes to normal
+planning with bounded failure context and available unverified workspace artifacts. This
+is not task completion or evidence of intrinsic complexity. Completed/exported partial
+artifacts are retained; an interrupted native sandbox is destroyed for safety, so changes
+not yet exported by the adapter cannot be recovered. An interrupted unfinished direct
+attempt is not repeated on resume. Uncertain effects never trigger automatic fallback.
