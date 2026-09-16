@@ -10,6 +10,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .command_diagnostics import CommandCapture
 from .isolated_worker import IsolatedWorkerProfile
 from .product_capabilities import SUPPORTED_BACKENDS
 from .semantics import (
@@ -444,6 +445,15 @@ class Limits(Contract):
 
 
 class RunConfig(Contract):
+    command_capture: CommandCapture | None = None
+
+    def canonical(self) -> str:
+        # Absent capture settings preserve pre-feature configuration digests.
+        body = self.model_dump(mode="json")
+        if self.command_capture is None:
+            body.pop("command_capture")
+        return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
     schema_version: Literal["autonomous-1"] = "autonomous-1"
     clarification: StagePolicy
     planning: StagePolicy

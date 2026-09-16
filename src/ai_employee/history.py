@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from . import command_diagnostics
+from .command_diagnostics import CommandCapture
 from .diagnostics import RECORD_BYTES, RUN_BYTES, capture
 from .models import Authority, RunConfig, StagePolicy, Usage
 from .stage_contracts import VERSION
@@ -75,6 +77,7 @@ class Journal:
                 "FOREIGN KEY(run) REFERENCES runs(id));"
                 "PRAGMA user_version=167;"
             )
+            command_diagnostics.initialize(db)
         path.chmod(0o600)
 
     @contextmanager
@@ -82,6 +85,7 @@ class Journal:
         db = sqlite3.connect(self.path, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA secure_delete=ON")
         try:
             with db:
                 yield db
@@ -256,6 +260,66 @@ class Journal:
             previous = expected
             result.append({"kind": row["kind"], "at": row["at"], "body": json.loads(row["body"])})
         return result
+
+    def command_snapshot(
+        self,
+        run: str,
+        reservation: str,
+        stage: str,
+        event: dict[str, Any],
+        policy: CommandCapture,
+        context: dict[str, Any],
+    ) -> None:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            command_diagnostics.record(db, run, reservation, stage, event, policy, context)
+
+    def commands(
+        self,
+        run: str,
+        *,
+        stage: str | None = None,
+        reservation: str | None = None,
+        failed_only: bool = False,
+    ) -> dict[str, Any]:
+        config = self.config(run)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            result = command_diagnostics.read(
+                db,
+                run,
+                stage=stage,
+                reservation=reservation,
+                failed_only=failed_only,
+            )
+        result["capture_policy"] = (
+            config.command_capture.model_dump() if config.command_capture else None
+        )
+        result["capture_failures"] = [
+            event["body"]
+            for event in self.events(run)
+            if event["kind"] == "command_capture_failed"
+            and (stage is None or event["body"].get("stage") == stage)
+            and (reservation is None or event["body"].get("reservation") == reservation)
+        ]
+        result["availability"] = (
+            "disabled_or_legacy"
+            if not config.command_capture or not config.command_capture.enabled
+            else "purged"
+            if result["purged"]
+            else "capture_incomplete"
+            if result["capture_failures"]
+            else "no_matching_records"
+            if not result["records"]
+            else "recorded"
+        )
+        return result
+
+    def purge_commands(self, run: str) -> int:
+        self.config(run)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return command_diagnostics.purge(db, run)
 
     def diagnostic(self, run: str, stage: str, payload: Any, **context: Any) -> None:
         """Append non-authoritative evidence even when acceptance has stopped."""

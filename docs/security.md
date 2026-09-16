@@ -87,3 +87,11 @@ work and cancels active invocations; it never triggers purchases or quota resets
 The Inspector binds to loopback, checks Host and bearer authorization, exposes no
 mutation endpoint, and uses text rendering for untrusted content. Its token is
 carried in the URL fragment rather than an HTTP query.
+
+
+Command bodies and tool output are a separate, non-authoritative diagnostic store.
+New init configurations enable bounded, best-effort redacted capture; existing
+configurations without the setting remain disabled. Use `--no-command-capture` for
+work where pattern-based redaction is insufficient. Per-command/Run limits, expiry,
+and explicit purge do not grant authority or modify the decision journal. See
+[command capture controls and limitations](run-interface.md#command-diagnostics).

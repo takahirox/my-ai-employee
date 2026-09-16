@@ -17,8 +17,16 @@ _SECRET_KEY = re.compile(
     r"refresh[_-]?token|id[_-]?token|token|client[_-]?secret|private[_-]?key)$"
 )
 _PATTERNS = (
+    re.compile(r"(?i)https?://[^\s/@]+:[^\s/@]+@"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"),
     re.compile(
-        r"-----BEGIN (?:[A-Z ]*PRIVATE KEY)-----[\s\S]*?-----END (?:[A-Z ]*PRIVATE KEY)-----"
+        r"(?i)--(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+        r"client[_-]?secret|token|authorization|cookie)(?:=|\s+)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
+    ),
+    re.compile(
+        r"-----BEGIN (?:[A-Z ]*PRIVATE KEY)-----[\s\S]*?"
+        r"(?:-----END (?:[A-Z ]*PRIVATE KEY)-----|\Z)"
     ),
     re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"),
@@ -97,8 +105,38 @@ def execution_snapshot(
     native root exit. Neither this snapshot nor its text can decide control flow.
     """
 
-    def stream(data: bytes | bytearray) -> dict[str, Any]:
-        cleaned, redactions = redact(data.decode("utf-8", errors="replace"))
+    def stream(data: bytes | bytearray, *, native_events: bool = False) -> dict[str, Any]:
+        text = data.decode("utf-8", errors="replace")
+        if native_events:
+            lines = []
+            for line in text.splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    # Incomplete JSON may contain truncated command/message bodies.
+                    lines.append(
+                        "[incomplete native event omitted]"
+                        if line.lstrip().startswith("{")
+                        else line
+                    )
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") in {"item.started", "item.updated", "item.completed"}
+                    and isinstance(event.get("item"), dict)
+                ):
+                    event = {
+                        "type": event.get("type"),
+                        "item": {
+                            k: event["item"][k]
+                            for k in ("type", "status", "exit_code")
+                            if k in event["item"]
+                        },
+                        "body_omitted": "see bounded command diagnostics",
+                    }
+                lines.append(json.dumps(event))
+            text = "\n".join(lines)
+        cleaned, redactions = redact(text)
         encoded = cleaned.encode("utf-8")
         return {
             "tail": encoded[-FAILURE_STREAM_BYTES:].decode("utf-8", errors="ignore"),
@@ -111,8 +149,8 @@ def execution_snapshot(
         "started": started,
         "transport_exit_code": exit_code,
         "native_exit_code": None,
-        "stdout": stream(stdout),
-        "stderr": stream(stderr),
+        "stdout": stream(stdout, native_events=True),
+        "stderr": stream(stderr, native_events=True),
         "last_event": capture(last_event, 4096) if last_event is not None else None,
         "last_update_seconds": last_update_seconds,
         "network": "unknown; no additional collection after failure",

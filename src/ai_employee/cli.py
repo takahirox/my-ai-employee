@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .candidates import Candidates
 from .capabilities import SUPPORTED_BACKENDS
+from .command_diagnostics import CommandCapture
 from .container import ContainerModel
 from .engine import Engine, Waiting
 from .history import Journal, Stopped
@@ -40,6 +41,7 @@ def parser() -> argparse.ArgumentParser:
     initialize.add_argument(
         "--auth-file", type=Path, required=True, help="explicit delegated model authentication"
     )
+    initialize.add_argument("--no-command-capture", action="store_true")
     initialize.add_argument("--output", type=Path, default=Path("fleet-run.json"))
     for name in ("submit", "work"):
         work = commands.add_parser(
@@ -50,6 +52,15 @@ def parser() -> argparse.ArgumentParser:
         work.add_argument("--root", type=Path, default=Path.cwd())
     for name in ("inspect", "status", "logs", "result", "resume", "cancel", "cleanup", "revoke"):
         commands.add_parser(name).add_argument("run_id")
+    command_logs = commands.add_parser(
+        "commands", help="inspect/export sanitized command diagnostics"
+    )
+    command_logs.add_argument("run_id")
+    command_logs.add_argument("--stage")
+    command_logs.add_argument("--reservation")
+    command_logs.add_argument("--failed", action="store_true")
+    purge = commands.add_parser("purge-commands", help="delete captured command bodies for a Run")
+    purge.add_argument("run_id")
     revise = commands.add_parser("revise", help="explicitly replace the Goal in a linked new Run")
     revise.add_argument("run_id")
     revise.add_argument("goal")
@@ -180,6 +191,7 @@ def _command(args: argparse.Namespace) -> int:
     if args.command == "init":
         stage = StagePolicy(backend=args.backend, model=args.model, transport_retries=2)
         config = RunConfig(
+            command_capture=CommandCapture(enabled=not args.no_command_capture),
             clarification=stage.model_copy(update={"review": "always"}),
             planning=stage,
             worker=stage,
@@ -204,6 +216,22 @@ def _command(args: argparse.Namespace) -> int:
         from .inspector import run_list
 
         emit({"runs": run_list(journal)})
+        return 0
+    if args.command == "commands":
+        emit(
+            {
+                "run_id": args.run_id,
+                "commands": journal.commands(
+                    args.run_id,
+                    stage=args.stage,
+                    reservation=args.reservation,
+                    failed_only=args.failed,
+                ),
+            }
+        )
+        return 0
+    if args.command == "purge-commands":
+        emit({"run_id": args.run_id, "purged_commands": journal.purge_commands(args.run_id)})
         return 0
     run: str | None = getattr(args, "run_id", None)
     try:
