@@ -173,20 +173,22 @@ and finding evidence, Worker results, selection and verification responses. This
 includes rejected proposals and each repair attempt. Schema-invalid responses retain
 recognized top-level schema fields and error paths/types; unknown top-level fields
 and non-object payloads are omitted with explicit counts/flags. Successful native
-streams are not persisted as transcripts. A failed invocation or protected check
+streams are not persisted as transcripts; enabled command capture stores bounded
+snapshots separately. A failed invocation or protected check
 additionally records `execution_failure`, linked to its Run, stage and reservation.
-Native stdout/stderr tails are redacted before being limited to 32,768 bytes each;
-they may include incomplete/non-JSON messages, otherwise unrecognized response text,
-tool command text or provider errors. The structured-response omissions above do not
-filter these stream excerpts. Authentication files, host launch argv/stdin and
+Native stdout/stderr tails are redacted before being limited to 32,768 bytes each.
+Parsed native item bodies (including command and reasoning text) are omitted from
+stdout/stderr failure tails; command snapshots use the separately controlled store below.
+Incomplete JSON event lines are also omitted. Other non-JSON transport messages and
+provider errors may remain as bounded excerpts. Authentication files, host launch argv/stdin and
 unrelated host files are not inspected or collected.
 A process killed before capture cannot guarantee a complete response; this is not
 a transcript of every internal model/tool action.
 
 Execution snapshots include whether transport streaming started, observed stdout/stderr byte
 counts, the last parsed event's type/tool status, the last read time in seconds since
-stream reading began, and transport/native exit codes when known. An incomplete
-line may appear in the tail without a parsed event. Native exit codes are reported
+stream reading began, and transport/native exit codes when known. An incomplete non-JSON
+transport line may appear without a parsed event; incomplete JSON is marked omitted. Native exit codes are reported
 only after guarded final accounting succeeds. An event showing tool completion
 followed by no final response identifies an observed waiting interval, not its
 provider-internal cause. Missing observations are unknown; no extra network-log
@@ -221,8 +223,9 @@ reach 16,000,000 bytes for a Run, subsequent payload text is omitted. Remaining
 capacity can truncate the event that crosses the threshold. Small omission metadata
 and up to 8,192 bytes of sanitized linking context per event are still retained, so
 this is a payload retention threshold, not a total database file-size quota. Existing
-runtime invocation/attempt limits still bound event production. No automatic history
-expiry is introduced; caller-owned state remains available after `cleanup`.
+runtime invocation/attempt limits still bound event production. These append-only diagnostic events have no automatic
+expiry; caller-owned state remains available after `cleanup`. Separate command bodies
+have the expiration/purge policy described under [Command diagnostics](#command-diagnostics).
 
 Common credential fields and text patterns (authorization/cookies, password/API and
 access/refresh tokens, private-key blocks, Bearer/Basic credentials and recognized
@@ -277,3 +280,99 @@ price source/version or effective date, model, and applicable pricing conditions
 price tables nor converts token counts to money. `cost` remains unknown unless
 supplied by the adapter. Provider fields absent from its usage report cannot be
 reconstructed from the total.
+
+## Command diagnostics
+
+New `fleet init` configurations enable bounded, redacted command capture. Use
+`fleet init ... --no-command-capture` to disable it, or edit the configuration
+**before submitting a new Run**:
+
+```json
+"command_capture": {
+  "enabled": true,
+  "command_bytes": 65536,
+  "run_bytes": 4000000,
+  "max_commands": 1000,
+  "retention_days": 7
+}
+```
+
+Configurations without this field remain readable with their original digest and
+leave capture disabled. Adding settings does not reconstruct past commands. Settings
+are snapshotted with the Run; do not edit persisted Run configuration to enable capture.
+
+Inspect or export diagnostic JSON without launching a model or applying authority:
+
+```sh
+fleet --state /path/to/state commands RUN_ID
+fleet --state /path/to/state commands RUN_ID --stage worker --failed
+umask 077
+fleet --state /path/to/state commands RUN_ID --reservation ATTEMPT_ID > commands.json
+fleet --state /path/to/state purge-commands RUN_ID
+```
+
+Records identify the Run, Stage, invocation reservation, Task/worker attempt when
+applicable, and provider command ID. Task and attempt are unknown for stages without
+that context. Provider IDs are scoped to each reservation; identical IDs in a later
+invocation are distinct. Duplicate snapshots do not repeat output or move timestamps.
+Only the latest snapshot is retained, and completed records ignore later updates.
+An invocation that ends without a command-completed event is explicitly incomplete;
+Fleet does not invent its exit code or claim that the command succeeded.
+
+`command`, `cwd`, `stdout`, `stderr`, and `combined_output` carry field-level
+availability, redaction counts, truncation reasons, and observed byte counts. Empty
+reported output is distinct from unavailable output. Codex exec normally supplies
+`aggregated_output`; it appears as `combined_output`, not an invented split into
+stdout/stderr. A provider-reported command cwd is distinct from the known `/work`
+session workspace; Fleet does not infer it by parsing shell commands. Capture consumes
+complete command snapshot events (`item.started`, `item.updated`, `item.completed`),
+not arbitrary output deltas or model messages/reasoning. If a provider emits no partial
+snapshot before interruption, those unreported output bytes are unavailable.
+
+Start/end timestamps and `observed_duration_seconds` measure **controller event
+reception**, which may be buffered; they are not precise process execution times or
+model inference latency. `provider_duration_seconds`, when supplied, is converted
+from the provider's `item.duration_ms` and is separately labeled. Missing start events
+leave duration unknown. Wall-clock timestamps and monotonic reception intervals have
+different meanings and are not substituted for one another.
+
+### Limits, retention, and confidentiality
+
+The command byte limit covers each stored JSON snapshot, including metadata; the Run
+byte limit covers the sum of those snapshots, not SQLite page overhead, tombstones,
+or other existing diagnostic records. Each text field gets up to one tenth of the
+command limit so one output stream cannot consume all space needed by the other
+fields and correlation metadata. The command ID is capped at 256 bytes. If the Run
+budget leaves only metadata space, text is omitted with a truncation reason. Missing
+IDs and byte/count exhaustion increment separate omission counters. Limits are
+transactional across concurrent workers and persist across resume/reopen. Counts also
+include expired/deleted command tombstones so late snapshots cannot bypass the cap.
+
+Command snapshots live in separate, non-authoritative SQLite tables in the private
+history database, rather than the append-only decision journal. Expiration clears
+bodies on command capture/inspection; there is no background timer. Retention starts
+at a command's first stored observation and updates do not extend it. Explicit purge
+clears bodies for the Run and prevents later snapshots from repopulating it. Tombstones
+retain only the reservation, Stage, opaque key, and removal metadata. These operations
+do not rewrite the decision hash chain, erase accounting, or change execution status.
+SQLite secure deletion is enabled, but exports, backups, filesystem snapshots, and
+already-existing diagnostics are outside this purge's scope; manage their retention
+separately. Stop the process or use an external maintenance schedule if expiry must
+occur while Fleet is idle.
+
+Capture redacts recognized credential keys/tokens, authorization values, private keys,
+URL credentials, and common secret command arguments **before** truncation and storage.
+This is best-effort pattern matching, not a guarantee that arbitrary business data,
+encoded secrets, or unknown credential formats are safe. Disable capture for sensitive
+work that cannot tolerate this limitation, and review exports before sharing. No extra
+environment, auth-file, network-body, or process-introspection collection is performed.
+Native failure snapshots omit item bodies so the command store's retention and disabled
+setting are not bypassed by a second raw command copy. Existing model-result/check
+reports remain separate diagnostics and may quote their own findings.
+
+The `commands` result includes filtered `capture_failures` metadata when persistence
+was unavailable, rather than presenting missing records as complete evidence.
+Diagnostic capture/storage failure emits bounded metadata when possible and must not
+replace quota, cancellation, cleanup, or settlement behavior. `commands` is diagnostic
+only: its content never grants authority, drives retries, or proves acceptance or
+external success. Old histories have no reconstructable command bodies.

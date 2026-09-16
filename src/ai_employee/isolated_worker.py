@@ -368,6 +368,22 @@ class DockerCandidate:
         began = time.monotonic()
         last_update: float | None = None
         last_event: dict[str, object] | None = None
+
+        def observe_line(line: bytes | bytearray) -> None:
+            nonlocal last_event
+            try:
+                event = json.loads(line)
+            except ValueError:
+                return
+            if isinstance(event, dict) and observe is not None:
+                item = event.get("item")
+                last_event = {"type": event.get("type")}
+                if isinstance(item, dict):
+                    last_event["item"] = {
+                        k: item[k] for k in ("type", "status", "exit_code") if k in item
+                    }
+                observe(event)
+
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, stdout)
@@ -382,6 +398,9 @@ class DockerCandidate:
                         data = os.read(key.fd, 65536)
                         if not data:
                             selector.unregister(key.fileobj)
+                            if observe and key.fileobj is process.stdout and pending:
+                                observe_line(pending)
+                                pending.clear()
                             continue
                         key.data.extend(data)
                         last_update = time.monotonic() - began
@@ -394,20 +413,7 @@ class DockerCandidate:
                             while b"\n" in pending:
                                 line, _, tail = pending.partition(b"\n")
                                 pending = bytearray(tail)
-                                try:
-                                    event = json.loads(line)
-                                except ValueError:
-                                    continue
-                                if isinstance(event, dict):
-                                    item = event.get("item")
-                                    last_event = {"type": event.get("type")}
-                                    if isinstance(item, dict):
-                                        last_event["item"] = {
-                                            k: item[k]
-                                            for k in ("type", "status", "exit_code")
-                                            if k in item
-                                        }
-                                    observe(event)
+                                observe_line(line)
             code = process.wait(timeout=2)
             self._snapshot(
                 stdout,

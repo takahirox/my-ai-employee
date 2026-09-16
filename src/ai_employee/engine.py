@@ -308,6 +308,20 @@ class Engine:
         contract: StageContract,
         action: str,
     ) -> T:
+        capture_policy = self.journal.config(run).command_capture
+        capture_failed = False
+        task_context = prompt.get("context", prompt)
+        task = task_context.get("task") if isinstance(task_context, dict) else None
+        command_context = {
+            "task": task.get("id") if isinstance(task, dict) else None,
+            "attempt": (
+                task_context.get("attempt_id")
+                or (task_context.get("candidate") or {}).get("attempt_id")
+            )
+            if isinstance(task_context, dict)
+            else None,
+        }
+
         try:
             reservation, timeout = self.journal.reserve(
                 run,
@@ -327,7 +341,29 @@ class Engine:
         diagnostic_boundary = sys.exception()
 
         def observe(body: dict[str, Any]) -> None:
-            nonlocal usage
+            nonlocal usage, capture_failed
+            if body.get("event") in {"command_snapshot", "command_capture_failed"}:
+                if capture_policy is None or not capture_policy.enabled:
+                    return
+                try:
+                    if body["event"] == "command_capture_failed":
+                        raise ValueError("COMMAND_CAPTURE_UNAVAILABLE")
+                    self.journal.command_snapshot(
+                        run, reservation, stage, body, capture_policy, command_context
+                    )
+                except Exception:
+                    if not capture_failed:
+                        capture_failed = True
+                        with suppress(Exception):
+                            self.journal.append(
+                                run,
+                                "command_capture_failed",
+                                stage=stage,
+                                reservation=reservation,
+                                reason="diagnostic_capture_unavailable",
+                            )
+                return
+
             if body.get("event") == "usage_observed":
                 usage = Usage.model_validate(
                     {key: body[key] for key in Usage.model_fields if key in body}

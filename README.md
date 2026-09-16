@@ -108,3 +108,13 @@ See [architecture](docs/architecture.md), [security](docs/security.md),
 [isolation setup](docs/isolated-worker.md), and
 [public Run interface](docs/run-interface.md). For development, follow
 [CONTRIBUTING.md](CONTRIBUTING.md) and [the verification sequence](docs/development.md).
+
+### Inspect command execution
+
+New `fleet init` configurations retain bounded, redacted command snapshots for
+post-run analysis. Use `fleet commands RUN_ID --stage worker --failed` to inspect
+failures, or `fleet purge-commands RUN_ID` to remove that Run's command bodies.
+`fleet init --no-command-capture` disables capture. Existing configurations do not
+opt in automatically. See [command diagnostics](docs/run-interface.md#command-diagnostics)
+for limits, retention, export, and the distinction between reported execution time
+and buffered event-reception time.

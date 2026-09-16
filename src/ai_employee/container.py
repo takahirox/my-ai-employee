@@ -22,6 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from .candidates import Candidates
+from .command_diagnostics import command_event
 from .diagnostics import CheckOutput, attach_failure
 from .history import Stopped
 from .isolated_worker import (
@@ -336,6 +337,15 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
                 observation(
                     {"event": "usage_observed", **measured_usage(event.get("usage")).model_dump()}
                 )
+            # Payload capture is separate from capped activity metadata and never
+            # participates in quota classification, model decoding or authority.
+            if observation is not None:
+                try:
+                    detail = command_event(event, time.monotonic() - began)
+                    if detail is not None:
+                        observation(detail)
+                except Exception:
+                    observation({"event": "command_capture_failed"})
             summary = summarize_event(encoded)
             if observation is not None and summary is not None and observation_count < 1000:
                 observation(summary)

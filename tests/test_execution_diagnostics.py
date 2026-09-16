@@ -24,7 +24,16 @@ MESSAGE = "synthetic provider failure: service unavailable"
 SECRET = "sk-fixtureSecretNeverPublish123456789"
 
 
-def pipe_runtime(tmp_path, monkeypatch, failure="nonzero", *, cleanup_failure=False):
+def pipe_runtime(
+    tmp_path,
+    monkeypatch,
+    failure="nonzero",
+    *,
+    cleanup_failure=False,
+    command_events=(),
+    capture=None,
+    final_newline=True,
+):
     events = [
         {"type": "thread.started", "thread_id": "fixture"},
         {
@@ -32,6 +41,7 @@ def pipe_runtime(tmp_path, monkeypatch, failure="nonzero", *, cleanup_failure=Fa
             "item": {"type": "command_execution", "status": "completed", "exit_code": 0},
         },
     ]
+    events.extend(command_events)
     if failure == "quota":
         events.append({"type": "error", "message": "usage_limit_reached"})
     elif failure == "nonzero":
@@ -39,7 +49,7 @@ def pipe_runtime(tmp_path, monkeypatch, failure="nonzero", *, cleanup_failure=Fa
             {"type": "error", "message": MESSAGE, "access_token": SECRET},
             {"type": "turn.failed", "error": {"message": MESSAGE}},
         ]
-    stdout = "\n".join(json.dumps(e) for e in events) + "\n"
+    stdout = "\n".join(json.dumps(e) for e in events) + ("\n" if final_newline else "")
     stderr = "transport detail retained; Authorization: Bearer " + SECRET + "\n"
     program = (
         "import os,time; "
@@ -93,6 +103,8 @@ def pipe_runtime(tmp_path, monkeypatch, failure="nonzero", *, cleanup_failure=Fa
     cfg = cfg.model_copy(
         update={"clarification": cfg.clarification.model_copy(update={"revisions": 0})}
     )
+    if capture is not None:
+        cfg = cfg.model_copy(update={"command_capture": capture})
     run = engine.prepare("Read the disposable input", cfg, source)
     if failure == "cancel":
         append = journal.append
