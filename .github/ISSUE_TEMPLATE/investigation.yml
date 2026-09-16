@@ -1,0 +1,69 @@
+name: "Investigation"
+description: "Investigate an open question before choosing a solution."
+body:
+  - type: markdown
+    attributes:
+      value: "Use English for the title and description. Keep original diagnostics or quotations when needed and explain them in English. Separate observed facts from hypotheses. If a requested fact is unknown, write Unknown and explain why. Remove secrets and unrelated private data from evidence. Search existing issues and link related work."
+  - type: textarea
+    id: question
+    attributes:
+      label: "Question"
+      description: "What needs to be established, and what decision will the answer inform?"
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Impact"
+      description: "Who is affected, and why is this investigation needed?"
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: "Existing evidence and limitations"
+      description: "What is already known? Include supporting observations and separate facts from hypotheses. If no evidence is available, state that and explain the question\u2019s origin."
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: "Root cause (if known)"
+      description: "Explain why the problem occurs and link supporting evidence. Mark the explanation Confirmed or Hypothesis; write Unknown if not investigated. Describe the cause separately from the proposed fix."
+    validations:
+      required: false
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "Desired outcome"
+      description: "What decision, explanation, or recommendation should the investigation enable?"
+    validations:
+      required: false
+  - type: textarea
+    id: completion
+    attributes:
+      label: "Completion criteria"
+      description: "What evidence and documented conclusions will complete the investigation? Record uncertainties and any follow-up work. Implementing a fix is not automatically part of this issue."
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "Constraints and non-goals"
+      description: "What must remain true, and what is outside this issue? Include required or forbidden methods here, not as optional suggestions."
+    validations:
+      required: false
+  - type: textarea
+    id: approach
+    attributes:
+      label: "Suggested approach (optional)"
+      description: "Describe a possible solution or investigation method and why it may help. This is a proposal, not an acceptance requirement. A completed implementation design is not required."
+    validations:
+      required: false
+  - type: textarea
+    id: related
+    attributes:
+      label: "Related issues and PRs"
+      description: "Link related discussions, dependencies, and possible duplicates."
+    validations:
+      required: false

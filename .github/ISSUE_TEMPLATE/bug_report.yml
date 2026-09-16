@@ -1,0 +1,90 @@
+name: "Bug report"
+description: "Report behavior that differs from what is expected."
+body:
+  - type: markdown
+    attributes:
+      value: "Use English for the title and description. Keep original diagnostics or quotations when needed and explain them in English. Separate observed facts from hypotheses. If a requested fact is unknown, write Unknown and explain why. Remove secrets and unrelated private data from evidence. Search existing issues and link related work."
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Summary"
+      description: "What is the problem?"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected behavior"
+      description: "What should happen? Describe the desired outcome."
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual behavior"
+      description: "What happened instead?"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Steps to reproduce"
+      description: "Give minimal steps, relevant configuration, and frequency. If reproduction is unavailable, state what is known and what is missing."
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment"
+      description: "Include relevant product version or commit, OS, backend/model/effort, CLI and runtime versions. Do not include credentials or private paths."
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Impact"
+      description: "Who is affected, and why does this matter?"
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: "Evidence and limitations"
+      description: "Provide relevant logs, measurements, code references, or observations. Distinguish facts from inferences and state what has not been verified."
+    validations:
+      required: false
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: "Root cause (if known)"
+      description: "Explain why the problem occurs and link supporting evidence. Mark the explanation Confirmed or Hypothesis; write Unknown if not investigated. Describe the cause separately from the proposed fix."
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance criteria"
+      description: "What observable checks would establish that this bug is fixed? If not yet clear, write Unknown and explain what must be established."
+    validations:
+      required: false
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "Constraints and non-goals"
+      description: "What must remain true, and what is outside this issue? Include required or forbidden methods here, not as optional suggestions."
+    validations:
+      required: false
+  - type: textarea
+    id: approach
+    attributes:
+      label: "Suggested approach (optional)"
+      description: "Describe a possible solution or investigation method and why it may help. This is a proposal, not an acceptance requirement. A completed implementation design is not required."
+    validations:
+      required: false
+  - type: textarea
+    id: related
+    attributes:
+      label: "Related issues and PRs"
+      description: "Link related discussions, dependencies, and possible duplicates."
+    validations:
+      required: false
