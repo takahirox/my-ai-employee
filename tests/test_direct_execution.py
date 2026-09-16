@@ -343,3 +343,59 @@ def test_run_budget_exhaustion_is_not_a_direct_fallback(tmp_path):
     with pytest.raises(Stopped, match="RUN_BUDGET_EXHAUSTED"):
         engine.execute(run)
     assert not any(e["kind"] == "direct_fallback" for e in engine.journal.events(run))
+
+
+@pytest.mark.parametrize("status", ["usage_limit", "uncertain"])
+def test_negative_safety_report_wins_over_local_token_threshold(tmp_path, status):
+    from ai_employee.models import Usage
+
+    class SafetyReport(DirectModel):
+        def generate(self, policy, prompt, schema, *args, **kwargs):
+            if schema is WorkerResult:
+                return WorkerResult(status=status, summary="stop"), Usage(tokens=100001)
+            return super().generate(policy, prompt, schema, *args, **kwargs)
+
+    engine, source = runtime(tmp_path, SafetyReport())
+    run = engine.prepare("Write result", direct_config(), source)
+    if status == "usage_limit":
+        with pytest.raises(Stopped, match="USAGE_LIMIT"):
+            engine.execute(run)
+    else:
+        engine.execute(run)
+    assert not any(e["kind"] == "direct_fallback" for e in engine.journal.events(run))
+    assert not any(e["kind"] == "completed" for e in engine.journal.events(run))
+
+
+def test_direct_retry_uses_remaining_time_and_token_allowance(tmp_path):
+    from ai_employee.models import Usage
+    from ai_employee.stage_contracts import OutputViolation
+
+    class RetryModel(DirectModel):
+        def __init__(self):
+            super().__init__()
+            self.worker_timeouts = []
+
+        def generate(self, policy, prompt, schema, workspace, authority, timeout, *args, **kwargs):
+            if schema is WorkerResult:
+                self.worker_timeouts.append(timeout)
+                if len(self.worker_timeouts) == 1:
+                    raise OutputViolation("INVALID_STRUCTURED_OUTPUT", Usage(tokens=99995))
+            return super().generate(
+                policy, prompt, schema, workspace, authority, timeout, *args, **kwargs
+            )
+
+    model = RetryModel()
+    engine, source = runtime(tmp_path, model)
+    run = engine.prepare("Write result", direct_config(), source)
+
+    def stop_plan(*args):
+        raise RuntimeError("normal planning reached")
+
+    engine._plan = stop_plan
+    with pytest.raises(RuntimeError, match="normal planning reached"):
+        engine.execute(run)
+    assert len(model.worker_timeouts) == 2
+    assert model.worker_timeouts[1] < model.worker_timeouts[0] <= 60
+    fallback = next(e["body"] for e in engine.journal.events(run) if e["kind"] == "direct_fallback")
+    assert fallback["reason"] == "direct_token_budget"
+    assert engine.journal.budget(run)["measured_usage"]["tokens"] >= 100005
