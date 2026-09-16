@@ -476,7 +476,7 @@ class RunConfig(Contract):
     command_capture: CommandCapture | None = None
 
     def canonical(self) -> str:
-        # Absent capture settings preserve pre-feature configuration digests.
+        # Absent optional features preserve pre-feature configuration digests.
         body = self.model_dump(mode="json")
         if self.direct_execution is None:
             body.pop("direct_execution")

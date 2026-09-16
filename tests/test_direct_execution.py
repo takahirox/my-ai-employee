@@ -196,6 +196,7 @@ def test_required_reviews_remain_and_planning_review_uses_normal_route(tmp_path)
     cfg = cfg.model_copy(update={"planning": cfg.planning.model_copy(update={"review": "always"})})
     run2 = engine2.start("Write result", cfg, source2)
     assert "Plan" in model2.calls
+    assert not any("direct_execution_handoff" in p for p in model2.prompts)
     assert not any(e["kind"] == "direct_started" for e in engine2.journal.events(run2))
 
 

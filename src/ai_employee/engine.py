@@ -950,7 +950,11 @@ class Engine:
                     "success criteria, verification plan and required evidence. "
                     "Use the shared graph, evidence/outcome and method_selection semantics.",
                     "goal": goal.model_dump(mode="json"),
-                    "direct_execution_handoff": self._direct_handoff(run),
+                    **(
+                        {"direct_execution_handoff": self._direct_handoff(run)}
+                        if self._direct_handoff(run) is not None
+                        else {}
+                    ),
                     "feedback": feedback,
                     "available_checks": [check.model_dump(mode="json") for check in config.checks],
                 },
