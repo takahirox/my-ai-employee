@@ -16,12 +16,19 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from . import owner_watch
 from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
-from .product_capabilities import NATIVE_PATH
+from .product_capabilities import LOCAL_SERVICE_DIRECTORY, NATIVE_PATH
 from .snapshot import LEGACY_SNAPSHOT_BYTES, pack_workspace
 from .time_budget import exhausted, minimum, remaining
 
@@ -37,7 +44,22 @@ class IsolatedWorkerProfile(BaseModel):
     memory_mb: int = Field(default=2048, ge=256, le=16384)
     pids_limit: int = Field(default=128, ge=16, le=1024)
     workspace_mb: int = Field(default=256, ge=16, le=4096)
+    local_service_storage_mb: int | None = Field(
+        default=None,
+        ge=16,
+        le=4096,
+        description="Enable command-scoped local TCP services with this many MiB of disposable "
+        "runtime storage; omission/null disables the added service environment. External "
+        "network authority is unchanged. Independent verification starts with empty storage.",
+    )
     auth_file: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        body: dict[str, Any] = handler(self)
+        if self.local_service_storage_mb is None:
+            body.pop("local_service_storage_mb", None)
+        return body
 
     @field_validator("image")
     @classmethod
@@ -254,6 +276,15 @@ class DockerCandidate:
                 "/tmp:rw,nosuid,nodev,size=128m,mode=1777",
                 "--tmpfs",
                 "/home/fleet:rw,nosuid,nodev,size=128m,mode=700,uid=1000,gid=1000",
+                *(
+                    (
+                        "--tmpfs",
+                        f"{LOCAL_SERVICE_DIRECTORY}:rw,noexec,nosuid,nodev,"
+                        f"size={self.profile.local_service_storage_mb}m,mode=700,uid=1000,gid=1000",
+                    )
+                    if self.profile.local_service_storage_mb is not None
+                    else ()
+                ),
                 "--workdir",
                 "/work",
                 "--user",

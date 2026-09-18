@@ -21,8 +21,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def configured() -> ContainerModel:
-    return ContainerModel(IsolatedWorkerProfile(image=os.environ["FLEET_TEST_DOCKER_IMAGE"]))
+def configured(local_service_storage_mb=None) -> ContainerModel:
+    return ContainerModel(
+        IsolatedWorkerProfile(
+            image=os.environ["FLEET_TEST_DOCKER_IMAGE"],
+            local_service_storage_mb=local_service_storage_mb,
+        )
+    )
 
 
 def test_native_processes_stop_before_actual_workspace_capture(tmp_path: Path) -> None:
@@ -79,10 +84,11 @@ def test_native_processes_stop_before_actual_workspace_capture(tmp_path: Path) -
     assert (workspace / ".fleet-inputs/0/upstream").read_text() == "immutable input"
 
 
-def test_timeout_removes_owned_namespace(tmp_path: Path) -> None:
+@pytest.mark.parametrize("storage", [None, 16])
+def test_timeout_removes_owned_namespace(tmp_path: Path, storage) -> None:
     workspace = tmp_path / "worker"
     workspace.mkdir()
-    model = configured()
+    model = configured(storage)
     with model._candidate(workspace, 30, lambda: False, models=False) as candidate:
         candidate.deadline = time.monotonic() + 0.3
         with pytest.raises(TimeoutError):
@@ -92,11 +98,14 @@ def test_timeout_removes_owned_namespace(tmp_path: Path) -> None:
         assert result.returncode != 0
 
 
-def test_unlimited_invocation_cancellation_removes_descendants(tmp_path: Path) -> None:
+@pytest.mark.parametrize("storage", [None, 16])
+def test_unlimited_invocation_cancellation_removes_descendants(tmp_path: Path, storage) -> None:
     workspace = tmp_path / "worker"
     workspace.mkdir()
     cancelled = False
-    with configured()._candidate(workspace, None, lambda: cancelled, models=False) as candidate:
+    with configured(storage)._candidate(
+        workspace, None, lambda: cancelled, models=False
+    ) as candidate:
         assert candidate.deadline is None
 
         def cancel(_size):
@@ -111,7 +120,10 @@ def test_unlimited_invocation_cancellation_removes_descendants(tmp_path: Path) -
         assert subprocess.run(["docker", "inspect", candidate.name], capture_output=True).returncode
 
 
-def test_controller_sigkill_reaps_unlimited_namespace_gateway_and_network(tmp_path: Path) -> None:
+@pytest.mark.parametrize("storage", [None, 16])
+def test_controller_sigkill_reaps_unlimited_namespace_gateway_and_network(
+    tmp_path: Path, storage
+) -> None:
     workspace = tmp_path / "worker"
     workspace.mkdir()
     ready = tmp_path / "ready.json"
@@ -121,8 +133,9 @@ from pathlib import Path
 from ai_employee.container import ContainerModel
 from ai_employee.isolated_worker import IsolatedWorkerProfile
 from ai_employee.models import Authority
-model=ContainerModel(IsolatedWorkerProfile(image=os.environ['FLEET_TEST_DOCKER_IMAGE']))
-workspace,ready=map(Path,sys.argv[1:])
+model=ContainerModel(IsolatedWorkerProfile(image=os.environ['FLEET_TEST_DOCKER_IMAGE'],
+    local_service_storage_mb=int(sys.argv[3]) if sys.argv[3] != 'none' else None))
+workspace,ready=map(Path,sys.argv[1:3])
 with model._candidate(workspace,None,lambda:False,models=False,
                       authority=Authority(network_hosts=('example.com',))) as candidate:
     candidate._docker('exec','-d','--user','1000:1000',candidate.name,'python','-I','-c',
@@ -131,7 +144,7 @@ with model._candidate(workspace,None,lambda:False,models=False,
     time.sleep(600)
 """
     owner = subprocess.Popen(
-        [sys.executable, "-c", script, str(workspace), str(ready)],
+        [sys.executable, "-c", script, str(workspace), str(ready), str(storage or "none")],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
