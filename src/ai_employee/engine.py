@@ -21,7 +21,7 @@ from .capabilities import (
     task_violation,
     validate_policy,
 )
-from .diagnostics import CheckOutput, failure_snapshots
+from .diagnostics import CheckOutput, attach_failure, failure_snapshots
 from .history import Journal, Stopped
 from .models import (
     Authority,
@@ -74,7 +74,12 @@ class Engine:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _failure_diagnostic(
-        self, run: str, stage: str, reservation: str, boundary: BaseException | None
+        self,
+        run: str,
+        stage: str,
+        reservation: str,
+        boundary: BaseException | None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         error = sys.exception()
         if error is None:
@@ -87,6 +92,7 @@ class Engine:
                 failure_snapshots(error, boundary=boundary),
                 reservation=reservation,
                 kind="execution_failure",
+                **(context or {}),
             )
 
     def _workspace(self, run: str, label: str, tree: str | None = None) -> Path:
@@ -349,9 +355,13 @@ class Engine:
         response_payload: dict[str, Any] | None = None
         invocation_returned = False
         diagnostic_boundary = sys.exception()
+        returned_execution: dict[str, Any] | None = None
 
         def observe(body: dict[str, Any]) -> None:
-            nonlocal usage, capture_failed
+            nonlocal usage, capture_failed, returned_execution
+            if body.get("event") == "execution_termination":
+                returned_execution = body["snapshot"]
+                return
             if body.get("event") in {"command_snapshot", "command_capture_failed"}:
                 if capture_policy is None or not capture_policy.enabled:
                     return
@@ -558,7 +568,24 @@ class Engine:
         finally:
             try:
                 if not invocation_returned:
-                    self._failure_diagnostic(run, stage, reservation, diagnostic_boundary)
+                    terminal_error = sys.exception()
+                    if terminal_error is not None and returned_execution is not None:
+                        returned_execution["termination"]["reason"] = "post_execution_failure"
+                        attach_failure(terminal_error, returned_execution)
+                    self._failure_diagnostic(
+                        run,
+                        stage,
+                        reservation,
+                        diagnostic_boundary,
+                        {
+                            **command_context,
+                            "commands": {
+                                "capture_enabled": bool(capture_policy and capture_policy.enabled),
+                                "reservation": reservation,
+                                "meaning": "command context, not causal attribution",
+                            },
+                        },
+                    )
             finally:
                 self.journal.settle(run, reservation, time.monotonic() - started, usage)
 

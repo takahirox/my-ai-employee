@@ -25,6 +25,8 @@ def test_cumulative_configuration_is_removed_without_compatibility():
         {"root_exit": True, "cleanup": "confirmed"},
         {"cleanup": "confirmed"},
         [],
+        b"{invalid",
+        b"\xff",
     ],
 )
 def test_invalid_completion_never_authorizes_snapshot(tmp_path, monkeypatch, report):
@@ -35,7 +37,11 @@ def test_invalid_completion_never_authorizes_snapshot(tmp_path, monkeypatch, rep
         cancellation=Mock(cancelled=lambda: False),
     )
     candidate.native_completion = {"root_exit": 0, "cleanup": "confirmed"}
-    monkeypatch.setattr(candidate, "_docker", lambda *a, **k: json.dumps(report).encode())
+    monkeypatch.setattr(
+        candidate,
+        "_docker",
+        lambda *a, **k: report if isinstance(report, bytes) else json.dumps(report).encode(),
+    )
     monkeypatch.setattr(candidate, "run", lambda *a, **k: (0, b"", b""))
     with pytest.raises(RuntimeError, match="ISOLATION_PROCESS_GUARD_FAILED"):
         candidate.run_guarded(("fixture",))

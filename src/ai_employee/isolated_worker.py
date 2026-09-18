@@ -96,10 +96,60 @@ class DockerCandidate:
         self.network: str | None = None
         self.proxy: str | None = None
         self.native_completion: dict[str, object] = {}
+        self.phase = "setup"
+        self.disposal = "not_created"
         self.confirmed_resources: set[tuple[str, str]] = set()
         self.pending_creations: set[tuple[str, str]] = set()
         self.owner_watch: subprocess.Popen[bytes] | None = None
         self.execution_diagnostic: dict[str, Any] = {"started": False}
+
+    def begin_execution(self, phase: str) -> None:
+        # Probe completion never authorizes capture of a later interrupted invocation.
+        self.phase = phase
+        self.native_completion = {}
+        self.execution_diagnostic = {"started": False}
+
+    def retention_status(self) -> str:
+        if self.native_completion.get("cleanup") != "confirmed":
+            return "stop_unconfirmed"
+        if not self.created:
+            return "environment_unavailable"
+        try:
+            if self.cancellation.cancelled():
+                return "cancelled"
+            if exhausted(remaining(self.deadline)):
+                return "deadline_exhausted"
+            self._check_owner()
+        except Exception:
+            return "control_unavailable"
+        return "eligible"
+
+    def record_termination(self, error: BaseException | None) -> None:
+        # Values are runtime facts, not error messages or worker claims.
+        from .history import Stopped
+
+        reason = "completed" if error is None else type(error).__name__
+        if isinstance(error, TimeoutError):
+            reason = "cancelled" if self.cancellation.cancelled() else "timeout"
+        elif isinstance(error, IsolatedBudgetExceeded):
+            reason = "output_limit"
+        elif isinstance(error, Stopped):
+            reason = "usage_limit" if str(error).startswith("USAGE_LIMIT") else "stopped"
+        elif str(error).startswith("ISOLATION_PROCESS_GUARD_FAILED"):
+            reason = "supervisor_failure"
+        elif str(error) == "WORKER_PROCESS_FAILED":
+            reason = "native_nonzero"
+        elif type(error).__name__ in {"ValidationError", "OutputViolation"}:
+            reason = "response_invalid"
+        status = self.retention_status()
+        self.execution_diagnostic["termination"] = {
+            "phase": self.phase,
+            "reason": reason,
+            "environment": self.name,
+            "process_stop": self.native_completion.get("cleanup", "unknown"),
+            "disposal": self.disposal,
+            "retention": {"eligible": status == "eligible", "reason": status},
+        }
 
     def _snapshot(
         self, stdout: bytes | bytearray, stderr: bytes | bytearray, **fields: Any
@@ -110,6 +160,8 @@ class DockerCandidate:
 
     def _record_resource(self, kind: str, name: str, state: str = "intent") -> None:
         """Operator-only crash-recovery ledger; never copied into the worker."""
+        if state != "removed":
+            self.disposal = "pending"
         if state == "created":
             self.confirmed_resources.add((kind, name))
             self.pending_creations.discard((kind, name))
@@ -235,7 +287,9 @@ class DockerCandidate:
             if self.profile.auth_file:
                 self._copy_auth()
             return self
-        except BaseException:
+        except BaseException as error:
+            with suppress(Exception):
+                self.record_termination(error)
             self.close()
             raise
 
@@ -399,6 +453,8 @@ class DockerCandidate:
                     last_event=last_event,
                     last_update_seconds=last_update,
                 )
+                with suppress(Exception):
+                    self.record_termination(error)
                 attach_failure(error, self.execution_diagnostic)
             raise
         finally:
@@ -414,6 +470,7 @@ class DockerCandidate:
         observe: Callable[[dict[str, object]], None] | None = None,
         supervise: Callable[[int], None] | None = None,
         timeout: float | None = None,
+        phase: str = "native",
     ) -> tuple[int, bytes, bytes]:
         """Run native work and confirm that every task process has stopped.
 
@@ -423,7 +480,7 @@ class DockerCandidate:
         """
         from .native_process_guard import PROCESS_GUARD_SOURCE
 
-        self.native_completion = {}
+        self.begin_execution(phase)
         directory = "/tmp/fleet-control-" + uuid.uuid4().hex
         report = directory + "/completion.json"
         self._docker(
@@ -447,17 +504,22 @@ class DockerCandidate:
         )
         if guard_code != 0:
             raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: no candidate accepted")
-        completion = json.loads(
-            self._docker(
-                "exec",
-                self.name,
-                "python",
-                "-I",
-                "-c",
-                "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[:4096])",
-                report,
+        try:
+            completion = json.loads(
+                self._docker(
+                    "exec",
+                    self.name,
+                    "python",
+                    "-I",
+                    "-c",
+                    "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[:4096])",
+                    report,
+                )
             )
-        )
+        except ValueError as error:
+            raise RuntimeError(
+                "ISOLATION_PROCESS_GUARD_FAILED: invalid final completion"
+            ) from error
         if (
             not isinstance(completion, dict)
             or completion.get("cleanup") != "confirmed"
@@ -582,6 +644,7 @@ class DockerCandidate:
                 # Uncertain cleanup leaves EOF recovery running independently.
 
     def _close_resources(self) -> None:
+        self.disposal = "unconfirmed"
         failures = []
         for kind, name in (
             ("container", self.name if self.created else None),
@@ -610,6 +673,8 @@ class DockerCandidate:
             raise RuntimeError(
                 "isolated environment cleanup could not be confirmed: " + ", ".join(failures)
             )
+
+        self.disposal = "unconfirmed" if self.pending_creations else "confirmed"
 
     def __exit__(self, *args: object) -> None:
         self.close()

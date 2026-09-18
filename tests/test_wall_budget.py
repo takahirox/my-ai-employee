@@ -235,7 +235,7 @@ def test_native_setup_reduces_prompt_budget_and_prevents_expired_launch(
             model.generate(*args, observation=observations.append)
             body = json.loads(candidate.run_guarded.call_args.kwargs["stdin"])
             assert body["execution_budget"]["reserved_active_seconds"] == expected
-            assert observations[-1] == {
+            assert [item for item in observations if item["event"] == "execution_budget"][-1] == {
                 "event": "execution_budget",
                 "phase": "native_launch",
                 "seconds": expected,

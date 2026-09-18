@@ -290,3 +290,22 @@ increase model output size; prefer directory selections when they express the ta
 The selection limit does not cap checked descendants, change the 64-change diagnostic
 excerpt, or alter the independent snapshot entry/byte limits. No performance or
 model-quality improvement is established by increasing this bound.
+
+## Failure finalization
+
+The process supervisor owns confirmed stop/reap facts. The container adapter owns
+environment lifetime and records retention eligibility before unconditional disposal;
+the Engine/Journal bind diagnostics to the Run, stage, task, attempt and reservation.
+Each native phase clears prior probe observations. Ordinary native nonzero exits and
+response decoding errors may have a stopped, recoverable workspace. Timeouts,
+cancellation, output limits, Usage Limit, guard failures and controller loss never
+imply recoverability: unconfirmed stop, missing environments, cancelled work, expired
+deadlines or lost ownership explicitly make retention unavailable.
+
+Failure diagnostics carry the primary reason, native/transport exits when observed,
+phase, environment identity, stop confirmation, pre-disposal retention eligibility
+and final disposal outcome. Existing command records can be located by reservation;
+they provide temporal context, not causal attribution. Diagnostic failure does not
+replace the primary failure, and uncertain cleanup still blocks continuation.
+Eligibility alone does not save an artifact, authorize more work or establish an
+accepted Candidate. No extra model calls or success-path journal stages are added.

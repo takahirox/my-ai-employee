@@ -246,7 +246,12 @@ def test_not_started_is_distinct_from_waiting_for_response(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="setup unavailable"):
         engine.execute(run)
     failures = diagnostics(engine, run)
-    assert any(f["execution"] == {"started": False} for f in failures)
+    assert any(
+        f["execution"]
+        and f["execution"]["started"] is False
+        and f["execution"]["termination"]["phase"] == "setup"
+        for f in failures
+    )
     assert not processes
 
 
