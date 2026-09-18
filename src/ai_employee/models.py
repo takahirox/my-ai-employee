@@ -62,6 +62,18 @@ class Criterion(Contract):
         default=(), max_length=64, description=INPUT_PRESERVATION
     )
 
+    preservation_mode: Literal["exact", "existing"] = Field(
+        default="exact", description=INPUT_PRESERVATION
+    )
+
+    @model_serializer(mode="wrap")
+    def serialize_preservation(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        # Preserve historical nested contract digests and saved evidence identities.
+        if self.preservation_mode == "exact":
+            data.pop("preservation_mode", None)
+        return data
+
     @model_validator(mode="after")
     def preservation_paths(self) -> Self:
         if len(set(self.preserved_paths)) != len(self.preserved_paths) or any(

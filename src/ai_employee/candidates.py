@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from .models import Candidate, TaskContext
 from .snapshot import LEGACY_SNAPSHOT_BYTES, PROTECTED, check_bytes, read_entries, validate_entries
@@ -22,7 +22,11 @@ class Candidates:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def compare_inputs(
-        self, initial: str, candidate: str, paths: tuple[str, ...]
+        self,
+        initial: str,
+        candidate: str,
+        paths: tuple[str, ...],
+        mode: Literal["exact", "existing"] = "exact",
     ) -> dict[str, Any]:
         """Compare authenticated snapshots; bounded details never truncate the verdict."""
         before, after = self.manifest(initial), self.manifest(candidate)
@@ -31,9 +35,8 @@ class Candidates:
             return scope == "." or name == scope or name.startswith(scope + "/")
 
         missing = [scope for scope in paths if not any(selected(p, scope) for p in before)]
-        names = sorted(
-            p for p in before.keys() | after.keys() if any(selected(p, s) for s in paths)
-        )
+        protected = before.keys() if mode == "existing" else before.keys() | after.keys()
+        names = sorted(p for p in protected if any(selected(p, s) for s in paths))
         changed = [p for p in names if before.get(p) != after.get(p)]
         return {
             "matches": not missing and not changed,
