@@ -95,7 +95,7 @@ class Criterion(Contract):
     id: Key
     description: Text
     preserved_paths: tuple[PreservationPath, ...] = Field(
-        default=(), max_length=64, description=INPUT_PRESERVATION
+        default=(), max_length=256, description=INPUT_PRESERVATION
     )
 
     preservation_mode: Literal["exact", "existing"] = Field(

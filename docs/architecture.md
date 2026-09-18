@@ -282,3 +282,11 @@ Runtime checks additionally reject duplicate selections; initial-snapshot existe
 Schema validity does not prove a path exists or reflects the user's intent. Invalid
 syntax retains `INVALID_PRESERVATION_PATH` repair guidance. These constraints do not
 normalize paths or change serialized criteria.
+
+Each criterion permits up to 256 distinct `preserved_paths` selections. This is a
+pragmatic provisional increase from 64 to accommodate independent path sets such
+as the reported 96-file requirement with headroom, not a measured optimum. It can
+increase model output size; prefer directory selections when they express the task.
+The selection limit does not cap checked descendants, change the 64-change diagnostic
+excerpt, or alter the independent snapshot entry/byte limits. No performance or
+model-quality improvement is established by increasing this bound.
