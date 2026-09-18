@@ -55,6 +55,13 @@ def parser() -> argparse.ArgumentParser:
         work.add_argument("--root", type=Path, default=Path.cwd())
     for name in ("inspect", "status", "logs", "result", "resume", "cancel", "cleanup", "revoke"):
         commands.add_parser(name).add_argument("run_id")
+    commands.add_parser("partials", help="list unverified partial artifacts").add_argument("run_id")
+    partial = commands.add_parser(
+        "export-partial", help="export unverified work to a new directory"
+    )
+    partial.add_argument("run_id")
+    partial.add_argument("--reservation", required=True)
+    partial.add_argument("--destination", type=Path, required=True)
     command_logs = commands.add_parser(
         "commands", help="inspect/export sanitized command diagnostics"
     )
@@ -157,6 +164,7 @@ def projection(journal: Journal, run: str) -> dict[str, object]:
         "cleanup": cleanup,
         "external_outcome_uncertain": "uncertain" in kinds,
         "budget": journal.budget(run),
+        "partial_artifacts": [e["body"] for e in events if e["kind"] == "partial_artifact"],
         "stage_diagnostics": [
             event["body"]
             for event in events
@@ -272,6 +280,12 @@ def _command(args: argparse.Namespace) -> int:
                 journal.stop(run, "OPERATOR_CANCELLED")
             elif args.command == "cleanup":
                 engine.cleanup(run)
+            elif args.command == "partials":
+                emit({"run_id": run, "partial_artifacts": engine.partials(run)})
+                return 0
+            elif args.command == "export-partial":
+                emit(engine.export_partial(run, args.reservation, args.destination))
+                return 0
             elif args.command == "result":
                 candidate = engine.result(run)
                 emit(

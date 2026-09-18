@@ -211,7 +211,7 @@ def test_snapshot_bounds_include_duplicates_links_and_publication(tmp_path):
         tree=tree, task_digest="a" * 64, attempt_id="test", authority_version=0, upstream=()
     )
     with pytest.raises(ValueError, match="CANDIDATE_SIZE_LIMIT"):
-        lower.publish_directory(candidate, tmp_path / "not-published")
+        lower.export_tree(candidate.tree, tmp_path / "not-published")
     assert not (tmp_path / "not-published").exists()
 
 

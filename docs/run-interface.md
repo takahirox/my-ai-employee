@@ -426,3 +426,37 @@ Diagnostic capture/storage failure emits bounded metadata when possible and must
 replace quota, cancellation, cleanup, or settlement behavior. `commands` is diagnostic
 only: its content never grants authority, drives retries, or proves acceptance or
 external success. Old histories have no reconstructable command bodies.
+
+## Unverified partial workspaces
+
+`fleet partials RUN_ID` lists failed worker capture outcomes. When the supervisor
+confirms worker stop/reap and the container remains available with controller
+ownership and budget, Fleet attempts one bounded extraction before disposal.
+Ordinary nonzero exit and invalid responses can therefore leave a saved snapshot.
+Timeout, cancellation, Usage Limit, transport failure or controller loss do not
+promise recovery; `unavailable` records explain missing prerequisites. A failed
+transfer or unsafe/oversized snapshot is `capture_failed`, never a saved baseline.
+
+Use an artifact's reservation ID to export it explicitly:
+
+```sh
+fleet export-partial RUN_ID --reservation RESERVATION_ID \
+  --destination /absolute/new-unverified-directory
+```
+
+The response includes `verified: false`, Run/task/attempt/reservation identity,
+failure category and the immutable tree digest. The destination must be new;
+existing paths are refused. `inspect` also includes `partial_artifacts`. These
+records survive environment cleanup and history reopening. They are separate from
+Candidate lineage: `result`/`promote` still require verification, and execution does
+not automatically reuse partial trees. Saved files do not resolve uncertain external
+effects or cleanup failures.
+
+Failure extraction uses a maximum 30-second Docker-control deadline, capped by the
+remaining invocation deadline and cancellation/ownership checks. Local archive and
+storage work uses the existing snapshot byte and 10,000-entry limits; it performs
+no model calls or native worker restart. File contents use the ordinary snapshot
+safety rules, including safe relative symlinks and excluded control files; contents
+are unverified workspace bytes, not redacted command logs. No additional credentials
+or host files are collected. A controller crash or inaccessible storage can prevent
+retention. Original failures and unconditional cleanup take precedence over capture.
