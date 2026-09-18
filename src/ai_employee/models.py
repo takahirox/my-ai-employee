@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from fnmatch import fnmatchcase
-from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -13,6 +12,9 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    WrapValidator,
     model_serializer,
     model_validator,
 )
@@ -44,6 +46,40 @@ Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 AUTHORITY_HOST_PATTERN = r"^(?:\*|(?:\*\.)?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$"
 
 
+# A segment is neither empty, '.' nor '..'. No lookaround or provider-specific
+# keywords: the same regular expression drives Pydantic and provider generation.
+_PATH_FORBIDDEN = r"/*?\[\]\\\x00"
+_PATH_CHAR = rf"[^{_PATH_FORBIDDEN}]"
+_PATH_NON_DOT = rf"[^.{_PATH_FORBIDDEN}]"
+_PATH_SEGMENT = (
+    rf"(?:{_PATH_NON_DOT}{_PATH_CHAR}*|\.{_PATH_NON_DOT}{_PATH_CHAR}*|\.\.{_PATH_CHAR}+)"
+)
+# Multi-segment paths contain a nonblank slash. For a single segment, require
+# a visible character (possibly after leading whitespace), or an allowed dot prefix.
+_PATH_SINGLE = (
+    rf"(?:[^{_PATH_FORBIDDEN}.\s]{_PATH_CHAR}*|\s+[^{_PATH_FORBIDDEN}\s]{_PATH_CHAR}*"
+    rf"|\.{_PATH_NON_DOT}{_PATH_CHAR}*|\.\.{_PATH_CHAR}+)"
+)
+PRESERVATION_PATH_PATTERN = rf"^(?:\.|{_PATH_SINGLE}|{_PATH_SEGMENT}(?:/{_PATH_SEGMENT})+)$"
+
+
+def validate_preservation_path(value: Any, handler: ValidatorFunctionWrapHandler) -> str:
+    try:
+        path: str = handler(value)
+    except ValidationError as error:
+        if any(item["type"] == "string_pattern_mismatch" for item in error.errors()):
+            raise ValueError("INVALID_PRESERVATION_PATH") from None
+        raise
+    return path
+
+
+PreservationPath = Annotated[
+    str,
+    Field(min_length=1, max_length=20000, pattern=PRESERVATION_PATH_PATTERN),
+    WrapValidator(validate_preservation_path),
+]
+
+
 class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -58,7 +94,7 @@ class Contract(BaseModel):
 class Criterion(Contract):
     id: Key
     description: Text
-    preserved_paths: tuple[Text, ...] = Field(
+    preserved_paths: tuple[PreservationPath, ...] = Field(
         default=(), max_length=64, description=INPUT_PRESERVATION
     )
 
@@ -76,16 +112,7 @@ class Criterion(Contract):
 
     @model_validator(mode="after")
     def preservation_paths(self) -> Self:
-        if len(set(self.preserved_paths)) != len(self.preserved_paths) or any(
-            name != "."
-            and (
-                PurePosixPath(name).is_absolute()
-                or str(PurePosixPath(name)) != name
-                or ".." in PurePosixPath(name).parts
-                or any(char in name for char in "*?[]\\\x00")
-            )
-            for name in self.preserved_paths
-        ):
+        if len(set(self.preserved_paths)) != len(self.preserved_paths):
             raise ValueError("INVALID_PRESERVATION_PATH")
         return self
 
