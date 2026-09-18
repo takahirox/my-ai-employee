@@ -64,8 +64,13 @@ class Candidates:
         try:
             entries = read_entries(source.resolve(), self.max_bytes, names=selected)
         except ValueError as error:
-            if str(error) == "CANDIDATE_SIZE_LIMIT":
-                raise ValueError("INPUT_SIZE_LIMIT") from error
+            input_errors = {
+                "CANDIDATE_SIZE_LIMIT": "INPUT_SIZE_LIMIT",
+                "CANDIDATE_UNSAFE_PATH": "INPUT_UNSAFE_PATH",
+                "CANDIDATE_SPECIAL_FILE": "INPUT_SPECIAL_FILE",
+            }
+            if str(error) in input_errors:
+                raise ValueError(input_errors[str(error)]) from error
             raise
         return self._store(entries)
 

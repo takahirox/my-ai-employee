@@ -303,3 +303,19 @@ def test_stored_entry_type_tampering_is_rejected(tmp_path, replacement):
     manifest.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")))
     with pytest.raises(ValueError, match="CANDIDATE_MANIFEST_CHANGED"):
         candidates.manifest(tree)
+
+
+@pytest.mark.parametrize(
+    "name,diagnostic", [("directory", "INPUT_SPECIAL_FILE"), ("../outside", "INPUT_UNSAFE_PATH")]
+)
+def test_git_input_preserves_existing_non_link_diagnostics(tmp_path, name, diagnostic):
+    source = fixture(tmp_path / "source")
+    git_track(source)
+    (source / "directory").mkdir()
+    with (
+        patch(
+            "ai_employee.candidates.subprocess.check_output", return_value=(name + "\0").encode()
+        ),
+        pytest.raises(ValueError, match=diagnostic),
+    ):
+        Candidates(tmp_path / "objects").capture_source(source)
