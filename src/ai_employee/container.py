@@ -7,12 +7,10 @@ No proposed edit is reconstructed: the quiesced workspace is copied verbatim.
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import shutil
 import subprocess
-import tarfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -21,6 +19,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
+from . import snapshot
 from .candidates import Candidates
 from .command_diagnostics import command_event
 from .diagnostics import CheckOutput, attach_failure
@@ -44,6 +43,7 @@ from .native import (
 )
 from .owner_watch import resource_missing
 from .product_capabilities import CODEX_VERSION
+from .snapshot import unpack_workspace
 from .time_budget import exhausted, minimum, remaining
 
 _OFFLINE = Authority()
@@ -199,47 +199,18 @@ class ContainerModel:
     @staticmethod
     def _copy_workspace(candidate: DockerCandidate, workspace: Path) -> None:
         candidate.quiesce()
-        # No task writer remains. Bound regular-file data before streaming it
-        # out; archive metadata is regenerated rather than trusted from the task.
-        program = """
-import io,os,stat,sys,tarfile
-from pathlib import Path
-root=Path('/work'); files=[]; size=0
-for directory,dirs,names in os.walk(root,followlinks=False):
-    dirs[:]=sorted(d for d in dirs if d not in {'.git','.fleet','.codex','.claude','.agents'})
-    for name in dirs:
-        if (Path(directory)/name).is_symlink(): raise ValueError('snapshot symlink')
-    for name in sorted(names):
-        path=Path(directory)/name
-        if name in {'.git','.fleet','.codex','.claude','.agents'}: continue
-        info=path.lstat()
-        if not stat.S_ISREG(info.st_mode): raise ValueError('snapshot special file')
-        size+=info.st_size
-        if size>64000000 or len(files)>=10000: raise ValueError('snapshot budget')
-        files.append((path,info.st_mode))
-with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
-    for path,mode in files:
-        data=path.read_bytes(); info=tarfile.TarInfo(path.relative_to(root).as_posix())
-        info.size=len(data); info.mode=0o700 if mode&0o111 else 0o600
-        archive.addfile(info,io.BytesIO(data))
-"""
+        # Execute the same stdlib-only snapshot contract inside the container.
+        # No task writer remains, and the source comes from the controller.
+        program = Path(snapshot.__file__).read_text() + (
+            "\nimport sys\nsys.stdout.buffer.write(pack_workspace(Path('/work'), 64000000))\n"
+        )
         data = candidate._docker("exec", candidate.name, "python", "-I", "-c", program)
         if len(data) > 80_000_000:
             raise ValueError("CANDIDATE_TRANSPORT_SIZE_LIMIT")
         with TemporaryDirectory(prefix="fleet-return-", dir=workspace.parent) as directory:
             returned = Path(directory)
-            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-                for member in archive:
-                    relative = Path(member.name)
-                    if not member.isfile() or relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError("CANDIDATE_TRANSPORT_UNSAFE_PATH")
-                    target = returned / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    stream = archive.extractfile(member)
-                    assert stream is not None
-                    target.write_bytes(stream.read())
-                    target.chmod(0o700 if member.mode & 0o111 else 0o600)
-            # Validate regular bytes before replacing this Run-owned workspace.
+            unpack_workspace(data, returned, 64_000_000)
+            # Validate candidate identity before replacing this Run-owned workspace.
             with TemporaryDirectory(prefix="fleet-return-check-") as objects:
                 Candidates(Path(objects)).capture(returned)
             for child in workspace.iterdir():

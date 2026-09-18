@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import owner_watch
 from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
+from .snapshot import pack_workspace
 from .time_budget import exhausted, minimum, remaining
 
 
@@ -51,58 +52,6 @@ class IsolatedWorkerProfile(BaseModel):
         if value is not None and (not Path(value).is_absolute() or "\x00" in value):
             raise ValueError("isolated worker auth file must be an explicit absolute path")
         return value
-
-
-def candidate_archive(root: Path, limit: int) -> bytes:
-    """Export the prepared workspace as regular files, never host runtime metadata."""
-    names = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(
-            part in {".git", ".fleet", ".codex", ".claude", ".agents"} for part in relative.parts
-        ):
-            continue
-        if path.is_symlink():
-            raise ValueError("workspace archive does not accept symlinks")
-        if not path.is_dir():
-            names.append(relative.as_posix())
-    output = io.BytesIO()
-    size = 0
-    directories: set[str] = set()
-    with tarfile.open(fileobj=output, mode="w") as archive:
-        for name in names:
-            if not name:
-                continue
-            path = Path(name)
-            target = root / path
-            if path.is_absolute() or ".." in path.parts or path.parts[0] == ".git":
-                raise ValueError("unsafe candidate path")
-            if not target.exists() and not target.is_symlink():
-                continue
-            if any(
-                p.is_symlink() for p in [target, *target.parents] if p != root and root in p.parents
-            ):
-                raise ValueError("initial isolated profile does not support candidate symlinks")
-            if not target.is_file():
-                raise ValueError("candidate must contain regular files (no submodules/devices)")
-            content = target.read_bytes()
-            size += len(content)
-            if size > limit:
-                raise ValueError("candidate export exceeds isolated workspace byte limit")
-            entry = tarfile.TarInfo(name)
-            for parent in reversed(path.parents):
-                if str(parent) == "." or str(parent) in directories:
-                    continue
-                directory = tarfile.TarInfo(str(parent))
-                directory.type, directory.uid, directory.gid = tarfile.DIRTYPE, 1000, 1000
-                directory.mode = 0o755
-                archive.addfile(directory)
-                directories.add(str(parent))
-            entry.size = len(content)
-            entry.uid = entry.gid = 1000
-            entry.mode = 0o755 if target.stat().st_mode & 0o111 else 0o644
-            archive.addfile(entry, io.BytesIO(content))
-    return output.getvalue()
 
 
 class IsolatedBudgetExceeded(RuntimeError):
@@ -269,7 +218,7 @@ class DockerCandidate:
                 "-c",
                 "import sys,tarfile; tarfile.open(fileobj=sys.stdin.buffer, mode='r|')"
                 ".extractall('/work', filter='data')",
-                data=candidate_archive(
+                data=pack_workspace(
                     self.root,
                     self.profile.workspace_mb * 1024**2,
                 ),

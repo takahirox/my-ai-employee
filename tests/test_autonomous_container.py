@@ -175,3 +175,34 @@ with model._candidate(workspace,None,lambda:False,models=False,
                 capture_output=True,
                 timeout=15,
             )
+
+
+def test_safe_symlinks_cross_real_container_and_candidate_boundaries(tmp_path: Path) -> None:
+    from ai_employee.candidates import Candidates
+
+    workspace = tmp_path / "worker"
+    (workspace / ".windsurf/rules").mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("instructions")
+    (workspace / "CLAUDE.md").symlink_to("AGENTS.md")
+    (workspace / ".windsurf/rules/chatwoot.md").symlink_to("../../AGENTS.md")
+    model = configured()
+    with model._candidate(workspace, 45, lambda: False, models=False) as candidate:
+        program = (
+            "from pathlib import Path; import os; "
+            "assert os.readlink('CLAUDE.md')=='AGENTS.md'; "
+            "assert os.readlink('.windsurf/rules/chatwoot.md')=='../../AGENTS.md'; "
+            "assert Path('.windsurf/rules/chatwoot.md').read_text()=='instructions'; "
+            "Path('new.txt').write_text('new artifact'); "
+            "Path('new-link').symlink_to('new.txt')"
+        )
+        candidate._docker(
+            "exec", "--user", "1000:1000", candidate.name, "python", "-I", "-c", program
+        )
+        model._copy_workspace(candidate, workspace)
+    assert (workspace / "new-link").read_text() == "new artifact"
+    assert os.readlink(workspace / ".windsurf/rules/chatwoot.md") == "../../AGENTS.md"
+    candidates = Candidates(tmp_path / "objects")
+    tree = candidates.capture(workspace)
+    candidates.materialize(tree, tmp_path / "restored")
+    assert (tmp_path / "restored/CLAUDE.md").is_symlink()
+    assert (tmp_path / "restored/new-link").read_text() == "new artifact"
