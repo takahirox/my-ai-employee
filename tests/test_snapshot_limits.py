@@ -303,3 +303,39 @@ def test_large_finite_allowance_does_not_become_a_read_allocation(tmp_path):
     unpack_workspace(data, tmp_path / "returned", cfg.snapshot_max_bytes)
     assert (tmp_path / "restored/file").read_bytes() == b"small input"
     assert (tmp_path / "returned/file").read_bytes() == b"small input"
+
+
+def test_slow_docker_consumer_receives_all_input_across_poll_timeouts(tmp_path):
+    from ai_employee.container import Cancellation
+
+    candidate = DockerCandidate(
+        IsolatedWorkerProfile(image="sha256:" + "a" * 64),
+        tmp_path,
+        seconds=3,
+        cancellation=Cancellation(lambda: False),
+    )
+    payload = b"archive-content" * 100_000
+    real_popen = subprocess.Popen
+    handles = []
+
+    def slow_consumer(argv, **kwargs):
+        assert argv[:2] == ["docker", "exec"]
+        handles.append(kwargs["stdin"])
+        return real_popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys,time,hashlib;time.sleep(.2);"
+                "print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())",
+            ],
+            **kwargs,
+        )
+
+    with patch("ai_employee.isolated_worker.subprocess.Popen", side_effect=slow_consumer):
+        assert (
+            candidate._docker("exec", "fixture", data=payload).decode().strip()
+            == hashlib.sha256(payload).hexdigest()
+        )
+
+    assert handles[0].closed

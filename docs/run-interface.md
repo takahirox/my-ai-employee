@@ -133,7 +133,9 @@ no limit is automatically increased, and no input paths or file contents appear
 in these size diagnostics. Larger allowances permit greater memory/disk use;
 packing and validating snapshots can hold multiple copies of content in memory,
 and tmpfs use also counts against container memory. Configure
-`isolation.memory_mb` and workspace headroom for the workload.
+`isolation.memory_mb` and workspace headroom for the workload. Docker uploads
+use a private temporary file, removed on completion or failure, so host temporary
+storage also needs room for one bounded archive per concurrent upload.
 
 
 `fleet init` leaves `limits.wall_seconds`, `limits.active_seconds`,

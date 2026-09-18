@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -130,27 +130,36 @@ class DockerCandidate:
         # Poll ownership/shared active consumption even during setup and capture.
         # A second call may consume the active allowance after this operation starts.
         deadline = minimum(self.deadline, time.monotonic() + 30)
-        process = subprocess.Popen(
-            ["docker", *args],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            while True:
-                self._check_owner()
-                if exhausted(remaining(deadline)) or self.cancellation.cancelled():
-                    raise TimeoutError("DOCKER_CONTROL_TIMEOUT")
-                try:
-                    stdout, stderr = process.communicate(input=data, timeout=0.05)
-                    break
-                except subprocess.TimeoutExpired:
-                    data = None  # communicate retains any unwritten input across polls.
-        except BaseException:
-            process.kill()
-            process.communicate(timeout=5)
-            self.close()
-            raise
+        # communicate(input=...) cannot resume partial stdin writes by calling
+        # communicate(None) after a timeout: CPython no longer selects stdin.
+        # A private, unlinked file lets Docker consume the full bounded payload
+        # while the controller continues polling cancellation and ownership.
+        with tempfile.TemporaryFile() if data is not None else nullcontext() as incoming:
+            if incoming is not None:
+                assert data is not None
+                incoming.write(data)
+                incoming.seek(0)
+            process = subprocess.Popen(
+                ["docker", *args],
+                stdin=incoming if incoming is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                while True:
+                    self._check_owner()
+                    if exhausted(remaining(deadline)) or self.cancellation.cancelled():
+                        raise TimeoutError("DOCKER_CONTROL_TIMEOUT")
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.05)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except BaseException:
+                process.kill()
+                process.communicate(timeout=5)
+                self.close()
+                raise
         if process.returncode:
             raise RuntimeError(
                 f"Docker operation {args[0]} failed: " + stderr.decode(errors="replace")[:1000]
