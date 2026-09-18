@@ -273,3 +273,33 @@ def test_link_target_bytes_are_bounded(tmp_path):
     with pytest.raises(ValueError, match="CANDIDATE_SIZE_LIMIT"):
         Candidates(tmp_path / "objects", max_bytes=4).capture(root)
     assert Candidates(tmp_path / "objects", max_bytes=5).capture(root)
+
+
+def test_deleted_tracked_directory_retains_regular_file_input_behavior(tmp_path):
+    source = fixture(tmp_path / "source")
+    (source / "removed").mkdir()
+    (source / "removed/file").write_text("tracked then deleted")
+    git_track(source)
+    (source / "removed/file").unlink()
+    (source / "removed").rmdir()
+    candidates = Candidates(tmp_path / "objects")
+    tree = candidates.capture_source(source)
+    assert set(candidates.manifest(tree)) == {"AGENTS.md", *LINKS}
+    candidates.materialize(tree, tmp_path / "restored")
+    assert_links(tmp_path / "restored")
+
+
+@pytest.mark.parametrize(
+    "replacement", [{"target": "AGENTS.md"}, {"blob": "0" * 64, "executable": False}]
+)
+def test_stored_entry_type_tampering_is_rejected(tmp_path, replacement):
+    source = fixture(tmp_path / "source")
+    candidates = Candidates(tmp_path / "objects")
+    tree = candidates.capture(source)
+    manifest = candidates.root / tree / "manifest.json"
+    data = json.loads(manifest.read_text())
+    name = "AGENTS.md" if "target" in replacement else "CLAUDE.md"
+    data[name] = replacement
+    manifest.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(ValueError, match="CANDIDATE_MANIFEST_CHANGED"):
+        candidates.manifest(tree)

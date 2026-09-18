@@ -111,15 +111,21 @@ def read_entries(
         path = PurePosixPath(name)
         parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            for part in path.parts[:-1]:
-                try:
-                    child = os.open(
-                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-                    )
-                except OSError as error:
-                    raise link_error(name, "unsafe or unavailable parent directory") from error
-                os.close(parent)
-                parent = child
+            try:
+                for part in path.parts[:-1]:
+                    try:
+                        child = os.open(
+                            part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+                        )
+                    except FileNotFoundError:
+                        raise
+                    except OSError as error:
+                        raise link_error(name, "unsafe or unavailable parent directory") from error
+                    os.close(parent)
+                    parent = child
+            except FileNotFoundError:
+                # Git may also contain files beneath a deleted directory.
+                continue
             try:
                 before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
