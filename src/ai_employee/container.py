@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -150,13 +150,27 @@ class ContainerModel:
         )
         try:
             with candidate:
-                yield candidate
+                try:
+                    yield candidate
+                except BaseException as error:
+                    # Capture eligibility while the stopped environment still exists.
+                    with suppress(Exception):
+                        if "termination" not in candidate.execution_diagnostic:
+                            candidate.record_termination(error)
+                    raise
         except BaseException as error:
+            with suppress(Exception):
+                if "termination" not in candidate.execution_diagnostic:
+                    candidate.record_termination(error)
+                if candidate.execution_diagnostic["termination"]["reason"] == "completed":
+                    candidate.execution_diagnostic["termination"]["reason"] = "cleanup_failure"
+                candidate.execution_diagnostic["termination"]["disposal"] = candidate.disposal
             attach_failure(error, candidate.execution_diagnostic)
             raise
 
     @staticmethod
     def _native_probe(candidate: DockerCandidate, authority: Authority = _OFFLINE) -> None:
+        candidate.begin_execution("probe")
         # A user-readable canary outside /work distinguishes native filesystem
         # confinement from the outer container's ordinary Unix permissions.
         candidate._docker(
@@ -197,7 +211,7 @@ class ContainerModel:
             "except (PermissionError, FileNotFoundError): pass\n"
             "else: raise AssertionError('native read boundary unavailable')\n",
         )
-        code, _, _ = candidate.run_guarded(command, timeout=15)
+        code, _, _ = candidate.run_guarded(command, timeout=15, phase="probe")
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
@@ -339,6 +353,7 @@ class ContainerModel:
             workspace, timeout, cancelled, models=True, authority=authority
         ) as candidate:
             self._native_probe(candidate, authority)
+            candidate.begin_execution("model")
             if observation is not None:
                 observation(
                     {
@@ -401,6 +416,7 @@ class ContainerModel:
             code, stdout, stderr = candidate.run_guarded(
                 command,
                 stdin=prompt.encode(),
+                phase="model",
                 observe=observe,
                 supervise=supervise,
             )
@@ -426,7 +442,16 @@ class ContainerModel:
                 if capacity_error(stdout.decode(errors="replace")):
                     raise ModelAtCapacity("MODEL_AT_CAPACITY")
                 raise ValueError("WORKER_PROCESS_FAILED")
-            return decode_response(stdout.decode(errors="replace"), schema)
+            result = decode_response(stdout.decode(errors="replace"), schema)
+            candidate.record_termination(None)
+        # Keep completion facts available for Engine-side response validation errors.
+        # The engine retains this in memory; successful calls need no extra journal event.
+        candidate.execution_diagnostic["termination"]["disposal"] = candidate.disposal
+        if observation is not None:
+            observation(
+                {"event": "execution_termination", "snapshot": candidate.execution_diagnostic}
+            )
+        return result
 
     def check(
         self,
@@ -437,6 +462,7 @@ class ContainerModel:
     ) -> tuple[bool, CheckOutput]:
         with self._candidate(workspace, timeout, cancelled, models=False) as candidate:
             self._native_probe(candidate)
+            candidate.begin_execution("check")
             command = (
                 "codex",
                 *codex_permissions(Path("/work"), Authority()),
@@ -448,7 +474,5 @@ class ContainerModel:
                 "--",
                 *argv,
             )
-            code, stdout, stderr = candidate.run_guarded(
-                command,
-            )
+            code, stdout, stderr = candidate.run_guarded(command, phase="check")
             return code == 0, CheckOutput(code, stdout, stderr)
