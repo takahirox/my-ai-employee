@@ -42,7 +42,7 @@ from .native import (
     summarize_event,
 )
 from .owner_watch import resource_missing
-from .product_capabilities import CODEX_VERSION
+from .product_capabilities import CODEX_VERSION, DEPENDENCY_ENVIRONMENT
 from .snapshot import LEGACY_SNAPSHOT_BYTES, unpack_workspace
 from .time_budget import exhausted, minimum, remaining
 
@@ -209,12 +209,21 @@ class ContainerModel:
             "-I",
             "-c",
             "from pathlib import Path\n"
+            "import os,sys\n"
             f"p=Path('/work/.fleet-probe-{uuid4().hex}'); p.open('x').close(); p.unlink()\n"
             "try: Path('/home/fleet/native-canary').read_text()\n"
             "except (PermissionError, FileNotFoundError): pass\n"
-            "else: raise AssertionError('native read boundary unavailable')\n",
+            "else: raise AssertionError('native read boundary unavailable')\n"
+            "try:\n"
+            " status=Path('/proc/self/status').read_text()\n"
+            " assert f'Pid:\\t{os.getpid()}\\n' in status\n"
+            " assert Path('/proc/self/smaps').read_text()\n"
+            " assert not Path('/proc/sys').exists()\n"
+            "except (OSError, AssertionError): sys.exit(78)\n",
         )
         code, _, _ = candidate.run_guarded(command, timeout=15, phase="probe")
+        if code == 78:
+            raise ValueError("NATIVE_RUNTIME_PROCFS_UNAVAILABLE")
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
@@ -412,6 +421,7 @@ class ContainerModel:
                 )
             body = json.loads(prompt)
             body["execution_workspace"] = "/work"
+            body["execution_environment"] = DEPENDENCY_ENVIRONMENT
             if isinstance(body.get("context"), dict):
                 body["context"]["workspace"] = "/work"
             schema_path = "/tmp/fleet-output-schema.json"

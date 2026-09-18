@@ -267,6 +267,8 @@ def run_process(
 
 def codex_permissions(workspace: Path, authority: Authority) -> tuple[str, ...]:
     """No host-wide read grant: only minimal runtime files and the task workspace."""
+    from .product_capabilities import NATIVE_PATH
+
     settings: dict[str, Any] = {
         "default_permissions": "fleet-worker",
         "permissions.fleet-worker.filesystem": {
@@ -286,7 +288,7 @@ def codex_permissions(workspace: Path, authority: Authority) -> tuple[str, ...]:
         "features.apps": False,
         "web_search": "disabled",
         "shell_environment_policy.inherit": "none",
-        "shell_environment_policy.set": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        "shell_environment_policy.set": {"PATH": NATIVE_PATH},
     }
     if authority.network_hosts:
         port = 20000 + int(hashlib.sha256(str(workspace).encode()).hexdigest()[:8], 16) % 40000
