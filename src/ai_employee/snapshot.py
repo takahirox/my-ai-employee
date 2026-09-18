@@ -161,7 +161,7 @@ def read_entries(
                     opened = os.fstat(stream.fileno())
                     if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                         raise ValueError("CANDIDATE_CHANGED_DURING_CAPTURE")
-                    data = stream.read(max(0, limit - total) + 1)
+                    data = stream.read(min(max(0, limit - total), before.st_size) + 1)
                     after = os.fstat(stream.fileno())
                     if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
                         raise ValueError("CANDIDATE_CHANGED_DURING_CAPTURE")

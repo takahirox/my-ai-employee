@@ -289,3 +289,17 @@ def test_changed_saved_allowance_cannot_bypass_run_identity(tmp_path):
         )
     with pytest.raises(ValueError, match="RUN_CONFIG_CHANGED"):
         Journal(journal.path).config(run)
+
+
+def test_large_finite_allowance_does_not_become_a_read_allocation(tmp_path):
+    cfg = RunConfig.model_validate({**config().model_dump(), "snapshot_max_bytes": 2**64})
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file").write_bytes(b"small input")
+    candidates = Candidates(tmp_path / "objects", max_bytes=cfg.snapshot_max_bytes)
+    tree = candidates.capture(root)
+    candidates.materialize(tree, tmp_path / "restored")
+    data = pack_workspace(root, cfg.snapshot_max_bytes)
+    unpack_workspace(data, tmp_path / "returned", cfg.snapshot_max_bytes)
+    assert (tmp_path / "restored/file").read_bytes() == b"small input"
+    assert (tmp_path / "returned/file").read_bytes() == b"small input"

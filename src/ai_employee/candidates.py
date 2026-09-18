@@ -137,7 +137,9 @@ class Candidates:
             if path.is_symlink():
                 raise ValueError("CANDIDATE_BYTES_CHANGED")
             with path.open("rb") as stream:
-                data = stream.read(self.max_bytes - total + 1)
+                data = stream.read(
+                    min(self.max_bytes - total, os.fstat(stream.fileno()).st_size) + 1
+                )
             total += len(data)
             check_bytes(total, self.max_bytes)
             if hashlib.sha256(data).hexdigest() != blob:
