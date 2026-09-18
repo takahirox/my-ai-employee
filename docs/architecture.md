@@ -273,3 +273,12 @@ them, while permitting new support files. Normal snapshot safety and capacity li
 still apply. Planning and recovery must retain both selections and modes; comparison
 evidence binds the mode and publication recomputes it. Default exact criteria retain
 their historical serialization and digests.
+
+The dedicated preservation-path type projects canonical relative-path syntax into
+provider schemas: no absolute paths, empty/dot/parent segments, glob characters,
+backslashes or NUL. `.` remains the whole-workspace selection, and spaces and Unicode
+are legitimate filename characters. Whitespace-only strings are rejected as well.
+Runtime checks additionally reject duplicate selections; initial-snapshot existence remains a comparison-time check.
+Schema validity does not prove a path exists or reflects the user's intent. Invalid
+syntax retains `INVALID_PRESERVATION_PATH` repair guidance. These constraints do not
+normalize paths or change serialized criteria.
