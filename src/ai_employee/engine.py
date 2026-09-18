@@ -997,7 +997,9 @@ class Engine:
         return {
             "scope": StageContract.input_scope(source, config),
             "results": {
-                c.id: self.candidates.compare_inputs(initial, candidate.tree, c.preserved_paths)
+                c.id: self.candidates.compare_inputs(
+                    initial, candidate.tree, c.preserved_paths, c.preservation_mode
+                )
                 for c in criteria
                 if c.preserved_paths
             },

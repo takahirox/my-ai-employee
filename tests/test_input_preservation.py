@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from ai_employee.cli import projection
+from ai_employee.engine import Engine
+from ai_employee.history import Journal
 from ai_employee.models import (
     Clarification,
     Criterion,
@@ -26,9 +28,10 @@ from .test_autonomous_runtime import OfflineModel, config, runtime
 
 
 class PreservationModel(OfflineModel):
-    def __init__(self, mutation: str = "none", *, lie: bool = False):
+    def __init__(self, mutation: str = "none", *, lie: bool = False, mode="exact"):
         super().__init__()
         self.mutation, self.lie = mutation, lie
+        self.mode = mode
         self.contexts: list[dict[str, Any]] = []
 
     def generate(self, policy, prompt, schema, workspace, authority, timeout, cancelled, **kwargs):
@@ -56,6 +59,7 @@ class PreservationModel(OfflineModel):
             data = result.model_dump(mode="json")
             criteria = data["criteria"] if schema is Clarification else data["tasks"][0]["criteria"]
             criteria[0]["preserved_paths"] = ["documents"]
+            criteria[0]["preservation_mode"] = self.mode
             return schema.model_validate(data), usage
         if schema is WorkerResult:
             p = workspace / "documents/record.txt"
@@ -84,8 +88,9 @@ def prepared(tmp_path, model, *, review=False):
 
 
 @pytest.mark.parametrize("review", [False, True])
-def test_initial_comparison_reaches_verifier_review_and_durable_replay(tmp_path, review):
-    model = PreservationModel()
+@pytest.mark.parametrize("mode", ["exact", "existing"])
+def test_initial_comparison_reaches_verifier_review_and_durable_replay(tmp_path, review, mode):
+    model = PreservationModel(mode=mode)
     engine, run, _ = prepared(tmp_path, model, review=review)
     engine.execute(run)
     view = projection(engine.journal, run)
@@ -104,6 +109,7 @@ def test_initial_comparison_reaches_verifier_review_and_durable_replay(tmp_path,
         assert model.contexts[0]["input_comparison"] == model.contexts[1]["input_comparison"]
         assert model.contexts[2]["input_comparison"] == model.contexts[3]["input_comparison"]
     before = list(model.calls)
+    engine = Engine(Journal(engine.journal.path), engine.candidates, model, engine.root)
     engine.execute(run)
     engine.promote(run, tmp_path / "published")
     assert model.calls == before
@@ -111,9 +117,10 @@ def test_initial_comparison_reaches_verifier_review_and_durable_replay(tmp_path,
     assert (tmp_path / "published/result.txt").read_text() == "correct"
 
 
-@pytest.mark.parametrize("mutation", ["change", "delete", "add", "mode"])
-def test_mutated_inputs_never_accepted_even_when_verifier_says_pass(tmp_path, mutation):
-    model = PreservationModel(mutation, lie=True)
+@pytest.mark.parametrize("mode", ["exact", "existing"])
+@pytest.mark.parametrize("mutation", ["change", "delete", "mode"])
+def test_mutated_inputs_never_accepted_even_when_verifier_says_pass(tmp_path, mutation, mode):
+    model = PreservationModel(mutation, lie=True, mode=mode)
     engine, run, _ = prepared(tmp_path, model)
     with pytest.raises(ValueError, match="REPLAN_LIMIT_EXHAUSTED"):
         engine.execute(run)
@@ -210,10 +217,11 @@ def test_absent_initial_scope_and_truncated_changes_never_prove_equality(tmp_pat
     assert result["truncated"]
 
 
+@pytest.mark.parametrize("mode", ["exact", "existing"])
 def test_interrupted_acceptance_reuses_verified_comparison_without_repeating_worker(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, mode
 ):
-    model = PreservationModel()
+    model = PreservationModel(mode=mode)
     engine, run, _ = prepared(tmp_path, model)
     append = engine.journal.append
 
@@ -250,3 +258,126 @@ def test_corrupted_initial_blob_cannot_be_used_for_replayed_comparison(tmp_path)
     blob.write_text("corrupted runtime object")
     with pytest.raises(ValueError, match="CANDIDATE_BYTES_CHANGED"):
         engine.promote(run, tmp_path / "published")
+
+
+@pytest.mark.parametrize("mode", ["exact", "existing"])
+def test_additions_follow_explicit_mode_at_acceptance_and_publication(tmp_path, mode):
+    model = PreservationModel("add", lie=True, mode=mode)
+    engine, run, _ = prepared(tmp_path, model, review=True)
+    if mode == "exact":
+        with pytest.raises(ValueError, match="REPLAN_LIMIT_EXHAUSTED"):
+            engine.execute(run)
+        with pytest.raises(ValueError, match="GOAL_NOT_VERIFIED"):
+            engine.promote(run, tmp_path / "published")
+    else:
+        engine.execute(run)
+        engine.execute(run)
+        engine.promote(run, tmp_path / "published")
+        assert (tmp_path / "published/documents/new.txt").read_text() == "new"
+        assert all(
+            c["input_comparison"]["scope"]["modes"] == {"result": "existing"}
+            for c in model.contexts
+        )
+
+
+@pytest.mark.parametrize("mode", ["exact", "existing"])
+@pytest.mark.parametrize(
+    "mutation", ["add", "change", "delete", "move", "mode", "link", "type", "file_to_link"]
+)
+def test_directory_selection_protects_all_96_initial_entries(tmp_path, mode, mutation):
+    engine, source = runtime(tmp_path, PreservationModel())
+    factories, support = source / "spec/factories", source / "spec/support"
+    factories.mkdir(parents=True)
+    support.mkdir()
+    for i in range(88):
+        (factories / f"factory-{i:02}.rb").write_text("factory")
+    for i in range(7):
+        (support / f"helper-{i}.rb").write_text("helper")
+    link = support / "helper-link.rb"
+    link.symlink_to("helper-0.rb")
+    initial = engine.candidates.capture(source)
+    target = factories / "factory-87.rb"
+    if mutation == "add":
+        (support / "new.rb").write_text("new")
+    elif mutation == "change":
+        target.write_text("changed")
+    elif mutation == "delete":
+        target.unlink()
+    elif mutation == "move":
+        target.rename(support / "moved.rb")
+    elif mutation == "mode":
+        target.chmod(0o755)
+    elif mutation == "link":
+        link.unlink()
+        link.symlink_to("helper-1.rb")
+    elif mutation == "file_to_link":
+        target.unlink()
+        target.symlink_to("factory-00.rb")
+    else:
+        link.unlink()
+        link.write_text("helper")
+    candidate = engine.candidates.capture(source)
+    result = engine.candidates.compare_inputs(
+        initial, candidate, ("spec/factories", "spec/support"), mode
+    )
+    assert result["matches"] == (mode == "existing" and mutation == "add")
+    assert result["compared_paths"] >= 96
+    assert not engine.candidates.compare_inputs(initial, candidate, ("absent",), mode)["matches"]
+
+
+def test_exact_serialization_remains_compatible_and_existing_is_explicit():
+    legacy = {
+        "id": "keep",
+        "description": "preserve",
+        "preserved_paths": ["."],
+        "checks": [],
+        "outcome": "artifact",
+    }
+    exact = Criterion.model_validate(legacy)
+    assert exact.preservation_mode == "exact"
+    assert exact.model_dump(mode="json") == legacy
+    assert exact.canonical() == json.dumps(legacy, sort_keys=True, separators=(",", ":"))
+    existing = Criterion.model_validate({**legacy, "preservation_mode": "existing"})
+    assert existing.digest != exact.digest
+    assert Criterion.model_validate_json(existing.model_dump_json()) == existing
+
+
+@pytest.mark.parametrize("stage", ["planning", "recovery"])
+@pytest.mark.parametrize("mode", ["exact", "existing"])
+def test_planning_and_recovery_retain_preservation_mode(tmp_path, stage, mode):
+    model = PreservationModel(mode=mode)
+    engine, run, cfg = prepared(tmp_path, model)
+    engine.execute(run)
+    prompt = {"goal": model.contexts[0]["goal"]}
+    contract = StageContract.bind(stage, prompt, cfg)
+    plan = projection(engine.journal, run)["plan"]
+    contract.validate(Plan.model_validate(plan), prompt, cfg)
+    plan["tasks"][0]["criteria"][0]["preservation_mode"] = (
+        "existing" if mode == "exact" else "exact"
+    )
+    with pytest.raises(OutputViolation, match="INPUT_PRESERVATION_WEAKENED"):
+        contract.validate(Plan.model_validate(plan), prompt, cfg)
+
+
+def test_comparison_mode_cannot_be_rebound_or_removed(tmp_path, monkeypatch):
+    model = PreservationModel(mode="existing")
+    engine, run, cfg = prepared(tmp_path, model)
+    engine.execute(run)
+    source = copy.deepcopy(model.contexts[0])
+    del source["input_comparison"]["scope"]["modes"]
+    with pytest.raises(ValueError, match="INPUT_COMPARISON_CONTEXT_MISMATCH"):
+        StageContract.bind("task_verification", source, cfg)
+    events = copy.deepcopy(engine.journal.events(run))
+    record = next(e["body"] for e in events if e["kind"] == "verification")
+    record["input_comparison"]["scope"]["modes"]["result"] = "exact"
+    monkeypatch.setattr(engine.journal, "events", lambda _: events)
+    with pytest.raises(ValueError, match="INPUT_COMPARISON_CONTEXT_MISMATCH"):
+        engine.promote(run, tmp_path / "published")
+
+
+@pytest.mark.parametrize("schema", [Clarification, Plan])
+def test_mode_is_explicit_in_provider_contract(schema):
+    properties = provider_schema(schema)["$defs"]["Criterion"]["properties"]
+    assert properties["preservation_mode"]["enum"] == ["exact", "existing"]
+    assert properties["preservation_mode"]["description"] == INPUT_PRESERVATION
+    assert "existing" in INPUT_PRESERVATION

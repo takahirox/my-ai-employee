@@ -280,13 +280,15 @@ class StageContract:
             from .capabilities import AUTHORITY_RULES, task_violation
 
             required_paths = {
-                path
+                (path, criterion.get("preservation_mode", "exact"))
                 for criterion in prompt.get("goal", {}).get("specification", {}).get("criteria", [])
                 for path in criterion.get("preserved_paths", [])
             }
             result_task = next(task for task in value.tasks if task.id == value.result_task)
             if not required_paths <= {
-                path for criterion in result_task.criteria for path in criterion.preserved_paths
+                (path, criterion.preservation_mode)
+                for criterion in result_task.criteria
+                for path in criterion.preserved_paths
             }:
                 raise OutputViolation(
                     "INPUT_PRESERVATION_WEAKENED",
@@ -403,6 +405,12 @@ class StageContract:
     @staticmethod
     def input_scope(source: dict[str, Any], config: RunConfig) -> dict[str, Any]:
         """Runtime comparison identity, shared by the producer and contract boundary."""
+        # Omit default modes to retain historical exact comparison identities.
+        modes = {
+            c["id"]: c["preservation_mode"]
+            for c in source["criteria"]
+            if c.get("preserved_paths") and c.get("preservation_mode", "exact") != "exact"
+        }
         return {
             "run": source["run"],
             "initial_tree": source["initial_tree"],
@@ -410,6 +418,7 @@ class StageContract:
             "goal": digest(source["goal"]),
             "task": None if source["task"] is None else digest(source["task"]),
             "policy": config.digest,
+            **({"modes": modes} if modes else {}),
             "paths": {
                 c["id"]: c["preserved_paths"]
                 for c in source["criteria"]

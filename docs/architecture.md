@@ -240,7 +240,7 @@ remain distinct validation levels (see development and isolated-worker guides).
 ## Input preservation evidence
 
 An explicit input-preservation criterion uses `preserved_paths` to name canonical
-workspace-relative files or directory subtrees (no globs). A directory comparison
+workspace-relative files or directory subtrees (no globs). The default exact directory comparison
 includes additions, deletions, content and executable flags; `.` selects the whole
 workspace. Each selection must contain a file in the initial snapshot. Empty
 directories are not represented by the existing Candidate store. Criteria without
@@ -262,3 +262,14 @@ baseline, extra model call or external check is needed. Equality proves only the
 two snapshots agree, not that no temporary change occurred during execution.
 Stage contract 7 introduces this field and evidence boundary; older histories remain
 inspectable but cannot resume under the new contract.
+
+Preservation criteria may explicitly set `preservation_mode: "existing"` to protect
+only entries selected from the immutable initial Run snapshot, allowing additions.
+The default `"exact"` mode continues to reject additions as well. Both modes reject
+content, executable-bit, symlink-target and entry-type changes or deletions; neither
+proves absence of transient writes. For example, selecting `spec/factories` and
+`spec/support` in existing mode protects all their initial entries without enumerating
+them, while permitting new support files. Normal snapshot safety and capacity limits
+still apply. Planning and recovery must retain both selections and modes; comparison
+evidence binds the mode and publication recomputes it. Default exact criteria retain
+their historical serialization and digests.
