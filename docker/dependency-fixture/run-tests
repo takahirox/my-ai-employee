@@ -1,0 +1,3 @@
+#!/bin/sh
+export PYTHONPATH=/usr/local/lib/fleet-dependency-fixture
+exec /usr/local/bin/python -B -m fixture_tests "$@"

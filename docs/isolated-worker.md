@@ -5,6 +5,56 @@ sandbox. Docker Desktop on macOS can supply the required process namespace.
 Linux hosts must permit the nested native sandbox; a host that rejects it is
 unsupported and fails closed. Do not disable host protections to make a test pass.
 
+### Prepared dependencies and runtime readiness
+
+Install immutable application dependencies beneath `/usr/local/lib` and executable
+wrappers in `/usr/local/bin`. Both paths are already covered by the native minimal
+read grant; Fleet does not grant arbitrary image or host paths. The shared command
+PATH starts with `/usr/local/bin`. A wrapper sets its application's required
+variables (for example `GEM_HOME`, `BUNDLE_PATH` or `NODE_PATH`) and invokes the
+installed executable. Do not depend on image `ENV` surviving the native shell's
+environment filtering. Use the same wrapper in worker commands and verification
+checks. Relative links must resolve to readable image paths; links cannot confer
+access to control directories. Dependencies remain read-only and outside captures.
+
+For example, a derived image may install a Python package to
+`/usr/local/lib/project-deps`, then install this executable wrapper as
+`/usr/local/bin/project-tests`:
+
+```sh
+#!/bin/sh
+export PYTHONPATH=/usr/local/lib/project-deps
+exec /usr/local/bin/python -m unittest discover -s tests "$@"
+```
+
+Include dependencies and wrappers in the prepared image and select its immutable
+image ID. Installation is an image-provider responsibility; Fleet does not install
+missing packages or enlarge source limits after a command fails.
+
+The worker recipe builds checksum-pinned bubblewrap 0.12.0 with one change: fresh
+inner procfs mounts use `subset=pid`. Codex 0.154.0 selects `/usr/bin/bwrap`; its
+bundled binary and integrity verification remain unchanged. This preserves a private
+PID namespace and outer Docker proc masks. Global proc interfaces such as
+`/proc/sys` and `/proc/meminfo` are deliberately unavailable. Applications requiring
+those interfaces are not qualified by this contract.
+
+The tested composition is Linux 7.2.0 ARM64, Docker 29.1.3 and Codex 0.154.0.
+Older kernels can reject this restricted nested mount; a kernel update alone with
+an unchanged helper did not fix the observed failure. Operators must supply a
+compatible maintained host kernel; Fleet does not install kernels or change host
+protections. Other architectures and runtime combinations require qualification.
+Preflight tests the effective sandbox's private process status and memory maps,
+not just version strings. Missing facilities report
+`NATIVE_RUNTIME_PROCFS_UNAVAILABLE`; confinement/startup failures report
+`NATIVE_SANDBOX_PREFLIGHT_FAILED`. This can reject previously accepted environments
+whose native probe passed but whose application runtimes could not function.
+
+Model-free qualification of that composition included RSpec 3.13.0, Vitest 3.0.5
+on Node 24.13.0, read-only dependency and control-path checks, and the existing
+14 Docker integration tests. It does not certify a complete application benchmark,
+all native tool entry points or live-model behavior. Re-run opt-in integration tests
+below against the actual prepared image; a skipped suite is not qualification.
+
 Build the image explicitly, then put its immutable `sha256:` ID in the Run's
 `isolation.image`. The image recipe is
 [`docker/autonomous-worker.Dockerfile`](../docker/autonomous-worker.Dockerfile).
@@ -28,6 +78,12 @@ no model calls. Additional model-free integration tests are opt-in:
 docker build -f docker/autonomous-worker.Dockerfile -t fleet-isolation-test docker
 export FLEET_TEST_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' fleet-isolation-test)
 .venv/bin/pytest tests/test_autonomous_container.py -q
+
+# Additional image-wrapper/transitive-link tests through worker and check paths:
+docker build -f docker/dependency-fixture.Dockerfile \
+  --build-arg WORKER_IMAGE="$FLEET_TEST_DOCKER_IMAGE" -t fleet-dependency-test docker
+export FLEET_TEST_DEPENDENCY_IMAGE=$(docker image inspect --format '{{.Id}}' fleet-dependency-test)
+.venv/bin/pytest tests/test_dependency_container.py -q
 ```
 
 These use disposable inputs and no authentication. On a host known to reject
