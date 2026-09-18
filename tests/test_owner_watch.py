@@ -127,4 +127,5 @@ def test_control_operation_observes_shared_cancellation_during_communication(tmp
             with pytest.raises(TimeoutError, match="DOCKER_CONTROL_TIMEOUT"):
                 candidate._docker("exec", "test", data=b"input")
         process.kill.assert_called_once()
-        assert process.communicate.call_args_list[0].kwargs == {"input": b"input", "timeout": 0.05}
+        assert docker.call_args.kwargs["stdin"].closed
+        assert process.communicate.call_args_list[0].kwargs == {"timeout": 0.05}

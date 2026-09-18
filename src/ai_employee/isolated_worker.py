@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import owner_watch
 from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
-from .snapshot import pack_workspace
+from .snapshot import LEGACY_SNAPSHOT_BYTES, pack_workspace
 from .time_budget import exhausted, minimum, remaining
 
 
@@ -86,12 +86,14 @@ class DockerCandidate:
         seconds: float | None,
         cancellation: Cancellation,
         output_limit: int = 1_000_000,
+        snapshot_max_bytes: int = LEGACY_SNAPSHOT_BYTES,
         resource_ledger: Path | None = None,
         service_hosts: tuple[str, ...] = (),
     ) -> None:
         self.profile, self.root, self.cancellation = profile, root.resolve(), cancellation
         self.deadline = None if seconds is None else time.monotonic() + seconds
         self.output_limit = output_limit
+        self.snapshot_max_bytes = snapshot_max_bytes
         self.resource_ledger = resource_ledger
         self.service_hosts = service_hosts
         self.name = "fleet-candidate-" + uuid.uuid4().hex
@@ -128,27 +130,36 @@ class DockerCandidate:
         # Poll ownership/shared active consumption even during setup and capture.
         # A second call may consume the active allowance after this operation starts.
         deadline = minimum(self.deadline, time.monotonic() + 30)
-        process = subprocess.Popen(
-            ["docker", *args],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            while True:
-                self._check_owner()
-                if exhausted(remaining(deadline)) or self.cancellation.cancelled():
-                    raise TimeoutError("DOCKER_CONTROL_TIMEOUT")
-                try:
-                    stdout, stderr = process.communicate(input=data, timeout=0.05)
-                    break
-                except subprocess.TimeoutExpired:
-                    data = None  # communicate retains any unwritten input across polls.
-        except BaseException:
-            process.kill()
-            process.communicate(timeout=5)
-            self.close()
-            raise
+        # communicate(input=...) cannot resume partial stdin writes by calling
+        # communicate(None) after a timeout: CPython no longer selects stdin.
+        # A private, unlinked file lets Docker consume the full bounded payload
+        # while the controller continues polling cancellation and ownership.
+        with tempfile.TemporaryFile() if data is not None else nullcontext() as incoming:
+            if incoming is not None:
+                assert data is not None
+                incoming.write(data)
+                incoming.seek(0)
+            process = subprocess.Popen(
+                ["docker", *args],
+                stdin=incoming if incoming is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                while True:
+                    self._check_owner()
+                    if exhausted(remaining(deadline)) or self.cancellation.cancelled():
+                        raise TimeoutError("DOCKER_CONTROL_TIMEOUT")
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.05)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except BaseException:
+                process.kill()
+                process.communicate(timeout=5)
+                self.close()
+                raise
         if process.returncode:
             raise RuntimeError(
                 f"Docker operation {args[0]} failed: " + stderr.decode(errors="replace")[:1000]
@@ -220,7 +231,8 @@ class DockerCandidate:
                 ".extractall('/work', filter='data')",
                 data=pack_workspace(
                     self.root,
-                    self.profile.workspace_mb * 1024**2,
+                    self.snapshot_max_bytes,
+                    workspace_limit=self.profile.workspace_mb * 1024**2,
                 ),
             )
             self._docker("exec", self.name, "mkdir", "-m", "700", "/work/.git")

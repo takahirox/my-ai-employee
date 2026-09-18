@@ -13,6 +13,10 @@ explicitly delegated model authentication file; never use ordinary history or
 normal operator credentials as test fixtures. The image itself contains no auth.
 
 The profile configures CPU, memory, process admissions and writable storage.
+New `fleet init` configurations set `isolation.workspace_mb` to 1024 (MiB);
+older profiles that omit it retain 256 MiB. This is distinct from the Run's
+`snapshot_max_bytes` content allowance. See the [capacity settings](run-interface.md#snapshot-and-workspace-capacity)
+for overrides, transfer bounds, memory implications, and dependency storage limits.
 Workers receive copies of permitted inputs. The native sandbox adds resource
 restrictions inside the container; the process guard terminates detached children
 before capture. Actual changed files are returned, not converted to edit proposals.

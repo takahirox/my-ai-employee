@@ -11,7 +11,27 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+LEGACY_SNAPSHOT_BYTES = 64_000_000
+INIT_SNAPSHOT_BYTES = 512 * 1024**2
+# Preserve the existing transport metadata allowance (80 MB minus 64 MB).
+ARCHIVE_METADATA_BYTES = 16_000_000
+
 PROTECTED = frozenset({".git", ".codex", ".claude", ".fleet", ".agents", ".fleet-inputs"})
+
+
+def check_bytes(
+    observed: int, limit: int, *, code: str = "CANDIDATE_SIZE_LIMIT", partial: bool = True
+) -> None:
+    if observed > limit:
+        raise ValueError(
+            f"{code}: limit_bytes={limit}, observed_bytes={observed}, "
+            f"count={'partial' if partial else 'complete'}"
+        )
+
+
+def archive_limit(content_limit: int) -> int:
+    """Bound tar headers, padding, paths and extended metadata in addition to content."""
+    return content_limit + ARCHIVE_METADATA_BYTES
 
 
 def safe_path(name: str) -> bool:
@@ -141,7 +161,7 @@ def read_entries(
                     opened = os.fstat(stream.fileno())
                     if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                         raise ValueError("CANDIDATE_CHANGED_DURING_CAPTURE")
-                    data = stream.read(max(0, limit - total) + 1)
+                    data = stream.read(min(max(0, limit - total), before.st_size) + 1)
                     after = os.fstat(stream.fileno())
                     if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
                         raise ValueError("CANDIDATE_CHANGED_DURING_CAPTURE")
@@ -159,14 +179,21 @@ def read_entries(
                 raise ValueError("CANDIDATE_CHANGED_DURING_CAPTURE")
         finally:
             os.close(parent)
-        if total > limit or len(entries) > 10000:
+        check_bytes(total, limit)
+        if len(entries) > 10000:
             raise ValueError("CANDIDATE_SIZE_LIMIT")
     validate_entries(entries, inputs=inputs)
     return entries
 
 
-def pack_workspace(root: Path, limit: int) -> bytes:
+def pack_workspace(root: Path, limit: int, *, workspace_limit: int | None = None) -> bytes:
     entries = read_entries(root, limit, inputs=True)
+    if workspace_limit is not None:
+        size = sum(
+            len(os.fsencode(e["target"])) if "target" in e else len(e["data"])
+            for e in entries.values()
+        )
+        check_bytes(size, workspace_limit, code="WORKSPACE_SIZE_LIMIT", partial=False)
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w") as archive:
         directories = sorted({str(p) for n in entries for p in PurePosixPath(n).parents} - {"."})
@@ -184,11 +211,18 @@ def pack_workspace(root: Path, limit: int) -> bytes:
                 info.size = len(entry["data"])
                 info.mode = 0o755 if entry["executable"] else 0o644
                 archive.addfile(info, io.BytesIO(entry["data"]))
-    return output.getvalue()
+    data = output.getvalue()
+    check_bytes(
+        len(data), archive_limit(limit), code="CANDIDATE_TRANSPORT_SIZE_LIMIT", partial=False
+    )
+    return data
 
 
 def unpack_workspace(data: bytes, root: Path, limit: int) -> None:
     """Validate the entire untrusted archive before creating files, then links."""
+    check_bytes(
+        len(data), archive_limit(limit), code="CANDIDATE_TRANSPORT_SIZE_LIMIT", partial=False
+    )
     entries: dict[str, dict[str, Any]] = {}
     directories: set[str] = set()
     seen: set[str] = set()
@@ -216,15 +250,15 @@ def unpack_workspace(data: bytes, root: Path, limit: int) -> None:
                 total += len(os.fsencode(member.linkname))
             elif member.isfile():
                 total += member.size
-                if total > limit:
-                    raise ValueError("CANDIDATE_SIZE_LIMIT")
+                check_bytes(total, limit)
                 stream = archive.extractfile(member)
                 assert stream is not None
                 entry = {"data": stream.read(), "executable": bool(member.mode & 0o111)}
             else:
                 raise ValueError("CANDIDATE_TRANSPORT_UNSAFE_TYPE")
             entries[name] = entry
-            if total > limit or len(entries) > 10000:
+            check_bytes(total, limit)
+            if len(entries) > 10000:
                 raise ValueError("CANDIDATE_SIZE_LIMIT")
     validate_entries(entries, inputs=True)
     for name in directories:

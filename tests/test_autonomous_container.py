@@ -206,3 +206,34 @@ def test_safe_symlinks_cross_real_container_and_candidate_boundaries(tmp_path: P
     candidates.materialize(tree, tmp_path / "restored")
     assert (tmp_path / "restored/CLAUDE.md").is_symlink()
     assert (tmp_path / "restored/new-link").read_text() == "new artifact"
+
+
+def test_configured_large_snapshot_crosses_real_container_recovery(tmp_path: Path) -> None:
+    from ai_employee.candidates import Candidates
+
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    size = 80_000_001  # Exceeds both former fixed content and archive ceilings.
+    with (workspace / "asset.bin").open("wb") as stream:
+        stream.truncate(size)
+    limit = 96 * 1024**2
+    model = ContainerModel(configured().profile, snapshot_max_bytes=limit)
+    with model._candidate(workspace, 60, lambda: False, models=False) as candidate:
+        candidate._docker(
+            "exec",
+            "--user",
+            "1000:1000",
+            candidate.name,
+            "python",
+            "-I",
+            "-c",
+            f"from pathlib import Path; assert Path('asset.bin').stat().st_size=={size}; "
+            "Path('result.txt').write_text('done')",
+        )
+        model._copy_workspace(candidate, workspace)
+    assert (workspace / "asset.bin").stat().st_size == size
+    assert (workspace / "result.txt").read_text() == "done"
+    candidates = Candidates(tmp_path / "objects", max_bytes=limit)
+    tree = candidates.capture(workspace)
+    candidates.materialize(tree, tmp_path / "restored")
+    assert (tmp_path / "restored/asset.bin").stat().st_size == size

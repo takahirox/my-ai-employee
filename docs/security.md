@@ -80,8 +80,11 @@ is excluded from candidate artifacts. Symlink diagnostics use `SNAPSHOT_SYMLINK`
 with the offending repository-relative path and reason, without echoing targets.
 
 Special files remain unsupported. Reserved runtime metadata is excluded. The
-existing 64,000,000-byte and 10,000-entry snapshot bounds remain; link target bytes
-count toward the byte limit. Regular-file-only snapshot identities are unchanged.
+10,000-entry snapshot bound remains; link target bytes count toward the configured
+`snapshot_max_bytes` limit. New init configurations use 512 MiB; omitted settings
+retain 64,000,000 bytes. The saved Run allowance also bounds candidate validation,
+materialization and both container transfer directions. Archive overhead has a
+separate derived ceiling; see [capacity settings](run-interface.md#snapshot-and-workspace-capacity). Regular-file-only snapshot identities are unchanged.
 Content hashes are validated when snapshots are read or materialized.
 Verification-side changes never become Candidate bytes. Publication requires a new
 destination and rechecks identity, lineage and terminal authority state.
