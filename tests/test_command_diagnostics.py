@@ -283,7 +283,9 @@ def test_retention_and_disabled_capture(tmp_path, monkeypatch):
 
 def test_old_configuration_digest_and_history_without_tables_remain_readable(tmp_path):
     cfg = config()
-    old_payload = cfg.model_dump(mode="json", exclude={"command_capture", "direct_execution"})
+    old_payload = cfg.model_dump(
+        mode="json", exclude={"command_capture", "direct_execution", "snapshot_max_bytes"}
+    )
     old_text = json.dumps(old_payload, sort_keys=True, separators=(",", ":"))
     assert cfg.digest == hashlib.sha256(old_text.encode()).hexdigest()
     assert RunConfig.model_validate_json(old_text).canonical() == old_text

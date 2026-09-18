@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import owner_watch
 from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
-from .snapshot import pack_workspace
+from .snapshot import LEGACY_SNAPSHOT_BYTES, pack_workspace
 from .time_budget import exhausted, minimum, remaining
 
 
@@ -86,12 +86,14 @@ class DockerCandidate:
         seconds: float | None,
         cancellation: Cancellation,
         output_limit: int = 1_000_000,
+        snapshot_max_bytes: int = LEGACY_SNAPSHOT_BYTES,
         resource_ledger: Path | None = None,
         service_hosts: tuple[str, ...] = (),
     ) -> None:
         self.profile, self.root, self.cancellation = profile, root.resolve(), cancellation
         self.deadline = None if seconds is None else time.monotonic() + seconds
         self.output_limit = output_limit
+        self.snapshot_max_bytes = snapshot_max_bytes
         self.resource_ledger = resource_ledger
         self.service_hosts = service_hosts
         self.name = "fleet-candidate-" + uuid.uuid4().hex
@@ -220,7 +222,8 @@ class DockerCandidate:
                 ".extractall('/work', filter='data')",
                 data=pack_workspace(
                     self.root,
-                    self.profile.workspace_mb * 1024**2,
+                    self.snapshot_max_bytes,
+                    workspace_limit=self.profile.workspace_mb * 1024**2,
                 ),
             )
             self._docker("exec", self.name, "mkdir", "-m", "700", "/work/.git")

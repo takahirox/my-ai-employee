@@ -117,7 +117,7 @@ def test_container_roundtrip_runs_actual_export_program_and_validates_return(tmp
             program = args[-1].replace("Path('/work')", f"Path({str(isolated)!r})")
             return subprocess.check_output([sys.executable, "-I", "-c", program])
 
-    ContainerModel._copy_workspace(LocalContainer(), workspace)
+    ContainerModel(None)._copy_workspace(LocalContainer(), workspace)
     assert_links(workspace)
     assert_links(workspace / ".fleet-inputs/0")
     assert (workspace / "new-link").read_text() == "worker-created"

@@ -15,6 +15,7 @@ from .engine import Engine, Waiting
 from .history import Journal, Stopped
 from .isolated_worker import IsolatedWorkerProfile
 from .models import Clarification, DirectExecution, RunConfig, StagePolicy
+from .snapshot import INIT_SNAPSHOT_BYTES
 from .source_refs import original_source
 from .stage_contracts import VERSION
 
@@ -41,6 +42,8 @@ def parser() -> argparse.ArgumentParser:
     initialize.add_argument(
         "--auth-file", type=Path, required=True, help="explicit delegated model authentication"
     )
+    initialize.add_argument("--snapshot-max-bytes", type=int, default=INIT_SNAPSHOT_BYTES)
+    initialize.add_argument("--workspace-mb", type=int, default=1024, help="workspace size in MiB")
     initialize.add_argument("--no-command-capture", action="store_true")
     initialize.add_argument("--output", type=Path, default=Path("fleet-run.json"))
     for name in ("submit", "work"):
@@ -191,6 +194,7 @@ def _command(args: argparse.Namespace) -> int:
     if args.command == "init":
         stage = StagePolicy(backend=args.backend, model=args.model, transport_retries=2)
         config = RunConfig(
+            snapshot_max_bytes=args.snapshot_max_bytes,
             direct_execution=DirectExecution(),
             command_capture=CommandCapture(enabled=not args.no_command_capture),
             clarification=stage.model_copy(update={"review": "always"}),
@@ -199,7 +203,9 @@ def _command(args: argparse.Namespace) -> int:
             verification=stage,
             recovery=stage,
             isolation=IsolatedWorkerProfile(
-                image=args.image, auth_file=str(args.auth_file.resolve())
+                image=args.image,
+                auth_file=str(args.auth_file.resolve()),
+                workspace_mb=args.workspace_mb,
             ),
         )
         with args.output.open("x") as stream:
@@ -243,8 +249,8 @@ def _command(args: argparse.Namespace) -> int:
         )
         engine = Engine(
             journal,
-            Candidates(root / "objects"),
-            ContainerModel(config.isolation),
+            Candidates(root / "objects", max_bytes=config.snapshot_max_bytes),
+            ContainerModel(config.isolation, snapshot_max_bytes=config.snapshot_max_bytes),
             root / "workspaces",
         )
         if args.command in {"submit", "work"}:

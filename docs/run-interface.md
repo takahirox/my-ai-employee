@@ -88,6 +88,54 @@ an executable deliverable. Existing histories remain readable but cannot resume 
 the new contract semantics.
 
 
+### Snapshot and workspace capacity
+
+New `fleet init` configurations explicitly write `snapshot_max_bytes: 536870912`
+(512 MiB) and `isolation.workspace_mb: 1024` (1 GiB). Set them in the JSON file or
+use `fleet init --snapshot-max-bytes <bytes> --workspace-mb <MiB>`. Snapshot bytes
+must be a positive integer; the existing workspace range is 16–4096 MiB.
+
+Configurations without `snapshot_max_bytes` retain 64,000,000 bytes. Isolation
+profiles without `workspace_mb` retain 256 MiB. Existing saved Run identities are
+preserved, and resume/result/promotion use the saved allowance, not a subsequently
+edited configuration file. Change the operator configuration before starting a
+new Run; do not edit a persisted Run to increase its allowance.
+
+The snapshot limit counts regular-file contents once per selected path (including
+identical files) and the bytes of each symlink's stored target. It applies to input,
+materialization/validation, container transfer/recovery, and published candidates.
+Transfers containing read-only upstream snapshots count their content too. Git
+input selection and reserved metadata exclusions are unchanged. Temporary and
+new files in the workspace remain candidate content; `.gitignore` does not filter
+them. The separate 10,000-entry limit remains unchanged (see #224).
+
+The archive byte ceiling is derived as the content allowance plus 16,000,000 bytes
+for tar headers, padding, path metadata, and other archive overhead. This preserves
+the former metadata headroom without the old fixed 80 MB ceiling. It is enforced
+on both archive creation and receipt and is not a separate operator setting.
+
+Workspace storage is independent: `/work` is a bounded tmpfs. Raising the snapshot
+allowance does not enlarge it. Input content exceeding the workspace capacity
+fails with `WORKSPACE_SIZE_LIMIT`; filesystem metadata, dependencies, temporary
+files, and build outputs need additional headroom even when that check passes.
+The default 1 GiB is not a guarantee for a complete development environment.
+Prepared dependencies may reside in the approved image; this feature does not
+install, relocate, filter, or automatically clean dependencies. In particular,
+approximately 451 MB of Node dependencies plus 3.17 GB of Ruby dependencies do not
+fit in a 1 GiB workspace with the reported 202 MB input.
+
+Byte-overflow diagnostics retain the `INPUT_SIZE_LIMIT`, `CANDIDATE_SIZE_LIMIT`,
+or `CANDIDATE_TRANSPORT_SIZE_LIMIT` code and include `limit_bytes`,
+`observed_bytes`, and `count=partial|complete`. A partial count describes only the
+traversal/read prefix observed at rejection, not the complete input size. Reads
+stop at the remaining allowance plus one byte. No files are silently truncated,
+no limit is automatically increased, and no input paths or file contents appear
+in these size diagnostics. Larger allowances permit greater memory/disk use;
+packing and validating snapshots can hold multiple copies of content in memory,
+and tmpfs use also counts against container memory. Configure
+`isolation.memory_mb` and workspace headroom for the workload.
+
+
 `fleet init` leaves `limits.wall_seconds`, `limits.active_seconds`,
 `limits.invocation_seconds` and each check's `timeout` unset (`null`). Omission has
 the same meaning: no hard time limit for that scope. Set positive seconds explicitly

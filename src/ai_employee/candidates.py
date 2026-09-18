@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -11,11 +12,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .models import Candidate, TaskContext
-from .snapshot import PROTECTED, read_entries, validate_entries
+from .snapshot import LEGACY_SNAPSHOT_BYTES, PROTECTED, check_bytes, read_entries, validate_entries
 
 
 class Candidates:
-    def __init__(self, root: Path, *, max_bytes: int = 64_000_000) -> None:
+    def __init__(self, root: Path, *, max_bytes: int = LEGACY_SNAPSHOT_BYTES) -> None:
         self.root = root.resolve()
         self.max_bytes = max_bytes
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -69,8 +70,9 @@ class Candidates:
                 "CANDIDATE_UNSAFE_PATH": "INPUT_UNSAFE_PATH",
                 "CANDIDATE_SPECIAL_FILE": "INPUT_SPECIAL_FILE",
             }
-            if str(error) in input_errors:
-                raise ValueError(input_errors[str(error)]) from error
+            code, separator, detail = str(error).partition(":")
+            if code in input_errors:
+                raise ValueError(input_errors[code] + separator + detail) from error
             raise
         return self._store(entries)
 
@@ -118,10 +120,13 @@ class Candidates:
             raise ValueError("CANDIDATE_MANIFEST_CHANGED")
         manifest: dict[str, dict[str, str | bool]] = json.loads(encoded)
         validate_entries(manifest)
+        total = 0
         for entry in manifest.values():
             if "target" in entry:
                 if set(entry) != {"target"}:
                     raise ValueError("INVALID_CANDIDATE_ENTRY")
+                total += len(os.fsencode(str(entry["target"])))
+                check_bytes(total, self.max_bytes)
                 continue
             if set(entry) != {"blob", "executable"} or type(entry["executable"]) is not bool:
                 raise ValueError("INVALID_CANDIDATE_ENTRY")
@@ -129,7 +134,13 @@ class Candidates:
             if len(blob) != 64 or any(c not in "0123456789abcdef" for c in blob):
                 raise ValueError("INVALID_BLOB_DIGEST")
             path = self.root / tree / blob
-            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != blob:
+            if path.is_symlink():
+                raise ValueError("CANDIDATE_BYTES_CHANGED")
+            with path.open("rb") as stream:
+                data = stream.read(self.max_bytes - total + 1)
+            total += len(data)
+            check_bytes(total, self.max_bytes)
+            if hashlib.sha256(data).hexdigest() != blob:
                 raise ValueError("CANDIDATE_BYTES_CHANGED")
         return manifest
 

@@ -35,6 +35,7 @@ from .semantics import (
     WORKER_STATES,
     external_evidence,
 )
+from .snapshot import LEGACY_SNAPSHOT_BYTES
 from .source_refs import MAX_SOURCE_FRAGMENTS, SOURCE_REFERENCE_RULE, resolve_source_refs
 
 Text = Annotated[str, Field(min_length=1, max_length=20000, pattern=r"\S")]
@@ -472,12 +473,15 @@ class DirectExecution(Contract):
 
 
 class RunConfig(Contract):
+    snapshot_max_bytes: int = Field(default=LEGACY_SNAPSHOT_BYTES, gt=0, strict=True)
     direct_execution: DirectExecution | None = None
     command_capture: CommandCapture | None = None
 
     def canonical(self) -> str:
         # Absent optional features preserve pre-feature configuration digests.
         body = self.model_dump(mode="json")
+        if self.snapshot_max_bytes == LEGACY_SNAPSHOT_BYTES:
+            body.pop("snapshot_max_bytes")
         if self.direct_execution is None:
             body.pop("direct_execution")
         if self.command_capture is None:

@@ -203,6 +203,7 @@ def test_required_reviews_remain_and_planning_review_uses_normal_route(tmp_path)
 def test_historical_config_digest_unchanged():
     cfg = config()
     body = cfg.model_dump(mode="json")
+    body.pop("snapshot_max_bytes")
     body.pop("command_capture")
     body.pop("direct_execution")
     assert cfg.canonical() == json.dumps(body, sort_keys=True, separators=(",", ":"))

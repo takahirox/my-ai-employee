@@ -43,7 +43,7 @@ from .native import (
 )
 from .owner_watch import resource_missing
 from .product_capabilities import CODEX_VERSION
-from .snapshot import unpack_workspace
+from .snapshot import LEGACY_SNAPSHOT_BYTES, unpack_workspace
 from .time_budget import exhausted, minimum, remaining
 
 _OFFLINE = Authority()
@@ -58,8 +58,14 @@ class Cancellation:
 
 
 class ContainerModel:
-    def __init__(self, profile: IsolatedWorkerProfile | None) -> None:
+    def __init__(
+        self,
+        profile: IsolatedWorkerProfile | None,
+        *,
+        snapshot_max_bytes: int = LEGACY_SNAPSHOT_BYTES,
+    ) -> None:
         self.profile = profile
+        self.snapshot_max_bytes = snapshot_max_bytes
 
     def preflight(
         self,
@@ -140,6 +146,7 @@ class ContainerModel:
             resource_ledger=workspace.parent / (workspace.name + ".resources.jsonl"),
             service_hosts=authority.network_hosts,
             output_limit=8_000_000,
+            snapshot_max_bytes=self.snapshot_max_bytes,
         )
         try:
             with candidate:
@@ -196,23 +203,21 @@ class ContainerModel:
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
-    @staticmethod
-    def _copy_workspace(candidate: DockerCandidate, workspace: Path) -> None:
+    def _copy_workspace(self, candidate: DockerCandidate, workspace: Path) -> None:
         candidate.quiesce()
         # Execute the same stdlib-only snapshot contract inside the container.
         # No task writer remains, and the source comes from the controller.
         program = Path(snapshot.__file__).read_text() + (
-            "\nimport sys\nsys.stdout.buffer.write(pack_workspace(Path('/work'), 64000000))\n"
+            "\nimport sys\nsys.stdout.buffer.write(pack_workspace(Path('/work'), "
+            f"{self.snapshot_max_bytes}))\n"
         )
         data = candidate._docker("exec", candidate.name, "python", "-I", "-c", program)
-        if len(data) > 80_000_000:
-            raise ValueError("CANDIDATE_TRANSPORT_SIZE_LIMIT")
         with TemporaryDirectory(prefix="fleet-return-", dir=workspace.parent) as directory:
             returned = Path(directory)
-            unpack_workspace(data, returned, 64_000_000)
+            unpack_workspace(data, returned, self.snapshot_max_bytes)
             # Validate candidate identity before replacing this Run-owned workspace.
             with TemporaryDirectory(prefix="fleet-return-check-") as objects:
-                Candidates(Path(objects)).capture(returned)
+                Candidates(Path(objects), max_bytes=self.snapshot_max_bytes).capture(returned)
             for child in workspace.iterdir():
                 if child.is_dir() and not child.is_symlink():
                     shutil.rmtree(child)
