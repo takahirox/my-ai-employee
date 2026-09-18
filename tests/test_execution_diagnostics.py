@@ -70,12 +70,8 @@ def pipe_runtime(
         if "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text()[:4096])" in args:
             return json.dumps(
                 {
-                    "cleanup": "confirmed",
-                    "guard_error": failure == "guard",
-                    "limit": candidate.profile.native_process_limit,
-                    "admitted": 1,
+                    "cleanup": "unconfirmed" if failure == "guard" else "confirmed",
                     "root_exit": 1 if failure == "nonzero" else 0,
-                    "denied": False,
                 }
             ).encode()
         return b""

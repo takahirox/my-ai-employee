@@ -35,7 +35,6 @@ class IsolatedWorkerProfile(BaseModel):
     cpus: float = Field(default=2.0, gt=0, le=16, allow_inf_nan=False)
     memory_mb: int = Field(default=2048, ge=256, le=16384)
     pids_limit: int = Field(default=128, ge=16, le=1024)
-    native_process_limit: int = Field(default=512, ge=1, le=1000)
     workspace_mb: int = Field(default=256, ge=16, le=4096)
     auth_file: str | None = None
 
@@ -56,10 +55,6 @@ class IsolatedWorkerProfile(BaseModel):
 
 class IsolatedBudgetExceeded(RuntimeError):
     """An enforced isolated resource budget has been exhausted."""
-
-
-class NativeProcessBudgetExceeded(IsolatedBudgetExceeded):
-    """No further native work or candidate submission is authorized."""
 
 
 def append_resource_event(path: Path | None, kind: str, name: str, state: str) -> None:
@@ -100,7 +95,7 @@ class DockerCandidate:
         self.created = False
         self.network: str | None = None
         self.proxy: str | None = None
-        self.native_process_usage: dict[str, object] = {}
+        self.native_completion: dict[str, object] = {}
         self.confirmed_resources: set[tuple[str, str]] = set()
         self.pending_creations: set[tuple[str, str]] = set()
         self.owner_watch: subprocess.Popen[bytes] | None = None
@@ -415,13 +410,12 @@ class DockerCandidate:
         self,
         argv: tuple[str, ...],
         *,
-        process_limit: int,
         stdin: bytes = b"",
         observe: Callable[[dict[str, object]], None] | None = None,
         supervise: Callable[[int], None] | None = None,
         timeout: float | None = None,
     ) -> tuple[int, bytes, bytes]:
-        """Admit cumulative native process creation before the syscall executes.
+        """Run native work and confirm that every task process has stopped.
 
         The report is not trusted until the supervisor has stopped/reaped all task
         processes. Its root-owned inode/directory cannot be replaced by the worker.
@@ -429,10 +423,9 @@ class DockerCandidate:
         """
         from .native_process_guard import PROCESS_GUARD_SOURCE
 
-        if type(process_limit) is not int or process_limit < 1:
-            raise ValueError("native execution requires a positive reserved process budget")
+        self.native_completion = {}
         directory = "/tmp/fleet-control-" + uuid.uuid4().hex
-        report = directory + "/usage.json"
+        report = directory + "/completion.json"
         self._docker(
             "exec",
             self.name,
@@ -446,15 +439,15 @@ class DockerCandidate:
             report,
         )
         guard_code, stdout, stderr = self.run(
-            ("python", "-I", "-c", PROCESS_GUARD_SOURCE, str(process_limit), report, *argv),
+            ("python", "-I", "-c", PROCESS_GUARD_SOURCE, report, *argv),
             stdin=stdin,
             observe=observe,
             supervise=supervise,
             timeout=timeout,
         )
-        if guard_code not in (0, 125):
+        if guard_code != 0:
             raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: no candidate accepted")
-        usage = json.loads(
+        completion = json.loads(
             self._docker(
                 "exec",
                 self.name,
@@ -466,23 +459,14 @@ class DockerCandidate:
             )
         )
         if (
-            not isinstance(usage, dict)
-            or usage.get("cleanup") != "confirmed"
-            or usage.get("guard_error") is not False
-            or usage.get("limit") != process_limit
-            or type(usage.get("admitted")) is not int
-            or not 1 <= usage["admitted"] <= process_limit
-            or type(usage.get("root_exit")) is not int
-            or usage.get("denied") is not (guard_code == 125)
+            not isinstance(completion, dict)
+            or completion.get("cleanup") != "confirmed"
+            or type(completion.get("root_exit")) is not int
         ):
-            raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: invalid final accounting")
-        self.native_process_usage = usage
-        self.execution_diagnostic["native_exit_code"] = usage["root_exit"]
-        if guard_code == 125:
-            raise NativeProcessBudgetExceeded(
-                "BUDGET_EXCEEDED: native process admissions exhausted"
-            )
-        return usage["root_exit"], stdout, stderr
+            raise RuntimeError("ISOLATION_PROCESS_GUARD_FAILED: invalid final completion")
+        self.native_completion = completion
+        self.execution_diagnostic["native_exit_code"] = completion["root_exit"]
+        return completion["root_exit"], stdout, stderr
 
     def quiesce(self) -> None:
         # PID 1 and Git authority are uid 0. All candidate/worker descendants are uid 1000.

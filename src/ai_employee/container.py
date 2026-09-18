@@ -197,9 +197,7 @@ class ContainerModel:
             "except (PermissionError, FileNotFoundError): pass\n"
             "else: raise AssertionError('native read boundary unavailable')\n",
         )
-        code, _, _ = candidate.run_guarded(
-            command, process_limit=candidate.profile.native_process_limit, timeout=15
-        )
+        code, _, _ = candidate.run_guarded(command, timeout=15)
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
@@ -402,7 +400,6 @@ class ContainerModel:
             prompt = json.dumps(body, ensure_ascii=False)
             code, stdout, stderr = candidate.run_guarded(
                 command,
-                process_limit=candidate.profile.native_process_limit,
                 stdin=prompt.encode(),
                 observe=observe,
                 supervise=supervise,
@@ -453,6 +450,5 @@ class ContainerModel:
             )
             code, stdout, stderr = candidate.run_guarded(
                 command,
-                process_limit=candidate.profile.native_process_limit,
             )
             return code == 0, CheckOutput(code, stdout, stderr)
