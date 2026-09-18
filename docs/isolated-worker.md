@@ -12,7 +12,7 @@ The build context contains only runtime recipes. `isolation.auth_file` is an
 explicitly delegated model authentication file; never use ordinary history or
 normal operator credentials as test fixtures. The image itself contains no auth.
 
-The profile configures CPU, memory, process admissions and writable storage.
+The profile configures CPU, memory, concurrent PIDs and writable storage.
 New `fleet init` configurations set `isolation.workspace_mb` to 1024 (MiB);
 older profiles that omit it retain 256 MiB. This is distinct from the Run's
 `snapshot_max_bytes` content allowance. See the [capacity settings](run-interface.md#snapshot-and-workspace-capacity)
@@ -63,3 +63,12 @@ Owned environments are cleaned before recovery. Potentially completed external
 writes still require uncertainty resolution rather than automatic replay. Exhaustion
 reports `MODEL_AT_CAPACITY_RETRIES_EXHAUSTED`. Quota stops never trigger recovery,
 model switching, allowance purchases, or resets.
+
+Cumulative native process admission limits have been removed. `native_process_limit`
+is no longer a supported field; old configurations and saved Runs containing it may
+fail strict validation. There is no migration or compatibility execution path. Use
+a current configuration for new Runs; stored history is not rewritten or deleted.
+Sequential process creation does not exhaust an implicit lifetime allowance. The
+concurrent PID limit (128 by default), CPU/memory/workspace controls, cancellation
+and explicitly configured time budgets still apply. The lifetime supervisor remains
+responsible for stopping/reaping descendants and confirming safe snapshot capture.

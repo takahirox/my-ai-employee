@@ -10,7 +10,7 @@ proof.
 Production execution requires an explicitly prepared immutable Docker image. The
 container has no host bind mounts, host history, host Git metadata, Docker socket,
 or unrelated credentials. Its root filesystem is read-only; CPU, memory, process
-count and writable storage are bounded. The existing seccomp process admission
+count and writable storage are bounded. The native process lifetime
 supervisor kills and reaps task-UID processes before accepting a snapshot. Before
 creating resources, the controller starts an independent host ownership watcher.
 Loss of its exclusive pipe triggers removal of the exact owned container, gateway

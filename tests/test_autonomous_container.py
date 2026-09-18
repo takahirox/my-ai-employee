@@ -67,9 +67,9 @@ def test_native_processes_stop_before_actual_workspace_capture(tmp_path: Path) -
             "-c",
             program,
         )
-        code, _, stderr = candidate.run_guarded(command, process_limit=100)
+        code, _, stderr = candidate.run_guarded(command)
         assert code == 0, stderr.decode(errors="replace")[-2000:]
-        assert candidate.native_process_usage["cleanup"] == "confirmed"
+        assert candidate.native_completion["cleanup"] == "confirmed"
         time.sleep(1.1)
         model._copy_workspace(candidate, workspace)
     assert (workspace / "initial.txt").read_text() == "actual worker modification"
@@ -86,9 +86,7 @@ def test_timeout_removes_owned_namespace(tmp_path: Path) -> None:
     with model._candidate(workspace, 30, lambda: False, models=False) as candidate:
         candidate.deadline = time.monotonic() + 0.3
         with pytest.raises(TimeoutError):
-            candidate.run_guarded(
-                ("python", "-I", "-c", "import time; time.sleep(30)"), process_limit=100
-            )
+            candidate.run_guarded(("python", "-I", "-c", "import time; time.sleep(30)"))
         assert not candidate.created
         result = subprocess.run(["docker", "inspect", candidate.name], capture_output=True)
         assert result.returncode != 0
@@ -108,7 +106,6 @@ def test_unlimited_invocation_cancellation_removes_descendants(tmp_path: Path) -
         with pytest.raises(TimeoutError):
             candidate.run_guarded(
                 ("python", "-I", "-c", "import time; time.sleep(30)"),
-                process_limit=100,
                 supervise=cancel,
             )
         assert subprocess.run(["docker", "inspect", candidate.name], capture_output=True).returncode
@@ -237,3 +234,82 @@ def test_configured_large_snapshot_crosses_real_container_recovery(tmp_path: Pat
     tree = candidates.capture(workspace)
     candidates.materialize(tree, tmp_path / "restored")
     assert (tmp_path / "restored/asset.bin").stat().st_size == size
+
+
+def test_sequential_creation_has_no_cumulative_limit(tmp_path: Path) -> None:
+    with configured()._candidate(tmp_path, 60, lambda: False, models=False) as candidate:
+        code, stdout, _ = candidate.run_guarded(
+            (
+                "python",
+                "-I",
+                "-c",
+                "import os\nfor i in range(1100):\n p=os.fork()\n if p==0: os._exit(0)\n"
+                " os.waitpid(p,0)\nprint('completed-1100')",
+            )
+        )
+        assert code == 0
+        assert b"completed-1100" in stdout
+        assert candidate.native_completion == {"root_exit": 0, "cleanup": "confirmed"}
+        candidate.quiesce()
+
+
+def test_concurrent_pid_limit_remains_enforced(tmp_path: Path) -> None:
+    with configured()._candidate(tmp_path, 60, lambda: False, models=False) as candidate:
+        code, stdout, _ = candidate.run_guarded(
+            (
+                "python",
+                "-I",
+                "-c",
+                "import subprocess\nchildren=[]\ntry:\n for i in range(200):\n"
+                "  children.append(subprocess.Popen(['/bin/sleep','30'], "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))\n"
+                "except BlockingIOError:\n print('pid-limit-hit',len(children))\n"
+                "else:\n raise AssertionError('concurrent PID limit not enforced')",
+            )
+        )
+        assert code == 0
+        assert b"pid-limit-hit" in stdout
+        candidate.quiesce()
+
+
+@pytest.mark.parametrize("root_exit", [0, 7])
+def test_lifetime_guard_reaps_detached_children_and_overwrites_untrusted_report(
+    tmp_path, root_exit
+):
+    with configured()._candidate(tmp_path, 45, lambda: False, models=False) as candidate:
+        # Worker may write the report inode, but may not replace its root-owned parent.
+        program = (
+            "import os,sys,subprocess; from pathlib import Path; "
+            "[p.write_text('untrusted') for p in "
+            "Path('/tmp').glob('fleet-control-*/completion.json')]; "
+            "subprocess.Popen(['/bin/sleep','30'],start_new_session=True, "
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"sys.exit({root_exit})"
+        )
+        code, _, _ = candidate.run_guarded(("python", "-I", "-c", program))
+        assert code == root_exit
+        assert candidate.native_completion == {"cleanup": "confirmed", "root_exit": root_exit}
+        candidate.quiesce()
+
+
+def test_killed_supervisor_cannot_authorize_capture(tmp_path: Path) -> None:
+    with configured()._candidate(tmp_path, 30, lambda: False, models=False) as candidate:
+        with pytest.raises(RuntimeError, match="ISOLATION_PROCESS_GUARD_FAILED"):
+            candidate.run_guarded(
+                ("python", "-I", "-c", "import os,signal; os.kill(os.getppid(),signal.SIGKILL)")
+            )
+        assert not candidate.native_completion
+
+
+def test_worker_ptrace_remains_denied(tmp_path: Path) -> None:
+    with configured()._candidate(tmp_path, 30, lambda: False, models=False) as candidate:
+        code, _, _ = candidate.run_guarded(
+            (
+                "python",
+                "-I",
+                "-c",
+                "import ctypes,errno; c=ctypes.CDLL(None,use_errno=True); "
+                "assert c.ptrace(0,0,0,0)==-1 and ctypes.get_errno()==errno.EPERM",
+            )
+        )
+        assert code == 0
