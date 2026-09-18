@@ -303,7 +303,7 @@ def test_snapshot_tampering_symlinks_and_promotion_overwrite_are_rejected(tmp_pa
     model = OfflineModel()
     engine, source = runtime(tmp_path, model)
     (source / "link").symlink_to(tmp_path / "host-secret")
-    with pytest.raises(ValueError, match="CANDIDATE_SPECIAL_FILE"):
+    with pytest.raises(ValueError, match=r"SNAPSHOT_SYMLINK.*absolute target"):
         engine.candidates.capture(source)
     (source / "link").unlink()
     run = engine.start("Write result", config(), source)

@@ -62,8 +62,27 @@ continuation instead of assuming that old authority disappeared.
 
 ## Results, history and budgets
 
-Snapshots accept bounded regular files, reject symlinks/special files, and validate
-content hashes when read or materialized. Reserved runtime metadata is excluded.
+Snapshots accept bounded regular files and relative symlinks to regular files in
+that same snapshot. Targets are interpreted from the link's parent directory;
+`..` is allowed only when resolution stays inside the snapshot. Absolute targets,
+link chains (including cycles), dangling links, directory links, and references to
+excluded metadata are rejected. Validation uses selected entries, not host-path
+resolution. Git input links may only refer to selected tracked files; candidate
+links may also refer to newly created files included in that candidate.
+
+The manifest records a link's original target string, distinct from regular-file
+blob/executable metadata. Both the target and entry type participate in snapshot
+identity, comparison, and integrity checks. Restoring a snapshot validates all
+entries first, writes regular files, then creates links. Container transfers use
+the same rules, including artifact recovery after task processes are quiesced.
+Each read-only `.fleet-inputs/<index>` snapshot retains its own link namespace and
+is excluded from candidate artifacts. Symlink diagnostics use `SNAPSHOT_SYMLINK`
+with the offending repository-relative path and reason, without echoing targets.
+
+Special files remain unsupported. Reserved runtime metadata is excluded. The
+existing 64,000,000-byte and 10,000-entry snapshot bounds remain; link target bytes
+count toward the byte limit. Regular-file-only snapshot identities are unchanged.
+Content hashes are validated when snapshots are read or materialized.
 Verification-side changes never become Candidate bytes. Publication requires a new
 destination and rechecks identity, lineage and terminal authority state.
 
