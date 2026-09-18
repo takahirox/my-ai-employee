@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/bin/python -B /usr/local/lib/fleet-service-fixture.py "$@"

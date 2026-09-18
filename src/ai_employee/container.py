@@ -42,7 +42,12 @@ from .native import (
     summarize_event,
 )
 from .owner_watch import resource_missing
-from .product_capabilities import CODEX_VERSION, DEPENDENCY_ENVIRONMENT, NATIVE_PATH
+from .product_capabilities import (
+    CODEX_VERSION,
+    LOCAL_SERVICE_DIRECTORY,
+    NATIVE_PATH,
+    execution_environment,
+)
 from .snapshot import LEGACY_SNAPSHOT_BYTES, unpack_workspace
 from .time_budget import exhausted, minimum, remaining
 
@@ -200,7 +205,11 @@ class ContainerModel:
         )
         command = (
             "codex",
-            *codex_permissions(Path("/work"), authority),
+            *codex_permissions(
+                Path("/work"),
+                authority,
+                local_service_storage_mb=candidate.profile.local_service_storage_mb,
+            ),
             "sandbox",
             "--permission-profile",
             "fleet-worker",
@@ -221,11 +230,26 @@ class ContainerModel:
             " assert f'Pid:\\t{os.getpid()}\\n' in status\n"
             " assert Path('/proc/self/smaps').read_text()\n"
             " assert not Path('/proc/sys').exists()\n"
-            "except (OSError, AssertionError): sys.exit(78)\n",
+            "except (OSError, AssertionError): sys.exit(78)\n"
+            + (
+                "try:\n"
+                " import socket\n"
+                f" p=Path({LOCAL_SERVICE_DIRECTORY!r})/'.readiness'; "
+                "p.write_text('probe'); p.unlink()\n"
+                " with socket.socket() as server:\n"
+                "  server.bind(('127.0.0.1',0)); server.listen(1)\n"
+                "  with socket.create_connection(server.getsockname(),timeout=1) as client:\n"
+                "   connection,_=server.accept(); connection.close()\n"
+                "except OSError: sys.exit(79)\n"
+                if candidate.profile.local_service_storage_mb is not None
+                else ""
+            ),
         )
         code, _, _ = candidate.run_guarded(command, timeout=15, phase="probe")
         if code == 78:
             raise ValueError("NATIVE_RUNTIME_PROCFS_UNAVAILABLE")
+        if code == 79:
+            raise ValueError("LOCAL_SERVICE_SANDBOX_UNAVAILABLE")
         if code:
             raise ValueError("NATIVE_SANDBOX_PREFLIGHT_FAILED")
 
@@ -423,7 +447,9 @@ class ContainerModel:
                 )
             body = json.loads(prompt)
             body["execution_workspace"] = "/work"
-            body["execution_environment"] = DEPENDENCY_ENVIRONMENT
+            body["execution_environment"] = execution_environment(
+                candidate.profile.local_service_storage_mb
+            )
             if isinstance(body.get("context"), dict):
                 body["context"]["workspace"] = "/work"
             schema_path = "/tmp/fleet-output-schema.json"
@@ -453,7 +479,11 @@ class ContainerModel:
                 policy.model,
                 "-c",
                 "model_reasoning_effort=" + json.dumps(policy.effort),
-                *codex_permissions(Path("/work"), authority),
+                *codex_permissions(
+                    Path("/work"),
+                    authority,
+                    local_service_storage_mb=candidate.profile.local_service_storage_mb,
+                ),
                 "--cd",
                 "/work",
                 "--output-schema",
@@ -525,7 +555,11 @@ class ContainerModel:
             candidate.begin_execution("check")
             command = (
                 "codex",
-                *codex_permissions(Path("/work"), Authority()),
+                *codex_permissions(
+                    Path("/work"),
+                    Authority(),
+                    local_service_storage_mb=candidate.profile.local_service_storage_mb,
+                ),
                 "sandbox",
                 "--permission-profile",
                 "fleet-worker",

@@ -265,23 +265,28 @@ def run_process(
                 process.stderr.close()
 
 
-def codex_permissions(workspace: Path, authority: Authority) -> tuple[str, ...]:
+def codex_permissions(
+    workspace: Path, authority: Authority, *, local_service_storage_mb: int | None = None
+) -> tuple[str, ...]:
     """No host-wide read grant: only minimal runtime files and the task workspace."""
-    from .product_capabilities import NATIVE_PATH
+    from .product_capabilities import LOCAL_SERVICE_DIRECTORY, NATIVE_PATH
 
+    local_services = local_service_storage_mb is not None
+    managed_network = bool(authority.network_hosts) or local_services
     settings: dict[str, Any] = {
         "default_permissions": "fleet-worker",
         "permissions.fleet-worker.filesystem": {
             ":minimal": "read",
             str(workspace.resolve()): "write",
             str(workspace.resolve() / ".fleet-inputs"): "read",
+            **({LOCAL_SERVICE_DIRECTORY: "write"} if local_services else {}),
             **{
                 str(workspace.resolve() / name): "deny"
                 for name in (".git", ".codex", ".claude", ".fleet", ".agents")
             },
         },
-        "permissions.fleet-worker.network.enabled": bool(authority.network_hosts),
-        "features.network_proxy": bool(authority.network_hosts),
+        "permissions.fleet-worker.network.enabled": managed_network,
+        "features.network_proxy": managed_network,
         "permissions.fleet-worker.network.enable_socks5": False,
         "features.multi_agent": False,
         "features.shell_snapshot": False,
@@ -290,12 +295,14 @@ def codex_permissions(workspace: Path, authority: Authority) -> tuple[str, ...]:
         "shell_environment_policy.inherit": "none",
         "shell_environment_policy.set": {"PATH": NATIVE_PATH},
     }
-    if authority.network_hosts:
+    if managed_network:
         port = 20000 + int(hashlib.sha256(str(workspace).encode()).hexdigest()[:8], 16) % 40000
         settings["permissions.fleet-worker.network.proxy_url"] = f"http://127.0.0.1:{port}"
         settings["permissions.fleet-worker.network.domains"] = {
             host: "allow" for host in authority.network_hosts
         }
+    if local_services:
+        settings["permissions.fleet-worker.network.allow_local_binding"] = True
     result: list[str] = []
     for key, value in settings.items():
         encoded = json.dumps(value)

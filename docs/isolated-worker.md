@@ -101,6 +101,68 @@ provider's allowance, and is not enabled by any ordinary or isolation test comma
 Stop on Usage Limit; never redeem tickets, buy allowance or switch providers to
 continue a test.
 
+### Disposable local services
+
+An operator may set `isolation.local_service_storage_mb` to an integer from 16
+through 4096 (MiB) in the Run configuration. Omission or `null` leaves the added
+service environment disabled. For example, `"local_service_storage_mb": 128`
+provides a 128 MiB `/fleet-runtime` tmpfs. Choose a capacity for the application's
+data; this also consumes the candidate's existing memory allowance. It is separate
+from workspace and snapshot allowances. The setting is saved with the Run and
+affects its identity; model output cannot enable it.
+
+The enabled native profile supports loopback TCP **within one command** using
+Codex's isolated network namespace and managed proxy. An empty external host
+allowlist still denies external destinations. Existing Authority and gateway rules
+continue to govern external access; local DB writes are disposable local work.
+Pathname Unix sockets are unsupported. Set clients explicitly to `127.0.0.1` and
+configure PostgreSQL with an empty Unix socket directory (`-k ''`). No host service,
+host Docker socket, or another execution's service is exposed.
+
+The option grants storage and a supported service workflow, not a promise to deny
+all local socket operations when omitted: Codex's existing external-network mode
+already allows command-local TCP on Linux. Its `allow_local_binding=false` flag is
+not an enforceable Linux denial. Fleet does not rely on that flag as a boundary.
+
+Use an image/project-owned test wrapper that starts services, waits for readiness,
+runs the application test, and stops services in `finally` or a shell trap. Run all
+of those steps in the **same command**. Each later command starts its own services;
+a background process started in one command is not a supported endpoint for another
+command. Data files can remain under `/fleet-runtime` during one candidate invocation,
+but a new invocation, retry or independent verification starts with empty storage.
+Verification must invoke the same reproducible setup wrapper, not assume the
+worker's DB state survives. Fleet deliberately adds no persistent service manager.
+
+`/fleet-runtime` is UID-1000-owned, size-limited and mounted with `noexec,nosuid,nodev`.
+It is outside both ordinary and partial source capture. Service data/logs must go
+there; Fleet does not infer which files placed under `/work` are database data.
+Do not link runtime files into deliverables: snapshot validation rejects links
+escaping the captured source. Worker cleanup is helpful but not trusted: the existing
+process guard and candidate owner stop descendants and destroy storage on completion,
+failure, cancellation, timeout and controller loss. If cleanup is unconfirmed,
+existing capture/acceptance restrictions still apply.
+
+Native preflight checks runtime writes and a local TCP round trip before work.
+Unavailable local capability reports `LOCAL_SERVICE_SANDBOX_UNAVAILABLE`; missing
+private procfs reports the separate readiness error described above. These probes
+do not establish application correctness or waive independent verification.
+
+The optional small application fixture tests PostgreSQL SQL insertion plus Redis
+cache round trips, orderly restart between commands, fresh verification, bounded
+storage, network denial and partial capture without model calls:
+
+```sh
+docker build -f docker/service-fixture.Dockerfile \
+  --build-arg WORKER_IMAGE="$FLEET_TEST_DOCKER_IMAGE" -t fleet-service-test docker
+export FLEET_TEST_SERVICE_IMAGE=$(docker image inspect --format '{{.Id}}' fleet-service-test)
+.venv/bin/pytest tests/test_local_service_container.py -q -s
+```
+
+The fixture installs Debian Bookworm PostgreSQL 15 and Redis 7 and prints exact
+versions. It is not a PostgreSQL 16/pgvector, browser, or complete Chatwoot fixture.
+Run the actual application's wrappers in its qualified image before claiming
+benchmark readiness. No live-model test is implied by these commands.
+
 ### Temporary model capacity failures
 
 Fresh `fleet init` configurations allow two transport retries per stage. Existing

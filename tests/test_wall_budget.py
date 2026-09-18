@@ -204,6 +204,7 @@ def test_native_setup_reduces_prompt_budget_and_prevents_expired_launch(
         IsolatedWorkerProfile(image="sha256:" + "a" * 64, auth_file="/test-auth")
     )
     candidate = MagicMock()
+    candidate.profile = model.profile
     candidate.deadline = None if limit is None else clock.now + limit
     candidate.proxy = None
     candidate.run_guarded.return_value = (

@@ -27,6 +27,7 @@ def test_wrapper_discovery_is_projected_without_additional_filesystem_grants(tmp
 )
 def test_effective_readiness_failure_is_not_reported_as_available(code, error):
     candidate = Mock()
+    candidate.profile.local_service_storage_mb = None
     candidate.run_guarded.return_value = (code, b"", b"")
     with pytest.raises(ValueError, match=error):
         ContainerModel._native_probe(candidate)
