@@ -95,6 +95,74 @@ class Engine:
                 **(context or {}),
             )
 
+    def _retain_partial(
+        self,
+        run: str,
+        reservation: str,
+        workspace: Path,
+        error: BaseException,
+        boundary: BaseException | None,
+        context: dict[str, Any],
+        extracted_tree: str | None = None,
+    ) -> None:
+        """Persist a diagnostic tree, without constructing a Candidate or lineage."""
+        snapshots = failure_snapshots(error, boundary=boundary)["failures"]
+        execution: dict[str, Any] = next((f["execution"] for f in snapshots if f["execution"]), {})
+        termination = execution.get("termination", {})
+        extraction = execution.get("partial_workspace", {})
+        record: dict[str, Any] = {
+            "run_id": run,
+            "stage": "worker",
+            "reservation": reservation,
+            **context,
+            "verified": False,
+            "status": "unavailable",
+            "reason": extraction.get("reason")
+            or termination.get("retention", {}).get("reason", "termination_unavailable"),
+            "failure": termination.get("reason", type(error).__name__),
+            "environment": termination.get("environment"),
+        }
+        # A prior baseline or probe must never become a recovered workspace.
+        ready = extraction.get("status") == "ready" or (
+            not extraction and execution.get("workspace_returned") is True
+        )
+        if (
+            ready
+            and termination.get("phase") == "model"
+            and termination.get("process_stop") == "confirmed"
+        ):
+            try:
+                if extraction.get("status") == "ready" and extraction.get("reason") == "extracted":
+                    if extracted_tree is None:
+                        raise ValueError("PARTIAL_SNAPSHOT_UNAVAILABLE")
+                    tree = extracted_tree
+                else:
+                    tree = self.candidates.capture(workspace)
+                record.update(status="saved", reason="captured", tree=tree)
+            except Exception as capture_error:
+                record.update(status="capture_failed", reason=type(capture_error).__name__)
+        elif extraction.get("status") == "capture_failed":
+            record["status"] = "capture_failed"
+        if record["status"] == "unavailable" and record["reason"] == "eligible":
+            record["reason"] = "workspace_not_returned"
+        execution["partial_artifact"] = record
+        try:
+            self.journal.append(run, "partial_artifact", **record)
+        except Exception:
+            record.update(status="capture_failed", reason="artifact_record_unavailable")
+            record.pop("tree", None)
+            raise
+
+    def partials(self, run: str) -> list[dict[str, Any]]:
+        return [e["body"] for e in self.journal.events(run) if e["kind"] == "partial_artifact"]
+
+    def export_partial(self, run: str, reservation: str, destination: Path) -> dict[str, Any]:
+        record = next((p for p in self.partials(run) if p["reservation"] == reservation), None)
+        if record is None or record["status"] != "saved":
+            raise ValueError("PARTIAL_ARTIFACT_UNAVAILABLE")
+        self.candidates.export_tree(record["tree"], destination)
+        return {**record, "destination": str(destination.resolve())}
+
     def _workspace(self, run: str, label: str, tree: str | None = None) -> Path:
         path = self.root / run / (label + "-" + uuid4().hex)
         path.mkdir(parents=True)
@@ -356,9 +424,15 @@ class Engine:
         invocation_returned = False
         diagnostic_boundary = sys.exception()
         returned_execution: dict[str, Any] | None = None
+        extracted_tree: str | None = None
 
         def observe(body: dict[str, Any]) -> None:
-            nonlocal usage, capture_failed, returned_execution
+            nonlocal usage, capture_failed, returned_execution, extracted_tree
+            if body.get("event") == "partial_workspace":
+                if stage != "worker":
+                    raise ValueError("PARTIAL_WORKER_REQUIRED")
+                extracted_tree = self.candidates.capture(Path(body["workspace"]))
+                return
             if body.get("event") == "execution_termination":
                 returned_execution = body["snapshot"]
                 return
@@ -572,6 +646,17 @@ class Engine:
                     if terminal_error is not None and returned_execution is not None:
                         returned_execution["termination"]["reason"] = "post_execution_failure"
                         attach_failure(terminal_error, returned_execution)
+                    if stage == "worker" and terminal_error is not None:
+                        with suppress(Exception):
+                            self._retain_partial(
+                                run,
+                                reservation,
+                                workspace,
+                                terminal_error,
+                                diagnostic_boundary,
+                                command_context,
+                                extracted_tree,
+                            )
                     self._failure_diagnostic(
                         run,
                         stage,
@@ -2207,7 +2292,7 @@ class Engine:
             ):
                 raise ValueError("PROMOTION_AUTHORITY_UNAVAILABLE")
             candidate = self._completion(run)
-            self.candidates.publish_directory(candidate, destination)
+            self.candidates.export_tree(candidate.tree, destination)
             self.journal.append(
                 run,
                 LIFECYCLE["promotion"]["postcondition"],

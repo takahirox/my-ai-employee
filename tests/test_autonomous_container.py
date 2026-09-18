@@ -313,3 +313,48 @@ def test_worker_ptrace_remains_denied(tmp_path: Path) -> None:
             )
         )
         assert code == 0
+
+
+@pytest.mark.parametrize("root_exit", [0, 7])
+def test_failed_worker_retains_edits_before_namespace_disposal(tmp_path, root_exit):
+    from ai_employee.stage_contracts import OutputViolation
+
+    model = configured()
+    from ai_employee.candidates import Candidates
+
+    store = Candidates(tmp_path.parent / (tmp_path.name + "-objects"))
+    trees = []
+
+    def retain(body):
+        trees.append(store.capture(Path(body["workspace"])))
+
+    with (
+        pytest.raises((ValueError, OutputViolation)) as caught,
+        model._candidate(
+            tmp_path, 45, lambda: False, models=False, retain_partial=retain
+        ) as candidate,
+    ):
+        code, _, _ = candidate.run_guarded(
+            (
+                "python",
+                "-I",
+                "-c",
+                "from pathlib import Path; import sys; "
+                f"Path('/work/partial.txt').write_text('unfinished'); sys.exit({root_exit})",
+            ),
+            phase="model",
+        )
+        assert code == root_exit
+        if root_exit:
+            raise ValueError("WORKER_PROCESS_FAILED")
+        raise OutputViolation("INVALID_STRUCTURED_OUTPUT")
+    assert not (tmp_path / "partial.txt").exists()
+    store.materialize(trees[0], tmp_path.parent / (tmp_path.name + "-export"))
+    assert (
+        tmp_path.parent / (tmp_path.name + "-export") / "partial.txt"
+    ).read_text() == "unfinished"
+    snapshot = caught.value.fleet_execution_diagnostic
+    assert snapshot["partial_workspace"]["status"] == "ready"
+    assert snapshot["termination"]["process_stop"] == "confirmed"
+    assert snapshot["termination"]["disposal"] == "confirmed"
+    assert not candidate.created

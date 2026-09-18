@@ -174,14 +174,14 @@ class Candidates:
             authority_version=context.authority_version,
         )
 
-    def publish_directory(self, candidate: Candidate, destination: Path) -> None:
-        """Publish to a new directory atomically; never overwrite an operator checkout."""
+    def export_tree(self, tree: str, destination: Path) -> None:
+        """Export to a new directory atomically; this does not confer verification."""
         if destination.exists() or destination.is_symlink():
             raise ValueError("PROMOTION_TARGET_EXISTS")
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".fleet-publish-", dir=destination.parent))
         try:
-            self.materialize(candidate.tree, staging)
+            self.materialize(tree, staging)
             # mkdir claims the exact target without overwriting even an empty directory.
             destination.mkdir()
             try:

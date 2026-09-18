@@ -29,7 +29,7 @@ from .isolated_worker import (
     IsolatedWorkerProfile,
     append_resource_event,
 )
-from .models import Authority, Check, StagePolicy, Usage
+from .models import Authority, Check, StagePolicy, Usage, WorkerResult
 from .native import (
     ModelAtCapacity,
     T,
@@ -129,6 +129,7 @@ class ContainerModel:
         cancelled: Callable[[], bool],
         *,
         models: bool,
+        retain_partial: Callable[[dict[str, Any]], None] | None = None,
         authority: Authority = _OFFLINE,
     ) -> Iterator[DockerCandidate]:
         if self.profile is None:
@@ -157,6 +158,8 @@ class ContainerModel:
                     with suppress(Exception):
                         if "termination" not in candidate.execution_diagnostic:
                             candidate.record_termination(error)
+                    if retain_partial is not None:
+                        self._retain_workspace(candidate, workspace, retain_partial)
                     raise
         except BaseException as error:
             with suppress(Exception):
@@ -237,6 +240,44 @@ class ContainerModel:
                     child.unlink()
             for child in returned.iterdir():
                 shutil.move(str(child), workspace / child.name)
+
+    def _retain_workspace(
+        self,
+        candidate: DockerCandidate,
+        workspace: Path,
+        observation: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Best-effort extraction at the shared pre-disposal boundary; never restart work."""
+        outcome = {"status": "unavailable", "reason": "control_unavailable"}
+        candidate.execution_diagnostic["partial_workspace"] = outcome
+        deadline = candidate.deadline
+        try:
+            if candidate.phase != "model":
+                outcome["reason"] = "worker_not_started"
+                return
+            outcome["reason"] = candidate.retention_status()
+            if candidate.execution_diagnostic.get("workspace_returned"):
+                outcome.update(status="ready", reason="already_returned")
+                return
+            if "workspace_returned" in candidate.execution_diagnostic:
+                outcome.update(status="capture_failed", reason="workspace_transfer_failed")
+                return
+            if outcome["reason"] != "eligible":
+                return
+            candidate.deadline = minimum(deadline, time.monotonic() + 30)
+            with TemporaryDirectory(prefix="fleet-partial-", dir=workspace.parent) as directory:
+                partial = Path(directory)
+                self._copy_workspace(candidate, partial)
+                if candidate.retention_status() != "eligible":
+                    raise TimeoutError("PARTIAL_EXTRACTION_INTERRUPTED")
+                # The engine stores the immutable tree while this private staging
+                # directory exists. Never replace the live retry workspace.
+                observation({"event": "partial_workspace", "workspace": str(partial)})
+                outcome.update(status="ready", reason="extracted")
+        except Exception as error:
+            outcome.update(status="capture_failed", reason=type(error).__name__)
+        finally:
+            candidate.deadline = deadline
 
     def reconcile(self, run_directory: Path) -> None:
         """Reconcile only owned resource ledgers before any continuation or revocation."""
@@ -350,7 +391,12 @@ class ContainerModel:
                 observer(supervised - began, output_bytes)
 
         with self._candidate(
-            workspace, timeout, cancelled, models=True, authority=authority
+            workspace,
+            timeout,
+            cancelled,
+            models=True,
+            authority=authority,
+            retain_partial=observation if schema is WorkerResult else None,
         ) as candidate:
             self._native_probe(candidate, authority)
             candidate.begin_execution("model")
@@ -437,12 +483,14 @@ class ContainerModel:
                             "allowed": item["allowed"],
                         }
                     )
-            self._copy_workspace(candidate, workspace)
             if code:
                 if capacity_error(stdout.decode(errors="replace")):
                     raise ModelAtCapacity("MODEL_AT_CAPACITY")
                 raise ValueError("WORKER_PROCESS_FAILED")
             result = decode_response(stdout.decode(errors="replace"), schema)
+            candidate.execution_diagnostic["workspace_returned"] = False
+            self._copy_workspace(candidate, workspace)
+            candidate.execution_diagnostic["workspace_returned"] = True
             candidate.record_termination(None)
         # Keep completion facts available for Engine-side response validation errors.
         # The engine retains this in memory; successful calls need no extra journal event.
