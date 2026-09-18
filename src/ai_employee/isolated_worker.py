@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from . import owner_watch
 from .diagnostics import attach_failure, execution_snapshot
 from .owner_watch import resource_missing
+from .product_capabilities import NATIVE_PATH
 from .snapshot import LEGACY_SNAPSHOT_BYTES, pack_workspace
 from .time_budget import exhausted, minimum, remaining
 
@@ -340,6 +341,8 @@ class DockerCandidate:
             raise TimeoutError("isolated execution cancelled or timed out before launch")
 
         environment = [
+            "--env",
+            f"PATH={NATIVE_PATH}",
             "--env",
             "HOME=/home/fleet",
             "--env",

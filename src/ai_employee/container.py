@@ -42,7 +42,7 @@ from .native import (
     summarize_event,
 )
 from .owner_watch import resource_missing
-from .product_capabilities import CODEX_VERSION, DEPENDENCY_ENVIRONMENT
+from .product_capabilities import CODEX_VERSION, DEPENDENCY_ENVIRONMENT, NATIVE_PATH
 from .snapshot import LEGACY_SNAPSHOT_BYTES, unpack_workspace
 from .time_budget import exhausted, minimum, remaining
 
@@ -93,6 +93,8 @@ class ContainerModel:
                 raise Stopped("UNSUPPORTED_NATIVE_VERSION")
             c._docker(
                 "exec",
+                "--env",
+                f"PATH={NATIVE_PATH}",
                 c.name,
                 "python",
                 "-I",
